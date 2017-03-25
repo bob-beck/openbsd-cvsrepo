@@ -1,0 +1,558 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_4_4:1.4.0.2
+	OPENBSD_4_4_BASE:1.4;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2008.10.26.08.49.43;	author ratchov;	state dead;
+branches;
+next	1.5;
+
+1.5
+date	2008.08.14.09.58.55;	author ratchov;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2008.06.03.14.36.20;	author drahn;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2008.06.02.17.08.11;	author ratchov;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2008.05.28.07.36.23;	author ratchov;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.05.23.07.15.46;	author ratchov;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@add minimal server capability to aucat(1). When started in server
+mode, it listens on an unix socket and mixes/demultiplexes any number
+of full-duplex streams, doing necessary format conversions and
+resampling on the fly.
+
+programs can use the new libsa(3) library to play and record audio.
+The library provides a very simple API to connect to the audio server;
+if aucat(1) isn't running, it uses the audio(4) driver transparently
+instead.
+@
+text
+@/*	$OpenBSD: dev_sun.c,v 1.5 2008/08/14 09:58:55 ratchov Exp $	*/
+/*
+ * Copyright (c) 2008 Alexandre Ratchov <alex@@caoua.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/audioio.h>
+
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "conf.h"
+#include "aparams.h"
+#include "dev.h"
+
+/*
+ * Convert sun device parameters to struct aparams
+ */
+int
+sun_infotopar(struct audio_prinfo *ai, struct aparams *par)
+{
+	par->rate = ai->sample_rate;
+	par->bps = ai->precision / 8;
+	par->bits = ai->precision;
+	par->cmax = par->cmin + ai->channels - 1;
+	if (par->cmax >= CHAN_MAX) {
+		warnx("%u:%u: channel range out of bounds",
+		    par->cmin, par->cmax);
+		return 0;
+	}
+	par->msb = 1;
+	switch (ai->encoding) {
+	case AUDIO_ENCODING_SLINEAR_LE:
+		par->le = 1;
+		par->sig = 1;
+		break;
+	case AUDIO_ENCODING_SLINEAR_BE:
+		par->le = 0;
+		par->sig = 1;
+		break;
+	case AUDIO_ENCODING_ULINEAR_LE:
+		par->le = 1;
+		par->sig = 0;
+		break;
+	case AUDIO_ENCODING_ULINEAR_BE:
+		par->le = 0;
+		par->sig = 0;
+		break;
+	case AUDIO_ENCODING_SLINEAR:
+		par->le = NATIVE_LE;
+		par->sig = 1;
+		break;
+	case AUDIO_ENCODING_ULINEAR:
+		par->le = NATIVE_LE;
+		par->sig = 0;
+		break;
+	default:
+		warnx("only linear encodings are supported for audio devices");
+		return 0;
+	}
+	return 1;
+}
+
+/*
+ * Convert struct aparams to sun device parameters.
+ */
+void
+sun_partoinfo(struct audio_prinfo *ai, struct aparams *par)
+{
+	ai->sample_rate = par->rate;
+	ai->precision = par->bps * 8;
+	ai->channels = par->cmax - par->cmin + 1;
+	if (par->le && par->sig) {
+		ai->encoding = AUDIO_ENCODING_SLINEAR_LE;
+	} else if (!par->le && par->sig) {
+		ai->encoding = AUDIO_ENCODING_SLINEAR_BE;
+	} else if (par->le && !par->sig) {
+		ai->encoding = AUDIO_ENCODING_ULINEAR_LE;
+	} else {
+		ai->encoding = AUDIO_ENCODING_ULINEAR_BE;
+	}
+}
+
+/*
+ * Open the device and pause it, so later play and record
+ * can be started simultaneously.
+ *
+ * in "infr" and "onfd" we return the input and the output
+ * block sizes respectively.
+ */
+int
+sun_open(char *path, struct aparams *ipar, struct aparams *opar,
+	 unsigned *infr, unsigned *onfr)
+{
+	int fd;
+	int fullduplex;
+	int flags;
+	struct audio_info aui;	
+	struct audio_bufinfo aubi;
+
+	if (!ipar && !opar)
+		errx(1, "%s: must at least play or record", path);
+
+	if (ipar && opar) {
+		flags = O_RDWR;
+	} else  if (ipar) {
+		flags = O_RDONLY;
+	} else {
+		flags = O_WRONLY;
+	}
+	fd = open(path, flags | O_NONBLOCK);
+	if (fd < 0) {
+		warn("%s", path);
+		return -1;
+	}
+
+	/*
+	 * If both play and record are requested then
+	 * set full duplex mode.
+	 */
+	if (ipar && opar) {
+		fullduplex = 1;
+		if (ioctl(fd, AUDIO_SETFD, &fullduplex) < 0) {
+			warn("%s: can't set full-duplex", path);
+			close(fd);
+			return -1;
+		}
+	}
+	
+	/*
+	 * Set parameters and pause the device. When paused, the write(2)
+	 * syscall will queue samples but the the kernel will not start playing
+	 * them. Setting the 'mode' and pausing the device must be done in a
+	 * single ioctl() call, otherwise the sun driver will start the device
+	 * and fill the record buffers.
+	 */
+	AUDIO_INITINFO(&aui);
+	aui.mode = 0;
+	if (opar) {
+		sun_partoinfo(&aui.play, opar);
+		aui.play.pause = 1;
+		aui.mode |= AUMODE_PLAY;
+	}
+	if (ipar) {
+		sun_partoinfo(&aui.record, ipar);
+		aui.record.pause = 1;
+		aui.mode |= AUMODE_RECORD;
+	}
+	if (ioctl(fd, AUDIO_SETINFO, &aui) < 0) {
+		fprintf(stderr, "%s: can't set audio params to ", path);
+		if (ipar)
+			aparams_print(ipar);
+		if (opar) {
+			if (ipar)
+				fprintf(stderr, " and ");
+			aparams_print(opar);
+		}
+		fprintf(stderr, ": %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	if (ioctl(fd, AUDIO_GETINFO, &aui) < 0) {
+		warn("sun_open: getinfo");
+		close(fd);
+		return -1;
+	}
+	if (opar) {
+		if (!sun_infotopar(&aui.play, opar)) {
+			close(fd);
+			return -1;
+		}
+		if (ioctl(fd, AUDIO_GETPRINFO, &aubi) < 0) {
+			warn("%s: AUDIO_GETPRINFO", path);
+			close(fd);
+			return -1;
+		}
+		*onfr = aubi.blksize * aubi.hiwat /
+		    (aui.play.channels * aui.play.precision / 8);
+	}
+	if (ipar) {
+		if (!sun_infotopar(&aui.record, ipar)) {
+			close(fd);
+			return -1;
+		}
+		if (ioctl(fd, AUDIO_GETRRINFO, &aubi) < 0) {
+			warn("%s: AUDIO_GETRRINFO", path);
+			close(fd);
+			return -1;
+		}
+		*infr = aubi.blksize * aubi.hiwat /
+		    (aui.record.channels * aui.record.precision / 8);
+	}
+	return fd;
+}
+
+/*
+ * Drain and close the device
+ */
+void
+sun_close(int fd)
+{
+	close(fd);
+	DPRINTF("sun_close: closed\n");
+}
+
+/*
+ * Start play/record simultaneously. Play buffers must be filled.
+ */
+void
+sun_start(int fd)
+{
+	audio_info_t aui;
+
+	/*
+	 * Just unpause the device. The kernel will start playback and record
+	 * simultaneously. There must be samples already written.
+	 */
+	AUDIO_INITINFO(&aui);	
+	aui.play.pause = aui.record.pause = 0;
+	if (ioctl(fd, AUDIO_SETINFO, &aui) < 0)
+		err(1, "sun_start: setinfo");
+
+	DPRINTF("sun_start: play/rec started\n");
+}
+
+/*
+ * Drain play buffers and then stop play/record simultaneously.
+ */
+void
+sun_stop(int fd)
+{
+	audio_info_t aui;
+
+	/*
+	 * Sun API doesn't not allows us to drain and stop without
+	 * loosing the sync between playback and record. So, for now we
+	 * just pause the device until this problem is worked around.
+	 *
+	 * there are three possible workarounds:
+	 *
+	 *	1) stop depending on this, ie. make the rest of the code
+	 *	   able to resynchronize playback to record. Then just
+	 *	   close/reset the device to stop it.
+	 *
+	 *	2) send "hiwat" blocks of silence and schedule the
+	 *	   very same amount of silence to drop.
+	 *
+	 *	3) modify the AUDIO_DRAIN ioctl(2) not to loose sync
+	 * 
+	 */
+	AUDIO_INITINFO(&aui);
+	aui.play.pause = aui.record.pause = 1;	
+	if (ioctl(fd, AUDIO_SETINFO, &aui) < 0)
+		err(1, "sun_stop: setinfo");
+
+	DPRINTF("sun_stop: play/rec stopped\n");
+}
+
+struct devops devops_sun = {
+	sun_open,
+	sun_close,
+	sun_start,
+	sun_stop
+};
+@
+
+
+1.5
+log
+@move all device related stuff from aucat.c to a new dev.c file.
+The new dev_xxx() routines expose a "high level" self-contained
+interface to the device. At initialization, the device is opened
+and two chains of aproc structures are created:
+
+ * a playback chain that exposes a (initially) empty mix
+   aproc to which the rest of the code can attach new
+   streams to be played
+
+ * record chain that exposes a (initially) empty sub aproc
+   to which the rest of the code can attach new stream to
+   to record
+
+The rest of the code, has just to use dev_attach() routine to
+attach streams. While we're at it, add a ``devops'' structure
+containing pointers to the device-specific routines. This will
+allow later to add support for other type of device than the
+Sun API.
+
+Also, write the .wav headers in file_del(), so put all header
+related data in the file strucuture. This allows to close() the
+file, as soon as wpipe_xxx() aproc terminates. This will be
+useful for the server, because it will need to close() descripts
+of closed connections immediately.
+
+add mix_pushzero() routine to fill the mixer with silence. It
+will be used to avoid the mixer to underrun when there are no
+input streams. Since we always have at least one input stream
+there's no behaviour change.
+
+ok jakemsr
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dev_sun.c,v 1.4 2008/06/03 14:36:20 drahn Exp $	*/
+@
+
+
+1.4
+log
+@Allow aucat to play/record from input-only or output-only devices.
+ok jakemsr, ratchov
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dev_sun.c,v 1.3 2008/06/02 17:08:11 ratchov Exp $	*/
+d18 4
+d27 1
+d35 1
+a35 1
+ * convert sun device parameters to struct params
+d83 1
+a83 1
+ * Convert struct params to sun device parameters.
+d106 1
+a106 1
+ * int "infr" and "onfd" we return the input and the output
+d110 1
+a110 1
+dev_init(char *path, struct aparams *ipar, struct aparams *opar,
+d181 1
+a181 1
+		warn("dev_init: getinfo");
+d214 3
+d218 1
+a218 1
+dev_done(int fd)
+d221 1
+a221 1
+	DPRINTF("dev_done: closed\n");
+d225 1
+a225 1
+ * Start play/record.
+d228 1
+a228 1
+dev_start(int fd)
+d239 1
+a239 1
+		err(1, "dev_start: setinfo");
+d241 1
+a241 1
+	DPRINTF("dev_start: play/rec started\n");
+d245 1
+a245 2
+ * Stop play/record and clear kernel buffers so that dev_start() can be called
+ * again.
+d248 1
+a248 1
+dev_stop(int fd)
+a250 4
+	unsigned mode;
+
+	if (ioctl(fd, AUDIO_DRAIN) < 0)
+		err(1, "dev_stop: drain");
+d253 15
+a267 2
+	 * The only way to clear kernel buffers and to pause the device
+	 * simultaneously is to set the mode again (to the same value).
+a268 4
+	if (ioctl(fd, AUDIO_GETINFO, &aui) < 0)
+		err(1, "dev_stop: getinfo");
+
+	mode = aui.mode;
+a269 1
+	aui.mode = mode;
+d272 1
+a272 1
+		err(1, "dev_stop: setinfo");
+d274 1
+a274 1
+	DPRINTF("dev_stop: play/rec stopped\n");
+d276 7
+@
+
+
+1.3
+log
+@if aucat is suspended, then the kernel continues running the device
+(produces silence) and later, once aucat is resumed the kernel starts
+dropping samples, it will try to drop as many samples as silence was
+produced. So suspending breaks the aucat process permanently.
+
+workaround this by blocking the signals ie disabling suspending of aucat
+from the tty. The long term solution would be to catch SIGCONT and to stop
+the device, resync/refill buffers and restart the device. That's really a
+lot of work...
+
+ok jakemsr
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dev_sun.c,v 1.2 2008/05/28 07:36:23 ratchov Exp $	*/
+d110 1
+d117 8
+a124 1
+	fd = open(path, O_RDWR | O_NONBLOCK);
+@
+
+
+1.2
+log
+@if aucat is resumed (after suspend), kernel buffers are empty, thus write()
+syscall succedes and consumes aucat buffers until kernel buffers are full.
+If aucat buffers are smaller than kernel ones, they will underrun, and aucat
+will terminate, since underruns are not handled yet.
+
+This changes is an improvement until SIGCONT handler is implemented. The
+correct approach is to add a handler for SIGCONT to: call dev_stop(), reset
+all buffers, bring play and record in sync, fill play buffers and call
+dev_start().
+
+ok jakemsr
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dev_sun.c,v 1.1 2008/05/23 07:15:46 ratchov Exp $	*/
+d205 1
+@
+
+
+1.1
+log
+@add support for:
+ - recording, full-duplex operation
+ - format conversions and resampling on the fly
+ - mixing on the fly of multiple inputs of different formats
+ - up to 16 channels, simplistic "routing" of channel ranges
+ - more linear encodings (in raw and wav files)
+the old behaviour is fully preserved if none of the new -i and -o
+options are used.
+
+code and fixes from jakemsr@@ and eric@@, suggestions by others.
+ok "go ahead" deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d111 1
+a143 1
+	aui.lowat = UINT_MAX / 2; /* will set lowat = hiwat - 1 */
+d173 1
+a173 16
+		/*
+		 * We _must_ ensure that write() will accept at most
+		 * one block when it unblocks. Here is our definition
+		 * of the block size: the minimum amount of data
+		 * write() accepts immediately when it unblocks. If
+		 * write() accepts more that 1 block, then this means
+		 * that we failed to provide the first block early
+		 * enough thus underrun happened.
+		 *
+		 * If we fail to ensure that lowat = hiwat - 1, then
+		 * we will trigger the underrun detection mechanism.
+		 * Recording doesn't use the water mark non-sense.
+		 */
+		if (aui.lowat != aui.hiwat - 1) {
+			warnx("%s: failed to disable lowat: hiwat = %u, "
+			    "lowat = %u", path, aui.hiwat, aui.lowat);
+d177 2
+a178 1
+		if (!sun_infotopar(&aui.play, opar)) {
+d182 1
+a182 1
+		*onfr = aui.play.block_size /
+d190 6
+a195 1
+		*infr = aui.record.block_size /
+@
+

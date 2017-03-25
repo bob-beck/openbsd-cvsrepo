@@ -1,0 +1,963 @@
+head	1.11;
+access;
+symbols
+	OPENBSD_5_2:1.4.0.2
+	OPENBSD_5_2_BASE:1.4;
+locks; strict;
+comment	@ * @;
+
+
+1.11
+date	2012.09.08.11.08.21;	author eric;	state dead;
+branches;
+next	1.10;
+
+1.10
+date	2012.08.19.17.59.15;	author eric;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2012.08.19.16.17.40;	author eric;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2012.08.18.16.48.17;	author eric;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2012.08.18.13.49.13;	author eric;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2012.08.18.11.19.51;	author eric;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2012.07.29.20.33.21;	author eric;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2012.07.11.16.49.12;	author eric;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.07.08.17.01.06;	author eric;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.07.08.13.12.46;	author eric;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.04.14.09.24.18;	author eric;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.11
+log
+@split asr_resolver.c into different files to overlay the libc/net
+resolver implementation.
+@
+text
+@/*	$OpenBSD: asr_resolver.c,v 1.10 2012/08/19 17:59:15 eric Exp $	*/
+/*
+ * Copyright (c) 2012 Eric Faurot <eric@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <netinet/in.h>
+
+#include <arpa/nameser.h> /* for MAXDNAME */
+#include <errno.h>
+#include <resolv.h>
+#include <string.h>
+
+#include "asr.h"
+#include "asr_private.h"
+
+/*
+ * XXX this function is actually internal to asr, but we use it here to force
+ * the creation a default resolver context in res_init().
+ */
+struct asr_ctx *asr_use_resolver(struct asr *);
+void asr_ctx_unref(struct asr_ctx *);
+
+static struct hostent *_gethostbyname(const char *, int);
+static void _fillhostent(const struct hostent *, struct hostent *, char *buf,
+    size_t);
+static void _fillnetent(const struct netent *, struct netent *, char *buf,
+    size_t);
+
+/* in res_init.c */
+struct __res_state _res;
+struct __res_state_ext _res_ext;
+
+/* in res_query.c */ 
+int h_errno;
+
+static struct hostent	 _hostent;
+static struct netent	 _netent;
+static char		 _entbuf[4096];
+
+static char *_empty[] = { NULL, };
+
+int
+res_init(void)
+{
+	async_resolver_done(NULL);
+	asr_ctx_unref(asr_use_resolver(NULL));
+
+	return (0);
+}
+
+int
+res_send(const u_char *buf, int buflen, u_char *ans, int anslen)
+{
+	struct async	*as;
+	struct async_res ar;
+
+	if (ans == NULL || anslen <= 0) {
+		errno = EINVAL;
+		return (-1);
+	}
+
+	as = res_send_async(buf, buflen, ans, anslen, NULL);
+	if (as == NULL)
+		return (-1); /* errno set */
+
+	async_run_sync(as, &ar);
+
+	if (ar.ar_errno) {
+		errno = ar.ar_errno;
+		return (-1);
+	}
+
+	return (ar.ar_datalen);
+}
+
+int
+res_query(const char *name, int class, int type, u_char *ans, int anslen)
+{
+	struct async	*as;
+	struct async_res ar;
+
+	if (ans == NULL || anslen <= 0) {
+		h_errno = NO_RECOVERY;
+		errno = EINVAL;
+		return (-1);
+	}
+
+	as = res_query_async(name, class, type, ans, anslen, NULL);
+	if (as == NULL) {
+		if (errno == EINVAL)
+			h_errno = NO_RECOVERY;
+		else
+			h_errno = NETDB_INTERNAL;
+		return (-1); /* errno set */
+	}
+
+	async_run_sync(as, &ar);
+
+	if (ar.ar_errno)
+		errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+
+	if (ar.ar_h_errno != NETDB_SUCCESS)
+		return (-1);
+
+	return (ar.ar_datalen);
+}
+
+/* This function is not documented, but used by sendmail. */
+int
+res_querydomain(const char *name,
+    const char *domain,
+    int class,
+    int type,
+    u_char *answer,
+    int anslen)
+{
+	char	fqdn[MAXDNAME], ndom[MAXDNAME];
+	size_t	n;
+
+	/* we really want domain to end with a dot for now */
+	if (domain && (n = strlen(domain)) == 0 || domain[n - 1 ] != '.') {
+		domain = ndom;
+		strlcpy(ndom, domain, sizeof ndom);
+		strlcat(ndom, ".", sizeof ndom);
+	}
+
+	if (asr_make_fqdn(name, domain, fqdn, sizeof fqdn) == 0) {
+		h_errno = NO_RECOVERY;
+		errno = EINVAL;
+		return (-1);
+	}
+
+	return (res_query(fqdn, class, type, answer, anslen));
+}
+
+/* This function is apparently needed by some ports. */
+int
+res_mkquery(int op, const char *dname, int class, int type,
+    const unsigned char *data, int datalen, const unsigned char *newrr,
+    unsigned char *buf, int buflen)
+{
+	struct asr_ctx	*ac;
+	struct packed	 p;
+	struct header	 h;
+	char		 fqdn[MAXDNAME];
+	char		 dn[MAXDNAME];
+
+	/* we currently only support QUERY */
+	if (op != QUERY || data)
+		return (-1);
+
+	if (dname[0] == '\0' || dname[strlen(dname) - 1] != '.') {
+		strlcpy(fqdn, dname, sizeof fqdn);
+		if (strlcat(fqdn, ".", sizeof fqdn) >= sizeof fqdn)
+			return (-1);
+		dname = fqdn;
+	}
+
+	if (dname_from_fqdn(dname, dn, sizeof(dn)) == -1)
+		return (-1);
+
+	ac = asr_use_resolver(NULL);
+
+	memset(&h, 0, sizeof h);
+	h.id = res_randomid();
+	if (ac->ac_options & RES_RECURSE)
+		h.flags |= RD_MASK;
+	h.qdcount = 1;
+
+	packed_init(&p, buf, buflen);
+	pack_header(&p, &h);
+	pack_query(&p, type, class, dn);
+
+	asr_ctx_unref(ac);
+
+	if (p.err)
+		return (-1);
+
+	return (p.offset);
+}
+
+int
+res_search(const char *name, int class, int type, u_char *ans, int anslen)
+{
+	struct async	*as;
+	struct async_res ar;
+
+	if (ans == NULL || anslen <= 0) {
+		h_errno = NO_RECOVERY;
+		errno = EINVAL;
+		return (-1);
+	}
+
+	as = res_search_async(name, class, type, ans, anslen, NULL);
+	if (as == NULL) {
+		if (errno == EINVAL)
+			h_errno = NO_RECOVERY;
+		else
+			h_errno = NETDB_INTERNAL;
+		return (-1); /* errno set */
+	}
+
+	async_run_sync(as, &ar);
+
+	if (ar.ar_errno)
+		errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+
+	if (ar.ar_h_errno != NETDB_SUCCESS)
+		return (-1);
+
+	return (ar.ar_datalen);
+}
+
+int
+getrrsetbyname(const char *name, unsigned int class, unsigned int type,
+    unsigned int flags, struct rrsetinfo **res)
+{
+	struct async	*as;
+	struct async_res ar;
+	int		 r, saved_errno = errno;
+
+	as = getrrsetbyname_async(name, class, type, flags, NULL);
+	if (as == NULL) {
+		r = (errno == ENOMEM) ? ERRSET_NOMEMORY : ERRSET_FAIL;
+		errno = saved_errno;
+		return (r);
+	}
+
+	async_run_sync(as, &ar);
+
+	*res = ar.ar_rrsetinfo;
+
+	return (ar.ar_rrset_errno);
+}
+
+void
+_fillhostent(const struct hostent *h, struct hostent *r, char *buf, size_t len)
+{
+	char	**ptr, *end, *pos;
+	size_t	n, i;
+	int	naliases, naddrs;
+
+	end = buf + len;
+	ptr = (char**)buf; /* XXX align */
+
+	for (naliases = 0; h->h_aliases[naliases]; naliases++)
+		;
+	for (naddrs = 0; h->h_addr_list[naddrs]; naddrs++)
+		;
+
+	r->h_name = NULL;
+	r->h_addrtype = h->h_addrtype;
+	r->h_length = h->h_length;
+	r->h_aliases = ptr;
+	r->h_addr_list = ptr + naliases + 1;
+
+	pos = (char*)(ptr + (naliases + 1) + (naddrs + 1));
+	if (pos > end) {
+		r->h_aliases = _empty;
+		r->h_addr_list = _empty;
+		return;
+	}
+	bzero(ptr, pos - (char*)ptr);
+
+	n = strlcpy(pos, h->h_name, end - pos);
+	if (n >= end - pos)
+		return;
+	r->h_name = pos;
+	pos += n + 1;
+
+	for(i = 0; i < naliases; i++) {
+		n = strlcpy(pos, h->h_aliases[i], end - pos);
+		if (n >= end - pos)
+			return;
+		r->h_aliases[i] = pos;
+		pos += n + 1;
+	}
+
+	for(i = 0; i < naddrs; i++) {
+		if (r->h_length > end - pos)
+			return;
+		memmove(pos, h->h_addr_list[i], r->h_length);
+		r->h_addr_list[i] = pos;
+		pos += r->h_length;
+	}
+}
+
+static struct hostent *
+_gethostbyname(const char *name, int af)
+{
+	struct async		*as;
+	struct async_res	 ar;
+
+	if (af == -1)
+		as = gethostbyname_async(name, NULL);
+	else
+		as = gethostbyname2_async(name, af, NULL);
+
+	if (as == NULL) {
+		h_errno = NETDB_INTERNAL;
+		return (NULL);
+	}
+
+	async_run_sync(as, &ar);
+
+	errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+	if (ar.ar_hostent == NULL)
+		return (NULL);
+
+	_fillhostent(ar.ar_hostent, &_hostent, _entbuf, sizeof(_entbuf));
+	free(ar.ar_hostent);
+
+	return (&_hostent);
+}
+
+struct hostent *
+gethostbyname(const char *name)
+{
+	return _gethostbyname(name, -1);
+}
+
+struct hostent *
+gethostbyname2(const char *name, int af)
+{
+	return _gethostbyname(name, af);
+}
+
+struct hostent *
+gethostbyaddr(const void *addr, socklen_t len, int af)
+{
+	struct async	*as;
+	struct async_res ar;
+
+	as = gethostbyaddr_async(addr, len, af, NULL);
+	if (as == NULL) {
+		h_errno = NETDB_INTERNAL;
+		return (NULL);
+	}
+
+	async_run_sync(as, &ar);
+
+	errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+	if (ar.ar_hostent == NULL)
+		return (NULL);
+
+	_fillhostent(ar.ar_hostent, &_hostent, _entbuf, sizeof(_entbuf));
+	free(ar.ar_hostent);
+
+	return (&_hostent);
+}
+
+/* XXX These functions do nothing for now. */
+void
+sethostent(int stayopen)
+{
+}
+
+void
+endhostent(void)
+{
+}
+
+struct hostent *
+gethostent(void)
+{
+	h_errno = NETDB_INTERNAL;
+	return (NULL);
+}
+
+void
+_fillnetent(const struct netent *e, struct netent *r, char *buf, size_t len)
+{
+	char	**ptr, *end, *pos;
+	size_t	n, i;
+	int	naliases;
+
+	end = buf + len;
+	ptr = (char**)buf; /* XXX align */
+
+	for (naliases = 0; e->n_aliases[naliases]; naliases++)
+		;
+
+	r->n_name = NULL;
+	r->n_addrtype = e->n_addrtype;
+	r->n_net = e->n_net;
+	r->n_aliases = ptr;
+
+	pos = (char *)(ptr + (naliases + 1));
+	if (pos > end) {
+		r->n_aliases = _empty;
+		return;
+	}
+	bzero(ptr, pos - (char *)ptr);
+
+	n = strlcpy(pos, e->n_name, end - pos);
+	if (n >= end - pos)
+		return;
+	r->n_name = pos;
+	pos += n + 1;
+
+	for(i = 0; i < naliases; i++) {
+		n = strlcpy(pos, e->n_aliases[i], end - pos);
+		if (n >= end - pos)
+			return;
+		r->n_aliases[i] = pos;
+		pos += n + 1;
+	}
+}
+
+struct netent *
+getnetbyname(const char *name)
+{
+	struct async	*as;
+	struct async_res ar;
+
+	as = getnetbyname_async(name, NULL);
+	if (as == NULL) {
+		h_errno = NETDB_INTERNAL;
+		return (NULL);
+	}
+
+	async_run_sync(as, &ar);
+
+	errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+	if (ar.ar_netent == NULL)
+		return (NULL);
+
+	_fillnetent(ar.ar_netent, &_netent, _entbuf, sizeof(_entbuf));
+	free(ar.ar_netent);
+
+	return (&_netent);
+}
+
+struct netent *
+getnetbyaddr(in_addr_t net, int type)
+{
+	struct async	*as;
+	struct async_res ar;
+
+	as = getnetbyaddr_async(net, type, NULL);
+	if (as == NULL) {
+		h_errno = NETDB_INTERNAL;
+		return (NULL);
+	}
+
+	async_run_sync(as, &ar);
+
+	errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+	if (ar.ar_netent == NULL)
+		return (NULL);
+
+	_fillnetent(ar.ar_netent, &_netent, _entbuf, sizeof(_entbuf));
+	free(ar.ar_netent);
+
+	return (&_netent);
+}
+
+int
+getaddrinfo(const char *hostname, const char *servname,
+    const struct addrinfo *hints, struct addrinfo **res)
+{
+	struct async	*as;
+	struct async_res ar;
+	int		 saved_errno = errno;
+
+	as = getaddrinfo_async(hostname, servname, hints, NULL);
+	if (as == NULL) {
+		if (errno == ENOMEM) {
+			errno = saved_errno;
+			return (EAI_MEMORY);
+		}
+		return (EAI_SYSTEM);
+	}
+
+	async_run_sync(as, &ar);
+
+	*res = ar.ar_addrinfo;
+	if (ar.ar_gai_errno == EAI_SYSTEM)
+		errno = ar.ar_errno;
+
+	return (ar.ar_gai_errno);
+}
+
+int
+getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
+    size_t hostlen, char *serv, size_t servlen, int flags)
+{
+	struct async	*as;
+	struct async_res ar;
+	int		 saved_errno = errno;
+
+	as = getnameinfo_async(sa, salen, host, hostlen, serv, servlen, flags,
+	    NULL);
+	if (as == NULL) {
+		if (errno == ENOMEM) {
+			errno = saved_errno;
+			return (EAI_MEMORY);
+		}
+		return (EAI_SYSTEM);
+	}
+
+	async_run_sync(as, &ar);
+	if (ar.ar_gai_errno == EAI_SYSTEM)
+		errno = ar.ar_errno;
+
+	return (ar.ar_gai_errno);
+}
+
+/* from getrrsetbyname.c */
+void
+freerrset(struct rrsetinfo *rrset)
+{
+	u_int16_t i;
+
+	if (rrset == NULL)
+		return;
+
+	if (rrset->rri_rdatas) {
+		for (i = 0; i < rrset->rri_nrdatas; i++) {
+			if (rrset->rri_rdatas[i].rdi_data == NULL)
+				break;
+			free(rrset->rri_rdatas[i].rdi_data);
+		}
+		free(rrset->rri_rdatas);
+	}
+
+	if (rrset->rri_sigs) {
+		for (i = 0; i < rrset->rri_nsigs; i++) {
+			if (rrset->rri_sigs[i].rdi_data == NULL)
+				break;
+			free(rrset->rri_sigs[i].rdi_data);
+		}
+		free(rrset->rri_sigs);
+	}
+
+	if (rrset->rri_name)
+		free(rrset->rri_name);
+	free(rrset);
+}
+@
+
+
+1.10
+log
+@Build static netent and hostent structure in a nicer and hopefully not
+broken way.  Make it almost trivial to implement gethostby*_r() family
+of functions when needed.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.9 2012/08/19 16:17:40 eric Exp $	*/
+@
+
+
+1.9
+log
+@When building dynamic hostent and netent, allocate a single linear buffer to
+hold both the structure and the data. The freehostent() and freenetent() API
+functions are not needed anymore.  While there, ensure that the constructed
+addr and alias lists are really NULL terminated.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.8 2012/08/18 16:48:17 eric Exp $	*/
+d37 4
+a40 3
+static struct hostent *_mkstatichostent(struct hostent *);
+static struct netent *_mkstaticnetent(struct netent *);
+
+d49 5
+d251 2
+a252 6
+#define MAXALIASES	16
+#define MAXADDRS	16
+
+/* XXX bound checks are incorrect */
+static struct hostent *
+_mkstatichostent(struct hostent *h)
+d254 30
+a283 19
+	static struct hostent r;
+	static char buf[4096];
+	static char *aliases[MAXALIASES+1];
+	static uint64_t addrbuf[64];
+	static char *addr_list[MAXADDRS + 1];
+
+	char	*pos, **c;
+	size_t	left, n;
+	int	naliases = 0, naddrs = 0;
+
+	r.h_addrtype = h->h_addrtype;
+	r.h_length = h->h_length;
+	r.h_name = buf;
+	r.h_aliases = aliases;
+	r.h_addr_list = addr_list;
+
+	pos = buf;
+	left = sizeof(buf);
+	n = strlcpy(pos, h->h_name, left);
+a284 1
+	left -= n + 1;
+d286 5
+a290 5
+	for(c = h->h_aliases; left && *c && naliases < MAXALIASES; c++) {
+		n = strlcpy(pos, *c, left);
+		if (n >= left + 1)
+			break;
+		aliases[naliases++] = pos;
+a291 1
+		left -= n + 1;
+a292 1
+	aliases[naliases] = NULL;
+d294 7
+a300 11
+	pos = (char*)addrbuf;
+	left = sizeof(addrbuf);
+	for(c = h->h_addr_list; *c && naddrs < MAXADDRS; c++) {
+		memmove(pos, *c,  r.h_length);
+		addr_list[naddrs++] = pos;
+		pos += r.h_length;
+		left -= r.h_length;
+        }
+	addr_list[naddrs] = NULL;
+
+	return (&r);
+d306 2
+a307 3
+	struct async	*as;
+	struct async_res ar;
+	struct hostent	*h;
+d326 1
+a326 1
+	h = _mkstatichostent(ar.ar_hostent);
+d329 1
+a329 1
+	return (h);
+a348 1
+	struct hostent	*h;
+d363 1
+a363 1
+	h = _mkstatichostent(ar.ar_hostent);
+d366 1
+a366 1
+	return (h);
+d387 37
+a423 31
+/* XXX bound checks are incorrect */
+static struct netent *
+_mkstaticnetent(struct netent *n)
+{
+	static struct netent r;
+	static char buf[4096];
+	static char *aliases[MAXALIASES+1];
+
+	char	*pos, **c;
+	size_t	left, s;
+	int	naliases = 0;
+
+	r.n_addrtype = n->n_addrtype;
+	r.n_net = n->n_net;
+
+	r.n_name = buf;
+	r.n_aliases = aliases;
+
+	pos = buf;
+	left = sizeof(buf);
+	s = strlcpy(pos, n->n_name, left);
+	pos += s + 1;
+	left -= s + 1;
+
+	for(c = n->n_aliases; left && *c && naliases < MAXALIASES; c++) {
+		s = strlcpy(pos, *c, left);
+		if (s >= left + 1)
+			break;
+		aliases[naliases++] = pos;
+		pos += s + 1;
+		left -= s + 1;
+a424 3
+	aliases[naliases] = NULL;
+
+	return (&r);
+a431 1
+	struct netent	*n;
+d446 1
+a446 1
+	n = _mkstaticnetent(ar.ar_netent);
+d449 1
+a449 1
+	return (n);
+a456 1
+	struct netent	*n;
+d471 1
+a471 1
+	n = _mkstaticnetent(ar.ar_netent);
+d474 1
+a474 1
+	return (n);
+@
+
+
+1.8
+log
+@ensure that async_run() and async_run_sync() always preserve errno.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.7 2012/08/18 13:49:13 eric Exp $	*/
+d322 1
+a322 1
+	freehostent(ar.ar_hostent);
+d360 1
+a360 1
+	freehostent(ar.ar_hostent);
+d441 1
+a441 1
+	freenetent(ar.ar_netent);
+d467 1
+a467 1
+	freenetent(ar.ar_netent);
+@
+
+
+1.7
+log
+@getrrsetyname() only uses ERRSET_* and is not supposed to set errno.
+make sure to save and restore errno properly.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.6 2012/08/18 11:19:51 eric Exp $	*/
+a239 1
+	errno = saved_errno;
+d492 2
+a493 1
+	errno = (ar.ar_gai_errno == EAI_SYSTEM) ? ar.ar_errno : saved_errno;
+d517 2
+a518 2
+
+	errno = (ar.ar_gai_errno == EAI_SYSTEM) ? ar.ar_errno : saved_errno;
+@
+
+
+1.6
+log
+@Improve error reporting in getnameinfo_async() and getaddrinfo_async().
+They do not have to deal with h_errno at all.  Also, errno is only kept
+for EAI_SYSTEM.  Small code cleanup while there.
+
+Adapt getnameinfo() and getaddrinfo() wrappers to correctly save errno
+and overwrite it in the EAI_SYSTEM case.
+
+General errno handling issue reported by mikeb@@.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.5 2012/07/29 20:33:21 eric Exp $	*/
+d229 1
+d232 5
+a236 2
+	if (as == NULL)
+		return (errno == ENOMEM) ? ERRSET_NOMEMORY : ERRSET_FAIL;
+d240 2
+a241 2
+	if (ar.ar_errno)
+		errno = ar.ar_errno;
+a242 1
+	*res = ar.ar_rrsetinfo;
+@
+
+
+1.5
+log
+@must be zero'd (found by regress)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.4 2012/07/11 16:49:12 eric Exp $	*/
+d476 1
+d479 7
+a485 2
+	if (as == NULL)
+		return ((errno == ENOMEM) ? EAI_MEMORY : EAI_SYSTEM);
+a488 2
+	errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+d490 1
+d501 1
+d505 7
+a511 2
+	if (as == NULL)
+		return ((errno == ENOMEM) ? EAI_MEMORY : EAI_SYSTEM);
+d515 1
+a515 2
+	errno = ar.ar_errno;
+	h_errno = ar.ar_h_errno;
+@
+
+
+1.4
+log
+@implement res_mkquery
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.3 2012/07/08 17:01:06 eric Exp $	*/
+d172 1
+@
+
+
+1.3
+log
+@implement res_querydomain() required by sendmail
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.2 2012/07/08 13:12:46 eric Exp $	*/
+d27 1
+d142 45
+@
+
+
+1.2
+log
+@add stub function for gethostent(), and move things around a bit while here.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr_resolver.c,v 1.1 2012/04/14 09:24:18 eric Exp $	*/
+d21 1
+d113 28
+@
+
+
+1.1
+log
+@Import asr, an experimental async resolver implementation.
+The idea is to eventually replace the existing resolver with
+something better. Time to start working on it in tree.
+
+ok deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: asr.h,v 1.5 2011/07/13 14:52:21 eric Exp $	*/
+d287 18
+a431 11
+}
+
+/* XXX see what to do */
+void
+sethostent(int stayopen)
+{
+}
+
+void
+endhostent(void)
+{
+@
+

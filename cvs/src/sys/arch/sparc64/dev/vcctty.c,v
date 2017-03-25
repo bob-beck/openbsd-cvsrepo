@@ -1,0 +1,882 @@
+head	1.12;
+access;
+symbols
+	OPENBSD_6_0:1.12.0.8
+	OPENBSD_6_0_BASE:1.12
+	OPENBSD_5_9:1.12.0.4
+	OPENBSD_5_9_BASE:1.12
+	OPENBSD_5_8:1.12.0.6
+	OPENBSD_5_8_BASE:1.12
+	OPENBSD_5_7:1.12.0.2
+	OPENBSD_5_7_BASE:1.12
+	OPENBSD_5_6:1.11.0.4
+	OPENBSD_5_6_BASE:1.11
+	OPENBSD_5_5:1.10.0.8
+	OPENBSD_5_5_BASE:1.10
+	OPENBSD_5_4:1.10.0.4
+	OPENBSD_5_4_BASE:1.10
+	OPENBSD_5_3:1.10.0.2
+	OPENBSD_5_3_BASE:1.10
+	OPENBSD_5_2:1.6.0.10
+	OPENBSD_5_2_BASE:1.6
+	OPENBSD_5_1_BASE:1.6
+	OPENBSD_5_1:1.6.0.8
+	OPENBSD_5_0:1.6.0.6
+	OPENBSD_5_0_BASE:1.6
+	OPENBSD_4_9:1.6.0.4
+	OPENBSD_4_9_BASE:1.6
+	OPENBSD_4_8:1.6.0.2
+	OPENBSD_4_8_BASE:1.6
+	OPENBSD_4_7:1.3.0.2
+	OPENBSD_4_7_BASE:1.3
+	OPENBSD_4_6:1.1.0.4
+	OPENBSD_4_6_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.12
+date	2015.01.25.21.42.13;	author kettenis;	state Exp;
+branches;
+next	1.11;
+commitid	ZoO3iubG0jt8mq0g;
+
+1.11
+date	2014.05.10.11.49.31;	author kettenis;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2012.12.02.19.40.45;	author kettenis;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2012.11.01.19.40.13;	author kettenis;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2012.10.26.20.57.08;	author kettenis;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2012.10.20.12.00.33;	author miod;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2010.07.02.17.27.01;	author nicm;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2010.06.28.14.13.31;	author deraadt;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2010.04.12.12.57.52;	author tedu;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2009.11.09.17.53.39;	author nicm;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.10.31.06.40.16;	author deraadt;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.05.10.12.24.04;	author kettenis;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.12
+log
+@Rework cbus(4) interrupt support a bit.  Instead of merging devhandle and
+devino into a pseudo-sysino, directly use the devino as the ihandle.  The
+devhandle is stored in the cbus softc, and accessed through the bus space
+tag.  This allows us to have more than 256 interrupts on a single cbus, and
+avoids relying on the lower bits of the devhandle being zero.
+@
+text
+@/*	$OpenBSD: vcctty.c,v 1.11 2014/05/10 11:49:31 kettenis Exp $	*/
+/*
+ * Copyright (c) 2009 Mark Kettenis
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/conf.h>
+#include <sys/device.h>
+#include <sys/malloc.h>
+#include <sys/proc.h>
+#include <sys/systm.h>
+#include <sys/tty.h>
+
+#include <machine/autoconf.h>
+#include <machine/conf.h>
+#include <machine/hypervisor.h>
+#include <machine/mdesc.h>
+
+#include <dev/cons.h>
+#include <sparc64/dev/cbusvar.h>
+#include <sparc64/dev/ldcvar.h>
+
+#ifdef VCCTTY_DEBUG
+#define DPRINTF(x)	printf x
+#else
+#define DPRINTF(x)
+#endif
+
+#define VCCTTY_TX_ENTRIES	128
+#define VCCTTY_RX_ENTRIES	128
+
+struct vcctty_msg {
+	uint8_t		type;
+	uint8_t		size;
+	uint16_t	rsvd;
+	uint32_t	ctrl_msg;
+	uint8_t		data[56];
+};
+
+/* Packet types. */
+#define LDC_CONSOLE_CTRL	0x01
+#define LDC_CONSOLE_DATA	0x02
+
+struct vcctty_softc {
+	struct device	sc_dv;
+	bus_space_tag_t	sc_bustag;
+	bus_dma_tag_t	sc_dmatag;
+
+	uint64_t	sc_tx_ino;
+	uint64_t	sc_rx_ino;
+	void		*sc_tx_ih;
+	void		*sc_rx_ih;
+
+	struct ldc_conn	sc_lc;
+
+	struct tty	*sc_tty;
+};
+
+int	vcctty_match(struct device *, void *, void *);
+void	vcctty_attach(struct device *, struct device *, void *);
+
+struct cfattach vcctty_ca = {
+	sizeof(struct vcctty_softc), vcctty_match, vcctty_attach
+};
+
+struct cfdriver vcctty_cd = {
+	NULL, "vcctty", DV_DULL
+};
+
+int	vcctty_tx_intr(void *);
+int	vcctty_rx_intr(void *);
+
+void	vcctty_send_data(struct vcctty_softc *, struct tty *);
+void	vcctty_send_break(struct vcctty_softc *);
+
+void	vccttystart(struct tty *);
+int	vccttyparam(struct tty *, struct termios *);
+int	vccttyhwiflow(struct tty *, int);
+
+int
+vcctty_match(struct device *parent, void *match, void *aux)
+{
+	return (1);
+}
+
+void
+vcctty_attach(struct device *parent, struct device *self, void *aux)
+{
+	struct vcctty_softc *sc = (struct vcctty_softc *)self;
+	struct cbus_attach_args *ca = aux;
+	struct ldc_conn *lc;
+	int err;
+
+	sc->sc_bustag = ca->ca_bustag;
+	sc->sc_dmatag = ca->ca_dmatag;
+	sc->sc_tx_ino = ca->ca_tx_ino;
+	sc->sc_rx_ino = ca->ca_rx_ino;
+
+	printf(": ivec 0x%llx, 0x%llx", sc->sc_tx_ino, sc->sc_rx_ino);
+
+	/*
+	 * Un-configure queues before registering interrupt handlers,
+	 * such that we dont get any stale LDC packets or events.
+	 */
+	hv_ldc_tx_qconf(ca->ca_id, 0, 0);
+	hv_ldc_rx_qconf(ca->ca_id, 0, 0);
+
+	sc->sc_tx_ih = bus_intr_establish(ca->ca_bustag, sc->sc_tx_ino,
+	    IPL_TTY, 0, vcctty_tx_intr, sc, sc->sc_dv.dv_xname);
+	sc->sc_rx_ih = bus_intr_establish(ca->ca_bustag, sc->sc_rx_ino,
+	    IPL_TTY, 0, vcctty_rx_intr, sc, sc->sc_dv.dv_xname);
+	if (sc->sc_tx_ih == NULL || sc->sc_rx_ih == NULL) {
+		printf(", can't establish interrupt\n");
+		return;
+	}
+
+	lc = &sc->sc_lc;
+	lc->lc_id = ca->ca_id;
+	lc->lc_sc = sc;
+
+	lc->lc_txq = ldc_queue_alloc(sc->sc_dmatag, VCCTTY_TX_ENTRIES);
+	if (lc->lc_txq == NULL) {
+		printf(", can't allocate tx queue\n");
+		return;
+	}
+
+	lc->lc_rxq = ldc_queue_alloc(sc->sc_dmatag, VCCTTY_RX_ENTRIES);
+	if (lc->lc_rxq == NULL) {
+		printf(", can't allocate rx queue\n");
+		goto free_txqueue;
+	}
+
+	err = hv_ldc_tx_qconf(lc->lc_id,
+	    lc->lc_txq->lq_map->dm_segs[0].ds_addr, lc->lc_txq->lq_nentries);
+	if (err != H_EOK)
+		printf("%s: hv_ldc_tx_qconf %d\n", __func__, err);
+
+	err = hv_ldc_rx_qconf(lc->lc_id,
+	    lc->lc_rxq->lq_map->dm_segs[0].ds_addr, lc->lc_rxq->lq_nentries);
+	if (err != H_EOK)
+		printf("%s: hv_ldc_rx_qconf %d\n", __func__, err);
+
+	cbus_intr_setenabled(sc->sc_bustag, sc->sc_tx_ino, INTR_ENABLED);
+	cbus_intr_setenabled(sc->sc_bustag, sc->sc_rx_ino, INTR_ENABLED);
+
+	printf(" domain \"%s\"\n", ca->ca_name);
+	return;
+
+free_txqueue:
+	ldc_queue_free(sc->sc_dmatag, lc->lc_txq);
+}
+
+int
+vcctty_tx_intr(void *arg)
+{
+	struct vcctty_softc *sc = arg;
+	struct ldc_conn *lc = &sc->sc_lc;
+	uint64_t tx_head, tx_tail, tx_state;
+	int err;
+
+	err = hv_ldc_tx_get_state(lc->lc_id, &tx_head, &tx_tail, &tx_state);
+	if (err != H_EOK) {
+		printf("%s: hv_ldc_tx_get_state %d\n", __func__, err);
+		return (0);
+	}
+
+	if (tx_state != lc->lc_tx_state) {
+		switch (tx_state) {
+		case LDC_CHANNEL_DOWN:
+			DPRINTF(("Tx link down\n"));
+			break;
+		case LDC_CHANNEL_UP:
+			DPRINTF(("Tx link up\n"));
+			break;
+		case LDC_CHANNEL_RESET:
+			DPRINTF(("Tx link reset\n"));
+			break;
+		}
+		lc->lc_tx_state = tx_state;
+	}
+
+	return (1);
+}
+
+int
+vcctty_rx_intr(void *arg)
+{
+	struct vcctty_softc *sc = arg;
+	struct tty *tp = sc->sc_tty;
+	struct ldc_conn *lc = &sc->sc_lc;
+	uint64_t rx_head, rx_tail, rx_state;
+	struct vcctty_msg *msg;
+	int err;
+	int i;
+
+	err = hv_ldc_rx_get_state(lc->lc_id, &rx_head, &rx_tail, &rx_state);
+	if (err != H_EOK) {
+		printf("%s: hv_ldc_rx_get_state %d\n", __func__, err);
+		return (0);
+	}
+
+	if (rx_state != lc->lc_rx_state) {
+		switch (rx_state) {
+		case LDC_CHANNEL_DOWN:
+			DPRINTF(("Rx link down\n"));
+			break;
+		case LDC_CHANNEL_UP:
+			DPRINTF(("Rx link up\n"));
+			break;
+		case LDC_CHANNEL_RESET:
+			DPRINTF(("Rx link reset\n"));
+			break;
+		}
+		lc->lc_rx_state = rx_state;
+		return (1);
+	}
+
+	if (rx_head == rx_tail)
+		return (0);
+
+	msg = (struct vcctty_msg *)(lc->lc_rxq->lq_va + rx_head);
+	if (tp && msg->type == LDC_CONSOLE_DATA) {
+		for (i = 0; i < msg->size; i++) {
+			if (tp->t_state & TS_ISOPEN)
+				(*linesw[tp->t_line].l_rint)(msg->data[i], tp);
+		}
+	}
+
+	rx_head += sizeof(*msg);
+	rx_head &= ((lc->lc_rxq->lq_nentries * sizeof(*msg)) - 1);
+	err = hv_ldc_rx_set_qhead(lc->lc_id, rx_head);
+	if (err != H_EOK)
+		printf("%s: hv_ldc_rx_set_qhead %d\n", __func__, err);
+
+	return (1);
+}
+
+void
+vcctty_send_data(struct vcctty_softc *sc, struct tty *tp)
+{
+	struct ldc_conn *lc = &sc->sc_lc;
+	uint64_t tx_head, tx_tail, tx_state;
+	uint64_t next_tx_tail;
+	struct vcctty_msg *msg;
+	int err;
+
+	err = hv_ldc_tx_get_state(lc->lc_id, &tx_head, &tx_tail, &tx_state);
+	if (err != H_EOK || tx_state != LDC_CHANNEL_UP)
+		return;
+
+	while (tp->t_outq.c_cc > 0) {
+		next_tx_tail = tx_tail + sizeof(*msg);
+		next_tx_tail &= ((lc->lc_txq->lq_nentries * sizeof(*msg)) - 1);
+
+		if (next_tx_tail == tx_head)
+			return;
+
+		msg = (struct vcctty_msg *)(lc->lc_txq->lq_va + tx_tail);
+		bzero(msg, sizeof(*msg));
+		msg->type = LDC_CONSOLE_DATA;
+		msg->size = q_to_b(&tp->t_outq, msg->data, sizeof(msg->data));
+
+		err = hv_ldc_tx_set_qtail(lc->lc_id, next_tx_tail);
+		if (err != H_EOK)
+			printf("%s: hv_ldc_tx_set_qtail: %d\n", __func__, err);
+		tx_tail = next_tx_tail;
+	}
+}
+
+void
+vcctty_send_break(struct vcctty_softc *sc)
+{
+	struct ldc_conn *lc = &sc->sc_lc;
+	uint64_t tx_head, tx_tail, tx_state;
+	struct vcctty_msg *msg;
+	int err;
+
+	err = hv_ldc_tx_get_state(lc->lc_id, &tx_head, &tx_tail, &tx_state);
+	if (err != H_EOK || tx_state != LDC_CHANNEL_UP)
+		return;
+
+	msg = (struct vcctty_msg *)(lc->lc_txq->lq_va + tx_tail);
+	bzero(msg, sizeof(*msg));
+	msg->type = LDC_CONSOLE_CTRL;
+	msg->ctrl_msg = CONS_BREAK;
+
+	tx_tail += sizeof(*msg);
+	tx_tail &= ((lc->lc_txq->lq_nentries * sizeof(*msg)) - 1);
+	err = hv_ldc_tx_set_qtail(lc->lc_id, tx_tail);
+	if (err != H_EOK)
+		printf("%s: hv_ldc_tx_set_qtail: %d\n", __func__, err);
+}
+
+int
+vccttyopen(dev_t dev, int flag, int mode, struct proc *p)
+{
+	struct vcctty_softc *sc;
+	struct tty *tp;
+	int unit = minor(dev);
+
+	if (unit >= vcctty_cd.cd_ndevs)
+		return (ENXIO);
+	sc = vcctty_cd.cd_devs[unit];
+	if (sc == NULL)
+		return (ENXIO);
+
+	if (sc->sc_tty)
+		tp = sc->sc_tty;
+	else
+		tp = sc->sc_tty = ttymalloc(0);
+
+	tp->t_oproc = vccttystart;
+	tp->t_param = vccttyparam;
+	tp->t_hwiflow = vccttyhwiflow;
+	tp->t_dev = dev;
+	if ((tp->t_state & TS_ISOPEN) == 0) {
+		ttychars(tp);
+		tp->t_iflag = TTYDEF_IFLAG;
+		tp->t_oflag = TTYDEF_OFLAG;
+		tp->t_cflag = TTYDEF_CFLAG | CRTSCTS;
+		tp->t_lflag = TTYDEF_LFLAG;
+		tp->t_ispeed = tp->t_ospeed = TTYDEF_SPEED;
+		ttsetwater(tp);
+	} else if ((tp->t_state & TS_XCLUDE) && suser(p, 0))
+		return (EBUSY);
+	tp->t_state |= TS_CARR_ON;
+
+	return ((*linesw[tp->t_line].l_open)(dev, tp, p));
+}
+
+int
+vccttyclose(dev_t dev, int flag, int mode, struct proc *p)
+{
+	struct vcctty_softc *sc;
+	struct tty *tp;
+	int unit = minor(dev);
+
+	if (unit >= vcctty_cd.cd_ndevs)
+		return (ENXIO);
+	sc = vcctty_cd.cd_devs[unit];
+	if (sc == NULL)
+		return (ENXIO);
+
+	tp = sc->sc_tty;
+	(*linesw[tp->t_line].l_close)(tp, flag, p);
+	ttyclose(tp);
+	return (0);
+}
+
+int
+vccttyread(dev_t dev, struct uio *uio, int flag)
+{
+	struct vcctty_softc *sc;
+	struct tty *tp;
+	int unit = minor(dev);
+
+	if (unit >= vcctty_cd.cd_ndevs)
+		return (ENXIO);
+	sc = vcctty_cd.cd_devs[unit];
+	if (sc == NULL)
+		return (ENXIO);
+
+	tp = sc->sc_tty;
+	return ((*linesw[tp->t_line].l_read)(tp, uio, flag));
+}
+
+int
+vccttywrite(dev_t dev, struct uio *uio, int flag)
+{
+	struct vcctty_softc *sc;
+	struct tty *tp;
+	int unit = minor(dev);
+
+	if (unit >= vcctty_cd.cd_ndevs)
+		return (ENXIO);
+	sc = vcctty_cd.cd_devs[unit];
+	if (sc == NULL)
+		return (ENXIO);
+
+	tp = sc->sc_tty;
+	return ((*linesw[tp->t_line].l_write)(tp, uio, flag));
+}
+
+int
+vccttyioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+{
+	struct vcctty_softc *sc;
+	struct tty *tp;
+	int unit = minor(dev);
+	int error;
+
+	if (unit >= vcctty_cd.cd_ndevs)
+		return (ENXIO);
+	sc = vcctty_cd.cd_devs[unit];
+	if (sc == NULL)
+		return (ENXIO);
+
+	tp = sc->sc_tty;
+	error = (*linesw[tp->t_line].l_ioctl)(tp, cmd, data, flag, p);
+	if (error >= 0)
+		return error;
+	error = ttioctl(tp, cmd, data, flag, p);
+	if (error >= 0)
+		return (error);
+
+	error = 0;
+
+	switch (cmd) {
+	case TIOCSBRK:
+		vcctty_send_break(sc);
+		break;
+	case TIOCCBRK:
+		/* BREAK gets cleared automatically. */
+		break;
+	default:
+		error = ENOTTY;
+		break;
+	}
+
+	return (error);
+}
+
+void
+vccttystart(struct tty *tp)
+{
+	struct vcctty_softc *sc = vcctty_cd.cd_devs[minor(tp->t_dev)];
+	int s;
+
+	s = spltty();
+	if (tp->t_state & (TS_TIMEOUT | TS_BUSY | TS_TTSTOP)) {
+		splx(s);
+		return;
+	}
+	ttwakeupwr(tp);
+	tp->t_state |= TS_BUSY;
+	if (tp->t_outq.c_cc > 0)
+		vcctty_send_data(sc, tp);
+	tp->t_state &= ~TS_BUSY;
+	if (tp->t_outq.c_cc > 0) {
+		tp->t_state |= TS_TIMEOUT;
+		timeout_add(&tp->t_rstrt_to, 1);
+	}
+	splx(s);
+}
+
+int
+vccttystop(struct tty *tp, int flag)
+{
+	int s;
+
+	s = spltty();
+	if (tp->t_state & TS_BUSY)
+		if ((tp->t_state & TS_TTSTOP) == 0)
+			tp->t_state |= TS_FLUSH;
+	splx(s);
+	return (0);
+}
+
+struct tty *
+vccttytty(dev_t dev)
+{
+	struct vcctty_softc *sc;
+	int unit = minor(dev);
+
+	if (unit >= vcctty_cd.cd_ndevs)
+		return (NULL);
+	sc = vcctty_cd.cd_devs[unit];
+	if (sc == NULL)
+		return (NULL);
+
+	return sc->sc_tty;
+}
+
+int
+vccttyparam(struct tty *tp, struct termios *t)
+{
+	tp->t_ispeed = t->c_ispeed;
+	tp->t_ospeed = t->c_ospeed;
+	tp->t_cflag = t->c_cflag;
+	return (0);
+}
+
+int
+vccttyhwiflow(struct tty *tp, int stop)
+{
+	struct vcctty_softc *sc = vcctty_cd.cd_devs[minor(tp->t_dev)];
+	uint64_t state = stop ? INTR_DISABLED : INTR_ENABLED;
+
+	cbus_intr_setenabled(sc->sc_bustag, sc->sc_tx_ino, state);
+	cbus_intr_setenabled(sc->sc_bustag, sc->sc_rx_ino, state);
+
+	return (1);
+}
+@
+
+
+1.11
+log
+@Some straightforward format string fixes.  Also, print both the tx and rx
+interrupt vector numbers instead of printing rx; pointed out by florian@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.10 2012/12/02 19:40:45 kettenis Exp $	*/
+d61 2
+a64 2
+	uint64_t	sc_tx_sysino;
+	uint64_t	sc_rx_sysino;
+d108 2
+d111 1
+a111 6
+	if (cbus_intr_map(ca->ca_node, ca->ca_tx_ino, &sc->sc_tx_sysino) ||
+	    cbus_intr_map(ca->ca_node, ca->ca_rx_ino, &sc->sc_rx_sysino)) {
+		printf(": can't map interrupt\n");
+		return;
+	}
+	printf(": ivec 0x%llx, 0x%llx", sc->sc_tx_sysino, sc->sc_rx_sysino);
+d120 1
+a120 1
+	sc->sc_tx_ih = bus_intr_establish(ca->ca_bustag, sc->sc_tx_sysino,
+d122 1
+a122 1
+	sc->sc_rx_ih = bus_intr_establish(ca->ca_bustag, sc->sc_rx_sysino,
+d155 2
+a156 2
+	cbus_intr_setenabled(sc->sc_tx_sysino, INTR_ENABLED);
+	cbus_intr_setenabled(sc->sc_rx_sysino, INTR_ENABLED);
+d499 1
+d501 2
+a502 7
+	if (stop) {
+		cbus_intr_setenabled(sc->sc_tx_sysino, INTR_DISABLED);
+		cbus_intr_setenabled(sc->sc_rx_sysino, INTR_DISABLED);
+	} else {
+		cbus_intr_setenabled(sc->sc_tx_sysino, INTR_ENABLED);
+		cbus_intr_setenabled(sc->sc_rx_sysino, INTR_ENABLED);
+	}
+@
+
+
+1.10
+log
+@Implement hardware flow control and enable it by default (by setting CRTSCTS).
+
+ok miod@@, deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.9 2012/11/01 19:40:13 kettenis Exp $	*/
+d114 1
+a114 1
+	printf(": ivec 0x%lx, 0x%lx", sc->sc_tx_sysino, sc->sc_rx_sysino);
+d156 1
+a156 1
+		printf("%d: hv_ldc_rx_qconf %d\n", __func__, err);
+@
+
+
+1.9
+log
+@When possible, send multiple characters per packet.  Also, stop sending when
+the transmit queue is full.  If the transmit queue is full, set a timeout to
+get things going again.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.8 2012/10/26 20:57:08 kettenis Exp $	*/
+d90 1
+d329 1
+d335 1
+a335 1
+		tp->t_cflag = TTYDEF_CFLAG;
+d496 16
+@
+
+
+1.8
+log
+@Turns out that for devices that attach to cbus(4), it is better to disable
+interrupts up-front and explicitly enabling them later than the other way
+around.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.7 2012/10/20 12:00:33 miod Exp $	*/
+d85 1
+a85 1
+void	vcctty_send_data(struct vcctty_softc *, int);
+d253 1
+a253 1
+vcctty_send_data(struct vcctty_softc *sc, int c)
+d257 1
+d265 17
+a281 11
+	msg = (struct vcctty_msg *)(lc->lc_txq->lq_va + tx_tail);
+	bzero(msg, sizeof(*msg));
+	msg->type = LDC_CONSOLE_DATA;
+	msg->size = 1;
+	msg->data[0] = c;
+
+	tx_tail += sizeof(*msg);
+	tx_tail &= ((lc->lc_txq->lq_nentries * sizeof(*msg)) - 1);
+	err = hv_ldc_tx_set_qtail(lc->lc_id, tx_tail);
+	if (err != H_EOK)
+		printf("%s: hv_ldc_tx_set_qtail: %d\n", __func__, err);
+d443 1
+a443 1
+	if (tp->t_state & (TS_TTSTOP | TS_BUSY)) {
+d449 2
+a450 2
+	while (tp->t_outq.c_cc != 0)
+		vcctty_send_data(sc, getc(&tp->t_outq));
+d452 4
+@
+
+
+1.7
+log
+@off-by-one in device number check; found the hard way and reported by J Sisson.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.6 2010/07/02 17:27:01 nicm Exp $	*/
+d156 3
+@
+
+
+1.6
+log
+@Move common code for waking up writers on a tty into a function.
+
+ok deraadt matthew millert
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.5 2010/06/28 14:13:31 deraadt Exp $	*/
+d305 1
+a305 1
+	if (unit > vcctty_cd.cd_ndevs)
+d341 1
+a341 1
+	if (unit > vcctty_cd.cd_ndevs)
+d360 1
+a360 1
+	if (unit > vcctty_cd.cd_ndevs)
+d377 1
+a377 1
+	if (unit > vcctty_cd.cd_ndevs)
+d395 1
+a395 1
+	if (unit > vcctty_cd.cd_ndevs)
+d464 1
+a464 1
+	if (unit > vcctty_cd.cd_ndevs)
+@
+
+
+1.5
+log
+@Allow tty drivers to request larger buffers at attach time using a
+max-baud-rate hint.  Adjust TTYHOG (the nearly full logic) to this new
+situation.  The larger buffers are required by the very high speed
+KDDI devices in Japan (CF com, or USB ucom) so those are the only two
+drivers which currently ask for a larger buffer size.
+ok yasuoka miod
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.4 2010/04/12 12:57:52 tedu Exp $	*/
+d437 1
+a437 7
+	if (tp->t_outq.c_cc <= tp->t_lowat) {
+		if (tp->t_state & TS_ASLEEP) {
+			tp->t_state &= ~TS_ASLEEP;
+			wakeup((caddr_t)&tp->t_outq);
+		}
+		selwakeup(&tp->t_wsel);
+	}
+@
+
+
+1.4
+log
+@Some of the line disciplines want to check for suser.  Better to pass them
+a process instead of using curproc.  ok deraadt
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.3 2009/11/09 17:53:39 nicm Exp $	*/
+d314 1
+a314 1
+		tp = sc->sc_tty = ttymalloc();
+@
+
+
+1.3
+log
+@Every selwakeup() should have a matching KNOTE() (even if kqueue isn't
+supported it doesn't do any harm), so put the KNOTE() in selwakeup() itself and
+remove it from any occurences where both are used, except one for kqueue itself
+and one in sys_pipe.c (where the selwakeup is under a PIPE_SEL flag).
+
+Based on a diff from tedu.
+
+ok deraadt
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.2 2009/10/31 06:40:16 deraadt Exp $	*/
+d331 1
+a331 1
+	return ((*linesw[tp->t_line].l_open)(dev, tp));
+d348 1
+a348 1
+	(*linesw[tp->t_line].l_close)(tp, flag);
+@
+
+
+1.2
+log
+@Add missing KNOTE() calls after selwakeup(), until we decide if the KNOTE()
+calls can go directly into selwakeup() safely
+long discussion with nicm, murmers of consent from tedu and miod, noone
+else seems to care of kqueue is busted as long as it makes their sockets
+move data fast... pretty sad.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vcctty.c,v 1.1 2009/05/10 12:24:04 kettenis Exp $	*/
+a442 1
+		KNOTE(&tp->t_wsel.si_note, 0);
+@
+
+
+1.1
+log
+@Add vcc(4) and vcctty(4).  The vcc(4) driver is a driver for the "Virtual
+Console Concentrator" found on the control domain of sun4v systems.  It
+manages the connections to the consoles of guest domains which are exposed
+as terminal-like devices through vcctty(4).
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d443 1
+@
+

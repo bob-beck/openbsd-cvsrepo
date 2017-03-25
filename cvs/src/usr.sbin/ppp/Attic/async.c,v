@@ -1,0 +1,330 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_2_3:1.2.0.2
+	OPENBSD_2_3_BASE:1.2
+	PPP1_5:1.1.1.1
+	BRIAN:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	98.08.31.00.20.16;	author brian;	state dead;
+branches;
+next	1.3;
+
+1.3
+date	98.06.27.12.06.39;	author brian;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	98.01.21.02.13.28;	author brian;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.11.23.20.27.32;	author brian;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.11.23.20.27.32;	author brian;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Upgrade ppp to version 2.0
+
+This adds a number of features including:
+o Multilink
+o Callback (including CBCP)
+o DNS negotiation (client & server)
+o Easy to configure masquerading/packet aliasing
+o Any number of diagnostic socket connections (limits DOS attacks)
+o Sticky routes (ppp updates the routing table when the IP number is changed)
+
+See the file README.changes for things that effect current
+configurations.
+@
+text
+@/*
+ *	             PPP Async HDLC Module
+ *
+ *	    Written by Toshiharu OHNO (tony-o@@iij.ad.jp)
+ *
+ *   Copyright (C) 1993, Internet Initiative Japan, Inc. All rights reserverd.
+ *
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the Internet Initiative Japan, Inc.  The name of the
+ * IIJ may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * $Id: async.c,v 1.3 1998/06/27 12:06:39 brian Exp $
+ *
+ */
+#include <sys/param.h>
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <string.h>
+#include <termios.h>
+
+#include "command.h"
+#include "mbuf.h"
+#include "log.h"
+#include "defs.h"
+#include "timer.h"
+#include "fsm.h"
+#include "hdlc.h"
+#include "lcp.h"
+#include "lcpproto.h"
+#include "modem.h"
+#include "loadalias.h"
+#include "vars.h"
+#include "async.h"
+
+#define HDLCSIZE	(MAX_MRU*2+6)
+
+static struct async_state {
+  int mode;
+  int length;
+  u_char hbuff[HDLCSIZE];	/* recv buffer */
+  u_char xbuff[HDLCSIZE];	/* xmit buffer */
+  u_int32_t my_accmap;
+  u_int32_t his_accmap;
+} AsyncState;
+
+#define MODE_HUNT 0x01
+#define MODE_ESC  0x02
+
+void
+AsyncInit()
+{
+  struct async_state *stp = &AsyncState;
+
+  stp->mode = MODE_HUNT;
+  stp->length = 0;
+  stp->my_accmap = stp->his_accmap = 0xffffffff;
+}
+
+void
+SetLinkParams(struct lcpstate *lcp)
+{
+  struct async_state *stp = &AsyncState;
+
+  stp->my_accmap = lcp->want_accmap;
+  stp->his_accmap = lcp->his_accmap;
+}
+
+/*
+ * Encode into async HDLC byte code if necessary
+ */
+static void
+HdlcPutByte(u_char **cp, u_char c, int proto)
+{
+  u_char *wp;
+
+  wp = *cp;
+  if ((c < 0x20 && (proto == PROTO_LCP || (AsyncState.his_accmap & (1 << c))))
+      || (c == HDLC_ESC) || (c == HDLC_SYN)) {
+    *wp++ = HDLC_ESC;
+    c ^= HDLC_XOR;
+  }
+  if (EscMap[32] && EscMap[c >> 3] & (1 << (c & 7))) {
+    *wp++ = HDLC_ESC;
+    c ^= HDLC_XOR;
+  }
+  *wp++ = c;
+  *cp = wp;
+}
+
+void
+AsyncOutput(int pri, struct mbuf *bp, int proto)
+{
+  struct async_state *hs = &AsyncState;
+  u_char *cp, *sp, *ep;
+  struct mbuf *wp;
+  int cnt;
+
+  if (plength(bp) > HDLCSIZE) {
+    pfree(bp);
+    return;
+  }
+  cp = hs->xbuff;
+  ep = cp + HDLCSIZE - 10;
+  wp = bp;
+  *cp++ = HDLC_SYN;
+  while (wp) {
+    sp = MBUF_CTOP(wp);
+    for (cnt = wp->cnt; cnt > 0; cnt--) {
+      HdlcPutByte(&cp, *sp++, proto);
+      if (cp >= ep) {
+	pfree(bp);
+	return;
+      }
+    }
+    wp = wp->next;
+  }
+  *cp++ = HDLC_SYN;
+
+  cnt = cp - hs->xbuff;
+  LogDumpBuff(LogASYNC, "WriteModem", hs->xbuff, cnt);
+  WriteModem(pri, (char *) hs->xbuff, cnt);
+  ModemAddOutOctets(cnt);
+  pfree(bp);
+}
+
+static struct mbuf *
+AsyncDecode(u_char c)
+{
+  struct async_state *hs = &AsyncState;
+  struct mbuf *bp;
+
+  if ((hs->mode & MODE_HUNT) && c != HDLC_SYN)
+    return NULL;
+
+  switch (c) {
+  case HDLC_SYN:
+    hs->mode &= ~MODE_HUNT;
+    if (hs->length) {		/* packet is ready. */
+      bp = mballoc(hs->length, MB_ASYNC);
+      mbwrite(bp, hs->hbuff, hs->length);
+      hs->length = 0;
+      return bp;
+    }
+    break;
+  case HDLC_ESC:
+    if (!(hs->mode & MODE_ESC)) {
+      hs->mode |= MODE_ESC;
+      break;
+    }
+    /* Fall into ... */
+  default:
+    if (hs->length >= HDLCSIZE) {
+      /* packet is too large, discard it */
+      LogPrintf(LogERROR, "Packet too large (%d), discarding.\n", hs->length);
+      hs->length = 0;
+      hs->mode = MODE_HUNT;
+      break;
+    }
+    if (hs->mode & MODE_ESC) {
+      c ^= HDLC_XOR;
+      hs->mode &= ~MODE_ESC;
+    }
+    hs->hbuff[hs->length++] = c;
+    break;
+  }
+  return NULL;
+}
+
+void
+AsyncInput(u_char *buff, int cnt)
+{
+  struct mbuf *bp;
+
+  ModemAddInOctets(cnt);
+  if (DEV_IS_SYNC) {
+    bp = mballoc(cnt, MB_ASYNC);
+    memcpy(MBUF_CTOP(bp), buff, cnt);
+    bp->cnt = cnt;
+    HdlcInput(bp);
+  } else {
+    while (cnt > 0) {
+      bp = AsyncDecode(*buff++);
+      if (bp)
+	HdlcInput(bp);
+      cnt--;
+    }
+  }
+}
+@
+
+
+1.3
+log
+@Fix ``sizeof(u_long) == 4'' errors.
+Suggested by: theo
+@
+text
+@d20 1
+a20 1
+ * $Id: async.c,v 1.2 1998/01/21 02:13:28 brian Exp $
+@
+
+
+1.2
+log
+@Remove unused #includes.
+Make various bits static.
+Remove unused variables.
+Submitted by: eivind
+@
+text
+@d20 1
+a20 1
+ * $Id: async.c,v 1.1.1.1 1997/11/23 20:27:32 brian Exp $
+d51 2
+a52 2
+  u_long my_accmap;
+  u_long his_accmap;
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d20 1
+a20 1
+ * $Id: async.c,v 1.14 1997/11/22 03:37:23 brian Exp $
+a41 1
+#include "os.h"
+d142 1
+a142 1
+    return (NULLBUFF);
+d151 1
+a151 1
+      return (bp);
+d175 1
+a175 1
+  return NULLBUFF;
+@
+
+
+1.1.1.1
+log
+@Import version 1.5 of ppp.
+
+<sales>
+This is a user-level ppp implementation that uses the
+tun driver.  It was originally created by a Japanese
+ISP.  It's now piled with features.  Check the man pages
+for details.
+</sales>
+
+The sources are identical to the ones in FreeBSD, except
+for the Makefile.
+
+IP aliasing (NAT) is disabled, and can be enabled by simply
+doing a ``make install'' of libalias, then rebuilding
+ppp.  I'll create libalias as a port soon.
+@
+text
+@@

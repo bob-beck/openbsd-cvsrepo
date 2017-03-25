@@ -1,0 +1,704 @@
+head	1.13;
+access;
+symbols
+	OPENBSD_4_2:1.9.0.2
+	OPENBSD_4_2_BASE:1.9
+	OPENBSD_4_1:1.8.0.2
+	OPENBSD_4_1_BASE:1.8;
+locks; strict;
+comment	@ * @;
+
+
+1.13
+date	2007.12.07.17.27.07;	author deraadt;	state dead;
+branches;
+next	1.12;
+
+1.12
+date	2007.12.05.23.02.05;	author reyk;	state Exp;
+branches;
+next	1.11;
+
+1.11
+date	2007.11.24.17.07.28;	author reyk;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2007.09.28.13.29.56;	author pyr;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2007.05.27.20.53.10;	author pyr;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2007.02.22.05.58.06;	author reyk;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2007.02.22.03.32.40;	author reyk;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2007.02.08.13.32.24;	author reyk;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2007.02.07.14.39.45;	author reyk;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2007.02.06.10.27.33;	author reyk;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2007.02.06.10.06.55;	author reyk;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2007.01.30.11.48.06;	author pyr;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2007.01.29.14.23.31;	author pyr;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.13
+log
+@hoststated/hoststatectl get repository copied (and de-tagged) into
+relayd/relayctl.  This is a more suitable place for a daemon that has
+grown out of it's initial roots of "monitoring and redirecting services
+at various layers", into one that is "a full featured proxy, which
+happens to know what is up/down"
+@
+text
+@/*	$OpenBSD: ssl.c,v 1.12 2007/12/05 23:02:05 reyk Exp $	*/
+
+/*
+ * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+
+#include <net/if.h>
+#include <netinet/in.h>
+
+#include <limits.h>
+#include <event.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/engine.h>
+
+#include "hoststated.h"
+
+void	ssl_read(int, short, void *);
+void	ssl_write(int, short, void *);
+void	ssl_connect(int, short, void *);
+void	ssl_cleanup(struct ctl_tcp_event *);
+
+void
+ssl_read(int s, short event, void *arg)
+{
+	struct ctl_tcp_event	*cte = arg;
+	int			 ret;
+	int			 ssl_err;
+	int			 retry_flag;
+	char			 rbuf[SMALL_READ_BUF_SIZE];
+
+	if (event == EV_TIMEOUT) {
+		cte->host->up = HOST_DOWN;
+		ssl_cleanup(cte);
+		hce_notify_done(cte->host, "ssl_read: timeout");
+		return;
+	}
+
+	bzero(rbuf, sizeof(rbuf));
+	ssl_err = 0;
+	retry_flag = EV_READ;
+
+	ret = SSL_read(cte->ssl, rbuf, sizeof(rbuf));
+	if (ret <= 0) {
+		ssl_err = SSL_get_error(cte->ssl, ret);
+		switch (ssl_err) {
+		case SSL_ERROR_WANT_READ:
+			retry_flag = EV_READ;
+			goto retry;
+		case SSL_ERROR_WANT_WRITE:
+			retry_flag = EV_WRITE;
+			goto retry;
+		case SSL_ERROR_ZERO_RETURN: /* FALLTHROUGH */
+		case SSL_ERROR_SYSCALL:
+			if (ret == 0) {
+				cte->host->up = HOST_DOWN;
+				(void)cte->validate_close(cte);
+				ssl_cleanup(cte);
+				if (cte->host->up == HOST_UP)
+					hce_notify_done(cte->host,
+					    "ssl_read: check succeeded");
+				else
+					hce_notify_done(cte->host,
+					    "ssl_read: check failed");
+				return;
+			}
+			/* FALLTHROUGH */
+		default:
+			cte->host->up = HOST_DOWN;
+			ssl_error(cte->host->conf.name, "cannot read");
+			ssl_cleanup(cte);
+			hce_notify_done(cte->host, "ssl_read: SSL error");
+			break;
+		}
+		return;
+	}
+	if (buf_add(cte->buf, rbuf, ret) == -1)
+		fatal("ssl_read: buf_add error");
+	if (cte->validate_read != NULL) {
+		if (cte->validate_read(cte) != 0)
+			goto retry;
+
+		ssl_cleanup(cte);
+		if (cte->host->up == HOST_UP)
+			hce_notify_done(cte->host, "ssl_read: check succeeded");
+		else
+			hce_notify_done(cte->host, "ssl_read: check failed");
+		return;
+	}
+
+retry:
+	event_again(&cte->ev, s, EV_TIMEOUT|retry_flag, ssl_read,
+	    &cte->tv_start, &cte->table->conf.timeout, cte);
+	return;
+}
+
+void
+ssl_write(int s, short event, void *arg)
+{
+	struct ctl_tcp_event	*cte = arg;
+	int			 len;
+	int			 ret;
+	int			 ssl_err;
+	int			 retry_flag;
+
+	if (event == EV_TIMEOUT) {
+		cte->host->up = HOST_DOWN;
+		ssl_cleanup(cte);
+		hce_notify_done(cte->host, "ssl_write: timeout");
+		return;
+	}
+
+	len = strlen(cte->table->sendbuf);
+	retry_flag = EV_WRITE;
+
+	ret = SSL_write(cte->ssl, cte->table->sendbuf, len);
+	if (ret <= 0) {
+		ssl_err = SSL_get_error(cte->ssl, ret);
+		switch (ssl_err) {
+		case SSL_ERROR_WANT_READ:
+			retry_flag = EV_READ;
+			goto retry;
+		case SSL_ERROR_WANT_WRITE:
+			retry_flag = EV_WRITE;
+			goto retry;
+		default:
+			cte->host->up = HOST_DOWN;
+			ssl_error(cte->host->conf.name, "cannot write");
+			ssl_cleanup(cte);
+			hce_notify_done(cte->host, "ssl_write: SSL error");
+			return;
+		}
+	}
+	if ((cte->buf = buf_dynamic(SMALL_READ_BUF_SIZE, UINT_MAX)) == NULL)
+		fatalx("ssl_write: cannot create dynamic buffer");
+
+	event_again(&cte->ev, s, EV_TIMEOUT|EV_READ, ssl_read,
+	    &cte->tv_start, &cte->table->conf.timeout, cte);
+	return;
+retry:
+	event_again(&cte->ev, s, EV_TIMEOUT|retry_flag, ssl_write,
+	    &cte->tv_start, &cte->table->conf.timeout, cte);
+}
+
+void
+ssl_connect(int s, short event, void *arg)
+{
+	struct ctl_tcp_event	*cte = arg;
+	int			 ret;
+	int			 ssl_err;
+	int			 retry_flag;
+
+	if (event == EV_TIMEOUT) {
+		cte->host->up = HOST_DOWN;
+		hce_notify_done(cte->host, "ssl_connect: timeout");
+		ssl_cleanup(cte);
+		return;
+	}
+
+	retry_flag = ssl_err = 0;
+
+	ret = SSL_connect(cte->ssl);
+	if (ret <= 0) {
+		ssl_err = SSL_get_error(cte->ssl, ret);
+		switch (ssl_err) {
+		case SSL_ERROR_WANT_READ:
+			retry_flag = EV_READ;
+			goto retry;
+		case SSL_ERROR_WANT_WRITE:
+			retry_flag = EV_WRITE;
+			goto retry;
+		default:
+			cte->host->up = HOST_DOWN;
+			ssl_error(cte->host->conf.name, "cannot connect");
+			hce_notify_done(cte->host, "ssl_connect: SSL error");
+			ssl_cleanup(cte);
+			return;
+		}
+	}
+
+	if (cte->table->conf.check == CHECK_TCP) {
+		cte->host->up = HOST_UP;
+		hce_notify_done(cte->host, "ssl_connect: connect successful");
+		ssl_cleanup(cte);
+		return;
+	}
+	if (cte->table->sendbuf != NULL) {
+		event_again(&cte->ev, cte->s, EV_TIMEOUT|EV_WRITE, ssl_write,
+		    &cte->tv_start, &cte->table->conf.timeout, cte);
+		return;
+	}
+
+	if ((cte->buf = buf_dynamic(SMALL_READ_BUF_SIZE, UINT_MAX)) == NULL)
+		fatalx("ssl_connect: cannot create dynamic buffer");
+	event_again(&cte->ev, cte->s, EV_TIMEOUT|EV_READ, ssl_read,
+	    &cte->tv_start, &cte->table->conf.timeout, cte);
+	return;
+
+retry:
+	event_again(&cte->ev, s, EV_TIMEOUT|retry_flag, ssl_connect,
+	    &cte->tv_start, &cte->table->conf.timeout, cte);
+}
+
+void
+ssl_cleanup(struct ctl_tcp_event *cte)
+{
+	close(cte->s);
+	if (cte->ssl != NULL)
+		SSL_free(cte->ssl);
+	if (cte->buf != NULL)
+		buf_free(cte->buf);
+}
+
+void
+ssl_error(const char *where, const char *what)
+{
+	unsigned long	 code;
+	char		 errbuf[128];
+	extern int	 debug;
+
+	if (!debug)
+		return;
+	for (; (code = ERR_get_error()) != 0 ;) {
+		ERR_error_string_n(code, errbuf, sizeof(errbuf));
+		log_debug("SSL library error: %s: %s: %s", where, what, errbuf);
+	}
+}
+
+void
+ssl_init(struct hoststated *env)
+{
+	SSL_library_init();
+	SSL_load_error_strings();
+
+	/* Init hardware crypto engines. */
+	ENGINE_load_builtin_engines();
+	ENGINE_register_all_complete();
+}
+
+void
+ssl_transaction(struct ctl_tcp_event *cte)
+{
+	cte->ssl = SSL_new(cte->table->ssl_ctx);
+	if (cte->ssl == NULL) {
+		ssl_error(cte->host->conf.name, "cannot create object");
+		fatal("cannot create SSL object");
+	}
+
+	if (SSL_set_fd(cte->ssl, cte->s) == 0) {
+		cte->host->up = HOST_UNKNOWN;
+		ssl_error(cte->host->conf.name, "cannot set fd");
+		ssl_cleanup(cte);
+		hce_notify_done(cte->host,
+		    "ssl_transaction: cannot set SSL fd");
+		return;
+	}
+	SSL_set_connect_state(cte->ssl);
+
+	event_again(&cte->ev, cte->s, EV_TIMEOUT|EV_WRITE, ssl_connect,
+	    &cte->tv_start, &cte->table->conf.timeout, cte);
+}
+
+SSL_CTX *
+ssl_ctx_create(struct hoststated *env)
+{
+	SSL_CTX	*ctx;
+
+	ctx = SSL_CTX_new(SSLv23_client_method());
+	if (ctx == NULL) {
+		ssl_error("ssl_ctx_create", "cannot create context");
+		fatal("could not create SSL context");
+	}
+	return (ctx);
+}
+@
+
+
+1.12
+log
+@fix fd/ssl leak in hoststated ssl checks
+
+From Przemyslaw Frasunek, closes PR 5671
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.11 2007/11/24 17:07:28 reyk Exp $	*/
+@
+
+
+1.11
+log
+@sort includes, adjust to style(9)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.10 2007/09/28 13:29:56 pyr Exp $	*/
+d178 1
+@
+
+
+1.10
+log
+@Correct my mail address.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.9 2007/05/27 20:53:10 pyr Exp $	*/
+d19 1
+a19 1
+#include <sys/types.h>
+d22 2
+a23 1
+#include <sys/param.h>
+d25 1
+a25 1
+#include <net/if.h>
+@
+
+
+1.9
+log
+@Second step towards hoststated reload:
+First split out hosts, tables and services into to structs, one that
+contains the runtime fields and one (inside the runtime) that contains
+mostly static fields that will be sent over the socket during reload.
+
+Also move the demoted field of tables inside the flags field as its
+just a boolean.
+ok reyk@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.8 2007/02/22 05:58:06 reyk Exp $	*/
+d4 1
+a4 1
+ * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@@spootnik.org>
+@
+
+
+1.8
+log
+@spacing
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.7 2007/02/22 03:32:40 reyk Exp $	*/
+d91 1
+a91 1
+			ssl_error(cte->host->name, "cannot read");
+d114 1
+a114 1
+	    &cte->tv_start, &cte->table->timeout, cte);
+d149 1
+a149 1
+			ssl_error(cte->host->name, "cannot write");
+d159 1
+a159 1
+	    &cte->tv_start, &cte->table->timeout, cte);
+d163 1
+a163 1
+	    &cte->tv_start, &cte->table->timeout, cte);
+d194 1
+a194 1
+			ssl_error(cte->host->name, "cannot connect");
+d201 1
+a201 1
+	if (cte->table->check == CHECK_TCP) {
+d209 1
+a209 1
+		    &cte->tv_start, &cte->table->timeout, cte);
+d216 1
+a216 1
+	    &cte->tv_start, &cte->table->timeout, cte);
+d221 1
+a221 1
+	    &cte->tv_start, &cte->table->timeout, cte);
+d265 1
+a265 1
+		ssl_error(cte->host->name, "cannot create object");
+d271 1
+a271 1
+		ssl_error(cte->host->name, "cannot set fd");
+d280 1
+a280 1
+	    &cte->tv_start, &cte->table->timeout, cte);
+@
+
+
+1.7
+log
+@Add layer 7 functionality to hoststated used for layer 7
+loadbalancing, SSL acceleration, general-purpose TCP relaying, and
+transparent proxying.
+
+see hoststated.conf(5) and my upcoming article on undeadly.org for
+details.
+
+ok to commit deraadt@@ pyr@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.6 2007/02/08 13:32:24 reyk Exp $	*/
+d97 1
+a97 1
+	} 
+d123 1
+a123 1
+	int		 	 ret;
+d137 1
+a137 1
+	ret = SSL_write(cte->ssl, cte->table->sendbuf, len); 
+d170 1
+a170 1
+	int		 	 ret;
+d182 1
+a182 1
+	ret = SSL_connect(cte->ssl); 
+d271 1
+a271 1
+		ssl_error(cte->host->name, "cannot set fd"); 
+@
+
+
+1.6
+log
+@carefully check some return values and make lint happier.  never pass
+any truncated strings (table names/anchors/tags/...) to pf and the
+kernel.
+
+ok pyr@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.5 2007/02/07 14:39:45 reyk Exp $	*/
+d35 1
+d254 4
+@
+
+
+1.5
+log
+@remove superfluos log_debug() messages
+
+ok pyr@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.4 2007/02/06 10:27:33 reyk Exp $	*/
+d97 2
+a98 2
+	buf_add(cte->buf, rbuf, ret);
+
+@
+
+
+1.4
+log
+@update some more debug messages and fix typos. also remove some extra
+debug noise from ssl.c.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.3 2007/02/06 10:06:55 reyk Exp $	*/
+a111 2
+	log_debug("ssl_read: scheduling ssl_read on %s",
+	    (retry_flag == EV_READ) ? "EV_READ" : "EV_WRITE");
+a156 1
+	log_debug("ssl_write: scheduling ssl_read on EV_READ");
+a160 2
+	log_debug("ssl_write: scheduling ssl_write on %s",
+	    (retry_flag == EV_READ) ? "EV_READ" : "EV_WRITE");
+a205 1
+	log_debug("ssl_connect: connect succeeded");
+a206 1
+		log_debug("ssl_connect: scheduling ssl_write on EV_WRITE");
+a213 1
+	log_debug("ssl_connect: scheduling ssl_read on EV_READ");
+a218 2
+	log_debug("ssl_write: scheduling ssl_write on %s",
+	    (retry_flag == EV_READ) ? "EV_READ" : "EV_WRITE");
+a225 1
+	log_debug("ssl_cleanup: cleaning for %s", cte->host->name);
+@
+
+
+1.3
+log
+@declare the function ssl_error() globally
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.2 2007/01/30 11:48:06 pyr Exp $	*/
+a57 1
+	log_debug("ssl_read: event occurred");
+a63 1
+
+a67 1
+			log_debug("ssl_read: want read");
+a70 1
+			log_debug("ssl_read: want read");
+a134 1
+	log_debug("ssl_write: event occurred");
+a138 1
+
+a142 1
+			log_debug("ssl_write: want read");
+a145 1
+			log_debug("ssl_write: want write");
+a186 1
+
+a190 1
+			log_debug("ssl_connect: want read");
+a193 1
+			log_debug("ssl_connect: want write");
+d249 4
+a252 1
+	
+d279 2
+a280 1
+		hce_notify_done(cte->host, "cannot set SSL fd");
+@
+
+
+1.2
+log
+@provide more accurate error messages.
+ok reyk@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ssl.c,v 1.1 2007/01/29 14:23:31 pyr Exp $	*/
+a41 1
+void	ssl_error(const char *, const char *);
+@
+
+
+1.1
+log
+@Add SSL support to hoststated.
+with help and OK reyk@@
+with help and advice by claudio@@ and Srebrenko Sehic
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d42 1
+a42 1
+void	ssl_error(const char *);
+d95 1
+a95 1
+			ssl_error("cannot read");
+d159 1
+a159 1
+			ssl_error("cannot write");
+d210 1
+a210 1
+			ssl_error("ssl_connect: cannot connect");
+d257 1
+a257 1
+ssl_error(const char *msg)
+d259 2
+a260 2
+	unsigned long	code;
+	char		errbuf[128];
+a261 1
+
+d264 1
+a264 1
+		log_debug("ssl_error: %s: %s", msg, errbuf);
+d280 1
+a280 1
+		ssl_error("ssl_transaction: cannot create object");
+d286 1
+a286 1
+		ssl_error("ssl_transaction: cannot set fd"); 
+d304 1
+a304 1
+		ssl_error("ssl_ctx_create: cannot create context");
+@
+

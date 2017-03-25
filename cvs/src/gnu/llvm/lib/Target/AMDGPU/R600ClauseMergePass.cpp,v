@@ -1,0 +1,403 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.04;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.32;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===-- R600ClauseMergePass - Merge consecutive CF_ALU -------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+/// \file
+/// R600EmitClauseMarker pass emits CFAlu instruction in a conservative maneer.
+/// This pass is merging consecutive CFAlus where applicable.
+/// It needs to be called after IfCvt for best results.
+//===----------------------------------------------------------------------===//
+
+#include "AMDGPU.h"
+#include "AMDGPUSubtarget.h"
+#include "R600Defines.h"
+#include "R600InstrInfo.h"
+#include "R600MachineFunctionInfo.h"
+#include "R600RegisterInfo.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "r600mergeclause"
+
+namespace {
+
+static bool isCFAlu(const MachineInstr *MI) {
+  switch (MI->getOpcode()) {
+  case AMDGPU::CF_ALU:
+  case AMDGPU::CF_ALU_PUSH_BEFORE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+class R600ClauseMergePass : public MachineFunctionPass {
+
+private:
+  static char ID;
+  const R600InstrInfo *TII;
+
+  unsigned getCFAluSize(const MachineInstr *MI) const;
+  bool isCFAluEnabled(const MachineInstr *MI) const;
+
+  /// IfCvt pass can generate "disabled" ALU clause marker that need to be
+  /// removed and their content affected to the previous alu clause.
+  /// This function parse instructions after CFAlu until it find a disabled
+  /// CFAlu and merge the content, or an enabled CFAlu.
+  void cleanPotentialDisabledCFAlu(MachineInstr *CFAlu) const;
+
+  /// Check whether LatrCFAlu can be merged into RootCFAlu and do it if
+  /// it is the case.
+  bool mergeIfPossible(MachineInstr *RootCFAlu, const MachineInstr *LatrCFAlu)
+      const;
+
+public:
+  R600ClauseMergePass(TargetMachine &tm) : MachineFunctionPass(ID) { }
+
+  bool runOnMachineFunction(MachineFunction &MF) override;
+
+  const char *getPassName() const override;
+};
+
+char R600ClauseMergePass::ID = 0;
+
+unsigned R600ClauseMergePass::getCFAluSize(const MachineInstr *MI) const {
+  assert(isCFAlu(MI));
+  return MI->getOperand(
+      TII->getOperandIdx(MI->getOpcode(), AMDGPU::OpName::COUNT)).getImm();
+}
+
+bool R600ClauseMergePass::isCFAluEnabled(const MachineInstr *MI) const {
+  assert(isCFAlu(MI));
+  return MI->getOperand(
+      TII->getOperandIdx(MI->getOpcode(), AMDGPU::OpName::Enabled)).getImm();
+}
+
+void R600ClauseMergePass::cleanPotentialDisabledCFAlu(MachineInstr *CFAlu)
+    const {
+  int CntIdx = TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::COUNT);
+  MachineBasicBlock::iterator I = CFAlu, E = CFAlu->getParent()->end();
+  I++;
+  do {
+    while (I!= E && !isCFAlu(I))
+      I++;
+    if (I == E)
+      return;
+    MachineInstr *MI = I++;
+    if (isCFAluEnabled(MI))
+      break;
+    CFAlu->getOperand(CntIdx).setImm(getCFAluSize(CFAlu) + getCFAluSize(MI));
+    MI->eraseFromParent();
+  } while (I != E);
+}
+
+bool R600ClauseMergePass::mergeIfPossible(MachineInstr *RootCFAlu,
+                                          const MachineInstr *LatrCFAlu) const {
+  assert(isCFAlu(RootCFAlu) && isCFAlu(LatrCFAlu));
+  int CntIdx = TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::COUNT);
+  unsigned RootInstCount = getCFAluSize(RootCFAlu),
+      LaterInstCount = getCFAluSize(LatrCFAlu);
+  unsigned CumuledInsts = RootInstCount + LaterInstCount;
+  if (CumuledInsts >= TII->getMaxAlusPerClause()) {
+    DEBUG(dbgs() << "Excess inst counts\n");
+    return false;
+  }
+  if (RootCFAlu->getOpcode() == AMDGPU::CF_ALU_PUSH_BEFORE)
+    return false;
+  // Is KCache Bank 0 compatible ?
+  int Mode0Idx =
+      TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::KCACHE_MODE0);
+  int KBank0Idx =
+      TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::KCACHE_BANK0);
+  int KBank0LineIdx =
+      TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::KCACHE_ADDR0);
+  if (LatrCFAlu->getOperand(Mode0Idx).getImm() &&
+      RootCFAlu->getOperand(Mode0Idx).getImm() &&
+      (LatrCFAlu->getOperand(KBank0Idx).getImm() !=
+       RootCFAlu->getOperand(KBank0Idx).getImm() ||
+      LatrCFAlu->getOperand(KBank0LineIdx).getImm() !=
+      RootCFAlu->getOperand(KBank0LineIdx).getImm())) {
+    DEBUG(dbgs() << "Wrong KC0\n");
+    return false;
+  }
+  // Is KCache Bank 1 compatible ?
+  int Mode1Idx =
+      TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::KCACHE_MODE1);
+  int KBank1Idx =
+      TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::KCACHE_BANK1);
+  int KBank1LineIdx =
+      TII->getOperandIdx(AMDGPU::CF_ALU, AMDGPU::OpName::KCACHE_ADDR1);
+  if (LatrCFAlu->getOperand(Mode1Idx).getImm() &&
+      RootCFAlu->getOperand(Mode1Idx).getImm() &&
+      (LatrCFAlu->getOperand(KBank1Idx).getImm() !=
+      RootCFAlu->getOperand(KBank1Idx).getImm() ||
+      LatrCFAlu->getOperand(KBank1LineIdx).getImm() !=
+      RootCFAlu->getOperand(KBank1LineIdx).getImm())) {
+    DEBUG(dbgs() << "Wrong KC0\n");
+    return false;
+  }
+  if (LatrCFAlu->getOperand(Mode0Idx).getImm()) {
+    RootCFAlu->getOperand(Mode0Idx).setImm(
+        LatrCFAlu->getOperand(Mode0Idx).getImm());
+    RootCFAlu->getOperand(KBank0Idx).setImm(
+        LatrCFAlu->getOperand(KBank0Idx).getImm());
+    RootCFAlu->getOperand(KBank0LineIdx).setImm(
+        LatrCFAlu->getOperand(KBank0LineIdx).getImm());
+  }
+  if (LatrCFAlu->getOperand(Mode1Idx).getImm()) {
+    RootCFAlu->getOperand(Mode1Idx).setImm(
+        LatrCFAlu->getOperand(Mode1Idx).getImm());
+    RootCFAlu->getOperand(KBank1Idx).setImm(
+        LatrCFAlu->getOperand(KBank1Idx).getImm());
+    RootCFAlu->getOperand(KBank1LineIdx).setImm(
+        LatrCFAlu->getOperand(KBank1LineIdx).getImm());
+  }
+  RootCFAlu->getOperand(CntIdx).setImm(CumuledInsts);
+  RootCFAlu->setDesc(TII->get(LatrCFAlu->getOpcode()));
+  return true;
+}
+
+bool R600ClauseMergePass::runOnMachineFunction(MachineFunction &MF) {
+  TII = static_cast<const R600InstrInfo *>(MF.getSubtarget().getInstrInfo());
+  for (MachineFunction::iterator BB = MF.begin(), BB_E = MF.end();
+                                                  BB != BB_E; ++BB) {
+    MachineBasicBlock &MBB = *BB;
+    MachineBasicBlock::iterator I = MBB.begin(),  E = MBB.end();
+    MachineBasicBlock::iterator LatestCFAlu = E;
+    while (I != E) {
+      MachineInstr *MI = I++;
+      if ((!TII->canBeConsideredALU(MI) && !isCFAlu(MI)) ||
+          TII->mustBeLastInClause(MI->getOpcode()))
+        LatestCFAlu = E;
+      if (!isCFAlu(MI))
+        continue;
+      cleanPotentialDisabledCFAlu(MI);
+
+      if (LatestCFAlu != E && mergeIfPossible(LatestCFAlu, MI)) {
+        MI->eraseFromParent();
+      } else {
+        assert(MI->getOperand(8).getImm() && "CF ALU instruction disabled");
+        LatestCFAlu = MI;
+      }
+    }
+  }
+  return false;
+}
+
+const char *R600ClauseMergePass::getPassName() const {
+  return "R600 Merge Clause Markers Pass";
+}
+
+} // end anonymous namespace
+
+
+llvm::FunctionPass *llvm::createR600ClauseMergePass(TargetMachine &TM) {
+  return new R600ClauseMergePass(TM);
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d34 2
+a35 2
+static bool isCFAlu(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+d50 2
+a51 2
+  unsigned getCFAluSize(const MachineInstr &MI) const;
+  bool isCFAluEnabled(const MachineInstr &MI) const;
+d57 1
+a57 1
+  void cleanPotentialDisabledCFAlu(MachineInstr &CFAlu) const;
+d61 2
+a62 2
+  bool mergeIfPossible(MachineInstr &RootCFAlu,
+                       const MachineInstr &LatrCFAlu) const;
+d74 1
+a74 1
+unsigned R600ClauseMergePass::getCFAluSize(const MachineInstr &MI) const {
+d76 2
+a77 3
+  return MI
+      .getOperand(TII->getOperandIdx(MI.getOpcode(), AMDGPU::OpName::COUNT))
+      .getImm();
+d80 1
+a80 1
+bool R600ClauseMergePass::isCFAluEnabled(const MachineInstr &MI) const {
+d82 2
+a83 3
+  return MI
+      .getOperand(TII->getOperandIdx(MI.getOpcode(), AMDGPU::OpName::Enabled))
+      .getImm();
+d86 2
+a87 2
+void R600ClauseMergePass::cleanPotentialDisabledCFAlu(
+    MachineInstr &CFAlu) const {
+d89 1
+a89 1
+  MachineBasicBlock::iterator I = CFAlu, E = CFAlu.getParent()->end();
+d92 1
+a92 1
+    while (I != E && !isCFAlu(*I))
+d96 1
+a96 1
+    MachineInstr &MI = *I++;
+d99 2
+a100 2
+    CFAlu.getOperand(CntIdx).setImm(getCFAluSize(CFAlu) + getCFAluSize(MI));
+    MI.eraseFromParent();
+d104 2
+a105 2
+bool R600ClauseMergePass::mergeIfPossible(MachineInstr &RootCFAlu,
+                                          const MachineInstr &LatrCFAlu) const {
+d115 1
+a115 1
+  if (RootCFAlu.getOpcode() == AMDGPU::CF_ALU_PUSH_BEFORE)
+d124 6
+a129 6
+  if (LatrCFAlu.getOperand(Mode0Idx).getImm() &&
+      RootCFAlu.getOperand(Mode0Idx).getImm() &&
+      (LatrCFAlu.getOperand(KBank0Idx).getImm() !=
+           RootCFAlu.getOperand(KBank0Idx).getImm() ||
+       LatrCFAlu.getOperand(KBank0LineIdx).getImm() !=
+           RootCFAlu.getOperand(KBank0LineIdx).getImm())) {
+d140 6
+a145 6
+  if (LatrCFAlu.getOperand(Mode1Idx).getImm() &&
+      RootCFAlu.getOperand(Mode1Idx).getImm() &&
+      (LatrCFAlu.getOperand(KBank1Idx).getImm() !=
+           RootCFAlu.getOperand(KBank1Idx).getImm() ||
+       LatrCFAlu.getOperand(KBank1LineIdx).getImm() !=
+           RootCFAlu.getOperand(KBank1LineIdx).getImm())) {
+d149 15
+a163 15
+  if (LatrCFAlu.getOperand(Mode0Idx).getImm()) {
+    RootCFAlu.getOperand(Mode0Idx).setImm(
+        LatrCFAlu.getOperand(Mode0Idx).getImm());
+    RootCFAlu.getOperand(KBank0Idx).setImm(
+        LatrCFAlu.getOperand(KBank0Idx).getImm());
+    RootCFAlu.getOperand(KBank0LineIdx)
+        .setImm(LatrCFAlu.getOperand(KBank0LineIdx).getImm());
+  }
+  if (LatrCFAlu.getOperand(Mode1Idx).getImm()) {
+    RootCFAlu.getOperand(Mode1Idx).setImm(
+        LatrCFAlu.getOperand(Mode1Idx).getImm());
+    RootCFAlu.getOperand(KBank1Idx).setImm(
+        LatrCFAlu.getOperand(KBank1Idx).getImm());
+    RootCFAlu.getOperand(KBank1LineIdx)
+        .setImm(LatrCFAlu.getOperand(KBank1LineIdx).getImm());
+d165 2
+a166 2
+  RootCFAlu.getOperand(CntIdx).setImm(CumuledInsts);
+  RootCFAlu.setDesc(TII->get(LatrCFAlu.getOpcode()));
+d171 1
+a171 6
+  if (skipFunction(*MF.getFunction()))
+    return false;
+
+  const R600Subtarget &ST = MF.getSubtarget<R600Subtarget>();
+  TII = ST.getInstrInfo();
+
+d178 1
+a178 1
+      MachineInstr &MI = *I++;
+d180 1
+a180 1
+          TII->mustBeLastInClause(MI.getOpcode()))
+d186 2
+a187 2
+      if (LatestCFAlu != E && mergeIfPossible(*LatestCFAlu, MI)) {
+        MI.eraseFromParent();
+d189 1
+a189 1
+        assert(MI.getOperand(8).getImm() && "CF ALU instruction disabled");
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d69 1
+a69 1
+  StringRef getPassName() const override;
+d204 1
+a204 1
+StringRef R600ClauseMergePass::getPassName() const {
+@
+
+

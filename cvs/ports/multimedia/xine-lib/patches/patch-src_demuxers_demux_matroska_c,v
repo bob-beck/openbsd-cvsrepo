@@ -1,0 +1,785 @@
+head	1.15;
+access;
+symbols
+	OPENBSD_5_2:1.11.0.2
+	OPENBSD_5_2_BASE:1.11;
+locks; strict;
+comment	@# @;
+
+
+1.15
+date	2017.03.20.08.14.03;	author ajacoutot;	state Exp;
+branches;
+next	1.14;
+commitid	cskePNdb4ONv3Bqf;
+
+1.14
+date	2014.07.13.20.03.51;	author brad;	state dead;
+branches;
+next	1.13;
+commitid	YLfQXW0aptQ3vfxK;
+
+1.13
+date	2014.05.21.23.41.03;	author brad;	state Exp;
+branches;
+next	1.12;
+
+1.12
+date	2012.11.29.20.18.21;	author brad;	state dead;
+branches;
+next	1.11;
+
+1.11
+date	2012.06.10.07.35.30;	author ajacoutot;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2012.06.09.08.41.16;	author ajacoutot;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2012.04.07.05.48.49;	author ajacoutot;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2011.11.16.00.43.17;	author sthen;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	2011.10.30.21.20.21;	author dcoppa;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2011.10.13.07.27.00;	author dcoppa;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2011.10.09.20.45.07;	author sthen;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2010.01.05.11.52.06;	author sthen;	state dead;
+branches;
+next	1.3;
+
+1.3
+date	2009.07.14.09.10.05;	author sthen;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2008.04.15.11.24.14;	author jakemsr;	state dead;
+branches;
+next	1.1;
+
+1.1
+date	2008.04.06.10.12.23;	author jakemsr;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.15
+log
+@Bring in some bug fixes from upstream and use the FFmpeg decoder for
+VP8 / VP9 content.
+
+from Brad (maintainer)
+@
+text
+@$OpenBSD$
+
+- MKV: fix generated bitmap head on big endian machines
+- MKV: tell decoders about keyframes
+- MKV: add vp9 multiframe blck support
+
+--- src/demuxers/demux_matroska.c.orig	Sun Mar 19 16:09:18 2017
++++ src/demuxers/demux_matroska.c	Sun Mar 19 16:43:33 2017
+@@@@ -992,7 +992,112 @@@@ static void handle_sub_utf8 (demux_plugin_t *this_gen,
+   }
+ }
+ 
++/* 0x02 (not a keyframe) | 0x01 (is visible) */
++static int vp9_frametype (const uint8_t *h) {
++  if ((h[0] & 0xc0) != 0x80) /* frame marker missing */
++    return 1;
++  if ((h[0] & 0x30) == 0x30) { /* profile 3+ */
++    if (h[0] & 0x08) /* profile 4+ not supported */
++      return 0;
++    if (h[0] & 0x04) /* 3 bits ref */
++      return 1;
++    return h[0] & 3;
++  }
++  if (h[0] & 0x08) /* 3 bits ref */
++    return 1;
++  return (h[0] >> 1) & 3;
++}
+ 
++static void handle_vp9 (demux_plugin_t *this_gen, matroska_track_t *track, int decoder_flags,
++  uint8_t *data, size_t data_len, int64_t data_pts, int data_duration, int input_normpos, int input_time) {
++  /* !@@$%*#~ undocumented multiframe feature */
++  do {
++    uint8_t mfhead;
++    uint8_t *l;
++    int mfframes, i;
++    size_t mfbytes, mfsize;
++
++    if (!data_len)
++      return;
++    mfhead = data[data_len - 1];
++    if ((mfhead & 0xe0) != 0xc0)
++      break;
++    mfframes =  (mfhead & 7) + 1;
++    mfbytes  = ((mfhead >> 3) & 3) + 1;
++    mfsize   =   mfframes * mfbytes + 2;
++    if (mfsize > data_len)
++      break;
++    l = data + data_len - mfsize;
++    if (*l++ != mfhead)
++      break;
++    data_len -= mfsize;
++    data_duration /= mfframes;
++    for (i = 0; i < mfframes; i++) {
++      size_t flen = *l++;
++      if (mfbytes > 1)
++        flen += (size_t)(*l++) << 8;
++      if (mfbytes > 2)
++        flen += (size_t)(*l++) << 16;
++      if (mfbytes > 3)
++        flen += (size_t)(*l++) << 24;
++      if (flen > data_len)
++        flen = data_len;
++      if (flen) {
++        /* Nasty kludge: take invisible frames out of pts sequence.
++         * A conventional b-frame sequence looks like this:
++         * I1 P1 B1 B2 B3 P2 B4 ...
++         * after reordering:
++         * I1 B1 B2 B3 P1 B4 ... P2
++         * VP9 now avoids reordering and storing both dts and pts
++         * by adding "P" as "invisible" to a (multiframe group):
++         * I1 (P1 B1) B2 B3 (P2 B4) ...
++         * "B3" usually is very small, and yields a quite verbatim copy of "P1",
++         * which does not stay completely hidden this way.
++         */
++        int64_t pts = data_pts;
++        int type = vp9_frametype (data);
++        if (type & 2)
++          decoder_flags &= ~BUF_FLAG_KEYFRAME;
++        else
++          decoder_flags |= BUF_FLAG_KEYFRAME;
++        if (type & 1) { /* visible */
++          if (!pts)
++            pts = track->delayed_pts;
++          track->delayed_pts = data_pts = 0;
++        } else { /* invisible */
++          pts = 0;
++          track->delayed_pts = data_pts;
++        }
++        _x_demux_send_data (track->fifo, data, flen, pts, track->buf_type,
++          decoder_flags, input_normpos, input_time, data_duration, 0);
++        data += flen;
++        data_len -= flen;
++      }
++    }
++    return;
++  } while (0);
++
++  {
++    int64_t pts = data_pts;
++    int type = vp9_frametype (data);
++    if (type & 2)
++      decoder_flags &= ~BUF_FLAG_KEYFRAME;
++    else
++      decoder_flags |= BUF_FLAG_KEYFRAME;
++    if (type & 1) { /* visible */
++      if (!pts)
++        pts = track->delayed_pts;
++      track->delayed_pts = data_pts = 0;
++    } else { /* invisible */
++      pts = 0;
++      track->delayed_pts = data_pts;
++    }
++    _x_demux_send_data (track->fifo, data, data_len, pts, track->buf_type,
++      decoder_flags, input_normpos, input_time, data_duration, 0);
++  }
++}
++
++
+ static int uncompress_zlib(demux_matroska_t *this,
+                            const uint8_t *data, size_t data_len, uint8_t **out_data, size_t *out_data_len)
+ {
+@@@@ -1235,7 +1340,8 @@@@ static void fill_extra_data(matroska_track_t *track, u
+   bih->biCompression = fourcc;
+   bih->biWidth = track->video_track->pixel_width;
+   bih->biHeight = track->video_track->pixel_height;
+-  _x_bmiheader_le2me(bih);
++  /* this is to be passed to decoder in native machine endian */
++  /* (no _x_bmiheader_le2me(bih);) */
+ 
+   /* add bih extra data */
+   memcpy(bih + 1, track->codec_private, track->codec_private_len);
+@@@@ -1462,6 +1568,7 @@@@ static int parse_track_entry(demux_matroska_t *this, m
+       fill_extra_data(track, ME_FOURCC('v', 'p', '9', '0'));
+       track->buf_type = BUF_VIDEO_VP9;
+       init_codec = init_codec_video;
++      track->handle_content = handle_vp9;
+     } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_V_HEVC)) {
+       lprintf("MATROSKA_CODEC_ID_V_HEVC\n");
+       fill_extra_data(track, ME_FOURCC('h', 'e', 'v', 'c'));
+@@@@ -2053,6 +2160,9 @@@@ static int parse_block (demux_matroska_t *this, size_t
+     size_t block_size_left;
+     lprintf("no lacing\n");
+ 
++    if (is_key)
++      decoder_flags |= BUF_FLAG_KEYFRAME;
++
+     block_size_left = (this->block_data + block_size + this->compress_maxlen) - data;
+     lprintf("size: %d, block_size: %u, block_offset: %u\n", block_size_left, block_size, this->compress_maxlen);
+ 
+@@@@ -2063,17 +2173,13 @@@@ static int parse_block (demux_matroska_t *this, size_t
+     }
+ 
+     if (track->handle_content != NULL) {
+-      track->handle_content((demux_plugin_t *)this, track,
+-                             decoder_flags,
+-                             data, block_size_left,
+-                             pts, xduration,
+-                             normpos, pts / 90);
++      track->handle_content((demux_plugin_t *)this, track, decoder_flags,
++        data, block_size_left, pts, xduration, normpos, pts / 90);
+     } else {
+-      _x_demux_send_data(track->fifo, data, block_size_left,
+-                         pts, track->buf_type, decoder_flags,
+-                         normpos, pts / 90,
+-                         this->duration, 0);
++      _x_demux_send_data(track->fifo, data, block_size_left, pts, track->buf_type,
++        decoder_flags, normpos, pts / 90, this->duration, 0);
+     }
++
+   } else {
+ 
+     size_t block_size_left;
+@
+
+
+1.14
+log
+@Update to Xine-lib 1.2.6.
+
+ok ajacoutot@@ sthen@@
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.13 2014/05/21 23:41:03 brad Exp $
+d3 3
+a5 1
+Demux Opus.
+d7 166
+a172 14
+--- src/demuxers/demux_matroska.c.orig	Wed May 21 09:35:32 2014
++++ src/demuxers/demux_matroska.c	Wed May 21 09:36:08 2014
+@@@@ -1425,6 +1425,11 @@@@ static int parse_track_entry(demux_matroska_t *this, m
+       track->buf_type = BUF_AUDIO_VORBIS;
+       init_codec = init_codec_xiph;
+ 
++    } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_A_OPUS)) {
++      lprintf("MATROSKA_CODEC_ID_A_OPUS\n");
++      track->buf_type = BUF_AUDIO_OPUS;
++      init_codec = init_codec_audio;
++
+     } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_A_ACM)) {
+       xine_waveformatex *wfh;
+       lprintf("MATROSKA_CODEC_ID_A_ACM\n");
+@
+
+
+1.13
+log
+@- Add some fixes for the FFmpeg decoder
+- Enable the libvpx decoder as a means of working around a bug
+  with Xine's VP9 decoder via FFmpeg
+- Add Opus support
+
+ok sthen@@
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+@
+
+
+1.12
+log
+@Update to Xine-lib 1.2.2.
+
+ok ajacoutot@@
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.11 2012/06/10 07:35:30 ajacoutot Exp $
+d3 1
+a3 1
+Add support for FLAC.
+d5 5
+a9 5
+--- src/demuxers/demux_matroska.c.orig	Thu Oct 13 16:18:39 2011
++++ src/demuxers/demux_matroska.c	Fri Jun  8 22:48:36 2012
+@@@@ -1393,6 +1393,11 @@@@ static int parse_track_entry(demux_matroska_t *this, m
+       track->buf_type = BUF_AUDIO_EAC3;
+       init_codec = init_codec_audio;
+d11 3
+a13 3
++    } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_A_FLAC)) {
++      lprintf("MATROSKA_CODEC_ID_A_FLAC\n");
++      track->buf_type = BUF_AUDIO_FLAC;
+d16 3
+a18 3
+     } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_A_DTS)) {
+       lprintf("MATROSKA_CODEC_ID_A_DTS\n");
+       track->buf_type = BUF_AUDIO_DTS;
+@
+
+
+1.11
+log
+@Update to stable, xine-lib-1.1.21.
+
+from Brad (maintainer)
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.10 2012/06/09 08:41:16 ajacoutot Exp $
+@
+
+
+1.10
+log
+@Several fixes from upstream:
+- Fix MPEG2 parsing.
+- Enable direct rendering for H.264.
+- Fix DR1 frame garbage collector when using multithreaded decoding.
+- Fix U-plane conversion (YUVJ444P -> YUV420).
+- Add support for FLAC with Matroska.
+- mmx_yuv2rgb() optimizations.
+
+from Brad (maintainer)
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.9 2012/04/07 05:48:49 ajacoutot Exp $
+d3 1
+a3 2
+- Fix Matroska header compression when using lacing (ex. multiple audio frames in one block).
+- Add support for FLAC.
+a18 14
+@@@@ -2049,6 +2054,13 @@@@ static int parse_block (demux_matroska_t *this, size_t
+     }
+     /* send each frame to the decoder */
+     for (i = 0; i <= lace_num; i++) {
++
++      if (headers_len) {
++        data -= headers_len;
++        xine_fast_memcpy(data, track->compress_settings, headers_len);
++        frame[i] += headers_len;
++      }
++
+       if (track->handle_content != NULL) {
+         track->handle_content((demux_plugin_t *)this, track,
+                                decoder_flags,
+@
+
+
+1.9
+log
+@Bring a bunch of bugfixes from upstream.
+
+from Brad
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+d3 2
+a4 1
+Fix Matroska header compression when using lacing (ex. multiple audio frames in one block).
+d6 15
+a20 3
+--- src/demuxers/demux_matroska.c.orig	Fri Feb 17 22:55:21 2012
++++ src/demuxers/demux_matroska.c	Fri Feb 17 22:55:59 2012
+@@@@ -2049,6 +2049,13 @@@@ static int parse_block (demux_matroska_t *this, size_t
+@
+
+
+1.8
+log
+@update to xine-lib 1.1.20, from Brad
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.7 2011/10/30 21:20:21 dcoppa Exp $
+d3 1
+a3 3
+- Header stripping support.
+- VP8 support.
+- Fix NULL dereferences and skipping of unknown elements.
+d5 6
+a10 42
+--- src/demuxers/demux_matroska.c.orig	Mon Jul 19 14:01:43 2010
++++ src/demuxers/demux_matroska.c	Fri Oct 28 00:49:57 2011
+@@@@ -304,8 +304,12 @@@@ static int parse_content_compression (demux_matroska_t
+         }
+         break;
+       case MATROSKA_ID_CE_COMPSETTINGS:
+-        lprintf("ContentCompSettings (UNSUPPORTED)\n");
+-        if (!ebml_skip(ebml, &elem))
++        lprintf("ContentCompSettings\n");
++        track->compress_settings = calloc(1, elem.len);
++        track->compress_len = elem.len;
++        if (elem.len > this->compress_maxlen)
++		this->compress_maxlen = elem.len;
++        if(!ebml_read_binary(ebml, &elem, track->compress_settings))
+           return 0;
+         break;
+       default:
+@@@@ -1327,6 +1331,29 @@@@ static int parse_track_entry(demux_matroska_t *this, m
+       lprintf("MATROSKA_CODEC_ID_V_MPEG2\n");
+       track->buf_type = BUF_VIDEO_MPEG;
+       init_codec = init_codec_video;
++    } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_V_VP8)) {
++      xine_bmiheader *bih;
++
++      lprintf("MATROSKA_CODEC_ID_V_VP8\n");
++      if (track->codec_private_len > 0x7fffffff - sizeof(xine_bmiheader))
++        track->codec_private_len = 0x7fffffff - sizeof(xine_bmiheader);
++
++      /* create a bitmap info header struct for vp8 */
++      bih = calloc(1, sizeof(xine_bmiheader) + track->codec_private_len);
++      bih->biSize = sizeof(xine_bmiheader) + track->codec_private_len;
++      bih->biCompression = ME_FOURCC('v', 'p', '8', '0');
++      bih->biWidth = track->video_track->pixel_width;
++      bih->biHeight = track->video_track->pixel_height;
++      _x_bmiheader_le2me(bih);
++
++      /* add bih extra data */
++      memcpy(bih + 1, track->codec_private, track->codec_private_len);
++      free(track->codec_private);
++      track->codec_private = (uint8_t *)bih;
++      track->codec_private_len = bih->biSize;
++      track->buf_type = BUF_VIDEO_VP8;
+d12 9
+a20 105
++      init_codec = init_codec_video;
+     } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_V_REAL_RV10)) {
+     } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_V_REAL_RV20)) {
+     } else if (!strcmp(track->codec_id, MATROSKA_CODEC_ID_V_REAL_RV30)) {
+@@@@ -1784,8 +1811,8 @@@@ static int find_track_by_id(demux_matroska_t *this, in
+ }
+ 
+ 
+-static int read_block_data (demux_matroska_t *this, size_t len) {
+-  alloc_block_data(this, len);
++static int read_block_data (demux_matroska_t *this, size_t len, size_t offset) {
++  alloc_block_data(this, len + offset);
+ 
+   /* block datas */
+   if (! this->block_data) {
+@@@@ -1793,7 +1820,7 @@@@ static int read_block_data (demux_matroska_t *this, si
+             "demux_matroska: memory allocation error\n");
+     return 0;
+   }
+-  if (this->input->read(this->input, this->block_data, len) != len) {
++  if (this->input->read(this->input, this->block_data + offset, len) != len) {
+     off_t pos = this->input->get_current_pos(this->input);
+     xprintf(this->stream->xine, XINE_VERBOSITY_LOG,
+             "demux_matroska: read error at position %" PRIdMAX "\n",
+@@@@ -1823,8 +1850,9 @@@@ static int parse_block (demux_matroska_t *this, size_t
+   int16_t           timecode_diff;
+   int64_t           pts, xduration;
+   int               decoder_flags = 0;
++  size_t            headers_len = 0;
+ 
+-  data = this->block_data;
++  data = this->block_data + this->compress_maxlen;
+   if (!(num_len = parse_ebml_uint(this, data, &track_num)))
+     return 0;
+   data += num_len;
+@@@@ -1877,13 +1905,22 @@@@ static int parse_block (demux_matroska_t *this, size_t
+     decoder_flags |= BUF_FLAG_PREVIEW;
+   }
+ 
++  if (track->compress_algo == MATROSKA_COMPRESS_HEADER_STRIP)
++    headers_len = track->compress_len;
++
+   if (lacing == MATROSKA_NO_LACING) {
+     size_t block_size_left;
+     lprintf("no lacing\n");
+ 
+-    block_size_left = (this->block_data + block_size) - data;
+-    lprintf("size: %d, block_size: %u\n", block_size_left, block_size);
++    block_size_left = (this->block_data + block_size + this->compress_maxlen) - data;
++    lprintf("size: %d, block_size: %u, block_offset: %u\n", block_size_left, block_size, this->compress_maxlen);
+ 
++    if (headers_len) {
++      data -= headers_len;
++      xine_fast_memcpy(data, track->compress_settings, headers_len);
++      block_size_left += headers_len;
++    }
++
+     if (track->handle_content != NULL) {
+       track->handle_content((demux_plugin_t *)this, track,
+                              decoder_flags,
+@@@@ -1912,7 +1949,7 @@@@ static int parse_block (demux_matroska_t *this, size_t
+               "demux_matroska: too many frames: %d\n", lace_num);
+       return 0;
+     }
+-    block_size_left = this->block_data + block_size - data;
++    block_size_left = this->block_data + block_size + this->compress_maxlen - data;
+ 
+     switch (lacing) {
+       case MATROSKA_XIPH_LACING: {
+@@@@ -2045,7 +2082,7 @@@@ static int parse_simpleblock(demux_matroska_t *this, s
+   if( file_len )
+     normpos = (int) ( (double) block_pos * 65535 / file_len );
+ 
+-  if (!read_block_data(this, block_len))
++  if (!read_block_data(this, block_len, this->compress_maxlen))
+     return 0;
+ 
+   has_block = 1;
+@@@@ -2084,7 +2121,7 @@@@ static int parse_block_group(demux_matroska_t *this,
+         if( file_len )
+           normpos = (int) ( (double) block_pos * 65535 / file_len );
+ 
+-        if (!read_block_data(this, elem.len))
++        if (!read_block_data(this, elem.len, this->compress_maxlen))
+           return 0;
+ 
+           has_block = 1;
+@@@@ -2993,7 +3030,7 @@@@ static demux_plugin_t *open_plugin (demux_class_t *cla
+   if (ebml->max_size_len > 8)
+     goto error;
+   /* handle both Matroska and WebM here; we don't (presently) differentiate */
+-  if (strcmp(ebml->doctype, "matroska") && strcmp(ebml->doctype, "webm"))
++  if (!ebml->doctype || (strcmp(ebml->doctype, "matroska") && strcmp(ebml->doctype, "webm")))
+     goto error;
+ 
+   this->event_queue = xine_event_new_queue(this->stream);
+@@@@ -3003,7 +3040,7 @@@@ static demux_plugin_t *open_plugin (demux_class_t *cla
+ error:
+   dispose_ebml_parser(ebml);
+ 
+-  if (NULL != this) {
++  if (this != NULL && this->event_queue != NULL) {
+     xine_event_dispose_queue(this->event_queue);
+     free(this);
+   }
+@
+
+
+1.7
+log
+@Bugfixes for the matroska demuxer.
+
+from Brad (maintainer)
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.6 2011/10/13 07:27:00 dcoppa Exp $
+@
+
+
+1.6
+log
+@Backport the Matroska header stripping support for Xine-lib.
+
+From upstream via Brad
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.5 2011/10/09 20:45:07 sthen Exp $
+d5 1
+d8 1
+a8 1
++++ src/demuxers/demux_matroska.c	Tue Oct 11 02:43:22 2011
+d137 18
+@
+
+
+1.5
+log
+@Backport support to xine-lib for VP8 (WebM) and RealVideo 3/4, improved
+24-bit LPCM support and various bug fixes. From Brad.
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+d3 2
+a4 1
+VP8 support.
+d6 18
+a23 3
+--- src/demuxers/demux_matroska.c.orig	Wed Sep 28 01:31:40 2011
++++ src/demuxers/demux_matroska.c	Wed Sep 28 01:32:48 2011
+@@@@ -1327,6 +1327,29 @@@@ static int parse_track_entry(demux_matroska_t *this, m
+d53 83
+@
+
+
+1.4
+log
+@Update to 1.1.7 from Brad; I missed a 'cvs rm' too :(
+@
+text
+@d1 12
+a12 14
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.3 2009/07/14 09:10:05 sthen Exp $
+--- src/demuxers/demux_matroska.c.orig	Mon Jul 13 04:09:24 2009
++++ src/demuxers/demux_matroska.c	Mon Jul 13 04:12:12 2009
+@@@@ -2078,6 +2078,31 @@@@ static int parse_block (demux_matroska_t *this, size_t
+   return 1;
+ }
+ 
++static int parse_simpleblock(demux_matroska_t *this, size_t block_len, uint64_t cluster_timecode, uint64_t block_duration)
++{
++  int has_block           = 0;
++  off_t block_pos         = 0;
++  off_t file_len          = 0;
++  int normpos             = 0;
++  int is_key              = 1;
+d14 3
+a16 16
++  lprintf("simpleblock\n");
++  block_pos = this->input->get_current_pos(this->input);
++  file_len = this->input->get_length(this->input);
++  if( file_len )
++    normpos = (int) ( (double) block_pos * 65535 / file_len );
++  
++  if (!read_block_data(this, block_len))
++    return 0;
++  
++  has_block = 1;
++    /* we have the duration, we can parse the block now */
++  if (!parse_block(this, block_len, cluster_timecode, block_duration,
++                   normpos, is_key))
++    return 0;
++  return 1;
++}
+d18 19
+a36 34
+ static int parse_block_group(demux_matroska_t *this,
+                              uint64_t cluster_timecode,
+                              uint64_t cluster_duration) {
+@@@@ -2142,7 +2167,8 @@@@ static int parse_block_group(demux_matroska_t *this,
+ 
+ static int parse_cluster(demux_matroska_t *this) {
+   ebml_parser_t *ebml = this->ebml;
+-  int next_level = 2;
++  int this_level = ebml->level;
++  int next_level = this_level;
+   uint64_t timecode = 0;
+   uint64_t duration = 0;
+ 
+@@@@ -2159,7 +2185,7 @@@@ static int parse_cluster(demux_matroska_t *this) {
+     this->first_cluster_found = 1;
+   }
+ 
+-  while (next_level == 2) {
++  while (next_level == this_level) {
+     ebml_elem_t elem;
+ 
+     if (!ebml_read_elem_head(ebml, &elem))
+@@@@ -2181,6 +2207,11 @@@@ static int parse_cluster(demux_matroska_t *this) {
+         if (!ebml_read_master (ebml, &elem))
+           return 0;
+         if ((elem.len > 0) && !parse_block_group(this, timecode, duration))
++          return 0;
++        break;
++      case MATROSKA_ID_CL_SIMPLEBLOCK:
++        lprintf("simpleblock\n");
++        if (!parse_simpleblock(this, elem.len, timecode, duration))
+           return 0;
+         break;
+       case MATROSKA_ID_CL_BLOCK:
+@
+
+
+1.3
+log
+@add SIMPLEBLOCK support for Matroska; from upstream repository.
+http://bugs.xine-project.org/show_bug.cgi?id=216
+
+from Brad (maintainer).
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+@
+
+
+1.2
+log
+@update to xine-lib-1.1.12
+
+This release contains a security fix (unchecked array index,
+CVE-2008-1686). There are also a few bug fixes, and open-source
+support for RealAudio "cook". For front-end package maintainers,
+there's a tool to help maintain MIME type lists, and for developers
+who need raw frame data, you can now get that with the "raw" video
+output plugin.
+
+from brad@@
+@
+text
+@d1 36
+a36 4
+$OpenBSD: patch-src_demuxers_demux_matroska_c,v 1.1 2008/04/06 10:12:23 jakemsr Exp $
+--- src/demuxers/demux_matroska.c.orig	Tue Apr  1 19:47:42 2008
++++ src/demuxers/demux_matroska.c	Tue Apr  1 19:48:55 2008
+@@@@ -2915,7 +2915,8 @@@@ static const char *get_extensions (demux_class_t *this
+d38 7
+d46 3
+a48 5
+ static const char *get_mimetypes (demux_class_t *this_gen) {
+-  return "video/mkv: mkv: matroska;";
++  return "video/mkv: mkv: matroska;"
++	"video/x-matroska: mkv: matroska;";
+ }
+d50 3
+d54 13
+@
+
+
+1.1
+log
+@
+fixes for quicktime, matroska and wavpack pulled from xine-lib repo
+by brad@@
+
+fixes problem reported by viq on ports@@
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+@
+

@@ -1,0 +1,961 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_5_4:1.5.0.4
+	OPENBSD_5_4_BASE:1.5
+	OPENBSD_5_3:1.5.0.2
+	OPENBSD_5_3_BASE:1.5
+	OPENBSD_5_2:1.4.0.4
+	OPENBSD_5_2_BASE:1.4
+	OPENBSD_5_1_BASE:1.4
+	OPENBSD_5_1:1.4.0.2
+	v7_10_3:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_0:1.3.0.6
+	OPENBSD_5_0_BASE:1.3
+	OPENBSD_4_9:1.3.0.2
+	OPENBSD_4_9_BASE:1.3
+	OPENBSD_4_8:1.3.0.4
+	OPENBSD_4_8_BASE:1.3
+	OPENBSD_4_7:1.2.0.4
+	OPENBSD_4_7_BASE:1.2
+	OPENBSD_4_6:1.2.0.2
+	OPENBSD_4_6_BASE:1.2
+	OPENBSD_4_5:1.1.0.2
+	OPENBSD_4_5_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2013.09.05.14.04.33;	author jsg;	state dead;
+branches;
+next	1.5;
+
+1.5
+date	2012.08.17.13.58.15;	author mpi;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2011.10.23.13.37.39;	author matthieu;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2010.05.22.20.06.19;	author matthieu;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.05.17.20.26.39;	author matthieu;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.11.02.14.58.16;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.10.23.13.29.38;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@Merge Mesa 9.2.0
+@
+text
+@/**************************************************************************
+ * 
+ * Copyright 2003 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * All Rights Reserved.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ * 
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL TUNGSTEN GRAPHICS AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * 
+ **************************************************************************/
+
+#include "main/glheader.h"
+#include "main/image.h"
+#include "main/state.h"
+#include "main/mtypes.h"
+#include "main/condrender.h"
+#include "drivers/common/meta.h"
+
+#include "intel_context.h"
+#include "intel_buffers.h"
+#include "intel_regions.h"
+#include "intel_pixel.h"
+#include "intel_fbo.h"
+
+#define FILE_DEBUG_FLAG DEBUG_PIXEL
+
+/**
+ * Check if any fragment operations are in effect which might effect
+ * glCopyPixels.  Differs from intel_check_blit_fragment_ops in that
+ * we allow Scissor.
+ */
+static GLboolean
+intel_check_copypixel_blit_fragment_ops(struct gl_context * ctx)
+{
+   if (ctx->NewState)
+      _mesa_update_state(ctx);
+
+   /* Could do logicop with the blitter: 
+    */
+   return !(ctx->_ImageTransferState ||
+            ctx->Color.AlphaEnabled ||
+            ctx->Depth.Test ||
+            ctx->Fog.Enabled ||
+            ctx->Stencil._Enabled ||
+            !ctx->Color.ColorMask[0][0] ||
+            !ctx->Color.ColorMask[0][1] ||
+            !ctx->Color.ColorMask[0][2] ||
+            !ctx->Color.ColorMask[0][3] ||
+            ctx->Texture._EnabledUnits ||
+	    ctx->FragmentProgram._Enabled ||
+	    ctx->Color.BlendEnabled);
+}
+
+
+/**
+ * CopyPixels with the blitter.  Don't support zooming, pixel transfer, etc.
+ */
+static GLboolean
+do_blit_copypixels(struct gl_context * ctx,
+                   GLint srcx, GLint srcy,
+                   GLsizei width, GLsizei height,
+                   GLint dstx, GLint dsty, GLenum type)
+{
+   struct intel_context *intel = intel_context(ctx);
+   struct gl_framebuffer *fb = ctx->DrawBuffer;
+   struct gl_framebuffer *read_fb = ctx->ReadBuffer;
+   GLint orig_dstx;
+   GLint orig_dsty;
+   GLint orig_srcx;
+   GLint orig_srcy;
+   GLboolean flip = GL_FALSE;
+   struct intel_renderbuffer *draw_irb = NULL;
+   struct intel_renderbuffer *read_irb = NULL;
+
+   /* Update draw buffer bounds */
+   _mesa_update_state(ctx);
+
+   switch (type) {
+   case GL_COLOR:
+      if (fb->_NumColorDrawBuffers != 1) {
+	 fallback_debug("glCopyPixels() fallback: MRT\n");
+	 return GL_FALSE;
+      }
+
+      draw_irb = intel_renderbuffer(fb->_ColorDrawBuffers[0]);
+      read_irb = intel_renderbuffer(read_fb->_ColorReadBuffer);
+      break;
+   case GL_DEPTH_STENCIL_EXT:
+      draw_irb = intel_renderbuffer(fb->Attachment[BUFFER_DEPTH].Renderbuffer);
+      read_irb =
+	 intel_renderbuffer(read_fb->Attachment[BUFFER_DEPTH].Renderbuffer);
+      break;
+   case GL_DEPTH:
+      fallback_debug("glCopyPixels() fallback: GL_DEPTH\n");
+      return GL_FALSE;
+   case GL_STENCIL:
+      fallback_debug("glCopyPixels() fallback: GL_STENCIL\n");
+      return GL_FALSE;
+   default:
+      fallback_debug("glCopyPixels(): Unknown type\n");
+      return GL_FALSE;
+   }
+
+   if (!draw_irb) {
+      fallback_debug("glCopyPixels() fallback: missing draw buffer\n");
+      return GL_FALSE;
+   }
+
+   if (!read_irb) {
+      fallback_debug("glCopyPixels() fallback: missing read buffer\n");
+      return GL_FALSE;
+   }
+
+   if (draw_irb->Base.Format != read_irb->Base.Format &&
+       !(draw_irb->Base.Format == MESA_FORMAT_XRGB8888 &&
+	 read_irb->Base.Format == MESA_FORMAT_ARGB8888)) {
+      fallback_debug("glCopyPixels() fallback: mismatched formats (%s -> %s\n",
+		     _mesa_get_format_name(read_irb->Base.Format),
+		     _mesa_get_format_name(draw_irb->Base.Format));
+      return GL_FALSE;
+   }
+
+   /* Copypixels can be more than a straight copy.  Ensure all the
+    * extra operations are disabled:
+    */
+   if (!intel_check_copypixel_blit_fragment_ops(ctx) ||
+       ctx->Pixel.ZoomX != 1.0F || ctx->Pixel.ZoomY != 1.0F)
+      return GL_FALSE;
+
+   intel_prepare_render(intel);
+
+   intel_flush(&intel->ctx);
+
+   /* Clip to destination buffer. */
+   orig_dstx = dstx;
+   orig_dsty = dsty;
+   if (!_mesa_clip_to_region(fb->_Xmin, fb->_Ymin,
+			     fb->_Xmax, fb->_Ymax,
+			     &dstx, &dsty, &width, &height))
+      goto out;
+   /* Adjust src coords for our post-clipped destination origin */
+   srcx += dstx - orig_dstx;
+   srcy += dsty - orig_dsty;
+
+   /* Clip to source buffer. */
+   orig_srcx = srcx;
+   orig_srcy = srcy;
+   if (!_mesa_clip_to_region(0, 0,
+			     read_fb->Width, read_fb->Height,
+			     &srcx, &srcy, &width, &height))
+      goto out;
+   /* Adjust dst coords for our post-clipped source origin */
+   dstx += srcx - orig_srcx;
+   dsty += srcy - orig_srcy;
+
+   /* Flip dest Y if it's a window system framebuffer. */
+   if (fb->Name == 0) {
+      /* copypixels to a window system framebuffer */
+      dsty = fb->Height - dsty - height;
+      flip = !flip;
+   }
+
+   /* Flip source Y if it's a window system framebuffer. */
+   if (read_fb->Name == 0) {
+      srcy = read_fb->Height - srcy - height;
+      flip = !flip;
+   }
+
+   srcx += read_irb->draw_x;
+   srcy += read_irb->draw_y;
+   dstx += draw_irb->draw_x;
+   dsty += draw_irb->draw_y;
+
+   if (!intel_region_copy(intel,
+			  draw_irb->region, 0, dstx, dsty,
+			  read_irb->region, 0, srcx, srcy,
+			  width, height, flip,
+			  ctx->Color.ColorLogicOpEnabled ?
+			  ctx->Color.LogicOp : GL_COPY)) {
+      DBG("%s: blit failure\n", __FUNCTION__);
+      return GL_FALSE;
+   }
+
+out:
+   intel_check_front_buffer_rendering(intel);
+
+   DBG("%s: success\n", __FUNCTION__);
+   return GL_TRUE;
+}
+
+
+void
+intelCopyPixels(struct gl_context * ctx,
+                GLint srcx, GLint srcy,
+                GLsizei width, GLsizei height,
+                GLint destx, GLint desty, GLenum type)
+{
+   DBG("%s\n", __FUNCTION__);
+
+   if (!_mesa_check_conditional_render(ctx))
+      return;
+
+   if (do_blit_copypixels(ctx, srcx, srcy, width, height, destx, desty, type))
+      return;
+
+   /* this will use swrast if needed */
+   _mesa_meta_CopyPixels(ctx, srcx, srcy, width, height, destx, desty, type);
+}
+@
+
+
+1.5
+log
+@Upate to libGL 7.11.2
+
+Tested by jsg@@, matthieu@@ and ajacoutot@@, ok mattieu@@
+@
+text
+@@
+
+
+1.4
+log
+@Merge Mesa 7.10.3
+@
+text
+@d32 1
+a42 31
+static struct intel_region *
+copypix_src_region(struct intel_context *intel, GLenum type)
+{
+   struct intel_renderbuffer *depth;
+
+   depth = (struct intel_renderbuffer *)
+      &intel->ctx.DrawBuffer->Attachment[BUFFER_DEPTH].Renderbuffer;
+
+   switch (type) {
+   case GL_COLOR:
+      return intel_readbuf_region(intel);
+   case GL_DEPTH:
+      /* Don't think this is really possible execpt at 16bpp, when we
+       * have no stencil. */
+      if (depth && depth->region->cpp == 2)
+         return depth->region;
+   case GL_STENCIL:
+      /* Don't think this is really possible. */
+      break;
+   case GL_DEPTH_STENCIL_EXT:
+      /* Does it matter whether it is stencil/depth or depth/stencil?
+       */
+      return depth->region;
+   default:
+      break;
+   }
+
+   return NULL;
+}
+
+
+a80 2
+   struct intel_region *dst;
+   struct intel_region *src;
+d88 2
+d91 36
+a126 2
+   if (type == GL_DEPTH || type == GL_STENCIL) {
+      fallback_debug("glCopyPixels() fallback: GL_DEPTH || GL_STENCIL\n");
+d130 8
+a137 2
+   /* Update draw buffer bounds */
+   _mesa_update_state(ctx);
+a147 6
+   dst = intel_drawbuf_region(intel);
+   src = copypix_src_region(intel, type);
+
+   if (!src || !dst)
+      return GL_FALSE;
+
+d185 5
+d191 2
+a192 2
+			  dst, 0, dstx, dsty,
+			  src, 0, srcx, srcy,
+d215 3
+@
+
+
+1.3
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@d79 1
+a79 1
+intel_check_copypixel_blit_fragment_ops(GLcontext * ctx)
+d105 1
+a105 1
+do_blit_copypixels(GLcontext * ctx,
+d122 1
+a122 2
+      if (INTEL_DEBUG & DEBUG_FALLBACKS)
+	 fprintf(stderr, "glCopyPixels() fallback: GL_DEPTH || GL_STENCIL\n");
+d144 1
+a144 1
+   intelFlush(&intel->ctx);
+d200 1
+a200 1
+intelCopyPixels(GLcontext * ctx,
+d205 1
+a205 2
+   if (INTEL_DEBUG & DEBUG_PIXEL)
+      fprintf(stderr, "%s\n", __FUNCTION__);
+@
+
+
+1.2
+log
+@Update to Mesa 7.4.2. Tested by oga@@, ckuethe@@ and naddy@@.
+@
+text
+@a28 1
+#include "main/enums.h"
+d32 1
+a32 2
+#include "main/macros.h"
+#include "swrast/swrast.h"
+a33 1
+#include "intel_screen.h"
+a34 1
+#include "intel_batchbuffer.h"
+a35 1
+#include "intel_blit.h"
+d38 1
+d45 5
+d54 4
+a57 4
+      /* Don't think this is really possible execpt at 16bpp, when we have no stencil.
+       */
+      if (intel->depth_region && intel->depth_region->cpp == 2)
+         return intel->depth_region;
+d59 1
+a59 2
+      /* Don't think this is really possible. 
+       */
+d64 1
+a64 1
+      return intel->depth_region;
+d90 5
+a94 5
+            ctx->Stencil.Enabled ||
+            !ctx->Color.ColorMask[0] ||
+            !ctx->Color.ColorMask[1] ||
+            !ctx->Color.ColorMask[2] ||
+            !ctx->Color.ColorMask[3] ||
+a99 156
+#ifdef I915
+/* Doesn't work for overlapping regions.  Could do a double copy or
+ * just fallback.
+ */
+static GLboolean
+do_texture_copypixels(GLcontext * ctx,
+                      GLint srcx, GLint srcy,
+                      GLsizei width, GLsizei height,
+                      GLint dstx, GLint dsty, GLenum type)
+{
+   struct intel_context *intel = intel_context(ctx);
+   struct intel_region *dst = intel_drawbuf_region(intel);
+   struct intel_region *src = copypix_src_region(intel, type);
+   GLenum src_format;
+   GLenum src_type;
+
+   DBG("%s %d,%d %dx%d --> %d,%d\n", __FUNCTION__, 
+       srcx, srcy, width, height, dstx, dsty);
+
+   if (!src || !dst || type != GL_COLOR)
+      return GL_FALSE;
+
+   if (ctx->_ImageTransferState) {
+      if (INTEL_DEBUG & DEBUG_PIXEL)
+         fprintf(stderr, "%s: check_color failed\n", __FUNCTION__);
+      return GL_FALSE;
+   }
+
+   /* Can't handle overlapping regions.  Don't have sufficient control
+    * over rasterization to pull it off in-place.  Punt on these for
+    * now.
+    * 
+    * XXX: do a copy to a temporary. 
+    */
+   if (src->buffer == dst->buffer) {
+      drm_clip_rect_t srcbox;
+      drm_clip_rect_t dstbox;
+      drm_clip_rect_t tmp;
+
+      srcbox.x1 = srcx;
+      srcbox.y1 = srcy;
+      srcbox.x2 = srcx + width;
+      srcbox.y2 = srcy + height;
+
+      if (ctx->Pixel.ZoomX > 0) {
+	 dstbox.x1 = dstx;
+	 dstbox.x2 = dstx + width * ctx->Pixel.ZoomX;
+      } else {
+	 dstbox.x1 = dstx + width * ctx->Pixel.ZoomX;
+	 dstbox.x2 = dstx;
+      }
+      if (ctx->Pixel.ZoomY > 0) {
+	 dstbox.y1 = dsty;
+	 dstbox.y2 = dsty + height * ctx->Pixel.ZoomY;
+      } else {
+	 dstbox.y1 = dsty + height * ctx->Pixel.ZoomY;
+	 dstbox.y2 = dsty;
+      }
+
+      DBG("src %d,%d %d,%d\n", srcbox.x1, srcbox.y1, srcbox.x2, srcbox.y2);
+      DBG("dst %d,%d %d,%d (%dx%d) (%f,%f)\n", dstbox.x1, dstbox.y1, dstbox.x2, dstbox.y2,
+	  width, height, ctx->Pixel.ZoomX, ctx->Pixel.ZoomY);
+
+      if (intel_intersect_cliprects(&tmp, &srcbox, &dstbox)) {
+         DBG("%s: regions overlap\n", __FUNCTION__);
+         return GL_FALSE;
+      }
+   }
+
+   intelFlush(&intel->ctx);
+
+   intel->vtbl.install_meta_state(intel);
+
+   /* Is this true?  Also will need to turn depth testing on according
+    * to state:
+    */
+   intel->vtbl.meta_no_stencil_write(intel);
+   intel->vtbl.meta_no_depth_write(intel);
+
+   /* Set the 3d engine to draw into the destination region:
+    */
+   intel->vtbl.meta_draw_region(intel, dst, intel->depth_region);
+
+   intel->vtbl.meta_import_pixel_state(intel);
+
+   if (src->cpp == 2) {
+      src_format = GL_RGB;
+      src_type = GL_UNSIGNED_SHORT_5_6_5;
+   }
+   else {
+      src_format = GL_BGRA;
+      src_type = GL_UNSIGNED_BYTE;
+   }
+
+   /* Set the frontbuffer up as a large rectangular texture.
+    */
+   if (!intel->vtbl.meta_tex_rect_source(intel, src->buffer, 0,
+                                         src->pitch,
+                                         src->height, src_format, src_type)) {
+      intel->vtbl.leave_meta_state(intel);
+      return GL_FALSE;
+   }
+
+
+   intel->vtbl.meta_texture_blend_replace(intel);
+
+   LOCK_HARDWARE(intel);
+
+   if (intel->driDrawable->numClipRects) {
+      __DRIdrawablePrivate *dPriv = intel->driDrawable;
+
+
+      srcy = dPriv->h - srcy - height;  /* convert from gl to hardware coords */
+
+      srcx += dPriv->x;
+      srcy += dPriv->y;
+
+      /* Clip against the source region.  This is the only source
+       * clipping we do.  XXX: Just set the texcord wrap mode to clamp
+       * or similar.
+       *
+       */
+      if (0) {
+         GLint orig_x = srcx;
+         GLint orig_y = srcy;
+
+         if (!_mesa_clip_to_region(0, 0, src->pitch, src->height,
+                                   &srcx, &srcy, &width, &height))
+            goto out;
+
+         dstx += srcx - orig_x;
+         dsty += (srcy - orig_y) * ctx->Pixel.ZoomY;
+      }
+
+      /* Just use the regular cliprect mechanism...  Does this need to
+       * even hold the lock???
+       */
+      intel->vtbl.meta_draw_quad(intel,
+				 dstx,
+				 dstx + width * ctx->Pixel.ZoomX,
+				 dPriv->h - (dsty + height * ctx->Pixel.ZoomY),
+				 dPriv->h - (dsty), 0, /* XXX: what z value? */
+				 0x00ff00ff,
+				 srcx, srcx + width, srcy, srcy + height);
+
+    out:
+      intel->vtbl.leave_meta_state(intel);
+      intel_batchbuffer_emit_mi_flush(intel->batch);
+   }
+   UNLOCK_HARDWARE(intel);
+
+   DBG("%s: success\n", __FUNCTION__);
+   return GL_TRUE;
+}
+#endif /* I915 */
+
+d111 2
+a112 2
+   struct intel_region *dst = intel_drawbuf_region(intel);
+   struct intel_region *src = copypix_src_region(intel, type);
+d115 11
+a125 3
+   unsigned int num_cliprects;
+   drm_clip_rect_t *cliprects;
+   int x_off, y_off;
+d137 5
+a144 2
+
+
+d147 44
+a190 35
+   LOCK_HARDWARE(intel);
+
+   intel_get_cliprects(intel, &cliprects, &num_cliprects, &x_off, &y_off);
+   if (num_cliprects != 0) {
+      GLint delta_x;
+      GLint delta_y;
+      GLint orig_dstx;
+      GLint orig_dsty;
+      GLint orig_srcx;
+      GLint orig_srcy;
+      GLuint i;
+
+      /* XXX: We fail to handle different inversion between read and draw framebuffer. */
+
+      /* Clip to destination buffer. */
+      orig_dstx = dstx;
+      orig_dsty = dsty;
+      if (!_mesa_clip_to_region(fb->_Xmin, fb->_Ymin,
+				fb->_Xmax, fb->_Ymax,
+				&dstx, &dsty, &width, &height))
+	 goto out;
+      /* Adjust src coords for our post-clipped destination origin */
+      srcx += dstx - orig_dstx;
+      srcy += dsty - orig_dsty;
+
+      /* Clip to source buffer. */
+      orig_srcx = srcx;
+      orig_srcy = srcy;
+      if (!_mesa_clip_to_region(0, 0,
+				read_fb->Width, read_fb->Height,
+				&srcx, &srcy, &width, &height))
+	 goto out;
+      /* Adjust dst coords for our post-clipped source origin */
+      dstx += srcx - orig_srcx;
+      dsty += srcy - orig_srcy;
+a191 47
+      /* Convert from GL to hardware coordinates:
+       */
+      if (fb->Name == 0) {
+	 /* copypixels to a system framebuffer */
+	 dstx = x_off + dstx;
+	 dsty = y_off + (fb->Height - dsty - height);
+      } else {
+	 /* copypixels to a user framebuffer object */
+	 dstx = x_off + dstx;
+	 dsty = y_off + dsty;
+      }
+
+      /* Flip source Y if it's a system framebuffer. */
+      if (read_fb->Name == 0) {
+	 srcx = intel->driReadDrawable->x + srcx;
+	 srcy = intel->driReadDrawable->y + (fb->Height - srcy - height);
+      }
+
+      delta_x = srcx - dstx;
+      delta_y = srcy - dsty;
+      /* Could do slightly more clipping: Eg, take the intersection of
+       * the destination cliprects and the read drawable cliprects
+       *
+       * This code will not overwrite other windows, but will
+       * introduce garbage when copying from obscured window regions.
+       */
+      for (i = 0; i < num_cliprects; i++) {
+	 GLint clip_x = dstx;
+	 GLint clip_y = dsty;
+	 GLint clip_w = width;
+	 GLint clip_h = height;
+
+         if (!_mesa_clip_to_region(cliprects[i].x1, cliprects[i].y1,
+				   cliprects[i].x2, cliprects[i].y2,
+				   &clip_x, &clip_y, &clip_w, &clip_h))
+            continue;
+
+         intelEmitCopyBlit(intel, dst->cpp,
+			   src->pitch, src->buffer, 0, src->tiling,
+			   dst->pitch, dst->buffer, 0, dst->tiling,
+			   clip_x + delta_x, clip_y + delta_y, /* srcx, srcy */
+			   clip_x, clip_y, /* dstx, dsty */
+			   clip_w, clip_h,
+			   ctx->Color.ColorLogicOpEnabled ?
+			   ctx->Color.LogicOp : GL_COPY);
+      }
+   }
+d193 1
+a193 1
+   UNLOCK_HARDWARE(intel);
+d212 2
+a213 8
+#ifdef I915
+   if (do_texture_copypixels(ctx, srcx, srcy, width, height, destx, desty, type))
+      return;
+#endif
+
+   DBG("fallback to _swrast_CopyPixels\n");
+
+   _swrast_CopyPixels(ctx, srcx, srcy, width, height, destx, desty, type);
+@
+
+
+1.1
+log
+@Mesa 7.2, Tested by ckuethe@@, naddy@@, oga@@, and others.
+@
+text
+@d28 6
+a33 6
+#include "glheader.h"
+#include "enums.h"
+#include "image.h"
+#include "state.h"
+#include "mtypes.h"
+#include "macros.h"
+a37 1
+#include "intel_ioctl.h"
+d122 6
+d144 14
+a157 4
+      dstbox.x1 = dstx;
+      dstbox.y1 = dsty;
+      dstbox.x2 = dstx + width * ctx->Pixel.ZoomX;
+      dstbox.y2 = dsty + height * ctx->Pixel.ZoomY;
+d247 1
+a247 1
+      intel_batchbuffer_flush(intel->batch);
+d269 8
+d294 8
+a301 7
+   if (intel->driDrawable->numClipRects) {
+      __DRIdrawablePrivate *dPriv = intel->driDrawable;
+      __DRIdrawablePrivate *dReadPriv = intel->driReadDrawable;
+      drm_clip_rect_t *box = dPriv->pClipRects;
+      GLint nbox = dPriv->numClipRects;
+      GLint delta_x = 0;
+      GLint delta_y = 0;
+d304 1
+a304 10
+      /* Do scissoring in GL coordinates:
+       */
+      if (ctx->Scissor.Enabled)
+      {
+	 GLint x = ctx->Scissor.X;
+	 GLint y = ctx->Scissor.Y;
+	 GLuint w = ctx->Scissor.Width;
+	 GLuint h = ctx->Scissor.Height;
+	 GLint dx = dstx - srcx;
+         GLint dy = dsty - srcy;
+d306 21
+a326 6
+         if (!_mesa_clip_to_region(x, y, x+w-1, y+h-1, &dstx, &dsty, &width, &height))
+            goto out;
+	 
+         srcx = dstx - dx;
+         srcy = dsty - dy;
+      }
+d330 9
+a338 13
+      dsty = dPriv->h - dsty - height;  
+      srcy = dPriv->h - srcy - height;  
+      dstx += dPriv->x;
+      dsty += dPriv->y;
+      srcx += dReadPriv->x;
+      srcy += dReadPriv->y;
+
+      /* Clip against the source region.  This is the only source
+       * clipping we do.  Dst is clipped with cliprects below.
+       */
+      {
+         delta_x = srcx - dstx;
+         delta_y = srcy - dsty;
+d340 4
+a343 6
+         if (!_mesa_clip_to_region(0, 0, src->pitch, src->height,
+                                   &srcx, &srcy, &width, &height))
+            goto out;
+
+         dstx = srcx - delta_x;
+         dsty = srcy - delta_y;
+d346 2
+d349 2
+a350 3
+       * the existing set of cliprects and those cliprects translated
+       * by delta_x, delta_y:
+       * 
+d354 1
+a354 1
+      for (i = 0; i < nbox; i++) {
+d360 2
+a361 1
+         if (!_mesa_clip_to_region(box[i].x1, box[i].y1, box[i].x2, box[i].y2,
+d366 2
+a367 2
+			   src->pitch, src->buffer, 0, src->tiled,
+			   dst->pitch, dst->buffer, 0, dst->tiled,
+a373 3
+
+    out:
+      intel_batchbuffer_flush(intel->batch);
+d375 1
+@
+
+
+1.1.1.1
+log
+@Import Mesa 7.10.3
+@
+text
+@d28 7
+a34 5
+#include "main/glheader.h"
+#include "main/image.h"
+#include "main/state.h"
+#include "main/mtypes.h"
+#include "drivers/common/meta.h"
+d36 1
+d38 2
+d41 1
+a43 1
+#include "intel_fbo.h"
+a49 5
+   struct intel_renderbuffer *depth;
+
+   depth = (struct intel_renderbuffer *)
+      &intel->ctx.DrawBuffer->Attachment[BUFFER_DEPTH].Renderbuffer;
+
+d54 4
+a57 4
+      /* Don't think this is really possible execpt at 16bpp, when we
+       * have no stencil. */
+      if (depth && depth->region->cpp == 2)
+         return depth->region;
+d59 2
+a60 1
+      /* Don't think this is really possible. */
+d65 1
+a65 1
+      return depth->region;
+d80 1
+a80 1
+intel_check_copypixel_blit_fragment_ops(struct gl_context * ctx)
+d91 5
+a95 5
+            ctx->Stencil._Enabled ||
+            !ctx->Color.ColorMask[0][0] ||
+            !ctx->Color.ColorMask[0][1] ||
+            !ctx->Color.ColorMask[0][2] ||
+            !ctx->Color.ColorMask[0][3] ||
+d101 140
+d246 1
+a246 1
+do_blit_copypixels(struct gl_context * ctx,
+d252 2
+a253 17
+   struct intel_region *dst;
+   struct intel_region *src;
+   struct gl_framebuffer *fb = ctx->DrawBuffer;
+   struct gl_framebuffer *read_fb = ctx->ReadBuffer;
+   GLint orig_dstx;
+   GLint orig_dsty;
+   GLint orig_srcx;
+   GLint orig_srcy;
+   GLboolean flip = GL_FALSE;
+
+   if (type == GL_DEPTH || type == GL_STENCIL) {
+      fallback_debug("glCopyPixels() fallback: GL_DEPTH || GL_STENCIL\n");
+      return GL_FALSE;
+   }
+
+   /* Update draw buffer bounds */
+   _mesa_update_state(ctx);
+d262 2
+a263 1
+   intel_prepare_render(intel);
+a264 2
+   dst = intel_drawbuf_region(intel);
+   src = copypix_src_region(intel, type);
+a265 2
+   if (!src || !dst)
+      return GL_FALSE;
+d267 81
+a347 1
+   intel_flush(&intel->ctx);
+d349 2
+a350 43
+   /* Clip to destination buffer. */
+   orig_dstx = dstx;
+   orig_dsty = dsty;
+   if (!_mesa_clip_to_region(fb->_Xmin, fb->_Ymin,
+			     fb->_Xmax, fb->_Ymax,
+			     &dstx, &dsty, &width, &height))
+      goto out;
+   /* Adjust src coords for our post-clipped destination origin */
+   srcx += dstx - orig_dstx;
+   srcy += dsty - orig_dsty;
+
+   /* Clip to source buffer. */
+   orig_srcx = srcx;
+   orig_srcy = srcy;
+   if (!_mesa_clip_to_region(0, 0,
+			     read_fb->Width, read_fb->Height,
+			     &srcx, &srcy, &width, &height))
+      goto out;
+   /* Adjust dst coords for our post-clipped source origin */
+   dstx += srcx - orig_srcx;
+   dsty += srcy - orig_srcy;
+
+   /* Flip dest Y if it's a window system framebuffer. */
+   if (fb->Name == 0) {
+      /* copypixels to a window system framebuffer */
+      dsty = fb->Height - dsty - height;
+      flip = !flip;
+   }
+
+   /* Flip source Y if it's a window system framebuffer. */
+   if (read_fb->Name == 0) {
+      srcy = read_fb->Height - srcy - height;
+      flip = !flip;
+   }
+
+   if (!intel_region_copy(intel,
+			  dst, 0, dstx, dsty,
+			  src, 0, srcx, srcy,
+			  width, height, flip,
+			  ctx->Color.ColorLogicOpEnabled ?
+			  ctx->Color.LogicOp : GL_COPY)) {
+      DBG("%s: blit failure\n", __FUNCTION__);
+      return GL_FALSE;
+d352 1
+a352 3
+
+out:
+   intel_check_front_buffer_rendering(intel);
+d360 1
+a360 1
+intelCopyPixels(struct gl_context * ctx,
+d365 2
+a366 1
+   DBG("%s\n", __FUNCTION__);
+d371 8
+a378 2
+   /* this will use swrast if needed */
+   _mesa_meta_CopyPixels(ctx, srcx, srcy, width, height, destx, desty, type);
+@
+
+

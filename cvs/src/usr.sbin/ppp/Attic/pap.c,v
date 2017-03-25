@@ -1,0 +1,374 @@
+head	1.5;
+access;
+symbols
+	OPENBSD_2_3:1.4.0.2
+	OPENBSD_2_3_BASE:1.4
+	PPP1_5:1.1.1.1
+	BRIAN:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.5
+date	98.08.31.00.21.21;	author brian;	state dead;
+branches;
+next	1.4;
+
+1.4
+date	98.03.13.01.26.01;	author brian;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	98.02.19.02.02.48;	author brian;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	97.12.24.09.30.45;	author brian;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.11.23.20.27.35;	author brian;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.11.23.20.27.35;	author brian;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.5
+log
+@Upgrade ppp to version 2.0
+
+This adds a number of features including:
+o Multilink
+o Callback (including CBCP)
+o DNS negotiation (client & server)
+o Easy to configure masquerading/packet aliasing
+o Any number of diagnostic socket connections (limits DOS attacks)
+o Sticky routes (ppp updates the routing table when the IP number is changed)
+
+See the file README.changes for things that effect current
+configurations.
+@
+text
+@/*
+ *			PPP PAP Module
+ *
+ *	    Written by Toshiharu OHNO (tony-o@@iij.ad.jp)
+ *
+ *   Copyright (C) 1993-94, Internet Initiative Japan, Inc.
+ *		     All rights reserverd.
+ *
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the Internet Initiative Japan, Inc.  The name of the
+ * IIJ may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * $Id: pap.c,v 1.4 1998/03/13 01:26:01 brian Exp $
+ *
+ *	TODO:
+ */
+#include <sys/param.h>
+#include <netinet/in.h>
+
+#include <pwd.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#ifdef __OpenBSD__
+#include <util.h>
+#else
+#include <libutil.h>
+#endif
+#include <utmp.h>
+
+#include "command.h"
+#include "mbuf.h"
+#include "log.h"
+#include "defs.h"
+#include "timer.h"
+#include "fsm.h"
+#include "lcp.h"
+#include "pap.h"
+#include "loadalias.h"
+#include "vars.h"
+#include "hdlc.h"
+#include "lcpproto.h"
+#include "phase.h"
+#include "auth.h"
+#include "id.h"
+
+static const char *papcodes[] = { "???", "REQUEST", "ACK", "NAK" };
+
+static void
+SendPapChallenge(int papid)
+{
+  struct fsmheader lh;
+  struct mbuf *bp;
+  u_char *cp;
+  int namelen, keylen, plen;
+
+  namelen = strlen(VarAuthName);
+  keylen = strlen(VarAuthKey);
+  plen = namelen + keylen + 2;
+  LogPrintf(LogDEBUG, "SendPapChallenge: namelen = %d, keylen = %d\n",
+	    namelen, keylen);
+  if (LogIsKept(LogDEBUG))
+    LogPrintf(LogPHASE, "PAP: %s (%s)\n", VarAuthName, VarAuthKey);
+  else
+    LogPrintf(LogPHASE, "PAP: %s\n", VarAuthName);
+  lh.code = PAP_REQUEST;
+  lh.id = papid;
+  lh.length = htons(plen + sizeof(struct fsmheader));
+  bp = mballoc(plen + sizeof(struct fsmheader), MB_FSM);
+  memcpy(MBUF_CTOP(bp), &lh, sizeof(struct fsmheader));
+  cp = MBUF_CTOP(bp) + sizeof(struct fsmheader);
+  *cp++ = namelen;
+  memcpy(cp, VarAuthName, namelen);
+  cp += namelen;
+  *cp++ = keylen;
+  memcpy(cp, VarAuthKey, keylen);
+
+  HdlcOutput(PRI_LINK, PROTO_PAP, bp);
+}
+
+struct authinfo AuthPapInfo = {
+  SendPapChallenge,
+};
+
+static void
+SendPapCode(int id, int code, const char *message)
+{
+  struct fsmheader lh;
+  struct mbuf *bp;
+  u_char *cp;
+  int plen, mlen;
+
+  lh.code = code;
+  lh.id = id;
+  mlen = strlen(message);
+  plen = mlen + 1;
+  lh.length = htons(plen + sizeof(struct fsmheader));
+  bp = mballoc(plen + sizeof(struct fsmheader), MB_FSM);
+  memcpy(MBUF_CTOP(bp), &lh, sizeof(struct fsmheader));
+  cp = MBUF_CTOP(bp) + sizeof(struct fsmheader);
+  *cp++ = mlen;
+  memcpy(cp, message, mlen);
+  LogPrintf(LogPHASE, "PapOutput: %s\n", papcodes[code]);
+  HdlcOutput(PRI_LINK, PROTO_PAP, bp);
+}
+
+/*
+ * Validate given username and passwrd against with secret table
+ */
+static int
+PapValidate(u_char * name, u_char * key)
+{
+  int nlen, klen;
+
+  nlen = *name++;
+  klen = *key;
+  *key++ = 0;
+  key[klen] = 0;
+  LogPrintf(LogDEBUG, "PapValidate: name %s (%d), key %s (%d)\n",
+	    name, nlen, key, klen);
+
+#ifndef NOPASSWDAUTH
+  if (Enabled(ConfPasswdAuth)) {
+    struct passwd *pwd;
+    int result;
+
+    LogPrintf(LogLCP, "Using PasswdAuth\n");
+    result = (pwd = getpwnam(name)) &&
+             !strcmp(crypt(key, pwd->pw_passwd), pwd->pw_passwd);
+    endpwent();
+    return result;
+  }
+#endif
+
+  return (AuthValidate(SECRETFILE, name, key));
+}
+
+void
+PapInput(struct mbuf * bp)
+{
+  int len = plength(bp);
+  struct fsmheader *php;
+  struct lcpstate *lcp = &LcpInfo;
+  u_char *cp;
+
+  if (len >= sizeof(struct fsmheader)) {
+    php = (struct fsmheader *) MBUF_CTOP(bp);
+    if (len >= ntohs(php->length)) {
+      if (php->code < PAP_REQUEST || php->code > PAP_NAK)
+	php->code = 0;
+      LogPrintf(LogPHASE, "PapInput: %s\n", papcodes[php->code]);
+
+      switch (php->code) {
+      case PAP_REQUEST:
+	cp = (u_char *) (php + 1);
+	if (PapValidate(cp, cp + *cp + 1)) {
+	  SendPapCode(php->id, PAP_ACK, "Greetings!!");
+	  lcp->auth_ineed = 0;
+	  if (lcp->auth_iwait == 0) {
+	    if ((mode & MODE_DIRECT) && isatty(modem) && Enabled(ConfUtmp)) {
+	      if (Utmp)
+		LogPrintf(LogERROR, "Oops, already logged in on %s\n",
+			  VarBaseDevice);
+	      else {
+	        struct utmp ut;
+	        memset(&ut, 0, sizeof ut);
+	        time(&ut.ut_time);
+	        strncpy(ut.ut_name, cp+1, sizeof ut.ut_name);
+	        strncpy(ut.ut_line, VarBaseDevice, sizeof ut.ut_line - 1);
+	        ID0login(&ut);
+	        Utmp = 1;
+	      }
+            }
+	    NewPhase(PHASE_NETWORK);
+	  }
+	} else {
+	  SendPapCode(php->id, PAP_NAK, "Login incorrect");
+	  reconnect(RECON_FALSE);
+	  LcpClose();
+	}
+	break;
+      case PAP_ACK:
+	StopAuthTimer(&AuthPapInfo);
+	cp = (u_char *) (php + 1);
+	len = *cp++;
+	cp[len] = 0;
+	LogPrintf(LogPHASE, "Received PAP_ACK (%s)\n", cp);
+	if (lcp->auth_iwait == PROTO_PAP) {
+	  lcp->auth_iwait = 0;
+	  if (lcp->auth_ineed == 0)
+	    NewPhase(PHASE_NETWORK);
+	}
+	break;
+      case PAP_NAK:
+	StopAuthTimer(&AuthPapInfo);
+	cp = (u_char *) (php + 1);
+	len = *cp++;
+	cp[len] = 0;
+	LogPrintf(LogPHASE, "Received PAP_NAK (%s)\n", cp);
+	reconnect(RECON_FALSE);
+	LcpClose();
+	break;
+      }
+    }
+  }
+  pfree(bp);
+}
+@
+
+
+1.4
+log
+@Add extraneous braces to stiffle warnings from gcc-2.8
+@
+text
+@d21 1
+a21 1
+ * $Id: pap.c,v 1.3 1998/02/19 02:02:48 brian Exp $
+@
+
+
+1.3
+log
+@Allow 8 character login names.
+Pointed out by: Forgotten
+
+Do the login()/logwtmp()/logout() as id 0.
+@
+text
+@d21 1
+a21 1
+ * $Id: pap.c,v 1.2 1997/12/24 09:30:45 brian Exp $
+d169 1
+a169 1
+	    if ((mode & MODE_DIRECT) && isatty(modem) && Enabled(ConfUtmp))
+d182 1
+@
+
+
+1.2
+log
+@Cosmetic (style):
+  sizeof(var) -> sizeof var
+  sizeof type -> sizeof(type)
+
+Suggested by: J Wunsch <j@@uriah.heep.sax.de>
+@
+text
+@d21 1
+a21 1
+ * $Id: pap.c,v 1.1.1.1 1997/11/23 20:27:35 brian Exp $
+d54 1
+d177 1
+a177 1
+	        strncpy(ut.ut_name, cp+1, sizeof ut.ut_name - 1);
+d179 1
+a179 3
+	        if (logout(ut.ut_line))
+		  logwtmp(ut.ut_line, "", "");
+	        login(&ut);
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d21 1
+a21 1
+ * $Id: pap.c,v 1.19 1997/11/22 03:37:43 brian Exp $
+d174 1
+a174 1
+	        memset(&ut, 0, sizeof(ut));
+d176 2
+a177 2
+	        strncpy(ut.ut_name, cp+1, sizeof(ut.ut_name)-1);
+	        strncpy(ut.ut_line, VarBaseDevice, sizeof(ut.ut_line)-1);
+@
+
+
+1.1.1.1
+log
+@Import version 1.5 of ppp.
+
+<sales>
+This is a user-level ppp implementation that uses the
+tun driver.  It was originally created by a Japanese
+ISP.  It's now piled with features.  Check the man pages
+for details.
+</sales>
+
+The sources are identical to the ones in FreeBSD, except
+for the Makefile.
+
+IP aliasing (NAT) is disabled, and can be enabled by simply
+doing a ``make install'' of libalias, then rebuilding
+ppp.  I'll create libalias as a port soon.
+@
+text
+@@
+

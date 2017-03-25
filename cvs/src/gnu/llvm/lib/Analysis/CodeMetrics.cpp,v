@@ -1,0 +1,365 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.02;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.02;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.09;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.23;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===- CodeMetrics.cpp - Code cost measurements ---------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements code cost measurement utilities.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/CallSite.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+
+#define DEBUG_TYPE "code-metrics"
+
+using namespace llvm;
+
+static void completeEphemeralValues(SmallVector<const Value *, 16> &WorkSet,
+                                    SmallPtrSetImpl<const Value*> &EphValues) {
+  SmallPtrSet<const Value *, 32> Visited;
+
+  // Make sure that all of the items in WorkSet are in our EphValues set.
+  EphValues.insert(WorkSet.begin(), WorkSet.end());
+
+  // Note: We don't speculate PHIs here, so we'll miss instruction chains kept
+  // alive only by ephemeral values.
+
+  while (!WorkSet.empty()) {
+    const Value *V = WorkSet.front();
+    WorkSet.erase(WorkSet.begin());
+
+    if (!Visited.insert(V).second)
+      continue;
+
+    // If all uses of this value are ephemeral, then so is this value.
+    if (!std::all_of(V->user_begin(), V->user_end(),
+                     [&](const User *U) { return EphValues.count(U); }))
+      continue;
+
+    EphValues.insert(V);
+    DEBUG(dbgs() << "Ephemeral Value: " << *V << "\n");
+
+    if (const User *U = dyn_cast<User>(V))
+      for (const Value *J : U->operands()) {
+        if (isSafeToSpeculativelyExecute(J))
+          WorkSet.push_back(J);
+      }
+  }
+}
+
+// Find all ephemeral values.
+void CodeMetrics::collectEphemeralValues(
+    const Loop *L, AssumptionCache *AC,
+    SmallPtrSetImpl<const Value *> &EphValues) {
+  SmallVector<const Value *, 16> WorkSet;
+
+  for (auto &AssumeVH : AC->assumptions()) {
+    if (!AssumeVH)
+      continue;
+    Instruction *I = cast<Instruction>(AssumeVH);
+
+    // Filter out call sites outside of the loop so we don't to a function's
+    // worth of work for each of its loops (and, in the common case, ephemeral
+    // values in the loop are likely due to @@llvm.assume calls in the loop).
+    if (!L->contains(I->getParent()))
+      continue;
+
+    WorkSet.push_back(I);
+  }
+
+  completeEphemeralValues(WorkSet, EphValues);
+}
+
+void CodeMetrics::collectEphemeralValues(
+    const Function *F, AssumptionCache *AC,
+    SmallPtrSetImpl<const Value *> &EphValues) {
+  SmallVector<const Value *, 16> WorkSet;
+
+  for (auto &AssumeVH : AC->assumptions()) {
+    if (!AssumeVH)
+      continue;
+    Instruction *I = cast<Instruction>(AssumeVH);
+    assert(I->getParent()->getParent() == F &&
+           "Found assumption for the wrong function!");
+    WorkSet.push_back(I);
+  }
+
+  completeEphemeralValues(WorkSet, EphValues);
+}
+
+/// analyzeBasicBlock - Fill in the current structure with information gleaned
+/// from the specified block.
+void CodeMetrics::analyzeBasicBlock(const BasicBlock *BB,
+                                    const TargetTransformInfo &TTI,
+                                    SmallPtrSetImpl<const Value*> &EphValues) {
+  ++NumBlocks;
+  unsigned NumInstsBeforeThisBB = NumInsts;
+  for (BasicBlock::const_iterator II = BB->begin(), E = BB->end();
+       II != E; ++II) {
+    // Skip ephemeral values.
+    if (EphValues.count(&*II))
+      continue;
+
+    // Special handling for calls.
+    if (isa<CallInst>(II) || isa<InvokeInst>(II)) {
+      ImmutableCallSite CS(cast<Instruction>(II));
+
+      if (const Function *F = CS.getCalledFunction()) {
+        // If a function is both internal and has a single use, then it is
+        // extremely likely to get inlined in the future (it was probably
+        // exposed by an interleaved devirtualization pass).
+        if (!CS.isNoInline() && F->hasInternalLinkage() && F->hasOneUse())
+          ++NumInlineCandidates;
+
+        // If this call is to function itself, then the function is recursive.
+        // Inlining it into other functions is a bad idea, because this is
+        // basically just a form of loop peeling, and our metrics aren't useful
+        // for that case.
+        if (F == BB->getParent())
+          isRecursive = true;
+
+        if (TTI.isLoweredToCall(F))
+          ++NumCalls;
+      } else {
+        // We don't want inline asm to count as a call - that would prevent loop
+        // unrolling. The argument setup cost is still real, though.
+        if (!isa<InlineAsm>(CS.getCalledValue()))
+          ++NumCalls;
+      }
+    }
+
+    if (const AllocaInst *AI = dyn_cast<AllocaInst>(II)) {
+      if (!AI->isStaticAlloca())
+        this->usesDynamicAlloca = true;
+    }
+
+    if (isa<ExtractElementInst>(II) || II->getType()->isVectorTy())
+      ++NumVectorInsts;
+
+    if (II->getType()->isTokenTy() && II->isUsedOutsideOfBlock(BB))
+      notDuplicatable = true;
+
+    if (const CallInst *CI = dyn_cast<CallInst>(II))
+      if (CI->cannotDuplicate())
+        notDuplicatable = true;
+
+    if (const InvokeInst *InvI = dyn_cast<InvokeInst>(II))
+      if (InvI->cannotDuplicate())
+        notDuplicatable = true;
+
+    NumInsts += TTI.getUserCost(&*II);
+  }
+
+  if (isa<ReturnInst>(BB->getTerminator()))
+    ++NumRets;
+
+  // We never want to inline functions that contain an indirectbr.  This is
+  // incorrect because all the blockaddress's (in static global initializers
+  // for example) would be referring to the original function, and this indirect
+  // jump would jump from the inlined copy of the function into the original
+  // function which is extremely undefined behavior.
+  // FIXME: This logic isn't really right; we can safely inline functions
+  // with indirectbr's as long as no other function or global references the
+  // blockaddress of a block within the current function.  And as a QOI issue,
+  // if someone is using a blockaddress without an indirectbr, and that
+  // reference somehow ends up in another function or global, we probably
+  // don't want to inline this function.
+  notDuplicatable |= isa<IndirectBrInst>(BB->getTerminator());
+
+  // Remember NumInsts for this BB.
+  NumBBInsts[BB] = NumInsts - NumInstsBeforeThisBB;
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d103 2
+a104 2
+/// Fill in the current structure with information gleaned from the specified
+/// block.
+d110 2
+a111 1
+  for (const Instruction &I : *BB) {
+d113 1
+a113 1
+    if (EphValues.count(&I))
+d117 2
+a118 2
+    if (isa<CallInst>(I) || isa<InvokeInst>(I)) {
+      ImmutableCallSite CS(&I);
+d144 1
+a144 1
+    if (const AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
+d149 1
+a149 1
+    if (isa<ExtractElementInst>(I) || I.getType()->isVectorTy())
+d152 1
+a152 1
+    if (I.getType()->isTokenTy() && I.isUsedOutsideOfBlock(BB))
+d155 1
+a155 1
+    if (const CallInst *CI = dyn_cast<CallInst>(&I)) {
+a157 3
+      if (CI->isConvergent())
+        convergent = true;
+    }
+d159 1
+a159 1
+    if (const InvokeInst *InvI = dyn_cast<InvokeInst>(&I))
+d163 1
+a163 1
+    NumInsts += TTI.getUserCost(&I);
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d30 6
+a35 13
+static void
+appendSpeculatableOperands(const Value *V,
+                           SmallPtrSetImpl<const Value *> &Visited,
+                           SmallVectorImpl<const Value *> &Worklist) {
+  const User *U = dyn_cast<User>(V);
+  if (!U)
+    return;
+
+  for (const Value *Operand : U->operands())
+    if (Visited.insert(Operand).second)
+      if (isSafeToSpeculativelyExecute(Operand))
+        Worklist.push_back(Operand);
+}
+a36 3
+static void completeEphemeralValues(SmallPtrSetImpl<const Value *> &Visited,
+                                    SmallVectorImpl<const Value *> &Worklist,
+                                    SmallPtrSetImpl<const Value *> &EphValues) {
+d40 3
+a42 6
+  // Walk the worklist using an index but without caching the size so we can
+  // append more entries as we process the worklist. This forms a queue without
+  // quadratic behavior by just leaving processed nodes at the head of the
+  // worklist forever.
+  for (int i = 0; i < (int)Worklist.size(); ++i) {
+    const Value *V = Worklist[i];
+d44 2
+a45 2
+    assert(Visited.count(V) &&
+           "Failed to add a worklist entry to our visited set!");
+d48 2
+a49 1
+    if (!all_of(V->users(), [&](const User *U) { return EphValues.count(U); }))
+d55 5
+a59 2
+    // Append any more operands to consider.
+    appendSpeculatableOperands(V, Visited, Worklist);
+d67 1
+a67 2
+  SmallPtrSet<const Value *, 32> Visited;
+  SmallVector<const Value *, 16> Worklist;
+d74 1
+a74 1
+    // Filter out call sites outside of the loop so we don't do a function's
+d80 1
+a80 2
+    if (EphValues.insert(I).second)
+      appendSpeculatableOperands(I, Visited, Worklist);
+d83 1
+a83 1
+  completeEphemeralValues(Visited, Worklist, EphValues);
+d89 1
+a89 2
+  SmallPtrSet<const Value *, 32> Visited;
+  SmallVector<const Value *, 16> Worklist;
+d97 1
+a97 3
+
+    if (EphValues.insert(I).second)
+      appendSpeculatableOperands(I, Visited, Worklist);
+d100 1
+a100 1
+  completeEphemeralValues(Visited, Worklist, EphValues);
+d107 1
+a107 1
+                                    const SmallPtrSetImpl<const Value*> &EphValues) {
+@
+
+

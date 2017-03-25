@@ -1,0 +1,327 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_6_0:1.7.0.6
+	OPENBSD_6_0_BASE:1.7
+	OPENBSD_5_9:1.7.0.2
+	OPENBSD_5_9_BASE:1.7
+	OPENBSD_5_8:1.7.0.4
+	OPENBSD_5_8_BASE:1.7
+	OPENBSD_5_7:1.6.0.2
+	OPENBSD_5_7_BASE:1.6
+	OPENBSD_5_6:1.6.0.4
+	OPENBSD_5_6_BASE:1.6
+	OPENBSD_5_5:1.5.0.4
+	OPENBSD_5_5_BASE:1.5
+	OPENBSD_5_4:1.3.0.10
+	OPENBSD_5_4_BASE:1.3
+	OPENBSD_5_3:1.3.0.8
+	OPENBSD_5_3_BASE:1.3
+	OPENBSD_5_2:1.3.0.6
+	OPENBSD_5_2_BASE:1.3
+	OPENBSD_5_1_BASE:1.3
+	OPENBSD_5_1:1.3.0.4
+	OPENBSD_5_0:1.3.0.2
+	OPENBSD_5_0_BASE:1.3
+	OPENBSD_4_9:1.2.0.16
+	OPENBSD_4_9_BASE:1.2
+	OPENBSD_4_8:1.2.0.14
+	OPENBSD_4_8_BASE:1.2
+	OPENBSD_4_7:1.2.0.10
+	OPENBSD_4_7_BASE:1.2
+	OPENBSD_4_6:1.2.0.12
+	OPENBSD_4_6_BASE:1.2
+	OPENBSD_4_5:1.2.0.8
+	OPENBSD_4_5_BASE:1.2
+	OPENBSD_4_4:1.2.0.6
+	OPENBSD_4_4_BASE:1.2
+	OPENBSD_4_3:1.2.0.4
+	OPENBSD_4_3_BASE:1.2
+	OPENBSD_4_2:1.2.0.2
+	OPENBSD_4_2_BASE:1.2;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2015.04.17.12.38.54;	author dlg;	state Exp;
+branches;
+next	1.6;
+commitid	wEE5kSMOezpoVivp;
+
+1.6
+date	2014.03.18.21.09.28;	author kettenis;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2014.01.28.22.04.07;	author miod;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2014.01.26.17.40.11;	author miod;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2011.03.23.16.54.34;	author pirofti;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2007.05.10.18.08.13;	author art;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2007.05.05.21.05.43;	author martin;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@while trying to reproduce lockups on mp alpha i hit an
+MUTEX_ASSERT_UNLOCKED, but it turns out alpha mutexes arent very
+friendly to diagnostics on smp systems.
+
+alpha mutexes contained an mtx_lock member. when 0 the mutex was
+unlocked, and when 1 it was locked. the MUTEX_ASSERT_UNLOCKED checked
+if mtx_lock was 1 to see if the current cpu owned the mutex, but
+in an mp system another cpu may have set mtx_lock to 1, which causes
+the assert to fire.
+
+this changes alpha mutexes so they record which cpu owns the lock
+rather than just if the lock is held or not. the diagnostics compare
+the owner to the current cpus curcpu() address so they can actually
+tell if the current cpu holds the lock instead of whether any cpu
+holds the lock.
+
+instead of using custom asm to implement a cas this uses atomic_cas_ptr,
+which on alpha uses gcc cas code. miod says he has far more confidence
+in the gcc cas than the code that was there before.
+
+while im here i also shuffled the code. on MULTIPROCESSOR systems
+instead of duplicating code between mtx_enter and mtx_enter_try,
+mtx_enter simply loops on mtx_enter_try until it succeeds.
+
+this also provides an alternative implementation of mutexes on
+!MULTIPROCESSOR systems that avoids interlocking opcodes. mutexes
+wont contend on UP boxes, theyre basically wrappers around spls.
+we can just do the splraise, stash the owner as a guard value for
+DIAGNOSTIC and return. similarly, mtx_enter_try on UP will never
+fail, so we can just call mtx_enter and return 1.
+
+ok miod@@
+@
+text
+@/*	$OpenBSD: mutex.h,v 1.6 2014/03/18 21:09:28 kettenis Exp $	*/
+
+/*
+ * Copyright (c) 2004 Artur Grabowski <art@@openbsd.org>
+ * All rights reserved. 
+ *
+ * Redistribution and use in source and binary forms, with or without 
+ * modification, are permitted provided that the following conditions 
+ * are met: 
+ *
+ * 1. Redistributions of source code must retain the above copyright 
+ *    notice, this list of conditions and the following disclaimer. 
+ * 2. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission. 
+ *
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+ * THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL  DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
+ */
+
+#ifndef _MACHINE_MUTEX_H_
+#define _MACHINE_MUTEX_H_
+
+struct mutex {
+	void *mtx_owner;
+	int mtx_wantipl;
+	int mtx_oldipl;
+};
+
+/*
+ * To prevent lock ordering problems with the kernel lock, we need to
+ * make sure we block all interrupts that can grab the kernel lock.
+ * The simplest way to achieve this is to make sure mutexes always
+ * raise the interrupt priority level to the highest level that has
+ * interrupts that grab the kernel lock.
+ */
+#ifdef MULTIPROCESSOR
+#define __MUTEX_IPL(ipl) \
+    (((ipl) > IPL_NONE && (ipl) < IPL_AUDIO) ? IPL_AUDIO : (ipl))
+#else
+#define __MUTEX_IPL(ipl) (ipl)
+#endif
+
+#define MUTEX_INITIALIZER(ipl) { NULL, __MUTEX_IPL((ipl)), IPL_NONE }
+
+void __mtx_init(struct mutex *, int);
+#define mtx_init(mtx, ipl) __mtx_init((mtx), __MUTEX_IPL((ipl)))
+
+#ifdef DIAGNOSTIC
+#define MUTEX_ASSERT_LOCKED(mtx) do {					\
+	if ((mtx)->mtx_owner != curcpu())				\
+		panic("mutex %p not held in %s", (mtx), __func__);	\
+} while (0)
+
+#define MUTEX_ASSERT_UNLOCKED(mtx) do {					\
+	if ((mtx)->mtx_owner == curcpu())				\
+		panic("mutex %p held in %s", (mtx), __func__);		\
+} while (0)
+#else
+#define MUTEX_ASSERT_LOCKED(mtx) do { } while (0)
+#define MUTEX_ASSERT_UNLOCKED(mtx) do { } while (0)
+#endif
+
+#define MUTEX_OLDIPL(mtx)	(mtx)->mtx_oldipl
+
+#endif	/* _MACHINE_MUTEX_H_ */
+@
+
+
+1.6
+log
+@To prevent lock ordering problems with the kernel lock, we need to make sure
+we block all interrupts that can grab the kernel lock.  The simplest way to
+achieve this is to make sure mutexes always raise the ipl to the highest
+level that has interrupts that grab the kernel lock.  This will allow us
+to have "mpsafe" interrupt handlers at lower priority levels.
+
+No change for non-MULTIPROCESSOR kernels.
+
+ok miod@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: mutex.h,v 1.5 2014/01/28 22:04:07 miod Exp $	*/
+d32 1
+a32 1
+	int mtx_lock;
+a34 1
+	void *mtx_owner;
+d51 1
+a51 1
+#define MUTEX_INITIALIZER(ipl) { 0, __MUTEX_IPL((ipl)), IPL_NONE, NULL }
+a56 1
+#ifdef MULTIPROCESSOR
+a57 2
+	if ((mtx)->mtx_lock == 0)					\
+		panic("mutex %p not held in %s", (mtx), __func__);	\
+a58 6
+		panic("mutex %p held by cpu %p in %s",			\
+		    (mtx), (mtx)->mtx_owner, __func__);			\
+} while (0)
+#else
+#define MUTEX_ASSERT_LOCKED(mtx) do {					\
+	if ((mtx)->mtx_lock == 0)					\
+a60 1
+#endif
+d63 1
+a63 1
+	if ((mtx)->mtx_lock != 0)					\
+@
+
+
+1.5
+log
+@In MUTEX_ASSERT_LOCKED, check we are the mutex owner if MULTIPROCESSOR.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: mutex.h,v 1.4 2014/01/26 17:40:11 miod Exp $	*/
+d38 15
+a52 1
+void mtx_init(struct mutex *, int);
+d54 2
+a55 1
+#define MUTEX_INITIALIZER(ipl) { 0, (ipl), IPL_NONE, NULL }
+@
+
+
+1.4
+log
+@Work in progress work towards SMP, heavily based upon NetBSD. The MP kernel
+will boot multiuser, but will deadlock under load, and I can't find my
+mistake yet.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: mutex.h,v 1.3 2011/03/23 16:54:34 pirofti Exp $	*/
+d43 1
+d47 3
+d51 6
+@
+
+
+1.3
+log
+@Normalize sentinel. Use _MACHINE_*_H_ and _<ARCH>_*_H_ properly and consitently.
+
+Discussed and okay drahn@@. Okay deraadt@@.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: mutex.h,v 1.2 2007/05/10 18:08:13 art Exp $	*/
+a30 3
+/*
+ * Simple non-mp implementation.
+ */
+d35 1
+d40 1
+a40 1
+#define MUTEX_INITIALIZER(ipl) { 0, (ipl), 0 }
+@
+
+
+1.2
+log
+@Alpha needs (will need) MUTEX_OLDIPL as well.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: mutex.h,v 1.1 2007/05/05 21:05:43 martin Exp $	*/
+d28 2
+a29 2
+#ifndef _ALPHA_MUTEX_H_
+#define _ALPHA_MUTEX_H_
+d61 1
+a61 1
+#endif	/* _ALPHA_MUTEX_H_ */
+@
+
+
+1.1
+log
+@simple single-processor only mutex implementation
+
+ok miod@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: mutex.h,v 1.1 2007/05/01 18:59:40 miod Exp $	*/
+d58 2
+@
+

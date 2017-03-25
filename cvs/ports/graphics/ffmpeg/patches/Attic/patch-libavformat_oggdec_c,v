@@ -1,0 +1,392 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_0:1.1.0.2
+	OPENBSD_5_0_BASE:1.1;
+locks; strict;
+comment	@# @;
+
+
+1.4
+date	2011.12.30.17.34.39;	author edd;	state dead;
+branches;
+next	1.3;
+
+1.3
+date	2011.08.28.11.17.48;	author sthen;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2011.08.16.19.01.47;	author sthen;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.08.03.18.44.07;	author dcoppa;	state Exp;
+branches
+	1.1.2.1;
+next	;
+
+1.1.2.1
+date	2011.08.21.16.51.13;	author jasper;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@update ffmpeg to a stable snapshot, from brad, OK aja@@
+@
+text
+@$OpenBSD: patch-libavformat_oggdec_c,v 1.3 2011/08/28 11:17:48 sthen Exp $
+
+- Fix demuxing chained audio streams.
+- Correct duration.
+- Abort header parsing when encountering a data packet.
+- Prevent heap corruption.
+- Make sure start time correction is applied once to each stream.
+
+--- libavformat/oggdec.c.orig	Tue Apr  5 19:28:59 2011
++++ libavformat/oggdec.c	Wed Aug 24 18:18:44 2011
+@@@@ -148,7 +148,7 @@@@ ogg_find_codec (uint8_t * buf, int size)
+ }
+ 
+ static int
+-ogg_new_stream (AVFormatContext * s, uint32_t serial)
++ogg_new_stream (AVFormatContext *s, uint32_t serial, int new_avstream)
+ {
+ 
+     struct ogg *ogg = s->priv_data;
+@@@@ -165,12 +165,14 @@@@ ogg_new_stream (AVFormatContext * s, uint32_t serial)
+     os->buf = av_malloc(os->bufsize);
+     os->header = -1;
+ 
+-    st = av_new_stream (s, idx);
+-    if (!st)
+-        return AVERROR(ENOMEM);
++    if (new_avstream) {
++        st = av_new_stream(s, idx);
++        if (!st)
++            return AVERROR(ENOMEM);
++ 
++        av_set_pts_info(st, 64, 1, 1000000);
++    }
+ 
+-    av_set_pts_info(st, 64, 1, 1000000);
+-
+     return idx;
+ }
+ 
+@@@@ -241,7 +243,20 @@@@ ogg_read_page (AVFormatContext * s, int *str)
+ 
+     idx = ogg_find_stream (ogg, serial);
+     if (idx < 0){
+-        idx = ogg_new_stream (s, serial);
++        if (ogg->headers) {
++            int n;
++
++            for (n = 0; n < ogg->nstreams; n++) {
++                av_freep(&ogg->streams[n].buf);
++                if (!ogg->state || ogg->state->streams[n].private != ogg->streams[n].private)
++                    av_freep(&ogg->streams[n].private);
++            }
++            ogg->curidx   = -1;
++            ogg->nstreams = 0;
++            idx = ogg_new_stream(s, serial, 0);
++        } else {
++            idx = ogg_new_stream(s, serial, 1);
++        }
+         if (idx < 0)
+             return -1;
+     }
+@@@@ -376,8 +391,7 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+ 
+             // We have reached the first non-header packet in this stream.
+             // Unfortunately more header packets may still follow for others,
+-            // so we reset this later unless we are done with the headers
+-            // for all streams.
++            // but if we continue with header parsing we may lose data packets.
+             ogg->headers = 1;
+ 
+             // Update the header state for all streams and
+@@@@ -386,8 +400,6 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+                 s->data_offset = os->sync_pos;
+             for (i = 0; i < ogg->nstreams; i++) {
+                 struct ogg_stream *cur_os = ogg->streams + i;
+-                if (cur_os->header > 0)
+-                    ogg->headers = 0;
+ 
+                 // if we have a partial non-header packet, its start is
+                 // obviously at or after the data start
+@@@@ -413,6 +425,8 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+             *fpos = os->sync_pos;
+         os->pstart += os->psize;
+         os->psize = 0;
++        if(os->pstart == os->bufpos)
++            os->bufpos = os->pstart = 0;
+         os->sync_pos = os->page_pos;
+     }
+ 
+@@@@ -454,6 +468,7 @@@@ ogg_get_length (AVFormatContext * s)
+     struct ogg *ogg = s->priv_data;
+     int i;
+     int64_t size, end;
++    int streams_left=0;
+ 
+     if(!s->pb->seekable)
+         return 0;
+@@@@ -475,13 +490,37 @@@@ ogg_get_length (AVFormatContext * s)
+             ogg->streams[i].codec) {
+             s->streams[i]->duration =
+                 ogg_gptopts (s, i, ogg->streams[i].granule, NULL);
+-            if (s->streams[i]->start_time != AV_NOPTS_VALUE)
++            if (s->streams[i]->start_time != AV_NOPTS_VALUE) {
+                 s->streams[i]->duration -= s->streams[i]->start_time;
++                streams_left-= (ogg->streams[i].got_start==-1);
++                ogg->streams[i].got_start= 1;
++            }else if(!ogg->streams[i].got_start){
++                ogg->streams[i].got_start= -1;
++                streams_left++;
++            }
+         }
+     }
+ 
+     ogg_restore (s, 0);
+ 
++    ogg_save (s);
++    avio_seek (s->pb, 0, SEEK_SET);
++    while (!ogg_read_page (s, &i)){
++        if (ogg->streams[i].granule != -1 && ogg->streams[i].granule != 0 &&
++            ogg->streams[i].codec) {
++            if(s->streams[i]->duration && s->streams[i]->start_time == AV_NOPTS_VALUE && !ogg->streams[i].got_start){
++                int64_t start= ogg_gptopts (s, i, ogg->streams[i].granule, NULL);
++                if(av_rescale_q(start, s->streams[i]->time_base, AV_TIME_BASE_Q) > AV_TIME_BASE)
++                    s->streams[i]->duration -= start;
++                ogg->streams[i].got_start= 1;
++                streams_left--;
++            }
++            if(streams_left<=0)
++                break;
++        }
++    }
++    ogg_restore (s, 0);
++
+     return 0;
+ }
+ 
+@@@@ -600,15 +639,15 @@@@ ogg_read_timestamp (AVFormatContext * s, int stream_in
+                     int64_t pos_limit)
+ {
+     struct ogg *ogg = s->priv_data;
+-    struct ogg_stream *os = ogg->streams + stream_index;
+     AVIOContext *bc = s->pb;
+     int64_t pts = AV_NOPTS_VALUE;
+-    int i;
++    int i = -1;
+     avio_seek(bc, *pos_arg, SEEK_SET);
+     ogg_reset(ogg);
+ 
+     while (avio_tell(bc) < pos_limit && !ogg_packet(s, &i, NULL, NULL, pos_arg)) {
+         if (i == stream_index) {
++            struct ogg_stream *os = ogg->streams + stream_index;
+             pts = ogg_calc_pts(s, i, NULL);
+             if (os->keyframe_seek && !(os->pflags & AV_PKT_FLAG_KEY))
+                 pts = AV_NOPTS_VALUE;
+@@@@ -633,6 +672,7 @@@@ static int ogg_read_seek(AVFormatContext *s, int strea
+         os->keyframe_seek = 1;
+ 
+     ret = av_seek_frame_binary(s, stream_index, timestamp, flags);
++    os = ogg->streams + stream_index;
+     if (ret < 0)
+         os->keyframe_seek = 0;
+     return ret;
+@
+
+
+1.3
+log
+@add a fix for the Ogg demuxer, from upstream via Brad
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-libavformat_oggdec_c,v 1.2 2011/08/16 19:01:47 sthen Exp $
+@
+
+
+1.2
+log
+@Bug and security fixes for FFmpeg, from Brad;
+- cavs decoder: security fix; insufficient boundary check. oCERT #2011-002
+- ogg demux: fix demuxing chained audio streams, correct duration
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-libavformat_oggdec_c,v 1.1 2011/08/03 18:44:07 dcoppa Exp $
+d7 1
+d10 1
+a10 1
++++ libavformat/oggdec.c	Wed Aug  3 15:46:38 2011
+d90 23
+a112 1
+@@@@ -482,6 +496,18 @@@@ ogg_get_length (AVFormatContext * s)
+d121 9
+a129 3
++            s->streams[i]->duration -=
++                ogg_gptopts (s, i, ogg->streams[i].granule, NULL);
++            break;
+d137 1
+a137 1
+@@@@ -600,15 +626,15 @@@@ ogg_read_timestamp (AVFormatContext * s, int stream_in
+d155 1
+a155 1
+@@@@ -633,6 +659,7 @@@@ static int ogg_read_seek(AVFormatContext *s, int strea
+@
+
+
+1.1
+log
+@Some security fixes and important bug fixes for the FFmpeg Matroska, Ogg
+and Wavpack demuxers.
+
+From Brad
+
+OK sthen@@, ajacoutot@@
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+d3 2
+d8 54
+a61 3
+--- libavformat/oggdec.c.orig	Sat Jul 30 00:31:23 2011
++++ libavformat/oggdec.c	Sat Jul 30 00:45:30 2011
+@@@@ -376,8 +376,7 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+d71 1
+a71 1
+@@@@ -386,8 +385,6 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+d80 29
+a108 1
+@@@@ -600,15 +597,15 @@@@ ogg_read_timestamp (AVFormatContext * s, int stream_in
+d126 1
+a126 1
+@@@@ -633,6 +630,7 @@@@ static int ogg_read_seek(AVFormatContext *s, int strea
+@
+
+
+1.1.2.1
+log
+@Bug and security fixes for FFmpeg, from Brad;
+- cavs decoder: security fix; insufficient boundary check. oCERT #2011-002
+- ogg demux: fix demuxing chained audio streams, correct duration
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-libavformat_oggdec_c,v 1.2 2011/08/16 19:01:47 sthen Exp $
+a2 2
+- Fix demuxing chained audio streams.
+- Correct duration.
+d6 3
+a8 54
+--- libavformat/oggdec.c.orig	Tue Apr  5 19:28:59 2011
++++ libavformat/oggdec.c	Wed Aug  3 15:46:38 2011
+@@@@ -148,7 +148,7 @@@@ ogg_find_codec (uint8_t * buf, int size)
+ }
+ 
+ static int
+-ogg_new_stream (AVFormatContext * s, uint32_t serial)
++ogg_new_stream (AVFormatContext *s, uint32_t serial, int new_avstream)
+ {
+ 
+     struct ogg *ogg = s->priv_data;
+@@@@ -165,12 +165,14 @@@@ ogg_new_stream (AVFormatContext * s, uint32_t serial)
+     os->buf = av_malloc(os->bufsize);
+     os->header = -1;
+ 
+-    st = av_new_stream (s, idx);
+-    if (!st)
+-        return AVERROR(ENOMEM);
++    if (new_avstream) {
++        st = av_new_stream(s, idx);
++        if (!st)
++            return AVERROR(ENOMEM);
++ 
++        av_set_pts_info(st, 64, 1, 1000000);
++    }
+ 
+-    av_set_pts_info(st, 64, 1, 1000000);
+-
+     return idx;
+ }
+ 
+@@@@ -241,7 +243,20 @@@@ ogg_read_page (AVFormatContext * s, int *str)
+ 
+     idx = ogg_find_stream (ogg, serial);
+     if (idx < 0){
+-        idx = ogg_new_stream (s, serial);
++        if (ogg->headers) {
++            int n;
++
++            for (n = 0; n < ogg->nstreams; n++) {
++                av_freep(&ogg->streams[n].buf);
++                if (!ogg->state || ogg->state->streams[n].private != ogg->streams[n].private)
++                    av_freep(&ogg->streams[n].private);
++            }
++            ogg->curidx   = -1;
++            ogg->nstreams = 0;
++            idx = ogg_new_stream(s, serial, 0);
++        } else {
++            idx = ogg_new_stream(s, serial, 1);
++        }
+         if (idx < 0)
+             return -1;
+     }
+@@@@ -376,8 +391,7 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+d18 1
+a18 1
+@@@@ -386,8 +400,6 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+d27 1
+a27 29
+@@@@ -413,6 +425,8 @@@@ ogg_packet (AVFormatContext * s, int *str, int *dstart
+             *fpos = os->sync_pos;
+         os->pstart += os->psize;
+         os->psize = 0;
++        if(os->pstart == os->bufpos)
++            os->bufpos = os->pstart = 0;
+         os->sync_pos = os->page_pos;
+     }
+ 
+@@@@ -482,6 +496,18 @@@@ ogg_get_length (AVFormatContext * s)
+ 
+     ogg_restore (s, 0);
+ 
++    ogg_save (s);
++    avio_seek (s->pb, 0, SEEK_SET);
++    while (!ogg_read_page (s, &i)){
++        if (ogg->streams[i].granule != -1 && ogg->streams[i].granule != 0 &&
++            ogg->streams[i].codec) {
++            s->streams[i]->duration -=
++                ogg_gptopts (s, i, ogg->streams[i].granule, NULL);
++            break;
++        }
++    }
++    ogg_restore (s, 0);
++
+     return 0;
+ }
+ 
+@@@@ -600,15 +626,15 @@@@ ogg_read_timestamp (AVFormatContext * s, int stream_in
+d45 1
+a45 1
+@@@@ -633,6 +659,7 @@@@ static int ogg_read_seek(AVFormatContext *s, int strea
+@
+
+

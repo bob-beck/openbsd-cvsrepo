@@ -1,0 +1,561 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.02;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.02;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.09;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.36;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===- llvm/ADT/SmallPtrSet.cpp - 'Normally small' pointer set ------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements the SmallPtrSet class.  See SmallPtrSet.h for an
+// overview of the algorithm.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/Support/MathExtras.h"
+#include <algorithm>
+#include <cstdlib>
+
+using namespace llvm;
+
+void SmallPtrSetImplBase::shrink_and_clear() {
+  assert(!isSmall() && "Can't shrink a small set!");
+  free(CurArray);
+
+  // Reduce the number of buckets.
+  CurArraySize = NumElements > 16 ? 1 << (Log2_32_Ceil(NumElements) + 1) : 32;
+  NumElements = NumTombstones = 0;
+
+  // Install the new array.  Clear all the buckets to empty.
+  CurArray = (const void**)malloc(sizeof(void*) * CurArraySize);
+  assert(CurArray && "Failed to allocate memory?");
+  memset(CurArray, -1, CurArraySize*sizeof(void*));
+}
+
+std::pair<const void *const *, bool>
+SmallPtrSetImplBase::insert_imp(const void *Ptr) {
+  if (isSmall()) {
+    // Check to see if it is already in the set.
+    for (const void **APtr = SmallArray, **E = SmallArray+NumElements;
+         APtr != E; ++APtr)
+      if (*APtr == Ptr)
+        return std::make_pair(APtr, false);
+
+    // Nope, there isn't.  If we stay small, just 'pushback' now.
+    if (NumElements < CurArraySize) {
+      SmallArray[NumElements++] = Ptr;
+      return std::make_pair(SmallArray + (NumElements - 1), true);
+    }
+    // Otherwise, hit the big set case, which will call grow.
+  }
+
+  if (LLVM_UNLIKELY(NumElements * 4 >= CurArraySize * 3)) {
+    // If more than 3/4 of the array is full, grow.
+    Grow(CurArraySize < 64 ? 128 : CurArraySize*2);
+  } else if (LLVM_UNLIKELY(CurArraySize - (NumElements + NumTombstones) <
+                           CurArraySize / 8)) {
+    // If fewer of 1/8 of the array is empty (meaning that many are filled with
+    // tombstones), rehash.
+    Grow(CurArraySize);
+  }
+  
+  // Okay, we know we have space.  Find a hash bucket.
+  const void **Bucket = const_cast<const void**>(FindBucketFor(Ptr));
+  if (*Bucket == Ptr)
+    return std::make_pair(Bucket, false); // Already inserted, good.
+
+  // Otherwise, insert it!
+  if (*Bucket == getTombstoneMarker())
+    --NumTombstones;
+  *Bucket = Ptr;
+  ++NumElements;  // Track density.
+  return std::make_pair(Bucket, true);
+}
+
+bool SmallPtrSetImplBase::erase_imp(const void * Ptr) {
+  if (isSmall()) {
+    // Check to see if it is in the set.
+    for (const void **APtr = SmallArray, **E = SmallArray+NumElements;
+         APtr != E; ++APtr)
+      if (*APtr == Ptr) {
+        // If it is in the set, replace this element.
+        *APtr = E[-1];
+        E[-1] = getEmptyMarker();
+        --NumElements;
+        return true;
+      }
+    
+    return false;
+  }
+  
+  // Okay, we know we have space.  Find a hash bucket.
+  void **Bucket = const_cast<void**>(FindBucketFor(Ptr));
+  if (*Bucket != Ptr) return false;  // Not in the set?
+
+  // Set this as a tombstone.
+  *Bucket = getTombstoneMarker();
+  --NumElements;
+  ++NumTombstones;
+  return true;
+}
+
+const void * const *SmallPtrSetImplBase::FindBucketFor(const void *Ptr) const {
+  unsigned Bucket = DenseMapInfo<void *>::getHashValue(Ptr) & (CurArraySize-1);
+  unsigned ArraySize = CurArraySize;
+  unsigned ProbeAmt = 1;
+  const void *const *Array = CurArray;
+  const void *const *Tombstone = nullptr;
+  while (1) {
+    // If we found an empty bucket, the pointer doesn't exist in the set.
+    // Return a tombstone if we've seen one so far, or the empty bucket if
+    // not.
+    if (LLVM_LIKELY(Array[Bucket] == getEmptyMarker()))
+      return Tombstone ? Tombstone : Array+Bucket;
+
+    // Found Ptr's bucket?
+    if (LLVM_LIKELY(Array[Bucket] == Ptr))
+      return Array+Bucket;
+
+    // If this is a tombstone, remember it.  If Ptr ends up not in the set, we
+    // prefer to return it than something that would require more probing.
+    if (Array[Bucket] == getTombstoneMarker() && !Tombstone)
+      Tombstone = Array+Bucket;  // Remember the first tombstone found.
+    
+    // It's a hash collision or a tombstone. Reprobe.
+    Bucket = (Bucket + ProbeAmt++) & (ArraySize-1);
+  }
+}
+
+/// Grow - Allocate a larger backing store for the buckets and move it over.
+///
+void SmallPtrSetImplBase::Grow(unsigned NewSize) {
+  // Allocate at twice as many buckets, but at least 128.
+  unsigned OldSize = CurArraySize;
+  
+  const void **OldBuckets = CurArray;
+  bool WasSmall = isSmall();
+  
+  // Install the new array.  Clear all the buckets to empty.
+  CurArray = (const void**)malloc(sizeof(void*) * NewSize);
+  assert(CurArray && "Failed to allocate memory?");
+  CurArraySize = NewSize;
+  memset(CurArray, -1, NewSize*sizeof(void*));
+  
+  // Copy over all the elements.
+  if (WasSmall) {
+    // Small sets store their elements in order.
+    for (const void **BucketPtr = OldBuckets, **E = OldBuckets+NumElements;
+         BucketPtr != E; ++BucketPtr) {
+      const void *Elt = *BucketPtr;
+      *const_cast<void**>(FindBucketFor(Elt)) = const_cast<void*>(Elt);
+    }
+  } else {
+    // Copy over all valid entries.
+    for (const void **BucketPtr = OldBuckets, **E = OldBuckets+OldSize;
+         BucketPtr != E; ++BucketPtr) {
+      // Copy over the element if it is valid.
+      const void *Elt = *BucketPtr;
+      if (Elt != getTombstoneMarker() && Elt != getEmptyMarker())
+        *const_cast<void**>(FindBucketFor(Elt)) = const_cast<void*>(Elt);
+    }
+    
+    free(OldBuckets);
+    NumTombstones = 0;
+  }
+}
+
+SmallPtrSetImplBase::SmallPtrSetImplBase(const void **SmallStorage,
+                                 const SmallPtrSetImplBase& that) {
+  SmallArray = SmallStorage;
+
+  // If we're becoming small, prepare to insert into our stack space
+  if (that.isSmall()) {
+    CurArray = SmallArray;
+  // Otherwise, allocate new heap space (unless we were the same size)
+  } else {
+    CurArray = (const void**)malloc(sizeof(void*) * that.CurArraySize);
+    assert(CurArray && "Failed to allocate memory?");
+  }
+  
+  // Copy over the new array size
+  CurArraySize = that.CurArraySize;
+
+  // Copy over the contents from the other set
+  memcpy(CurArray, that.CurArray, sizeof(void*)*CurArraySize);
+  
+  NumElements = that.NumElements;
+  NumTombstones = that.NumTombstones;
+}
+
+SmallPtrSetImplBase::SmallPtrSetImplBase(const void **SmallStorage,
+                                         unsigned SmallSize,
+                                         SmallPtrSetImplBase &&that) {
+  SmallArray = SmallStorage;
+
+  // Copy over the basic members.
+  CurArraySize = that.CurArraySize;
+  NumElements = that.NumElements;
+  NumTombstones = that.NumTombstones;
+
+  // When small, just copy into our small buffer.
+  if (that.isSmall()) {
+    CurArray = SmallArray;
+    memcpy(CurArray, that.CurArray, sizeof(void *) * CurArraySize);
+  } else {
+    // Otherwise, we steal the large memory allocation and no copy is needed.
+    CurArray = that.CurArray;
+    that.CurArray = that.SmallArray;
+  }
+
+  // Make the "that" object small and empty.
+  that.CurArraySize = SmallSize;
+  assert(that.CurArray == that.SmallArray);
+  that.NumElements = 0;
+  that.NumTombstones = 0;
+}
+
+/// CopyFrom - implement operator= from a smallptrset that has the same pointer
+/// type, but may have a different small size.
+void SmallPtrSetImplBase::CopyFrom(const SmallPtrSetImplBase &RHS) {
+  assert(&RHS != this && "Self-copy should be handled by the caller.");
+
+  if (isSmall() && RHS.isSmall())
+    assert(CurArraySize == RHS.CurArraySize &&
+           "Cannot assign sets with different small sizes");
+
+  // If we're becoming small, prepare to insert into our stack space
+  if (RHS.isSmall()) {
+    if (!isSmall())
+      free(CurArray);
+    CurArray = SmallArray;
+  // Otherwise, allocate new heap space (unless we were the same size)
+  } else if (CurArraySize != RHS.CurArraySize) {
+    if (isSmall())
+      CurArray = (const void**)malloc(sizeof(void*) * RHS.CurArraySize);
+    else {
+      const void **T = (const void**)realloc(CurArray,
+                                             sizeof(void*) * RHS.CurArraySize);
+      if (!T)
+        free(CurArray);
+      CurArray = T;
+    }
+    assert(CurArray && "Failed to allocate memory?");
+  }
+  
+  // Copy over the new array size
+  CurArraySize = RHS.CurArraySize;
+
+  // Copy over the contents from the other set
+  memcpy(CurArray, RHS.CurArray, sizeof(void*)*CurArraySize);
+  
+  NumElements = RHS.NumElements;
+  NumTombstones = RHS.NumTombstones;
+}
+
+void SmallPtrSetImplBase::MoveFrom(unsigned SmallSize,
+                                   SmallPtrSetImplBase &&RHS) {
+  assert(&RHS != this && "Self-move should be handled by the caller.");
+
+  if (!isSmall())
+    free(CurArray);
+
+  if (RHS.isSmall()) {
+    // Copy a small RHS rather than moving.
+    CurArray = SmallArray;
+    memcpy(CurArray, RHS.CurArray, sizeof(void*)*RHS.CurArraySize);
+  } else {
+    CurArray = RHS.CurArray;
+    RHS.CurArray = RHS.SmallArray;
+  }
+
+  // Copy the rest of the trivial members.
+  CurArraySize = RHS.CurArraySize;
+  NumElements = RHS.NumElements;
+  NumTombstones = RHS.NumTombstones;
+
+  // Make the RHS small and empty.
+  RHS.CurArraySize = SmallSize;
+  assert(RHS.CurArray == RHS.SmallArray);
+  RHS.NumElements = 0;
+  RHS.NumTombstones = 0;
+}
+
+void SmallPtrSetImplBase::swap(SmallPtrSetImplBase &RHS) {
+  if (this == &RHS) return;
+
+  // We can only avoid copying elements if neither set is small.
+  if (!this->isSmall() && !RHS.isSmall()) {
+    std::swap(this->CurArray, RHS.CurArray);
+    std::swap(this->CurArraySize, RHS.CurArraySize);
+    std::swap(this->NumElements, RHS.NumElements);
+    std::swap(this->NumTombstones, RHS.NumTombstones);
+    return;
+  }
+
+  // FIXME: From here on we assume that both sets have the same small size.
+
+  // If only RHS is small, copy the small elements into LHS and move the pointer
+  // from LHS to RHS.
+  if (!this->isSmall() && RHS.isSmall()) {
+    std::copy(RHS.SmallArray, RHS.SmallArray+RHS.CurArraySize,
+              this->SmallArray);
+    std::swap(this->NumElements, RHS.NumElements);
+    std::swap(this->CurArraySize, RHS.CurArraySize);
+    RHS.CurArray = this->CurArray;
+    RHS.NumTombstones = this->NumTombstones;
+    this->CurArray = this->SmallArray;
+    this->NumTombstones = 0;
+    return;
+  }
+
+  // If only LHS is small, copy the small elements into RHS and move the pointer
+  // from RHS to LHS.
+  if (this->isSmall() && !RHS.isSmall()) {
+    std::copy(this->SmallArray, this->SmallArray+this->CurArraySize,
+              RHS.SmallArray);
+    std::swap(RHS.NumElements, this->NumElements);
+    std::swap(RHS.CurArraySize, this->CurArraySize);
+    this->CurArray = RHS.CurArray;
+    this->NumTombstones = RHS.NumTombstones;
+    RHS.CurArray = RHS.SmallArray;
+    RHS.NumTombstones = 0;
+    return;
+  }
+
+  // Both a small, just swap the small elements.
+  assert(this->isSmall() && RHS.isSmall());
+  assert(this->CurArraySize == RHS.CurArraySize);
+  std::swap_ranges(this->SmallArray, this->SmallArray+this->CurArraySize,
+                   RHS.SmallArray);
+  std::swap(this->NumElements, RHS.NumElements);
+}
+
+SmallPtrSetImplBase::~SmallPtrSetImplBase() {
+  if (!isSmall())
+    free(CurArray);
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d28 2
+a29 3
+  unsigned Size = size();
+  CurArraySize = Size > 16 ? 1 << (Log2_32_Ceil(Size) + 1) : 32;
+  NumNonEmpty = NumTombstones = 0;
+d38 17
+a54 2
+SmallPtrSetImplBase::insert_imp_big(const void *Ptr) {
+  if (LLVM_UNLIKELY(size() * 4 >= CurArraySize * 3)) {
+d56 3
+a58 2
+    Grow(CurArraySize < 64 ? 128 : CurArraySize * 2);
+  } else if (LLVM_UNLIKELY(CurArraySize - NumNonEmpty < CurArraySize / 8)) {
+d63 1
+a63 1
+
+a71 2
+  else
+    ++NumNonEmpty; // Track density.
+d73 1
+d80 2
+a81 2
+    for (const void **APtr = CurArray, **E = CurArray + NumNonEmpty; APtr != E;
+         ++APtr)
+d84 3
+a86 2
+        *APtr = getTombstoneMarker();
+        ++NumTombstones;
+d89 1
+a89 1
+
+d92 1
+a92 1
+
+d99 1
+d125 1
+a125 1
+
+d134 3
+a137 1
+  const void **OldEnd = EndPointer();
+d139 1
+a139 1
+
+d145 7
+a151 6
+
+  // Copy over all valid entries.
+  for (const void **BucketPtr = OldBuckets; BucketPtr != OldEnd; ++BucketPtr) {
+    // Copy over the element if it is valid.
+    const void *Elt = *BucketPtr;
+    if (Elt != getTombstoneMarker() && Elt != getEmptyMarker())
+d153 13
+a166 5
+
+  if (!WasSmall)
+    free(OldBuckets);
+  NumNonEmpty -= NumTombstones;
+  NumTombstones = 0;
+d170 1
+a170 1
+                                         const SmallPtrSetImplBase &that) {
+d181 3
+d185 5
+a189 2
+  // Copy over the that array.
+  CopyHelper(that);
+d196 21
+a216 1
+  MoveHelper(SmallSize, std::move(that));
+d219 2
+d246 1
+a246 5
+
+  CopyHelper(RHS);
+}
+
+void SmallPtrSetImplBase::CopyHelper(const SmallPtrSetImplBase &RHS) {
+d251 3
+a253 3
+  std::copy(RHS.CurArray, RHS.EndPointer(), CurArray);
+
+  NumNonEmpty = RHS.NumNonEmpty;
+d259 2
+a262 6
+  MoveHelper(SmallSize, std::move(RHS));
+}
+
+void SmallPtrSetImplBase::MoveHelper(unsigned SmallSize,
+                                     SmallPtrSetImplBase &&RHS) {
+  assert(&RHS != this && "Self-move should be handled by the caller.");
+d267 1
+a267 1
+    std::copy(RHS.CurArray, RHS.CurArray + RHS.NumNonEmpty, CurArray);
+d275 1
+a275 1
+  NumNonEmpty = RHS.NumNonEmpty;
+d281 1
+a281 1
+  RHS.NumNonEmpty = 0;
+d292 1
+a292 1
+    std::swap(this->NumNonEmpty, RHS.NumNonEmpty);
+d302 4
+a305 5
+    assert(RHS.CurArray == RHS.SmallArray);
+    std::copy(RHS.CurArray, RHS.CurArray + RHS.NumNonEmpty, this->SmallArray);
+    std::swap(RHS.CurArraySize, this->CurArraySize);
+    std::swap(this->NumNonEmpty, RHS.NumNonEmpty);
+    std::swap(this->NumTombstones, RHS.NumTombstones);
+d307 1
+d309 1
+d316 1
+a316 2
+    assert(this->CurArray == this->SmallArray);
+    std::copy(this->CurArray, this->CurArray + this->NumNonEmpty,
+d318 1
+a319 2
+    std::swap(RHS.NumNonEmpty, this->NumNonEmpty);
+    std::swap(RHS.NumTombstones, this->NumTombstones);
+d321 1
+d323 1
+d329 2
+a330 2
+  unsigned MinNonEmpty = std::min(this->NumNonEmpty, RHS.NumNonEmpty);
+  std::swap_ranges(this->SmallArray, this->SmallArray + MinNonEmpty,
+d332 6
+a337 11
+  if (this->NumNonEmpty > MinNonEmpty) {
+    std::copy(this->SmallArray + MinNonEmpty,
+              this->SmallArray + this->NumNonEmpty,
+              RHS.SmallArray + MinNonEmpty);
+  } else {
+    std::copy(RHS.SmallArray + MinNonEmpty, RHS.SmallArray + RHS.NumNonEmpty,
+              this->SmallArray + MinNonEmpty);
+  }
+  assert(this->CurArraySize == RHS.CurArraySize);
+  std::swap(this->NumNonEmpty, RHS.NumNonEmpty);
+  std::swap(this->NumTombstones, RHS.NumTombstones);
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@a18 1
+#include <cassert>
+d63 25
+d94 1
+a94 1
+  while (true) {
+@
+
+

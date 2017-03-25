@@ -1,0 +1,2333 @@
+head	1.13;
+access;
+symbols
+	OPENBSD_2_6:1.12.0.4
+	OPENBSD_2_6_BASE:1.12
+	OPENBSD_2_5:1.12.0.2
+	OPENBSD_2_5_BASE:1.12
+	OPENBSD_2_4:1.8.0.2
+	OPENBSD_2_4_BASE:1.8
+	sendmail_8_9_1:1.1.1.2
+	UCB:1.1.1
+	OPENBSD_2_3:1.7.0.2
+	OPENBSD_2_3_BASE:1.7
+	OPENBSD_2_2:1.6.0.2
+	OPENBSD_2_2_BASE:1.6
+	OPENBSD_2_1:1.4.0.2
+	OPENBSD_2_1_BASE:1.4
+	OPENBSD_2_0:1.2.0.2
+	OPENBSD_2_0_BASE:1.2
+	netbsd_1_1:1.1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.13
+date	2000.04.18.04.57.17;	author millert;	state dead;
+branches;
+next	1.12;
+
+1.12
+date	99.02.05.05.59.23;	author millert;	state Exp;
+branches;
+next	1.11;
+
+1.11
+date	99.01.21.19.37.23;	author millert;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	99.01.19.21.00.28;	author millert;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	99.01.01.20.33.39;	author millert;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	98.07.12.19.44.24;	author millert;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	97.11.09.04.05.35;	author gene;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	97.08.04.02.17.47;	author downsj;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	97.07.15.07.23.59;	author downsj;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	97.01.22.01.07.01;	author downsj;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	96.12.14.21.17.05;	author downsj;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	96.01.29.01.43.30;	author dm;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	95.10.18.08.48.17;	author deraadt;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	95.10.18.08.48.17;	author deraadt;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	98.07.12.17.09.52;	author millert;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.13
+log
+@remove sendmail 8.9.3
+@
+text
+@/*
+ * Copyright (c) 1998 Sendmail, Inc.  All rights reserved.
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman.  All rights reserved.
+ * Copyright (c) 1988, 1993
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * By using this file, you agree to the terms and conditions set
+ * forth in the LICENSE file which can be found at the top level of
+ * the sendmail distribution.
+ *
+ */
+
+#ifndef lint
+static char sccsid[] = "@@(#)collect.c	8.93 (Berkeley) 1/26/1999";
+#endif /* not lint */
+
+# include <errno.h>
+# include "sendmail.h"
+
+/*
+**  COLLECT -- read & parse message header & make temp file.
+**
+**	Creates a temporary file name and copies the standard
+**	input to that file.  Leading UNIX-style "From" lines are
+**	stripped off (after important information is extracted).
+**
+**	Parameters:
+**		fp -- file to read.
+**		smtpmode -- if set, we are running SMTP: give an RFC821
+**			style message to say we are ready to collect
+**			input, and never ignore a single dot to mean
+**			end of message.
+**		hdrp -- the location to stash the header.
+**		e -- the current envelope.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		Temp file is created and filled.
+**		The from person may be set.
+*/
+
+static jmp_buf	CtxCollectTimeout;
+static void	collecttimeout __P((time_t));
+static bool	CollectProgress;
+static EVENT	*CollectTimeout;
+
+/* values for input state machine */
+#define IS_NORM		0	/* middle of line */
+#define IS_BOL		1	/* beginning of line */
+#define IS_DOT		2	/* read a dot at beginning of line */
+#define IS_DOTCR	3	/* read ".\r" at beginning of line */
+#define IS_CR		4	/* read a carriage return */
+
+/* values for message state machine */
+#define MS_UFROM	0	/* reading Unix from line */
+#define MS_HEADER	1	/* reading message header */
+#define MS_BODY		2	/* reading message body */
+#define MS_DISCARD	3	/* discarding rest of message */
+
+void
+collect(fp, smtpmode, hdrp, e)
+	FILE *fp;
+	bool smtpmode;
+	HDR **hdrp;
+	register ENVELOPE *e;
+{
+	register FILE *volatile tf;
+	volatile bool ignrdot = smtpmode ? FALSE : IgnrDot;
+	volatile time_t dbto = smtpmode ? TimeOuts.to_datablock : 0;
+	register char *volatile bp;
+	volatile int c = EOF;
+	volatile bool inputerr = FALSE;
+	bool headeronly;
+	char *volatile buf;
+	volatile int buflen;
+	volatile int istate;
+	volatile int mstate;
+	u_char *volatile pbp;
+	int hdrslen = 0;
+	u_char peekbuf[8];
+	char dfname[MAXQFNAME];
+	char bufbuf[MAXLINE];
+	extern bool isheader __P((char *));
+	extern void tferror __P((FILE *volatile, ENVELOPE *));
+
+	headeronly = hdrp != NULL;
+
+	/*
+	**  Create the temp file name and create the file.
+	*/
+
+	if (!headeronly)
+	{
+		int tfd;
+		struct stat stbuf;
+
+		strcpy(dfname, queuename(e, 'd'));
+		tfd = dfopen(dfname, O_WRONLY|O_CREAT|O_TRUNC, FileMode, SFF_ANYFILE);
+		if (tfd < 0 || (tf = fdopen(tfd, "w")) == NULL)
+		{
+			syserr("Cannot create %s", dfname);
+			e->e_flags |= EF_NO_BODY_RETN;
+			finis(TRUE, ExitStat);
+		}
+		if (fstat(fileno(tf), &stbuf) < 0)
+			e->e_dfino = -1;
+		else
+		{
+			e->e_dfdev = stbuf.st_dev;
+			e->e_dfino = stbuf.st_ino;
+		}
+		HasEightBits = FALSE;
+		e->e_msgsize = 0;
+		e->e_flags |= EF_HAS_DF;
+	}
+
+	/*
+	**  Tell ARPANET to go ahead.
+	*/
+
+	if (smtpmode)
+		message("354 Enter mail, end with \".\" on a line by itself");
+
+	if (tTd(30, 2))
+		printf("collect\n");
+
+	/*
+	**  Read the message.
+	**
+	**	This is done using two interleaved state machines.
+	**	The input state machine is looking for things like
+	**	hidden dots; the message state machine is handling
+	**	the larger picture (e.g., header versus body).
+	*/
+
+	buf = bp = bufbuf;
+	buflen = sizeof bufbuf;
+	pbp = peekbuf;
+	istate = IS_BOL;
+	mstate = SaveFrom ? MS_HEADER : MS_UFROM;
+	CollectProgress = FALSE;
+
+	if (dbto != 0)
+	{
+		/* handle possible input timeout */
+		if (setjmp(CtxCollectTimeout) != 0)
+		{
+			if (LogLevel > 2)
+				sm_syslog(LOG_NOTICE, e->e_id,
+				    "timeout waiting for input from %s during message collect",
+				    CurHostName ? CurHostName : "<local machine>");
+			errno = 0;
+			usrerr("451 timeout waiting for input during message collect");
+			goto readerr;
+		}
+		CollectTimeout = setevent(dbto, collecttimeout, dbto);
+	}
+
+	for (;;)
+	{
+		if (tTd(30, 35))
+			printf("top, istate=%d, mstate=%d\n", istate, mstate);
+		for (;;)
+		{
+			if (pbp > peekbuf)
+				c = *--pbp;
+			else
+			{
+				while (!feof(fp) && !ferror(fp))
+				{
+					errno = 0;
+					c = getc(fp);
+					if (errno != EINTR)
+						break;
+					clearerr(fp);
+				}
+				CollectProgress = TRUE;
+				if (TrafficLogFile != NULL && !headeronly)
+				{
+					if (istate == IS_BOL)
+						fprintf(TrafficLogFile, "%05d <<< ",
+							(int) getpid());
+					if (c == EOF)
+						fprintf(TrafficLogFile, "[EOF]\n");
+					else
+						putc(c, TrafficLogFile);
+				}
+				if (c == EOF)
+					goto readerr;
+				if (SevenBitInput)
+					c &= 0x7f;
+				else
+					HasEightBits |= bitset(0x80, c);
+			}
+			if (tTd(30, 94))
+				printf("istate=%d, c=%c (0x%x)\n",
+					istate, c, c);
+			switch (istate)
+			{
+			  case IS_BOL:
+				if (c == '.')
+				{
+					istate = IS_DOT;
+					continue;
+				}
+				break;
+
+			  case IS_DOT:
+				if (c == '\n' && !ignrdot &&
+				    !bitset(EF_NL_NOT_EOL, e->e_flags))
+					goto readerr;
+				else if (c == '\r' &&
+					 !bitset(EF_CRLF_NOT_EOL, e->e_flags))
+				{
+					istate = IS_DOTCR;
+					continue;
+				}
+				else if (c != '.' ||
+					 (OpMode != MD_SMTP &&
+					  OpMode != MD_DAEMON &&
+					  OpMode != MD_ARPAFTP))
+				{
+					*pbp++ = c;
+					c = '.';
+				}
+				break;
+
+			  case IS_DOTCR:
+				if (c == '\n' && !ignrdot)
+					goto readerr;
+				else
+				{
+					/* push back the ".\rx" */
+					*pbp++ = c;
+					*pbp++ = '\r';
+					c = '.';
+				}
+				break;
+
+			  case IS_CR:
+				if (c == '\n')
+					istate = IS_BOL;
+				else
+				{
+					ungetc(c, fp);
+					c = '\r';
+					istate = IS_NORM;
+				}
+				goto bufferchar;
+			}
+
+			if (c == '\r' && !bitset(EF_CRLF_NOT_EOL, e->e_flags))
+			{
+				istate = IS_CR;
+				continue;
+			}
+			else if (c == '\n' && !bitset(EF_NL_NOT_EOL, e->e_flags))
+				istate = IS_BOL;
+			else
+				istate = IS_NORM;
+
+bufferchar:
+			if (!headeronly)
+				e->e_msgsize++;
+			switch (mstate)
+			{
+			  case MS_BODY:
+				/* just put the character out */
+				if (MaxMessageSize <= 0 ||
+				    e->e_msgsize <= MaxMessageSize)
+					putc(c, tf);
+
+				/* fall through */
+
+			  case MS_DISCARD:
+				continue;
+			}
+
+			/* header -- buffer up */
+			if (bp >= &buf[buflen - 2])
+			{
+				char *obuf;
+
+				if (mstate != MS_HEADER)
+					break;
+
+				/* out of space for header */
+				obuf = buf;
+				if (buflen < MEMCHUNKSIZE)
+					buflen *= 2;
+				else
+					buflen += MEMCHUNKSIZE;
+				buf = xalloc(buflen);
+				bcopy(obuf, buf, bp - obuf);
+				bp = &buf[bp - obuf];
+				if (obuf != bufbuf)
+					free(obuf);
+			}
+			if (c >= 0200 && c <= 0237)
+			{
+#if 0	/* causes complaints -- figure out something for 8.9 */
+				usrerr("Illegal character 0x%x in header", c);
+#endif
+			}
+			else if (c != '\0')
+			{
+				*bp++ = c;
+				if (MaxHeadersLength > 0 &&
+				    ++hdrslen > MaxHeadersLength)
+				{
+					sm_syslog(LOG_NOTICE, e->e_id,
+						  "headers too large (%d max) from %s during message collect",
+						  MaxHeadersLength,
+						  CurHostName != NULL ? CurHostName : "localhost");
+					errno = 0;
+					e->e_flags |= EF_CLRQUEUE;
+					e->e_status = "5.6.0";
+					usrerr("552 Headers too large (%d max)",
+						MaxHeadersLength);
+					mstate = MS_DISCARD;
+				}
+			}
+			if (istate == IS_BOL)
+				break;
+		}
+		*bp = '\0';
+
+nextstate:
+		if (tTd(30, 35))
+			printf("nextstate, istate=%d, mstate=%d, line = \"%s\"\n",
+				istate, mstate, buf);
+		switch (mstate)
+		{
+		  case MS_UFROM:
+			mstate = MS_HEADER;
+#ifndef NOTUNIX
+			if (strncmp(buf, "From ", 5) == 0)
+			{
+				extern void eatfrom __P((char *volatile, ENVELOPE *));
+
+				bp = buf;
+				eatfrom(buf, e);
+				continue;
+			}
+#endif
+			/* fall through */
+
+		  case MS_HEADER:
+			if (!isheader(buf))
+			{
+				mstate = MS_BODY;
+				goto nextstate;
+			}
+
+			/* check for possible continuation line */
+			do
+			{
+				clearerr(fp);
+				errno = 0;
+				c = getc(fp);
+			} while (errno == EINTR);
+			if (c != EOF)
+				ungetc(c, fp);
+			if (c == ' ' || c == '\t')
+			{
+				/* yep -- defer this */
+				continue;
+			}
+
+			/* trim off trailing CRLF or NL */
+			if (*--bp != '\n' || *--bp != '\r')
+				bp++;
+			*bp = '\0';
+
+			if (bitset(H_EOH, chompheader(buf, FALSE, hdrp, e)))
+			{
+				mstate = MS_BODY;
+				goto nextstate;
+			}
+			break;
+
+		  case MS_BODY:
+			if (tTd(30, 1))
+				printf("EOH\n");
+			if (headeronly)
+				goto readerr;
+			bp = buf;
+
+			/* toss blank line */
+			if ((!bitset(EF_CRLF_NOT_EOL, e->e_flags) &&
+				bp[0] == '\r' && bp[1] == '\n') ||
+			    (!bitset(EF_NL_NOT_EOL, e->e_flags) &&
+				bp[0] == '\n'))
+			{
+				break;
+			}
+
+			/* if not a blank separator, write it out */
+			if (MaxMessageSize <= 0 ||
+			    e->e_msgsize <= MaxMessageSize)
+			{
+				while (*bp != '\0')
+					putc(*bp++, tf);
+			}
+			break;
+		}
+		bp = buf;
+	}
+
+readerr:
+	if ((feof(fp) && smtpmode) || ferror(fp))
+	{
+		const char *errmsg = errstring(errno);
+
+		if (tTd(30, 1))
+			printf("collect: premature EOM: %s\n", errmsg);
+		if (LogLevel >= 2)
+			sm_syslog(LOG_WARNING, e->e_id,
+				"collect: premature EOM: %s", errmsg);
+		inputerr = TRUE;
+	}
+
+	/* reset global timer */
+	clrevent(CollectTimeout);
+
+	if (headeronly)
+		return;
+
+	if (tf != NULL &&
+	    (fflush(tf) != 0 || ferror(tf) ||
+	     (SuperSafe && fsync(fileno(tf)) < 0) ||
+	     fclose(tf) < 0))
+	{
+		tferror(tf, e);
+		flush_errors(TRUE);
+		finis(TRUE, ExitStat);
+	}
+
+	/* An EOF when running SMTP is an error */
+	if (inputerr && (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+	{
+		char *host;
+		char *problem;
+
+		host = RealHostName;
+		if (host == NULL)
+			host = "localhost";
+
+		if (feof(fp))
+			problem = "unexpected close";
+		else if (ferror(fp))
+			problem = "I/O error";
+		else
+			problem = "read timeout";
+		if (LogLevel > 0 && feof(fp))
+			sm_syslog(LOG_NOTICE, e->e_id,
+			    "collect: %s on connection from %.100s, sender=%s: %s",
+			    problem, host,
+			    shortenstring(e->e_from.q_paddr, MAXSHORTSTR),
+			    errstring(errno));
+		if (feof(fp))
+			usrerr("451 collect: %s on connection from %s, from=%s",
+				problem, host,
+				shortenstring(e->e_from.q_paddr, MAXSHORTSTR));
+		else
+			syserr("451 collect: %s on connection from %s, from=%s",
+				problem, host,
+				shortenstring(e->e_from.q_paddr, MAXSHORTSTR));
+
+		/* don't return an error indication */
+		e->e_to = NULL;
+		e->e_flags &= ~EF_FATALERRS;
+		e->e_flags |= EF_CLRQUEUE;
+
+		/* and don't try to deliver the partial message either */
+		if (InChild)
+			ExitStat = EX_QUIT;
+		finis(TRUE, ExitStat);
+	}
+
+	/*
+	**  Find out some information from the headers.
+	**	Examples are who is the from person & the date.
+	*/
+
+	eatheader(e, TRUE);
+
+	if (GrabTo && e->e_sendqueue == NULL)
+		usrerr("No recipient addresses found in header");
+
+	/* collect statistics */
+	if (OpMode != MD_VERIFY)
+		markstats(e, (ADDRESS *) NULL, FALSE);
+
+#if _FFR_DSN_RRT_OPTION
+	/*
+	**  If we have a Return-Receipt-To:, turn it into a DSN.
+	*/
+
+	if (RrtImpliesDsn && hvalue("return-receipt-to", e->e_header) != NULL)
+	{
+		ADDRESS *q;
+
+		for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+			if (!bitset(QHASNOTIFY, q->q_flags))
+				q->q_flags |= QHASNOTIFY|QPINGONSUCCESS;
+	}
+#endif
+
+	/*
+	**  Add an Apparently-To: line if we have no recipient lines.
+	*/
+
+	if (hvalue("to", e->e_header) != NULL ||
+	    hvalue("cc", e->e_header) != NULL ||
+	    hvalue("apparently-to", e->e_header) != NULL)
+	{
+		/* have a valid recipient header -- delete Bcc: headers */
+		e->e_flags |= EF_DELETE_BCC;
+	}
+	else if (hvalue("bcc", e->e_header) == NULL)
+	{
+		/* no valid recipient headers */
+		register ADDRESS *q;
+		char *hdr = NULL;
+
+		/* create an Apparently-To: field */
+		/*    that or reject the message.... */
+		switch (NoRecipientAction)
+		{
+		  case NRA_ADD_APPARENTLY_TO:
+			hdr = "Apparently-To";
+			break;
+
+		  case NRA_ADD_TO:
+			hdr = "To";
+			break;
+
+		  case NRA_ADD_BCC:
+			addheader("Bcc", " ", &e->e_header);
+			break;
+
+		  case NRA_ADD_TO_UNDISCLOSED:
+			addheader("To", "undisclosed-recipients:;", &e->e_header);
+			break;
+		}
+
+		if (hdr != NULL)
+		{
+			for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+			{
+				if (q->q_alias != NULL)
+					continue;
+				if (tTd(30, 3))
+					printf("Adding %s: %s\n",
+						hdr, q->q_paddr);
+				addheader(hdr, q->q_paddr, &e->e_header);
+			}
+		}
+	}
+
+	/* check for message too large */
+	if (MaxMessageSize > 0 && e->e_msgsize > MaxMessageSize)
+	{
+		e->e_flags |= EF_NO_BODY_RETN|EF_CLRQUEUE;
+		e->e_status = "5.2.3";
+		usrerr("552 Message exceeds maximum fixed size (%ld)",
+			MaxMessageSize);
+		if (LogLevel > 6)
+			sm_syslog(LOG_NOTICE, e->e_id,
+				"message size (%ld) exceeds maximum (%ld)",
+				e->e_msgsize, MaxMessageSize);
+	}
+
+	/* check for illegal 8-bit data */
+	if (HasEightBits)
+	{
+		e->e_flags |= EF_HAS8BIT;
+		if (!bitset(MM_PASS8BIT|MM_MIME8BIT, MimeMode) &&
+		    !bitset(EF_IS_MIME, e->e_flags))
+		{
+			e->e_status = "5.6.1";
+			usrerr("554 Eight bit data not allowed");
+		}
+	}
+	else
+	{
+		/* if it claimed to be 8 bits, well, it lied.... */
+		if (e->e_bodytype != NULL &&
+		    strcasecmp(e->e_bodytype, "8BITMIME") == 0)
+			e->e_bodytype = "7BIT";
+	}
+
+	if ((e->e_dfp = fopen(dfname, "r")) == NULL)
+	{
+		/* we haven't acked receipt yet, so just chuck this */
+		syserr("Cannot reopen %s", dfname);
+		finis(TRUE, ExitStat);
+	}
+}
+
+
+static void
+collecttimeout(timeout)
+	time_t timeout;
+{
+	/* if no progress was made, die now */
+	if (!CollectProgress)
+		longjmp(CtxCollectTimeout, 1);
+
+	/* otherwise reset the timeout */
+	CollectTimeout = setevent(timeout, collecttimeout, timeout);
+	CollectProgress = FALSE;
+}
+/*
+**  TFERROR -- signal error on writing the temporary file.
+**
+**	Parameters:
+**		tf -- the file pointer for the temporary file.
+**		e -- the current envelope.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		Gives an error message.
+**		Arranges for following output to go elsewhere.
+*/
+
+void
+tferror(tf, e)
+	FILE *volatile tf;
+	register ENVELOPE *e;
+{
+	setstat(EX_IOERR);
+	if (errno == ENOSPC)
+	{
+#if STAT64 > 0
+		struct stat64 st;
+#else
+		struct stat st;
+#endif
+		long avail;
+		long bsize;
+		extern long freediskspace __P((char *, long *));
+
+		e->e_flags |= EF_NO_BODY_RETN;
+
+		if (
+#if STAT64 > 0
+		    fstat64(fileno(tf), &st) 
+#else
+		    fstat(fileno(tf), &st) 
+#endif
+		    < 0)
+		  st.st_size = 0;
+		(void) freopen(queuename(e, 'd'), "w", tf);
+		if (st.st_size <= 0)
+			fprintf(tf, "\n*** Mail could not be accepted");
+		else if (sizeof st.st_size > sizeof (long))
+			fprintf(tf, "\n*** Mail of at least %s bytes could not be accepted\n",
+				quad_to_string(st.st_size));
+		else
+			fprintf(tf, "\n*** Mail of at least %lu bytes could not be accepted\n",
+				(unsigned long) st.st_size);
+		fprintf(tf, "*** at %s due to lack of disk space for temp file.\n",
+			MyHostName);
+		avail = freediskspace(QueueDir, &bsize);
+		if (avail > 0)
+		{
+			if (bsize > 1024)
+				avail *= bsize / 1024;
+			else if (bsize < 1024)
+				avail /= 1024 / bsize;
+			fprintf(tf, "*** Currently, %ld kilobytes are available for mail temp files.\n",
+				avail);
+		}
+		e->e_status = "4.3.1";
+		usrerr("452 Out of disk space for temp file");
+	}
+	else
+		syserr("collect: Cannot write tf%s", e->e_id);
+	if (freopen("/dev/null", "w", tf) == NULL)
+		sm_syslog(LOG_ERR, e->e_id,
+			  "tferror: freopen(\"/dev/null\") failed: %s",
+			  errstring(errno));
+}
+/*
+**  EATFROM -- chew up a UNIX style from line and process
+**
+**	This does indeed make some assumptions about the format
+**	of UNIX messages.
+**
+**	Parameters:
+**		fm -- the from line.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		extracts what information it can from the header,
+**		such as the date.
+*/
+
+# ifndef NOTUNIX
+
+char	*DowList[] =
+{
+	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", NULL
+};
+
+char	*MonthList[] =
+{
+	"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	"Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+	NULL
+};
+
+void
+eatfrom(fm, e)
+	char *volatile fm;
+	register ENVELOPE *e;
+{
+	register char *p;
+	register char **dt;
+
+	if (tTd(30, 2))
+		printf("eatfrom(%s)\n", fm);
+
+	/* find the date part */
+	p = fm;
+	while (*p != '\0')
+	{
+		/* skip a word */
+		while (*p != '\0' && *p != ' ')
+			p++;
+		while (*p == ' ')
+			p++;
+		if (!(isascii(*p) && isupper(*p)) ||
+		    p[3] != ' ' || p[13] != ':' || p[16] != ':')
+			continue;
+
+		/* we have a possible date */
+		for (dt = DowList; *dt != NULL; dt++)
+			if (strncmp(*dt, p, 3) == 0)
+				break;
+		if (*dt == NULL)
+			continue;
+
+		for (dt = MonthList; *dt != NULL; dt++)
+			if (strncmp(*dt, &p[4], 3) == 0)
+				break;
+		if (*dt != NULL)
+			break;
+	}
+
+	if (*p != '\0')
+	{
+		char *q;
+
+		/* we have found a date */
+		q = xalloc(25);
+		(void) strncpy(q, p, 25);
+		q[24] = '\0';
+		q = arpadate(q);
+		define('a', newstr(q), e);
+	}
+}
+
+# endif /* NOTUNIX */
+@
+
+
+1.12
+log
+@sendmail 8.9.3
+@
+text
+@@
+
+
+1.11
+log
+@official fix for sendmail header length DoS
+@
+text
+@d14 1
+a14 1
+static char sccsid[] = "@@(#)collect.c	8.91 (Berkeley) 8/19/1998";
+d60 1
+a60 1
+#define MS_DISCARD    3       /* discarding rest of message */
+d81 1
+a81 2
+      int nhdrlines = 0;
+      int hdrlinelen = 0;
+a202 1
+                              hdrlinelen = 0;
+d267 1
+a267 1
+                      switch (mstate)
+d269 1
+a269 1
+                        case MS_BODY:
+d275 1
+a275 1
+                              /* fall through */
+d277 1
+a277 1
+                        case MS_DISCARD:
+d308 1
+a308 1
+                      {
+d310 15
+a324 15
+                              if (MaxHeaderLineLength > 0 &&
+                                  ++hdrlinelen > MaxHeaderLineLength)
+                              {
+                                      sm_syslog(LOG_NOTICE, e->e_id,
+                                                "header line too long (%d max) from %s during message collect",
+                                                MaxHeaderLineLength,
+                                                CurHostName != NULL ? CurHostName : "localhost");
+                                      errno = 0;
+                                      e->e_flags |= EF_CLRQUEUE;
+                                      e->e_status = "5.6.0";
+                                      usrerr("552 Header line too long (%d max)",
+                                              MaxHeaderLineLength);
+                                      mstate = MS_DISCARD;
+                              }
+                      }
+a355 16
+
+                      if (MaxHeaderLines > 0 &&
+                          ++nhdrlines > MaxHeaderLines)
+                      {
+                              sm_syslog(LOG_NOTICE, e->e_id,
+                                        "too many header lines (%d max) from %s during message collect",
+                                        MaxHeaderLines,
+                                        CurHostName != NULL ? CurHostName : "localhost");
+                              errno = 0;
+                              e->e_flags |= EF_CLRQUEUE;
+                              e->e_status = "5.6.0";
+                              usrerr("552 Too many header lines (%d max)",
+                                      MaxHeaderLines);
+                              mstate = MS_DISCARD;
+                              break;
+                      }
+@
+
+
+1.10
+log
+@Avoid a DoS caused by messages containing a huge number of mail header lines; lcamtuf@@IDS.PL
+@
+text
+@d60 1
+a60 2
+
+#define MAXHDRLINES	512	/* max number of lines in the mail headers */
+d81 2
+a85 1
+	int numheaders = 0;
+d204 1
+d269 1
+a269 1
+			if (mstate == MS_BODY)
+d271 1
+d276 4
+d310 1
+d312 15
+d359 15
+a373 10
+			/* check for unreasonable number of headers */
+			if (numheaders++ > MAXHDRLINES)
+			{
+				sm_syslog(LOG_NOTICE, e->e_id,
+				    "excessive headers from %s during message collect",
+				    CurHostName ? CurHostName : "<local machine>");
+				errno = 0;
+				usrerr("451 Excessive number of mail headers.");
+				goto readerr;
+			}
+d394 1
+@
+
+
+1.9
+log
+@sendmail 8.9.2
+@
+text
+@d61 2
+d85 1
+d335 11
+@
+
+
+1.8
+log
+@something hosed the sendmail import; fix up by hand
+@
+text
+@d14 1
+a14 1
+static char sccsid[] = "@@(#)collect.c	8.89 (Berkeley) 6/4/98";
+a83 1
+	extern void eatheader __P((ENVELOPE *, bool));
+d103 1
+a103 1
+			finis();
+a160 2
+		extern int chompheader __P((char *, bool, HDR **, ENVELOPE *));
+
+d414 1
+a414 1
+		finis();
+d456 1
+a456 1
+		finis();
+a503 1
+		extern void addheader __P((char *, char *, HDR **));
+d576 1
+a576 1
+		finis();
+@
+
+
+1.7
+log
+@Upgrade to sendmail 8.8.8
+@
+text
+@d2 2
+a3 1
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman
+d7 3
+a9 15
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *	This product includes software developed by the University of
+ *	California, Berkeley and its contributors.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+a10 11
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+d14 1
+a14 1
+static char sccsid[] = "@@(#)collect.c	8.72 (Berkeley) 10/6/97";
+d45 1
+a45 1
+static void	collecttimeout();
+d83 3
+a85 3
+	extern bool isheader();
+	extern void eatheader();
+	extern void tferror();
+d162 2
+a315 2
+			extern int chompheader();
+
+d321 1
+a321 1
+				extern void eatfrom();
+d357 1
+d359 2
+d440 1
+a440 1
+			    shortenstring(e->e_from.q_paddr, 203),
+d445 1
+a445 1
+				shortenstring(e->e_from.q_paddr, 203));
+d449 1
+a449 1
+				shortenstring(e->e_from.q_paddr, 203));
+d474 1
+a474 5
+	{
+		extern void markstats();
+
+		markstats(e, (ADDRESS *) NULL);
+	}
+d507 1
+a507 1
+		extern void addheader();
+d614 1
+a614 1
+	FILE *tf;
+d620 3
+d624 1
+d630 9
+a638 2
+		if (fstat(fileno(tf), &st) < 0)
+			st.st_size = 0;
+d643 2
+a644 2
+			fprintf(tf, "\n*** Mail of at least %qd bytes could not be accepted\n",
+				st.st_size);
+d646 2
+a647 2
+			fprintf(tf, "\n*** Mail of at least %ld bytes could not be accepted\n",
+				(long) st.st_size);
+d665 4
+a668 1
+	(void) freopen("/dev/null", "w", tf);
+d703 1
+a703 1
+	char *fm;
+@
+
+
+1.6
+log
+@sendmail 8.8.7.
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.71 (Berkeley) 6/30/97";
+d570 1
+a570 1
+		e->e_flags |= EF_NO_BODY_RETN;
+@
+
+
+1.5
+log
+@Sendmail 8.8.6.
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.69 (Berkeley) 5/29/97";
+d430 2
+a431 1
+	    (fflush(tf) != 0 || ferror(tf) || fsync(fileno(tf)) < 0 ||
+d545 1
+a545 1
+			addheader("Bcc", "", &e->e_header);
+@
+
+
+1.4
+log
+@Sendmail 8.8.5.
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1983, 1995, 1996 Eric P. Allman
+d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.62 (Berkeley) 12/11/96";
+a54 2
+**		requeueflag -- this message will be requeued later, so
+**			don't do final processing on it.
+d84 1
+a84 1
+collect(fp, smtpmode, requeueflag, hdrp, e)
+a86 1
+	bool requeueflag;
+d94 1
+a94 1
+	volatile int c = '\0';
+d103 1
+a103 1
+	char dfname[20];
+d117 1
+d121 2
+a122 1
+		if ((tf = dfopen(dfname, O_WRONLY|O_CREAT|O_TRUNC, FileMode)) == NULL)
+a170 1
+#ifdef LOG
+d172 1
+a172 1
+				syslog(LOG_NOTICE,
+a174 1
+#endif
+a416 1
+#ifdef LOG
+d418 2
+a419 2
+			syslog(LOG_WARNING, "collect: premature EOM: %s", errmsg);
+#endif
+a453 1
+# ifdef LOG
+d455 1
+a455 1
+			syslog(LOG_NOTICE,
+a459 1
+# endif
+d498 1
+a498 1
+#ifdef _FFR_DSN_RRT
+a572 1
+# ifdef LOG
+d574 3
+a576 3
+			syslog(LOG_NOTICE, "%s: message size (%ld) exceeds maximum (%ld)",
+				e->e_id, e->e_msgsize, MaxMessageSize);
+# endif
+@
+
+
+1.3
+log
+@Update to Sendmail 8.8.4, plus recent patches, plus OpenBSD support.
+Also include entire example configuration subset.
+Includes smrsh (using /usr/libexec/sm.bin).
+
+Of the top of my head, the only things I removed from the distribution were
+contrib/mail.local.linux, src/Makefiles, all the *.0 and *.ps files.
+Our praliases man page replaces the distributed one, ours is better.
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.61 (Berkeley) 11/24/96";
+d503 15
+@
+
+
+1.2
+log
+@Sendmail 8.7.3 from NetBSD
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1983, 1995 Eric P. Allman
+d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.49 (Berkeley) 10/29/95";
+d93 6
+a98 6
+	register FILE *tf;
+	bool ignrdot = smtpmode ? FALSE : IgnrDot;
+	time_t dbto = smtpmode ? TimeOuts.to_datablock : 0;
+	register char *bp;
+	int c = '\0';
+	bool inputerr = FALSE;
+d100 6
+a105 6
+	char *buf;
+	int buflen;
+	int istate;
+	int mstate;
+	char *pbp;
+	char peekbuf[8];
+d173 4
+a176 3
+			syslog(LOG_NOTICE,
+			    "timeout waiting for input from %s during message collect",
+			    CurHostName ? CurHostName : "<local machine>");
+d208 1
+a208 1
+							getpid());
+a219 2
+				if (!headeronly)
+					e->e_msgsize++;
+d255 1
+a255 1
+				if (c == '\n')
+d289 2
+d320 7
+a326 1
+			if (c != '\0')
+d491 1
+a491 1
+	eatheader(e, !requeueflag);
+d560 1
+d575 2
+a576 1
+		if (!bitset(MM_PASS8BIT|MM_MIME8BIT, MimeMode))
+d637 1
+d650 1
+a650 1
+				st.st_size);
+a741 1
+		extern char *arpadate();
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1983 Eric P. Allman
+d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.14 (Berkeley) 4/18/94";
+d50 1
+d57 1
+d68 16
+a83 2
+char	*CollectErrorMessage;
+bool	CollectErrno;
+d85 3
+a87 1
+collect(smtpmode, requeueflag, e)
+d90 1
+d95 3
+a97 2
+	char buf[MAXLINE], buf2[MAXLINE];
+	register char *workbuf, *freebuf;
+d99 12
+a110 2
+	extern char *hvalue();
+	extern bool isheader(), flusheol();
+d112 1
+a112 2
+	CollectErrorMessage = NULL;
+	CollectErrno = 0;
+d118 1
+a118 3
+	e->e_df = queuename(e, 'd');
+	e->e_df = newstr(e->e_df);
+	if ((tf = dfopen(e->e_df, O_WRONLY|O_CREAT|O_TRUNC, FileMode)) == NULL)
+d120 19
+a138 3
+		syserr("Cannot create %s", e->e_df);
+		NoReturn = TRUE;
+		finis();
+d148 2
+a149 2
+	/* set global timer to monitor progress */
+	sfgetset(TimeOuts.to_datablock);
+d152 6
+a157 1
+	**  Try to read a UNIX-style From line
+d160 8
+a167 6
+	if (sfgets(buf, MAXLINE, InChannel, TimeOuts.to_datablock,
+			"initial message read") == NULL)
+		goto readerr;
+	fixcrlf(buf, FALSE);
+# ifndef NOTUNIX
+	if (!SaveFrom && strncmp(buf, "From ", 5) == 0)
+d169 10
+a178 1
+		if (!flusheol(buf, InChannel))
+d180 2
+a181 5
+		eatfrom(buf, e);
+		if (sfgets(buf, MAXLINE, InChannel, TimeOuts.to_datablock,
+				"message header read") == NULL)
+			goto readerr;
+		fixcrlf(buf, FALSE);
+a182 8
+# endif /* NOTUNIX */
+
+	/*
+	**  Copy InChannel to temp file & do message editing.
+	**	To keep certain mailers from getting confused,
+	**	and to keep the output clean, lines that look
+	**	like UNIX "From" lines are deleted in the header.
+	*/
+a183 2
+	workbuf = buf;		/* `workbuf' contains a header field */
+	freebuf = buf2;		/* `freebuf' can be used for read-ahead */
+d186 2
+a187 25
+		char *curbuf;
+		int curbuffree;
+		register int curbuflen;
+		char *p;
+
+		/* first, see if the header is over */
+		if (!isheader(workbuf))
+		{
+			fixcrlf(workbuf, TRUE);
+			break;
+		}
+
+		/* if the line is too long, throw the rest away */
+		if (!flusheol(workbuf, InChannel))
+			goto readerr;
+
+		/* it's okay to toss '\n' now (flusheol() needed it) */
+		fixcrlf(workbuf, TRUE);
+
+		curbuf = workbuf;
+		curbuflen = strlen(curbuf);
+		curbuffree = MAXLINE - curbuflen;
+		p = curbuf + curbuflen;
+
+		/* get the rest of this field */
+d190 44
+a233 1
+			int clen;
+d235 18
+a252 5
+			if (sfgets(freebuf, MAXLINE, InChannel,
+					TimeOuts.to_datablock,
+					"message header read") == NULL)
+			{
+				freebuf[0] = '\0';
+a253 1
+			}
+d255 10
+a264 2
+			/* is this a continuation line? */
+			if (*freebuf != ' ' && *freebuf != '\t')
+d267 11
+a277 2
+			if (!flusheol(freebuf, InChannel))
+				goto readerr;
+d279 9
+a287 2
+			fixcrlf(freebuf, TRUE);
+			clen = strlen(freebuf) + 1;
+d289 2
+a290 2
+			/* if insufficient room, dynamically allocate buffer */
+			if (clen >= curbuffree)
+d292 6
+a297 18
+				/* reallocate buffer */
+				int nbuflen = ((p - curbuf) + clen) * 2;
+				char *nbuf = xalloc(nbuflen);
+
+				p = nbuf + curbuflen;
+				curbuffree = nbuflen - curbuflen;
+				bcopy(curbuf, nbuf, curbuflen);
+				if (curbuf != buf && curbuf != buf2)
+					free(curbuf);
+				curbuf = nbuf;
+			}
+			*p++ = '\n';
+			bcopy(freebuf, p, clen - 1);
+			p += clen - 1;
+			curbuffree -= clen;
+			curbuflen += clen;
+		}
+		*p++ = '\0';
+d299 4
+a302 1
+		e->e_msgsize += curbuflen;
+d304 2
+a305 11
+		/*
+		**  The working buffer now becomes the free buffer, since
+		**  the free buffer contains a new header field.
+		**
+		**  This is premature, since we still havent called
+		**  chompheader() to process the field we just created
+		**  (so the call to chompheader() will use `freebuf').
+		**  This convolution is necessary so that if we break out
+		**  of the loop due to H_EOH, `workbuf' will always be
+		**  the next unprocessed buffer.
+		*/
+d307 16
+a322 4
+		{
+			register char *tmp = workbuf;
+			workbuf = freebuf;
+			freebuf = tmp;
+d324 1
+d326 7
+a332 3
+		/*
+		**  Snarf header away.
+		*/
+d334 6
+a339 2
+		if (bitset(H_EOH, chompheader(curbuf, FALSE, e)))
+			break;
+d341 6
+a346 3
+		/*
+		**  If the buffer was dynamically allocated, free it.
+		*/
+d348 6
+a353 3
+		if (curbuf != buf && curbuf != buf2)
+			free(curbuf);
+	}
+d355 14
+a368 2
+	if (tTd(30, 1))
+		printf("EOH\n");
+d370 7
+a376 9
+	if (*workbuf == '\0')
+	{
+		/* throw away a blank line */
+		if (sfgets(buf, MAXLINE, InChannel, TimeOuts.to_datablock,
+				"message separator read") == NULL)
+			goto readerr;
+	}
+	else if (workbuf == buf2)	/* guarantee `buf' contains data */
+		(void) strcpy(buf, buf2);
+d378 6
+a383 3
+	/*
+	**  Collect the body of the message.
+	*/
+d385 8
+a392 3
+	for (;;)
+	{
+		register char *bp = buf;
+d394 7
+a400 4
+		fixcrlf(buf, TRUE);
+
+		/* check for end-of-message */
+		if (!ignrdot && buf[0] == '.' && (buf[1] == '\n' || buf[1] == '\0'))
+d402 2
+a403 19
+
+		/* check for transparent dot */
+		if ((OpMode == MD_SMTP || OpMode == MD_DAEMON) &&
+		    bp[0] == '.' && bp[1] == '.')
+			bp++;
+
+		/*
+		**  Figure message length, output the line to the temp
+		**  file, and insert a newline if missing.
+		*/
+
+		e->e_msgsize += strlen(bp) + 1;
+		fputs(bp, tf);
+		fputs("\n", tf);
+		if (ferror(tf))
+			tferror(tf, e);
+		if (sfgets(buf, MAXLINE, InChannel, TimeOuts.to_datablock,
+				"message body read") == NULL)
+			goto readerr;
+d406 2
+a407 1
+	if (feof(InChannel) || ferror(InChannel))
+d409 2
+a410 1
+readerr:
+d412 5
+a416 1
+			printf("collect: read error\n");
+d421 4
+a424 1
+	sfgetset((time_t) 0);
+d426 3
+a428 3
+	if (fflush(tf) != 0)
+		tferror(tf, e);
+	if (fsync(fileno(tf)) < 0 || fclose(tf) < 0)
+d431 1
+d435 2
+a436 11
+	if (CollectErrorMessage != NULL && Errors <= 0)
+	{
+		if (CollectErrno != 0)
+		{
+			errno = CollectErrno;
+			syserr(CollectErrorMessage, e->e_df);
+			finis();
+		}
+		usrerr(CollectErrorMessage);
+	}
+	else if (inputerr && (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+a437 1
+		/* An EOF when running SMTP is an error */
+d445 1
+a445 1
+		if (feof(InChannel))
+d447 1
+a447 1
+		else if (ferror(InChannel))
+d452 1
+a452 1
+		if (LogLevel > 0 && feof(InChannel))
+d454 4
+a457 2
+			    "collect: %s on connection from %s, sender=%s: %s\n",
+			    problem, host, e->e_from.q_paddr, errstring(errno));
+d459 1
+a459 1
+		if (feof(InChannel))
+d461 2
+a462 1
+				problem, host, e->e_from.q_paddr);
+d465 2
+a466 1
+				problem, host, e->e_from.q_paddr);
+d486 3
+d491 3
+d495 1
+d501 8
+a508 2
+	if (hvalue("to", e) == NULL && hvalue("cc", e) == NULL &&
+	    hvalue("bcc", e) == NULL && hvalue("apparently-to", e) == NULL)
+d510 1
+d512 2
+d517 1
+a517 1
+		for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+d519 28
+a546 5
+			if (q->q_alias != NULL)
+				continue;
+			if (tTd(30, 3))
+				printf("Adding Apparently-To: %s\n", q->q_paddr);
+			addheader("Apparently-To", q->q_paddr, e);
+d553 1
+d556 5
+d563 19
+a581 1
+	if ((e->e_dfp = fopen(e->e_df, "r")) == NULL)
+d584 1
+a584 1
+		syserr("Cannot reopen %s", e->e_df);
+a587 13
+/*
+**  FLUSHEOL -- if not at EOL, throw away rest of input line.
+**
+**	Parameters:
+**		buf -- last line read in (checked for '\n'),
+**		fp -- file to be read from.
+**
+**	Returns:
+**		FALSE on error from sfgets(), TRUE otherwise.
+**
+**	Side Effects:
+**		none.
+*/
+d589 4
+a592 4
+bool
+flusheol(buf, fp)
+	char *buf;
+	FILE *fp;
+d594 7
+a600 14
+	register char *p = buf;
+	char junkbuf[MAXLINE];
+
+	while (strchr(p, '\n') == NULL)
+	{
+		CollectErrorMessage = "553 header line too long";
+		CollectErrno = 0;
+		if (sfgets(junkbuf, MAXLINE, fp, TimeOuts.to_datablock,
+				"long line flush") == NULL)
+			return (FALSE);
+		p = junkbuf;
+	}
+
+	return (TRUE);
+d607 1
+d617 1
+d622 1
+a622 1
+	CollectErrno = errno;
+d629 1
+a629 1
+		NoReturn = TRUE;
+d632 1
+a632 1
+		(void) freopen(e->e_df, "w", tf);
+d643 1
+a643 1
+		avail = freespace(QueueDir, &bsize);
+d653 2
+a654 1
+		CollectErrorMessage = "452 Out of disk space for temp file";
+d657 1
+a657 3
+	{
+		CollectErrorMessage = "cannot write message body to disk (%s)";
+	}
+d691 1
+@
+
+
+1.1.1.1
+log
+@initial import of NetBSD tree
+@
+text
+@@
+
+
+1.1.1.2
+log
+@sendmail 8.9.1
+@
+text
+@d2 1
+a2 2
+ * Copyright (c) 1998 Sendmail, Inc.  All rights reserved.
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman.  All rights reserved.
+d6 15
+a20 3
+ * By using this file, you agree to the terms and conditions set
+ * forth in the LICENSE file which can be found at the top level of
+ * the sendmail distribution.
+d22 11
+d36 1
+a36 1
+static char sccsid[] = "@@(#)collect.c	8.89 (Berkeley) 6/4/98";
+a49 1
+**		fp -- file to read.
+d54 2
+a55 1
+**		hdrp -- the location to stash the header.
+d66 2
+a67 16
+static jmp_buf	CtxCollectTimeout;
+static void	collecttimeout __P((time_t));
+static bool	CollectProgress;
+static EVENT	*CollectTimeout;
+
+/* values for input state machine */
+#define IS_NORM		0	/* middle of line */
+#define IS_BOL		1	/* beginning of line */
+#define IS_DOT		2	/* read a dot at beginning of line */
+#define IS_DOTCR	3	/* read ".\r" at beginning of line */
+#define IS_CR		4	/* read a carriage return */
+
+/* values for message state machine */
+#define MS_UFROM	0	/* reading Unix from line */
+#define MS_HEADER	1	/* reading message header */
+#define MS_BODY		2	/* reading message body */
+d69 1
+a69 3
+void
+collect(fp, smtpmode, hdrp, e)
+	FILE *fp;
+d71 1
+a71 1
+	HDR **hdrp;
+d74 7
+a80 18
+	register FILE *volatile tf;
+	volatile bool ignrdot = smtpmode ? FALSE : IgnrDot;
+	volatile time_t dbto = smtpmode ? TimeOuts.to_datablock : 0;
+	register char *volatile bp;
+	volatile int c = EOF;
+	volatile bool inputerr = FALSE;
+	bool headeronly;
+	char *volatile buf;
+	volatile int buflen;
+	volatile int istate;
+	volatile int mstate;
+	u_char *volatile pbp;
+	u_char peekbuf[8];
+	char dfname[MAXQFNAME];
+	char bufbuf[MAXLINE];
+	extern bool isheader __P((char *));
+	extern void eatheader __P((ENVELOPE *, bool));
+	extern void tferror __P((FILE *volatile, ENVELOPE *));
+d82 2
+a83 1
+	headeronly = hdrp != NULL;
+d89 3
+a91 1
+	if (!headeronly)
+d93 3
+a95 21
+		int tfd;
+		struct stat stbuf;
+
+		strcpy(dfname, queuename(e, 'd'));
+		tfd = dfopen(dfname, O_WRONLY|O_CREAT|O_TRUNC, FileMode, SFF_ANYFILE);
+		if (tfd < 0 || (tf = fdopen(tfd, "w")) == NULL)
+		{
+			syserr("Cannot create %s", dfname);
+			e->e_flags |= EF_NO_BODY_RETN;
+			finis();
+		}
+		if (fstat(fileno(tf), &stbuf) < 0)
+			e->e_dfino = -1;
+		else
+		{
+			e->e_dfdev = stbuf.st_dev;
+			e->e_dfino = stbuf.st_ino;
+		}
+		HasEightBits = FALSE;
+		e->e_msgsize = 0;
+		e->e_flags |= EF_HAS_DF;
+d105 2
+a106 2
+	if (tTd(30, 2))
+		printf("collect\n");
+d109 1
+a109 6
+	**  Read the message.
+	**
+	**	This is done using two interleaved state machines.
+	**	The input state machine is looking for things like
+	**	hidden dots; the message state machine is handling
+	**	the larger picture (e.g., header versus body).
+d112 6
+a117 8
+	buf = bp = bufbuf;
+	buflen = sizeof bufbuf;
+	pbp = peekbuf;
+	istate = IS_BOL;
+	mstate = SaveFrom ? MS_HEADER : MS_UFROM;
+	CollectProgress = FALSE;
+
+	if (dbto != 0)
+d119 5
+a123 9
+		/* handle possible input timeout */
+		if (setjmp(CtxCollectTimeout) != 0)
+		{
+			if (LogLevel > 2)
+				sm_syslog(LOG_NOTICE, e->e_id,
+				    "timeout waiting for input from %s during message collect",
+				    CurHostName ? CurHostName : "<local machine>");
+			errno = 0;
+			usrerr("451 timeout waiting for input during message collect");
+d125 1
+a125 2
+		}
+		CollectTimeout = setevent(dbto, collecttimeout, dbto);
+d127 8
+d136 2
+d140 4
+a143 1
+		extern int chompheader __P((char *, bool, HDR **, ENVELOPE *));
+d145 20
+a164 2
+		if (tTd(30, 35))
+			printf("top, istate=%d, mstate=%d\n", istate, mstate);
+d167 5
+a171 3
+			if (pbp > peekbuf)
+				c = *--pbp;
+			else
+d173 2
+a174 25
+				while (!feof(fp) && !ferror(fp))
+				{
+					errno = 0;
+					c = getc(fp);
+					if (errno != EINTR)
+						break;
+					clearerr(fp);
+				}
+				CollectProgress = TRUE;
+				if (TrafficLogFile != NULL && !headeronly)
+				{
+					if (istate == IS_BOL)
+						fprintf(TrafficLogFile, "%05d <<< ",
+							(int) getpid());
+					if (c == EOF)
+						fprintf(TrafficLogFile, "[EOF]\n");
+					else
+						putc(c, TrafficLogFile);
+				}
+				if (c == EOF)
+					goto readerr;
+				if (SevenBitInput)
+					c &= 0x7f;
+				else
+					HasEightBits |= bitset(0x80, c);
+a175 12
+			if (tTd(30, 94))
+				printf("istate=%d, c=%c (0x%x)\n",
+					istate, c, c);
+			switch (istate)
+			{
+			  case IS_BOL:
+				if (c == '.')
+				{
+					istate = IS_DOT;
+					continue;
+				}
+				break;
+d177 2
+a178 18
+			  case IS_DOT:
+				if (c == '\n' && !ignrdot &&
+				    !bitset(EF_NL_NOT_EOL, e->e_flags))
+					goto readerr;
+				else if (c == '\r' &&
+					 !bitset(EF_CRLF_NOT_EOL, e->e_flags))
+				{
+					istate = IS_DOTCR;
+					continue;
+				}
+				else if (c != '.' ||
+					 (OpMode != MD_SMTP &&
+					  OpMode != MD_DAEMON &&
+					  OpMode != MD_ARPAFTP))
+				{
+					*pbp++ = c;
+					c = '.';
+				}
+d181 2
+a182 11
+			  case IS_DOTCR:
+				if (c == '\n' && !ignrdot)
+					goto readerr;
+				else
+				{
+					/* push back the ".\rx" */
+					*pbp++ = c;
+					*pbp++ = '\r';
+					c = '.';
+				}
+				break;
+d184 2
+a185 11
+			  case IS_CR:
+				if (c == '\n')
+					istate = IS_BOL;
+				else
+				{
+					ungetc(c, fp);
+					c = '\r';
+					istate = IS_NORM;
+				}
+				goto bufferchar;
+			}
+d187 2
+a188 1
+			if (c == '\r' && !bitset(EF_CRLF_NOT_EOL, e->e_flags))
+d190 18
+a207 19
+				istate = IS_CR;
+				continue;
+			}
+			else if (c == '\n' && !bitset(EF_NL_NOT_EOL, e->e_flags))
+				istate = IS_BOL;
+			else
+				istate = IS_NORM;
+
+bufferchar:
+			if (!headeronly)
+				e->e_msgsize++;
+			if (mstate == MS_BODY)
+			{
+				/* just put the character out */
+				if (MaxMessageSize <= 0 ||
+				    e->e_msgsize <= MaxMessageSize)
+					putc(c, tf);
+				continue;
+			}
+d209 1
+a209 4
+			/* header -- buffer up */
+			if (bp >= &buf[buflen - 2])
+			{
+				char *obuf;
+d211 11
+a221 2
+				if (mstate != MS_HEADER)
+					break;
+d223 4
+a226 22
+				/* out of space for header */
+				obuf = buf;
+				if (buflen < MEMCHUNKSIZE)
+					buflen *= 2;
+				else
+					buflen += MEMCHUNKSIZE;
+				buf = xalloc(buflen);
+				bcopy(obuf, buf, bp - obuf);
+				bp = &buf[bp - obuf];
+				if (obuf != bufbuf)
+					free(obuf);
+			}
+			if (c >= 0200 && c <= 0237)
+			{
+#if 0	/* causes complaints -- figure out something for 8.9 */
+				usrerr("Illegal character 0x%x in header", c);
+#endif
+			}
+			else if (c != '\0')
+				*bp++ = c;
+			if (istate == IS_BOL)
+				break;
+a227 1
+		*bp = '\0';
+d229 10
+a238 12
+nextstate:
+		if (tTd(30, 35))
+			printf("nextstate, istate=%d, mstate=%d, line = \"%s\"\n",
+				istate, mstate, buf);
+		switch (mstate)
+		{
+		  case MS_UFROM:
+			mstate = MS_HEADER;
+#ifndef NOTUNIX
+			if (strncmp(buf, "From ", 5) == 0)
+			{
+				extern void eatfrom __P((char *volatile, ENVELOPE *));
+d240 3
+a242 6
+				bp = buf;
+				eatfrom(buf, e);
+				continue;
+			}
+#endif
+			/* fall through */
+d244 2
+a245 6
+		  case MS_HEADER:
+			if (!isheader(buf))
+			{
+				mstate = MS_BODY;
+				goto nextstate;
+			}
+d247 9
+a255 14
+			/* check for possible continuation line */
+			do
+			{
+				clearerr(fp);
+				errno = 0;
+				c = getc(fp);
+			} while (errno == EINTR);
+			if (c != EOF)
+				ungetc(c, fp);
+			if (c == ' ' || c == '\t')
+			{
+				/* yep -- defer this */
+				continue;
+			}
+d257 3
+a259 10
+			/* trim off trailing CRLF or NL */
+			if (*--bp != '\n' || *--bp != '\r')
+				bp++;
+			*bp = '\0';
+			if (bitset(H_EOH, chompheader(buf, FALSE, hdrp, e)))
+			{
+				mstate = MS_BODY;
+				goto nextstate;
+			}
+			break;
+d261 3
+a263 6
+		  case MS_BODY:
+			if (tTd(30, 1))
+				printf("EOH\n");
+			if (headeronly)
+				goto readerr;
+			bp = buf;
+d265 1
+a265 8
+			/* toss blank line */
+			if ((!bitset(EF_CRLF_NOT_EOL, e->e_flags) &&
+				bp[0] == '\r' && bp[1] == '\n') ||
+			    (!bitset(EF_NL_NOT_EOL, e->e_flags) &&
+				bp[0] == '\n'))
+			{
+				break;
+			}
+d267 2
+a268 7
+			/* if not a blank separator, write it out */
+			if (MaxMessageSize <= 0 ||
+			    e->e_msgsize <= MaxMessageSize)
+			{
+				while (*bp != '\0')
+					putc(*bp++, tf);
+			}
+d270 19
+a288 2
+		}
+		bp = buf;
+d291 2
+a293 4
+	if ((feof(fp) && smtpmode) || ferror(fp))
+	{
+		const char *errmsg = errstring(errno);
+
+d295 1
+a295 4
+			printf("collect: premature EOM: %s\n", errmsg);
+		if (LogLevel >= 2)
+			sm_syslog(LOG_WARNING, e->e_id,
+				"collect: premature EOM: %s", errmsg);
+d300 1
+a300 1
+	clrevent(CollectTimeout);
+d302 3
+a304 7
+	if (headeronly)
+		return;
+
+	if (tf != NULL &&
+	    (fflush(tf) != 0 || ferror(tf) ||
+	     (SuperSafe && fsync(fileno(tf)) < 0) ||
+	     fclose(tf) < 0))
+a306 1
+		flush_errors(TRUE);
+d310 11
+a320 2
+	/* An EOF when running SMTP is an error */
+	if (inputerr && (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+d322 1
+d330 1
+a330 1
+		if (feof(fp))
+d332 1
+a332 1
+		else if (ferror(fp))
+d336 7
+a342 7
+		if (LogLevel > 0 && feof(fp))
+			sm_syslog(LOG_NOTICE, e->e_id,
+			    "collect: %s on connection from %.100s, sender=%s: %s",
+			    problem, host,
+			    shortenstring(e->e_from.q_paddr, MAXSHORTSTR),
+			    errstring(errno));
+		if (feof(fp))
+d344 1
+a344 2
+				problem, host,
+				shortenstring(e->e_from.q_paddr, MAXSHORTSTR));
+d347 1
+a347 2
+				problem, host,
+				shortenstring(e->e_from.q_paddr, MAXSHORTSTR));
+d365 1
+a365 4
+	eatheader(e, TRUE);
+
+	if (GrabTo && e->e_sendqueue == NULL)
+		usrerr("No recipient addresses found in header");
+d369 1
+a369 16
+		markstats(e, (ADDRESS *) NULL, FALSE);
+
+#if _FFR_DSN_RRT_OPTION
+	/*
+	**  If we have a Return-Receipt-To:, turn it into a DSN.
+	*/
+
+	if (RrtImpliesDsn && hvalue("return-receipt-to", e->e_header) != NULL)
+	{
+		ADDRESS *q;
+
+		for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+			if (!bitset(QHASNOTIFY, q->q_flags))
+				q->q_flags |= QHASNOTIFY|QPINGONSUCCESS;
+	}
+#endif
+d375 2
+a376 3
+	if (hvalue("to", e->e_header) != NULL ||
+	    hvalue("cc", e->e_header) != NULL ||
+	    hvalue("apparently-to", e->e_header) != NULL)
+a377 6
+		/* have a valid recipient header -- delete Bcc: headers */
+		e->e_flags |= EF_DELETE_BCC;
+	}
+	else if (hvalue("bcc", e->e_header) == NULL)
+	{
+		/* no valid recipient headers */
+a378 2
+		char *hdr = NULL;
+		extern void addheader __P((char *, char *, HDR **));
+d382 1
+a382 1
+		switch (NoRecipientAction)
+d384 5
+a388 28
+		  case NRA_ADD_APPARENTLY_TO:
+			hdr = "Apparently-To";
+			break;
+
+		  case NRA_ADD_TO:
+			hdr = "To";
+			break;
+
+		  case NRA_ADD_BCC:
+			addheader("Bcc", " ", &e->e_header);
+			break;
+
+		  case NRA_ADD_TO_UNDISCLOSED:
+			addheader("To", "undisclosed-recipients:;", &e->e_header);
+			break;
+		}
+
+		if (hdr != NULL)
+		{
+			for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+			{
+				if (q->q_alias != NULL)
+					continue;
+				if (tTd(30, 3))
+					printf("Adding %s: %s\n",
+						hdr, q->q_paddr);
+				addheader(hdr, q->q_paddr, &e->e_header);
+			}
+a394 2
+		e->e_flags |= EF_NO_BODY_RETN|EF_CLRQUEUE;
+		e->e_status = "5.2.3";
+a396 4
+		if (LogLevel > 6)
+			sm_syslog(LOG_NOTICE, e->e_id,
+				"message size (%ld) exceeds maximum (%ld)",
+				e->e_msgsize, MaxMessageSize);
+d399 1
+a399 20
+	/* check for illegal 8-bit data */
+	if (HasEightBits)
+	{
+		e->e_flags |= EF_HAS8BIT;
+		if (!bitset(MM_PASS8BIT|MM_MIME8BIT, MimeMode) &&
+		    !bitset(EF_IS_MIME, e->e_flags))
+		{
+			e->e_status = "5.6.1";
+			usrerr("554 Eight bit data not allowed");
+		}
+	}
+	else
+	{
+		/* if it claimed to be 8 bits, well, it lied.... */
+		if (e->e_bodytype != NULL &&
+		    strcasecmp(e->e_bodytype, "8BITMIME") == 0)
+			e->e_bodytype = "7BIT";
+	}
+
+	if ((e->e_dfp = fopen(dfname, "r")) == NULL)
+d402 1
+a402 1
+		syserr("Cannot reopen %s", dfname);
+d406 13
+d420 7
+d428 11
+a438 11
+static void
+collecttimeout(timeout)
+	time_t timeout;
+{
+	/* if no progress was made, die now */
+	if (!CollectProgress)
+		longjmp(CtxCollectTimeout, 1);
+
+	/* otherwise reset the timeout */
+	CollectTimeout = setevent(timeout, collecttimeout, timeout);
+	CollectProgress = FALSE;
+a444 1
+**		e -- the current envelope.
+a453 1
+void
+d455 1
+a455 1
+	FILE *volatile tf;
+d458 1
+a458 1
+	setstat(EX_IOERR);
+a460 3
+#if STAT64 > 0
+		struct stat64 st;
+#else
+a461 1
+#endif
+a463 3
+		extern long freediskspace __P((char *, long *));
+
+		e->e_flags |= EF_NO_BODY_RETN;
+d465 4
+a468 9
+		if (
+#if STAT64 > 0
+		    fstat64(fileno(tf), &st) 
+#else
+		    fstat(fileno(tf), &st) 
+#endif
+		    < 0)
+		  st.st_size = 0;
+		(void) freopen(queuename(e, 'd'), "w", tf);
+d472 2
+a473 2
+			fprintf(tf, "\n*** Mail of at least %s bytes could not be accepted\n",
+				quad_to_string(st.st_size));
+d475 2
+a476 2
+			fprintf(tf, "\n*** Mail of at least %lu bytes could not be accepted\n",
+				(unsigned long) st.st_size);
+d479 1
+a479 1
+		avail = freediskspace(QueueDir, &bsize);
+d489 1
+a489 2
+		e->e_status = "4.3.1";
+		usrerr("452 Out of disk space for temp file");
+d492 4
+a495 5
+		syserr("collect: Cannot write tf%s", e->e_id);
+	if (freopen("/dev/null", "w", tf) == NULL)
+		sm_syslog(LOG_ERR, e->e_id,
+			  "tferror: freopen(\"/dev/null\") failed: %s",
+			  errstring(errno));
+a527 1
+void
+d529 1
+a529 1
+	char *volatile fm;
+d568 1
+@
+

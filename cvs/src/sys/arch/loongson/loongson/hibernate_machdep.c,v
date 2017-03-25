@@ -1,0 +1,439 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_6_0:1.8.0.6
+	OPENBSD_6_0_BASE:1.8
+	OPENBSD_5_9:1.8.0.2
+	OPENBSD_5_9_BASE:1.8
+	OPENBSD_5_8:1.8.0.4
+	OPENBSD_5_8_BASE:1.8
+	OPENBSD_5_7:1.7.0.2
+	OPENBSD_5_7_BASE:1.7
+	OPENBSD_5_6:1.7.0.4
+	OPENBSD_5_6_BASE:1.7
+	OPENBSD_5_5:1.3.0.6
+	OPENBSD_5_5_BASE:1.3
+	OPENBSD_5_4:1.3.0.2
+	OPENBSD_5_4_BASE:1.3;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2015.05.05.02.13.46;	author guenther;	state Exp;
+branches;
+next	1.7;
+commitid	dNPv28CJI5BxtRGW;
+
+1.7
+date	2014.07.20.19.47.53;	author deraadt;	state Exp;
+branches;
+next	1.6;
+commitid	ITyy4ODprXXhxf1d;
+
+1.6
+date	2014.07.20.18.05.21;	author mlarkin;	state Exp;
+branches;
+next	1.5;
+commitid	F1K1yInguabWnn54;
+
+1.5
+date	2014.07.09.15.03.12;	author mlarkin;	state Exp;
+branches;
+next	1.4;
+commitid	umg7lvIvVAUp4krC;
+
+1.4
+date	2014.05.31.06.30.16;	author mlarkin;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2013.06.05.01.33.02;	author pirofti;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2013.06.05.01.28.04;	author pirofti;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2013.06.02.21.46.04;	author pirofti;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@emul_native is only used for kernel threads which can't dump core, so
+delete coredump_trad(), uvm_coredump(), cpu_coredump(), struct md_coredump,
+and various #includes that are superfluous.
+
+This leaves compat_linux processes without a coredump callback.  If that
+ability is desired, someone should update it to use coredump_elf32() and
+verify the results...
+
+ok kettenis@@
+@
+text
+@/*	$OpenBSD: hibernate_machdep.c,v 1.7 2014/07/20 19:47:53 deraadt Exp $	*/
+
+/*
+ * Copyright (c) 2013 Paul Irofti.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+
+#include <sys/param.h>
+#include <sys/buf.h>
+#include <sys/conf.h>
+#include <sys/device.h>
+#include <sys/disk.h>
+#include <sys/disklabel.h>
+#include <sys/hibernate.h>
+#include <sys/timeout.h>
+#include <sys/malloc.h>
+
+#include <uvm/uvm_extern.h>
+#include <uvm/uvm_pmemrange.h>
+
+#include <mips64/cache.h>
+
+#include <machine/hibernate.h>
+#include <machine/hibernate_var.h>
+#include <machine/kcore.h>
+#include <machine/pmap.h>
+#include <machine/memconf.h>
+
+#include "wd.h"
+#include "ahci.h"
+#include "softraid.h"
+#include "sd.h"
+
+#if NWD > 0
+#include <dev/ata/atavar.h>
+#include <dev/ata/wdvar.h>
+#endif
+
+/*
+ * Loongson MD Hibernate functions
+ *
+ * see Loongson hibernate.h for lowmem layout used during hibernate
+ */
+
+/*
+ * Returns the hibernate write I/O function to use on this machine
+ */
+hibio_fn
+get_hibernate_io_function(dev_t dev)
+{
+	char *blkname = findblkname(major(dev));
+
+	if (blkname == NULL)
+		return NULL;
+
+#if NWD > 0
+	if (strcmp(blkname, "wd") == 0)
+		return wd_hibernate_io;
+#endif
+#if NSD > 0
+	if (strcmp(blkname, "sd") == 0) {
+		extern struct cfdriver sd_cd;
+		extern int ahci_hibernate_io(dev_t dev, daddr_t blkno,
+		    vaddr_t addr, size_t size, int op, void *page);
+		extern int sr_hibernate_io(dev_t dev, daddr_t blkno,
+		    vaddr_t addr, size_t size, int op, void *page);
+		struct device *dv = disk_lookup(&sd_cd, DISKUNIT(dev));
+
+#if NAHCI > 0
+		if (dv && dv->dv_parent && dv->dv_parent->dv_parent &&
+		    strcmp(dv->dv_parent->dv_parent->dv_cfdata->cf_driver->cd_name,
+		    "ahci") == 0)
+			return ahci_hibernate_io;
+#endif
+#if NSOFTRAID > 0
+		if (dv && dv->dv_parent && dv->dv_parent->dv_parent &&
+		    strcmp(dv->dv_parent->dv_parent->dv_cfdata->cf_driver->cd_name,
+		    "softraid") == 0)
+			return sr_hibernate_io;
+	}
+#endif
+#endif /* NSD > 0 */
+	return NULL;
+}
+
+/*
+ * Gather MD-specific data and store into hiber_info
+ */
+int
+get_hibernate_info_md(union hibernate_info *hiber_info)
+{
+	int i;
+
+	/* Calculate memory ranges */
+	hiber_info->nranges = 0;
+	hiber_info->image_size = 0;
+
+	for (i = 0; i < MAXMEMSEGS && mem_layout[i].mem_last_page != 0; i++) {
+		/* XXX: Adjust for stolen pages later */
+		hiber_info->ranges[i].base =
+		    mem_layout[i].mem_first_page >> PAGE_SHIFT;
+		hiber_info->ranges[i].end =
+		    mem_layout[i].mem_last_page >> PAGE_SHIFT;
+		hiber_info->image_size +=
+		    hiber_info->ranges[i].end - hiber_info->ranges[i].base;
+		hiber_info->nranges++;
+	}
+
+	return (0);
+}
+
+/*
+ * Enter a mapping for va->pa in the resume pagetable
+ */
+void
+hibernate_enter_resume_mapping(vaddr_t va, paddr_t pa, int size)
+{
+	/* XXX TBD */
+}
+
+/*
+ * Create the resume-time page table. This table maps the image(pig) area,
+ * the kernel text area, and various utility pages for use during resume,
+ * since we cannot overwrite the resuming kernel's page table during inflate
+ * and expect things to work properly.
+ */
+void
+hibernate_populate_resume_pt(union hibernate_info *hib_info,
+    paddr_t image_start, paddr_t image_end)
+{
+	/* XXX TBD */
+}
+
+/*
+ * During inflate, certain pages that contain our bookkeeping information
+ * (eg, the chunk table, scratch pages, etc) need to be skipped over and
+ * not inflated into.
+ *
+ * Returns 1 if the physical page at dest should be skipped, 0 otherwise
+ */
+int
+hibernate_inflate_skip(union hibernate_info *hib_info, paddr_t dest)
+{
+	if (dest >= hib_info->piglet_pa &&
+	    dest <= (hib_info->piglet_pa + 4 * HIBERNATE_CHUNK_SIZE))
+		return (1);
+
+	return (0);
+}
+
+void
+hibernate_enable_intr_machdep(void)
+{
+	enableintr();
+}
+
+void
+hibernate_disable_intr_machdep(void)
+{
+	disableintr();
+}
+
+void
+hibernate_flush(void)
+{
+	Mips_SyncCache(curcpu());
+}
+@
+
+
+1.7
+log
+@look up correct dev_t.  This matters for the case where a device is
+underlying softraid.
+ok mlarkin
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hibernate_machdep.c,v 1.6 2014/07/20 18:05:21 mlarkin Exp $	*/
+a28 1
+#include <sys/kcore.h>
+@
+
+
+1.6
+log
+@
+Support hibernating to softraid crypto volumes.
+
+much help and ok from deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hibernate_machdep.c,v 1.5 2014/07/09 15:03:12 mlarkin Exp $	*/
+d80 1
+a80 1
+		struct device *dv;
+a82 1
+		dv = disk_lookup(&sd_cd, DISKUNIT(swdevt[0].sw_dev));
+@
+
+
+1.5
+log
+@
+
+Don't use the suspending kernel's VA mapping for the piglet. It's far
+easier and much less error-prone to just identity map it in the resuming
+kernel as we have more control over the VA space layout there (otherwise
+we are at the mercy of the suspending kernel's placement of the piglet VA).
+
+This diff also increases the size of the piglet to 4 chunks, to avoid an
+overwrite issue seen in m2k14 where the start of the kernel text was
+overwritten with a bounced chunk before unpack.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hibernate_machdep.c,v 1.4 2014/05/31 06:30:16 mlarkin Exp $	*/
+d44 1
+a51 1
+
+d62 1
+a62 1
+get_hibernate_io_function(void)
+d64 1
+a64 1
+	char *blkname = findblkname(major(swdevt[0].sw_dev));
+d73 1
+a73 1
+#if NAHCI > 0 && NSD > 0
+d78 2
+d82 1
+d88 6
+d96 1
+@
+
+
+1.4
+log
+@
+Remove some unused code that we added at the 2013 Toronto hackathon but
+don't need anymore.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hibernate_machdep.c,v 1.3 2013/06/05 01:33:02 pirofti Exp $	*/
+d149 1
+a149 1
+	    dest <= (hib_info->piglet_pa + 3 * HIBERNATE_CHUNK_SIZE))
+@
+
+
+1.3
+log
+@Remove unused variables.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hibernate_machdep.c,v 1.2 2013/06/05 01:28:04 pirofti Exp $	*/
+a135 34
+}
+
+/*
+ * MD-specific resume preparation (creating resume time pagetables,
+ * stacks, etc).
+ */
+void
+hibernate_prepare_resume_machdep(union hibernate_info *hib_info)
+{
+	paddr_t pa, piglet_end;
+	vaddr_t va;
+
+	/*
+	 * At this point, we are sure that the piglet's phys space is going to
+	 * have been unused by the suspending kernel, but the vaddrs used by
+	 * the suspending kernel may or may not be available to us here in the
+	 * resuming kernel, so we allocate a new range of VAs for the piglet.
+	 * Those VAs will be temporary and will cease to exist as soon as we
+	 * switch to the resume PT, so we need to ensure that any VAs required
+	 * during inflate are also entered into that map.
+	 */
+
+        hib_info->piglet_va = (vaddr_t)km_alloc(HIBERNATE_CHUNK_SIZE*3,
+	    &kv_any, &kp_none, &kd_nowait);
+        if (!hib_info->piglet_va)
+                panic("Unable to allocate vaddr for hibernate resume piglet\n");
+
+	piglet_end = hib_info->piglet_pa + HIBERNATE_CHUNK_SIZE*3;
+
+	for (pa = hib_info->piglet_pa,va = hib_info->piglet_va;
+	    pa <= piglet_end; pa += PAGE_SIZE, va += PAGE_SIZE)
+		pmap_kenter_pa(va, pa, VM_PROT_ALL);
+
+	pmap_activate(curproc);
+@
+
+
+1.2
+log
+@Implement hibernate_flush.
+
+Might have to find a better place for the cache.h header but until then
+it will have to do.
+
+Discussed with miod@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hibernate_machdep.c,v 1.1 2013/06/02 21:46:04 pirofti Exp $	*/
+a50 8
+/* Hibernate support */
+void    hibernate_enter_resume_4k_pte(vaddr_t, paddr_t);
+void    hibernate_enter_resume_2m_pde(vaddr_t, paddr_t);
+
+extern	void hibernate_resume_machdep(void);
+extern	void hibernate_flush(void);
+extern	caddr_t start, end;
+extern	struct hibernate_state *hibernate_state;
+@
+
+
+1.1
+log
+@Start working on hibernate support for Loongson
+
+This is work in progress. Nothing to test or play with for now.
+Commiting it now so that I can work on it in-tree.
+
+Okay miod@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d34 2
+d209 5
+@
+

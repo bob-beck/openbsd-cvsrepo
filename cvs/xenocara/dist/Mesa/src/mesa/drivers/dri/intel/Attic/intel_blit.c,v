@@ -1,0 +1,2067 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_5_4:1.5.0.4
+	OPENBSD_5_4_BASE:1.5
+	OPENBSD_5_3:1.5.0.2
+	OPENBSD_5_3_BASE:1.5
+	OPENBSD_5_2:1.4.0.4
+	OPENBSD_5_2_BASE:1.4
+	OPENBSD_5_1_BASE:1.4
+	OPENBSD_5_1:1.4.0.2
+	v7_10_3:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_0:1.3.0.6
+	OPENBSD_5_0_BASE:1.3
+	OPENBSD_4_9:1.3.0.2
+	OPENBSD_4_9_BASE:1.3
+	OPENBSD_4_8:1.3.0.4
+	OPENBSD_4_8_BASE:1.3
+	OPENBSD_4_7:1.2.0.4
+	OPENBSD_4_7_BASE:1.2
+	OPENBSD_4_6:1.2.0.2
+	OPENBSD_4_6_BASE:1.2
+	OPENBSD_4_5:1.1.0.2
+	OPENBSD_4_5_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2013.09.05.14.04.29;	author jsg;	state dead;
+branches;
+next	1.5;
+
+1.5
+date	2012.08.17.13.58.15;	author mpi;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2011.10.23.13.37.39;	author matthieu;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2010.05.22.20.06.19;	author matthieu;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.05.17.20.26.39;	author matthieu;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.11.02.14.58.16;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.10.23.13.29.38;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@Merge Mesa 9.2.0
+@
+text
+@/**************************************************************************
+ * 
+ * Copyright 2003 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * All Rights Reserved.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ * 
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL TUNGSTEN GRAPHICS AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * 
+ **************************************************************************/
+
+
+#include "main/mtypes.h"
+#include "main/context.h"
+#include "main/enums.h"
+#include "main/colormac.h"
+
+#include "intel_blit.h"
+#include "intel_buffers.h"
+#include "intel_context.h"
+#include "intel_fbo.h"
+#include "intel_reg.h"
+#include "intel_regions.h"
+#include "intel_batchbuffer.h"
+#include "intel_mipmap_tree.h"
+
+#define FILE_DEBUG_FLAG DEBUG_BLIT
+
+static GLuint translate_raster_op(GLenum logicop)
+{
+   switch(logicop) {
+   case GL_CLEAR: return 0x00;
+   case GL_AND: return 0x88;
+   case GL_AND_REVERSE: return 0x44;
+   case GL_COPY: return 0xCC;
+   case GL_AND_INVERTED: return 0x22;
+   case GL_NOOP: return 0xAA;
+   case GL_XOR: return 0x66;
+   case GL_OR: return 0xEE;
+   case GL_NOR: return 0x11;
+   case GL_EQUIV: return 0x99;
+   case GL_INVERT: return 0x55;
+   case GL_OR_REVERSE: return 0xDD;
+   case GL_COPY_INVERTED: return 0x33;
+   case GL_OR_INVERTED: return 0xBB;
+   case GL_NAND: return 0x77;
+   case GL_SET: return 0xFF;
+   default: return 0;
+   }
+}
+
+static uint32_t
+br13_for_cpp(int cpp)
+{
+   switch (cpp) {
+   case 4:
+      return BR13_8888;
+      break;
+   case 2:
+      return BR13_565;
+      break;
+   case 1:
+      return BR13_8;
+      break;
+   default:
+      assert(0);
+      return 0;
+   }
+}
+
+/* Copy BitBlt
+ */
+GLboolean
+intelEmitCopyBlit(struct intel_context *intel,
+		  GLuint cpp,
+		  GLshort src_pitch,
+		  drm_intel_bo *src_buffer,
+		  GLuint src_offset,
+		  uint32_t src_tiling,
+		  GLshort dst_pitch,
+		  drm_intel_bo *dst_buffer,
+		  GLuint dst_offset,
+		  uint32_t dst_tiling,
+		  GLshort src_x, GLshort src_y,
+		  GLshort dst_x, GLshort dst_y,
+		  GLshort w, GLshort h,
+		  GLenum logic_op)
+{
+   GLuint CMD, BR13, pass = 0;
+   int dst_y2 = dst_y + h;
+   int dst_x2 = dst_x + w;
+   drm_intel_bo *aper_array[3];
+   BATCH_LOCALS;
+
+   if (dst_tiling != I915_TILING_NONE) {
+      if (dst_offset & 4095)
+	 return GL_FALSE;
+      if (dst_tiling == I915_TILING_Y)
+	 return GL_FALSE;
+   }
+   if (src_tiling != I915_TILING_NONE) {
+      if (src_offset & 4095)
+	 return GL_FALSE;
+      if (src_tiling == I915_TILING_Y)
+	 return GL_FALSE;
+   }
+
+   /* do space check before going any further */
+   do {
+       aper_array[0] = intel->batch.bo;
+       aper_array[1] = dst_buffer;
+       aper_array[2] = src_buffer;
+
+       if (dri_bufmgr_check_aperture_space(aper_array, 3) != 0) {
+           intel_batchbuffer_flush(intel);
+           pass++;
+       } else
+           break;
+   } while (pass < 2);
+
+   if (pass >= 2)
+      return GL_FALSE;
+
+   intel_batchbuffer_require_space(intel, 8 * 4, true);
+   DBG("%s src:buf(%p)/%d+%d %d,%d dst:buf(%p)/%d+%d %d,%d sz:%dx%d\n",
+       __FUNCTION__,
+       src_buffer, src_pitch, src_offset, src_x, src_y,
+       dst_buffer, dst_pitch, dst_offset, dst_x, dst_y, w, h);
+
+   src_pitch *= cpp;
+   dst_pitch *= cpp;
+
+   /* For big formats (such as floating point), do the copy using 32bpp and
+    * multiply the coordinates.
+    */
+   if (cpp > 4) {
+      assert(cpp % 4 == 0);
+      dst_x *= cpp / 4;
+      dst_x2 *= cpp / 4;
+      src_x *= cpp / 4;
+      cpp = 4;
+   }
+
+   BR13 = br13_for_cpp(cpp) | translate_raster_op(logic_op) << 16;
+
+   switch (cpp) {
+   case 1:
+   case 2:
+      CMD = XY_SRC_COPY_BLT_CMD;
+      break;
+   case 4:
+      CMD = XY_SRC_COPY_BLT_CMD | XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+      break;
+   default:
+      return GL_FALSE;
+   }
+
+#ifndef I915
+   if (dst_tiling != I915_TILING_NONE) {
+      CMD |= XY_DST_TILED;
+      dst_pitch /= 4;
+   }
+   if (src_tiling != I915_TILING_NONE) {
+      CMD |= XY_SRC_TILED;
+      src_pitch /= 4;
+   }
+#endif
+
+   if (dst_y2 <= dst_y || dst_x2 <= dst_x) {
+      return GL_TRUE;
+   }
+
+   assert(dst_x < dst_x2);
+   assert(dst_y < dst_y2);
+
+   BEGIN_BATCH_BLT(8);
+   OUT_BATCH(CMD);
+   OUT_BATCH(BR13 | (uint16_t)dst_pitch);
+   OUT_BATCH((dst_y << 16) | dst_x);
+   OUT_BATCH((dst_y2 << 16) | dst_x2);
+   OUT_RELOC_FENCED(dst_buffer,
+		    I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		    dst_offset);
+   OUT_BATCH((src_y << 16) | src_x);
+   OUT_BATCH((uint16_t)src_pitch);
+   OUT_RELOC_FENCED(src_buffer,
+		    I915_GEM_DOMAIN_RENDER, 0,
+		    src_offset);
+   ADVANCE_BATCH();
+
+   intel_batchbuffer_emit_mi_flush(intel);
+
+   return GL_TRUE;
+}
+
+
+/**
+ * Use blitting to clear the renderbuffers named by 'flags'.
+ * Note: we can't use the ctx->DrawBuffer->_ColorDrawBufferIndexes field
+ * since that might include software renderbuffers or renderbuffers
+ * which we're clearing with triangles.
+ * \param mask  bitmask of BUFFER_BIT_* values indicating buffers to clear
+ */
+GLbitfield
+intelClearWithBlit(struct gl_context *ctx, GLbitfield mask)
+{
+   struct intel_context *intel = intel_context(ctx);
+   struct gl_framebuffer *fb = ctx->DrawBuffer;
+   GLuint clear_depth_value, clear_depth_mask;
+   GLboolean all;
+   GLint cx, cy, cw, ch;
+   GLbitfield fail_mask = 0;
+   BATCH_LOCALS;
+
+   /*
+    * Compute values for clearing the buffers.
+    */
+   clear_depth_value = 0;
+   clear_depth_mask = 0;
+   if (mask & BUFFER_BIT_DEPTH) {
+      clear_depth_value = (GLuint) (fb->_DepthMax * ctx->Depth.Clear);
+      clear_depth_mask = XY_BLT_WRITE_RGB;
+   }
+   if (mask & BUFFER_BIT_STENCIL) {
+      clear_depth_value |= (ctx->Stencil.Clear & 0xff) << 24;
+      clear_depth_mask |= XY_BLT_WRITE_ALPHA;
+   }
+
+   cx = fb->_Xmin;
+   if (fb->Name == 0)
+      cy = ctx->DrawBuffer->Height - fb->_Ymax;
+   else
+      cy = fb->_Ymin;
+   cw = fb->_Xmax - fb->_Xmin;
+   ch = fb->_Ymax - fb->_Ymin;
+
+   if (cw == 0 || ch == 0)
+      return 0;
+
+   all = (cw == fb->Width && ch == fb->Height);
+
+   /* Loop over all renderbuffers */
+   mask &= (1 << BUFFER_COUNT) - 1;
+   while (mask) {
+      GLuint buf = _mesa_ffs(mask) - 1;
+      GLboolean is_depth_stencil = buf == BUFFER_DEPTH || buf == BUFFER_STENCIL;
+      struct intel_renderbuffer *irb;
+      drm_intel_bo *write_buffer;
+      int x1, y1, x2, y2;
+      uint32_t clear_val;
+      uint32_t BR13, CMD;
+      int pitch, cpp;
+      drm_intel_bo *aper_array[2];
+
+      mask &= ~(1 << buf);
+
+      irb = intel_get_renderbuffer(fb, buf);
+      if (irb == NULL || irb->region == NULL || irb->region->buffer == NULL) {
+         fail_mask |= 1 << buf;
+         continue;
+      }
+
+      /* OK, clear this renderbuffer */
+      write_buffer = intel_region_buffer(intel, irb->region,
+					 all ? INTEL_WRITE_FULL :
+					 INTEL_WRITE_PART);
+      x1 = cx + irb->draw_x;
+      y1 = cy + irb->draw_y;
+      x2 = cx + cw + irb->draw_x;
+      y2 = cy + ch + irb->draw_y;
+
+      pitch = irb->region->pitch;
+      cpp = irb->region->cpp;
+
+      DBG("%s dst:buf(%p)/%d %d,%d sz:%dx%d\n",
+	  __FUNCTION__,
+	  irb->region->buffer, (pitch * cpp),
+	  x1, y1, x2 - x1, y2 - y1);
+
+      BR13 = 0xf0 << 16;
+      CMD = XY_COLOR_BLT_CMD;
+
+      /* Setup the blit command */
+      if (cpp == 4) {
+	 if (is_depth_stencil) {
+	    CMD |= clear_depth_mask;
+	 } else {
+	    /* clearing RGBA */
+	    CMD |= XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+	 }
+      }
+
+      assert(irb->region->tiling != I915_TILING_Y);
+
+#ifndef I915
+      if (irb->region->tiling != I915_TILING_NONE) {
+	 CMD |= XY_DST_TILED;
+	 pitch /= 4;
+      }
+#endif
+      BR13 |= (pitch * cpp);
+
+      if (is_depth_stencil) {
+	 clear_val = clear_depth_value;
+      } else {
+	 uint8_t clear[4];
+	 GLclampf *color = ctx->Color.ClearColor;
+
+	 CLAMPED_FLOAT_TO_UBYTE(clear[0], color[0]);
+	 CLAMPED_FLOAT_TO_UBYTE(clear[1], color[1]);
+	 CLAMPED_FLOAT_TO_UBYTE(clear[2], color[2]);
+	 CLAMPED_FLOAT_TO_UBYTE(clear[3], color[3]);
+
+	 switch (irb->Base.Format) {
+	 case MESA_FORMAT_ARGB8888:
+	 case MESA_FORMAT_XRGB8888:
+	    clear_val = PACK_COLOR_8888(clear[3], clear[0],
+					clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_RGB565:
+	    clear_val = PACK_COLOR_565(clear[0], clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_ARGB4444:
+	    clear_val = PACK_COLOR_4444(clear[3], clear[0],
+					clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_ARGB1555:
+	    clear_val = PACK_COLOR_1555(clear[3], clear[0],
+					clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_A8:
+	    clear_val = PACK_COLOR_8888(clear[3], clear[3],
+					clear[3], clear[3]);
+	    break;
+	 default:
+	    fail_mask |= 1 << buf;
+	    continue;
+	 }
+      }
+
+      BR13 |= br13_for_cpp(cpp);
+
+      assert(x1 < x2);
+      assert(y1 < y2);
+
+      /* do space check before going any further */
+      aper_array[0] = intel->batch.bo;
+      aper_array[1] = write_buffer;
+
+      if (drm_intel_bufmgr_check_aperture_space(aper_array,
+						ARRAY_SIZE(aper_array)) != 0) {
+	 intel_batchbuffer_flush(intel);
+      }
+
+      BEGIN_BATCH_BLT(6);
+      OUT_BATCH(CMD);
+      OUT_BATCH(BR13);
+      OUT_BATCH((y1 << 16) | x1);
+      OUT_BATCH((y2 << 16) | x2);
+      OUT_RELOC_FENCED(write_buffer,
+		       I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		       0);
+      OUT_BATCH(clear_val);
+      ADVANCE_BATCH();
+
+      if (intel->always_flush_cache)
+	 intel_batchbuffer_emit_mi_flush(intel);
+
+      if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL)
+	 mask &= ~(BUFFER_BIT_DEPTH | BUFFER_BIT_STENCIL);
+   }
+
+   return fail_mask;
+}
+
+GLboolean
+intelEmitImmediateColorExpandBlit(struct intel_context *intel,
+				  GLuint cpp,
+				  GLubyte *src_bits, GLuint src_size,
+				  GLuint fg_color,
+				  GLshort dst_pitch,
+				  drm_intel_bo *dst_buffer,
+				  GLuint dst_offset,
+				  uint32_t dst_tiling,
+				  GLshort x, GLshort y,
+				  GLshort w, GLshort h,
+				  GLenum logic_op)
+{
+   int dwords = ALIGN(src_size, 8) / 4;
+   uint32_t opcode, br13, blit_cmd;
+
+   if (dst_tiling != I915_TILING_NONE) {
+      if (dst_offset & 4095)
+	 return GL_FALSE;
+      if (dst_tiling == I915_TILING_Y)
+	 return GL_FALSE;
+   }
+
+   assert( logic_op - GL_CLEAR >= 0 );
+   assert( logic_op - GL_CLEAR < 0x10 );
+   assert(dst_pitch > 0);
+
+   if (w < 0 || h < 0)
+      return GL_TRUE;
+
+   dst_pitch *= cpp;
+
+   DBG("%s dst:buf(%p)/%d+%d %d,%d sz:%dx%d, %d bytes %d dwords\n",
+       __FUNCTION__,
+       dst_buffer, dst_pitch, dst_offset, x, y, w, h, src_size, dwords);
+
+   intel_batchbuffer_require_space(intel,
+				   (8 * 4) +
+				   (3 * 4) +
+				   dwords * 4, true);
+
+   opcode = XY_SETUP_BLT_CMD;
+   if (cpp == 4)
+      opcode |= XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+#ifndef I915
+   if (dst_tiling != I915_TILING_NONE) {
+      opcode |= XY_DST_TILED;
+      dst_pitch /= 4;
+   }
+#endif
+
+   br13 = dst_pitch | (translate_raster_op(logic_op) << 16) | (1 << 29);
+   br13 |= br13_for_cpp(cpp);
+
+   blit_cmd = XY_TEXT_IMMEDIATE_BLIT_CMD | XY_TEXT_BYTE_PACKED; /* packing? */
+   if (dst_tiling != I915_TILING_NONE)
+      blit_cmd |= XY_DST_TILED;
+
+   BEGIN_BATCH_BLT(8 + 3);
+   OUT_BATCH(opcode);
+   OUT_BATCH(br13);
+   OUT_BATCH((0 << 16) | 0); /* clip x1, y1 */
+   OUT_BATCH((100 << 16) | 100); /* clip x2, y2 */
+   OUT_RELOC_FENCED(dst_buffer,
+		    I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		    dst_offset);
+   OUT_BATCH(0); /* bg */
+   OUT_BATCH(fg_color); /* fg */
+   OUT_BATCH(0); /* pattern base addr */
+
+   OUT_BATCH(blit_cmd | ((3 - 2) + dwords));
+   OUT_BATCH((y << 16) | x);
+   OUT_BATCH(((y + h) << 16) | (x + w));
+   ADVANCE_BATCH();
+
+   intel_batchbuffer_data(intel, src_bits, dwords * 4, true);
+
+   intel_batchbuffer_emit_mi_flush(intel);
+
+   return GL_TRUE;
+}
+
+/* We don't have a memmove-type blit like some other hardware, so we'll do a
+ * rectangular blit covering a large space, then emit 1-scanline blit at the
+ * end to cover the last if we need.
+ */
+void
+intel_emit_linear_blit(struct intel_context *intel,
+		       drm_intel_bo *dst_bo,
+		       unsigned int dst_offset,
+		       drm_intel_bo *src_bo,
+		       unsigned int src_offset,
+		       unsigned int size)
+{
+   GLuint pitch, height;
+   GLboolean ok;
+
+   /* The pitch given to the GPU must be DWORD aligned, and
+    * we want width to match pitch. Max width is (1 << 15 - 1),
+    * rounding that down to the nearest DWORD is 1 << 15 - 4
+    */
+   pitch = MIN2(size, (1 << 15) - 4);
+   height = size / pitch;
+   ok = intelEmitCopyBlit(intel, 1,
+			  pitch, src_bo, src_offset, I915_TILING_NONE,
+			  pitch, dst_bo, dst_offset, I915_TILING_NONE,
+			  0, 0, /* src x/y */
+			  0, 0, /* dst x/y */
+			  pitch, height, /* w, h */
+			  GL_COPY);
+   assert(ok);
+
+   src_offset += pitch * height;
+   dst_offset += pitch * height;
+   size -= pitch * height;
+   assert (size < (1 << 15));
+   assert ((size & 3) == 0); /* Pitch must be DWORD aligned */
+   if (size != 0) {
+      ok = intelEmitCopyBlit(intel, 1,
+			     size, src_bo, src_offset, I915_TILING_NONE,
+			     size, dst_bo, dst_offset, I915_TILING_NONE,
+			     0, 0, /* src x/y */
+			     0, 0, /* dst x/y */
+			     size, 1, /* w, h */
+			     GL_COPY);
+      assert(ok);
+   }
+}
+
+/**
+ * Used to initialize the alpha value of an ARGB8888 teximage after
+ * loading it from an XRGB8888 source.
+ *
+ * This is very common with glCopyTexImage2D().
+ */
+void
+intel_set_teximage_alpha_to_one(struct gl_context *ctx,
+				struct intel_texture_image *intel_image)
+{
+   struct intel_context *intel = intel_context(ctx);
+   unsigned int image_x, image_y;
+   uint32_t x1, y1, x2, y2;
+   uint32_t BR13, CMD;
+   int pitch, cpp;
+   drm_intel_bo *aper_array[2];
+   struct intel_region *region = intel_image->mt->region;
+   BATCH_LOCALS;
+
+   assert(intel_image->base.TexFormat == MESA_FORMAT_ARGB8888);
+
+   /* get dest x/y in destination texture */
+   intel_miptree_get_image_offset(intel_image->mt,
+				  intel_image->level,
+				  intel_image->face,
+				  0,
+				  &image_x, &image_y);
+
+   x1 = image_x;
+   y1 = image_y;
+   x2 = image_x + intel_image->base.Width;
+   y2 = image_y + intel_image->base.Height;
+
+   pitch = region->pitch;
+   cpp = region->cpp;
+
+   DBG("%s dst:buf(%p)/%d %d,%d sz:%dx%d\n",
+       __FUNCTION__,
+       intel_image->mt->region->buffer, (pitch * cpp),
+       x1, y1, x2 - x1, y2 - y1);
+
+   BR13 = br13_for_cpp(cpp) | 0xf0 << 16;
+   CMD = XY_COLOR_BLT_CMD;
+   CMD |= XY_BLT_WRITE_ALPHA;
+
+   assert(region->tiling != I915_TILING_Y);
+
+#ifndef I915
+   if (region->tiling != I915_TILING_NONE) {
+      CMD |= XY_DST_TILED;
+      pitch /= 4;
+   }
+#endif
+   BR13 |= (pitch * cpp);
+
+   /* do space check before going any further */
+   aper_array[0] = intel->batch.bo;
+   aper_array[1] = region->buffer;
+
+   if (drm_intel_bufmgr_check_aperture_space(aper_array,
+					     ARRAY_SIZE(aper_array)) != 0) {
+      intel_batchbuffer_flush(intel);
+   }
+
+   BEGIN_BATCH_BLT(6);
+   OUT_BATCH(CMD);
+   OUT_BATCH(BR13);
+   OUT_BATCH((y1 << 16) | x1);
+   OUT_BATCH((y2 << 16) | x2);
+   OUT_RELOC_FENCED(region->buffer,
+		    I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		    0);
+   OUT_BATCH(0xffffffff); /* white, but only alpha gets written */
+   ADVANCE_BATCH();
+
+   intel_batchbuffer_emit_mi_flush(intel);
+}
+@
+
+
+1.5
+log
+@Upate to libGL 7.11.2
+
+Tested by jsg@@, matthieu@@ and ajacoutot@@, ok mattieu@@
+@
+text
+@@
+
+
+1.4
+log
+@Merge Mesa 7.10.3
+@
+text
+@a40 1
+#include "intel_tex.h"
+d126 1
+a126 1
+       aper_array[0] = intel->batch->buf;
+d131 1
+a131 1
+           intel_batchbuffer_flush(intel->batch);
+d140 1
+a140 1
+   intel_batchbuffer_require_space(intel->batch, 8 * 4, true);
+d149 11
+d207 1
+a207 1
+   intel_batchbuffer_emit_mi_flush(intel->batch);
+d225 1
+a225 1
+   GLuint clear_depth;
+d234 2
+a235 1
+   clear_depth = 0;
+d237 2
+a238 1
+      clear_depth = (GLuint) (fb->_DepthMax * ctx->Depth.Clear);
+d241 2
+a242 1
+      clear_depth |= (ctx->Stencil.Clear & 0xff) << 24;
+a255 1
+   GLuint buf;
+d259 4
+a262 2
+   for (buf = 0; buf < BUFFER_COUNT && mask; buf++) {
+      const GLbitfield bufBit = 1 << buf;
+d271 7
+a277 2
+      if (!(mask & bufBit))
+	 continue;
+a279 1
+      irb = intel_get_renderbuffer(fb, buf);
+d283 4
+a286 4
+      x1 = cx + irb->region->draw_x;
+      y1 = cy + irb->region->draw_y;
+      x2 = cx + cw + irb->region->draw_x;
+      y2 = cy + ch + irb->region->draw_y;
+d296 1
+a296 1
+      BR13 = br13_for_cpp(cpp) | 0xf0 << 16;
+d301 2
+a302 5
+	 if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL) {
+	    if (mask & BUFFER_BIT_DEPTH)
+	       CMD |= XY_BLT_WRITE_RGB;
+	    if (mask & BUFFER_BIT_STENCIL)
+	       CMD |= XY_BLT_WRITE_ALPHA;
+d319 2
+a320 2
+      if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL) {
+	 clear_val = clear_depth;
+d352 1
+a352 2
+	    fail_mask |= bufBit;
+	    mask &= ~bufBit;
+d357 2
+d363 1
+a363 1
+      aper_array[0] = intel->batch->buf;
+d368 1
+a368 1
+	 intel_batchbuffer_flush(intel->batch);
+d383 1
+a383 1
+	 intel_batchbuffer_emit_mi_flush(intel->batch);
+a386 2
+      else
+	 mask &= ~bufBit;    /* turn off bit, for faster loop exit */
+d428 4
+a431 4
+   intel_batchbuffer_require_space( intel->batch,
+				    (8 * 4) +
+				    (3 * 4) +
+				    dwords * 4, true);
+d467 1
+a467 3
+   intel_batchbuffer_data(intel->batch,
+			  src_bits,
+			  dwords * 4, true);
+d469 1
+a469 1
+   intel_batchbuffer_emit_mi_flush(intel->batch);
+d559 1
+a559 1
+       intel_image->mt->region->buffer, (pitch * region->cpp),
+d562 1
+a562 1
+   BR13 = br13_for_cpp(region->cpp) | 0xf0 << 16;
+d574 1
+a574 1
+   BR13 |= (pitch * region->cpp);
+d577 1
+a577 1
+   aper_array[0] = intel->batch->buf;
+d582 1
+a582 1
+      intel_batchbuffer_flush(intel->batch);
+d596 1
+a596 1
+   intel_batchbuffer_emit_mi_flush(intel->batch);
+@
+
+
+1.3
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@d41 2
+d69 18
+d94 1
+a94 1
+		  dri_bo *src_buffer,
+d98 1
+a98 1
+		  dri_bo *dst_buffer,
+d109 1
+a109 1
+   dri_bo *aper_array[3];
+a111 4
+   /* Blits are in a different ringbuffer so we don't use them. */
+   if (intel->gen >= 6)
+      return GL_FALSE;
+
+d138 2
+a139 16
+   if (pass >= 2) {
+      drm_intel_gem_bo_map_gtt(dst_buffer);
+      drm_intel_gem_bo_map_gtt(src_buffer);
+      _mesa_copy_rect((GLubyte *)dst_buffer->virtual + dst_offset,
+		      cpp,
+		      dst_pitch,
+		      dst_x, dst_y,
+		      w, h,
+		      (GLubyte *)src_buffer->virtual + src_offset,
+		      src_pitch,
+		      src_x, src_y);
+      drm_intel_gem_bo_unmap_gtt(src_buffer);
+      drm_intel_gem_bo_unmap_gtt(dst_buffer);
+
+      return GL_TRUE;
+   }
+d141 1
+a141 1
+   intel_batchbuffer_require_space(intel->batch, 8 * 4);
+d150 1
+a150 1
+   BR13 = translate_raster_op(logic_op) << 16;
+a153 2
+      CMD = XY_SRC_COPY_BLT_CMD;
+      break;
+a154 1
+      BR13 |= BR13_565;
+a157 1
+      BR13 |= BR13_8888;
+d182 1
+a182 1
+   BEGIN_BATCH(8);
+d210 2
+a211 2
+void
+intelClearWithBlit(GLcontext *ctx, GLbitfield mask)
+d218 1
+a220 3
+   /* Blits are in a different ringbuffer so we don't use them. */
+   assert(intel->gen < 6);
+
+d241 1
+a241 1
+      return;
+d278 1
+a278 1
+      BR13 = 0xf0 << 16;
+a282 1
+	 BR13 |= BR13_8888;
+a291 3
+      } else {
+	 ASSERT(cpp == 2);
+	 BR13 |= BR13_565;
+d332 4
+d337 3
+a339 3
+	    _mesa_problem(ctx, "Unexpected renderbuffer format: %d\n",
+			  irb->Base.Format);
+	    clear_val = 0;
+d355 1
+a355 1
+      BEGIN_BATCH(6);
+d366 3
+d374 2
+d384 1
+a384 1
+				  dri_bo *dst_buffer,
+a393 4
+   /* Blits are in a different ringbuffer so we don't use them. */
+   if (intel->gen >= 6)
+      return GL_FALSE;
+
+d417 1
+a417 1
+				    dwords * 4 );
+d430 1
+a430 4
+   if (cpp == 2)
+      br13 |= BR13_565;
+   else
+      br13 |= BR13_8888;
+d436 1
+a436 1
+   BEGIN_BATCH(8 + 3);
+d453 3
+a455 3
+   intel_batchbuffer_data( intel->batch,
+			   src_bits,
+			   dwords * 4 );
+d475 1
+d477 5
+a481 5
+   /* Blits are in a different ringbuffer so we don't use them. */
+   assert(intel->gen < 6);
+
+   /* The pitch is a signed value. */
+   pitch = MIN2(size, (1 << 15) - 1);
+d483 8
+a490 7
+   intelEmitCopyBlit(intel, 1,
+		     pitch, src_bo, src_offset, I915_TILING_NONE,
+		     pitch, dst_bo, dst_offset, I915_TILING_NONE,
+		     0, 0, /* src x/y */
+		     0, 0, /* dst x/y */
+		     pitch, height, /* w, h */
+		     GL_COPY);
+d496 1
+d498 8
+a505 7
+      intelEmitCopyBlit(intel, 1,
+			size, src_bo, src_offset, I915_TILING_NONE,
+			size, dst_bo, dst_offset, I915_TILING_NONE,
+			0, 0, /* src x/y */
+			0, 0, /* dst x/y */
+			size, 1, /* w, h */
+			GL_COPY);
+d507 78
+@
+
+
+1.2
+log
+@Update to Mesa 7.4.2. Tested by oga@@, ckuethe@@ and naddy@@.
+@
+text
+@a28 3
+#include <stdio.h>
+#include <errno.h>
+
+d32 1
+a40 1
+#include "intel_chipset.h"
+a43 187
+/**
+ * Copy the back color buffer to the front color buffer. 
+ * Used for SwapBuffers().
+ */
+void
+intelCopyBuffer(const __DRIdrawablePrivate * dPriv,
+                const drm_clip_rect_t * rect)
+{
+
+   struct intel_context *intel;
+   const intelScreenPrivate *intelScreen;
+
+   DBG("%s\n", __FUNCTION__);
+
+   assert(dPriv);
+
+   intel = intelScreenContext(dPriv->driScreenPriv->private);
+   if (!intel)
+      return;
+
+   intelScreen = intel->intelScreen;
+
+   /* The LOCK_HARDWARE is required for the cliprects.  Buffer offsets
+    * should work regardless.
+    */
+   LOCK_HARDWARE(intel);
+
+   if (dPriv && dPriv->numClipRects) {
+      struct intel_framebuffer *intel_fb = dPriv->driverPrivate;
+      struct intel_region *src, *dst;
+      int nbox = dPriv->numClipRects;
+      drm_clip_rect_t *pbox = dPriv->pClipRects;
+      int cpp;
+      int src_pitch, dst_pitch;
+      unsigned short src_x, src_y;
+      int BR13, CMD;
+      int i;
+      dri_bo *aper_array[3];
+
+      src = intel_get_rb_region(&intel_fb->Base, BUFFER_BACK_LEFT);
+      dst = intel_get_rb_region(&intel_fb->Base, BUFFER_FRONT_LEFT);
+
+      src_pitch = src->pitch * src->cpp;
+      dst_pitch = dst->pitch * dst->cpp;
+
+      cpp = src->cpp;
+
+      ASSERT(intel_fb);
+      ASSERT(intel_fb->Base.Name == 0);    /* Not a user-created FBO */
+      ASSERT(src);
+      ASSERT(dst);
+      ASSERT(src->cpp == dst->cpp);
+
+      if (cpp == 2) {
+	 BR13 = (0xCC << 16) | (1 << 24);
+	 CMD = XY_SRC_COPY_BLT_CMD;
+      }
+      else {
+	 BR13 = (0xCC << 16) | (1 << 24) | (1 << 25);
+	 CMD = XY_SRC_COPY_BLT_CMD | XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+      }
+
+#ifndef I915
+      if (src->tiling != I915_TILING_NONE) {
+	 CMD |= XY_SRC_TILED;
+	 src_pitch /= 4;
+      }
+      if (dst->tiling != I915_TILING_NONE) {
+	 CMD |= XY_DST_TILED;
+	 dst_pitch /= 4;
+      }
+#endif
+      /* do space/cliprects check before going any further */
+      intel_batchbuffer_require_space(intel->batch, 8 * 4,
+				      REFERENCES_CLIPRECTS);
+   again:
+      aper_array[0] = intel->batch->buf;
+      aper_array[1] = dst->buffer;
+      aper_array[2] = src->buffer;
+
+      if (dri_bufmgr_check_aperture_space(aper_array, 3) != 0) {
+	intel_batchbuffer_flush(intel->batch);
+	goto again;
+      }
+
+      for (i = 0; i < nbox; i++, pbox++) {
+	 drm_clip_rect_t box = *pbox;
+
+	 if (rect) {
+	    if (!intel_intersect_cliprects(&box, &box, rect))
+	       continue;
+	 }
+
+	 if (box.x1 >= box.x2 ||
+	     box.y1 >= box.y2)
+	    continue;
+
+	 assert(box.x1 < box.x2);
+	 assert(box.y1 < box.y2);
+	 src_x = box.x1 - dPriv->x + dPriv->backX;
+	 src_y = box.y1 - dPriv->y + dPriv->backY;
+
+	 BEGIN_BATCH(8, REFERENCES_CLIPRECTS);
+	 OUT_BATCH(CMD);
+	 OUT_BATCH(BR13 | dst_pitch);
+	 OUT_BATCH((box.y1 << 16) | box.x1);
+	 OUT_BATCH((box.y2 << 16) | box.x2);
+
+	 OUT_RELOC(dst->buffer,
+		   I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		   0);
+	 OUT_BATCH((src_y << 16) | src_x);
+	 OUT_BATCH(src_pitch);
+	 OUT_RELOC(src->buffer,
+		   I915_GEM_DOMAIN_RENDER, 0,
+		   0);
+	 ADVANCE_BATCH();
+      }
+
+      /* Flush the rendering and the batch so that the results all land on the
+       * screen in a timely fashion.
+       */
+      intel_batchbuffer_emit_mi_flush(intel->batch);
+      intel_batchbuffer_flush(intel->batch);
+   }
+
+   UNLOCK_HARDWARE(intel);
+}
+
+
+
+
+void
+intelEmitFillBlit(struct intel_context *intel,
+		  GLuint cpp,
+		  GLshort dst_pitch,
+		  dri_bo *dst_buffer,
+		  GLuint dst_offset,
+		  uint32_t dst_tiling,
+		  GLshort x, GLshort y,
+		  GLshort w, GLshort h,
+		  GLuint color)
+{
+   GLuint BR13, CMD;
+   BATCH_LOCALS;
+
+   dst_pitch *= cpp;
+
+   switch (cpp) {
+   case 1:
+   case 2:
+   case 3:
+      BR13 = (0xF0 << 16) | (1 << 24);
+      CMD = XY_COLOR_BLT_CMD;
+      break;
+   case 4:
+      BR13 = (0xF0 << 16) | (1 << 24) | (1 << 25);
+      CMD = XY_COLOR_BLT_CMD | XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+      break;
+   default:
+      return;
+   }
+#ifndef I915
+   if (dst_tiling != I915_TILING_NONE) {
+      CMD |= XY_DST_TILED;
+      dst_pitch /= 4;
+   }
+#endif
+
+   DBG("%s dst:buf(%p)/%d+%d %d,%d sz:%dx%d\n",
+       __FUNCTION__, dst_buffer, dst_pitch, dst_offset, x, y, w, h);
+
+   assert(w > 0);
+   assert(h > 0);
+
+   BEGIN_BATCH(6, NO_LOOP_CLIPRECTS);
+   OUT_BATCH(CMD);
+   OUT_BATCH(BR13 | dst_pitch);
+   OUT_BATCH((y << 16) | x);
+   OUT_BATCH(((y + h) << 16) | (x + w));
+   OUT_RELOC(dst_buffer,
+	     I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+	     dst_offset);
+   OUT_BATCH(color);
+   ADVANCE_BATCH();
+}
+
+d70 1
+a70 1
+void
+d92 18
+a109 1
+   /* do space/cliprects check before going any further */
+d123 12
+a134 22
+       GLboolean locked = GL_FALSE;       
+       if (!intel->locked) {
+           LOCK_HARDWARE(intel);
+           locked = GL_TRUE;
+       }
+
+       dri_bo_map(dst_buffer, GL_TRUE);
+       dri_bo_map(src_buffer, GL_FALSE);
+       _mesa_copy_rect((GLubyte *)dst_buffer->virtual + dst_offset,
+                       cpp,
+                       dst_pitch,
+                       dst_x, dst_y, 
+                       w, h, 
+                       (GLubyte *)src_buffer->virtual + src_offset, 
+                       src_pitch,
+                       src_x, src_y);
+       
+       dri_bo_unmap(src_buffer);
+       dri_bo_unmap(dst_buffer);
+       
+       if (locked)
+           UNLOCK_HARDWARE(intel);
+d136 1
+a136 1
+       return;
+d139 1
+a139 1
+   intel_batchbuffer_require_space(intel->batch, 8 * 4, NO_LOOP_CLIPRECTS);
+d155 1
+a155 2
+   case 3:
+      BR13 |= (1 << 24);
+d159 1
+a159 1
+      BR13 |= (1 << 24) | (1 << 25);
+d163 1
+a163 1
+      return;
+d178 1
+a178 1
+      return;
+d184 1
+a184 1
+   BEGIN_BATCH(8, NO_LOOP_CLIPRECTS);
+d189 3
+a191 3
+   OUT_RELOC(dst_buffer,
+	     I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+	     dst_offset);
+d194 3
+a196 3
+   OUT_RELOC(src_buffer,
+	     I915_GEM_DOMAIN_RENDER, 0,
+	     src_offset);
+d200 2
+d218 2
+a219 4
+   GLbitfield skipBuffers = 0;
+   unsigned int num_cliprects;
+   struct drm_clip_rect *cliprects;
+   int x_off, y_off;
+d222 3
+d236 10
+a245 6
+   /* If clearing both depth and stencil, skip BUFFER_BIT_STENCIL in
+    * the loop below.
+    */
+   if ((mask & BUFFER_BIT_DEPTH) && (mask & BUFFER_BIT_STENCIL)) {
+      skipBuffers = BUFFER_BIT_STENCIL;
+   }
+d247 2
+a248 9
+   /* XXX Move this flush/lock into the following conditional? */
+   intelFlush(&intel->ctx);
+   LOCK_HARDWARE(intel);
+
+   intel_get_cliprects(intel, &cliprects, &num_cliprects, &x_off, &y_off);
+   if (num_cliprects) {
+      GLint cx, cy, cw, ch;
+      drm_clip_rect_t clear;
+      int i;
+d250 31
+a280 5
+      /* Get clear bounds after locking */
+      cx = fb->_Xmin;
+      cy = fb->_Ymin;
+      cw = fb->_Xmax - cx;
+      ch = fb->_Ymax - cy;
+d282 2
+a283 2
+      if (fb->Name == 0) {
+         /* clearing a window */
+d285 15
+a299 15
+         /* flip top to bottom */
+         clear.x1 = cx + x_off;
+         clear.y1 = intel->driDrawable->y + intel->driDrawable->h - cy - ch;
+         clear.x2 = clear.x1 + cw;
+         clear.y2 = clear.y1 + ch;
+      }
+      else {
+         /* clearing FBO */
+         assert(num_cliprects == 1);
+         assert(cliprects == &intel->fboRect);
+         clear.x1 = cx;
+         clear.y1 = cy;
+         clear.x2 = clear.x1 + cw;
+         clear.y2 = clear.y1 + ch;
+         /* no change to mask */
+d302 1
+a302 69
+      for (i = 0; i < num_cliprects; i++) {
+         const drm_clip_rect_t *box = &cliprects[i];
+         drm_clip_rect_t b;
+         GLuint buf;
+         GLuint clearMask = mask;      /* use copy, since we modify it below */
+         GLboolean all = (cw == fb->Width && ch == fb->Height);
+
+         if (!all) {
+            intel_intersect_cliprects(&b, &clear, box);
+         }
+         else {
+            b = *box;
+         }
+
+         if (b.x1 >= b.x2 || b.y1 >= b.y2)
+            continue;
+
+         if (0)
+            _mesa_printf("clear %d,%d..%d,%d, mask %x\n",
+                         b.x1, b.y1, b.x2, b.y2, mask);
+
+         /* Loop over all renderbuffers */
+         for (buf = 0; buf < BUFFER_COUNT && clearMask; buf++) {
+            const GLbitfield bufBit = 1 << buf;
+            if ((clearMask & bufBit) && !(bufBit & skipBuffers)) {
+               /* OK, clear this renderbuffer */
+               struct intel_region *irb_region =
+		  intel_get_rb_region(fb, buf);
+               dri_bo *write_buffer =
+                  intel_region_buffer(intel, irb_region,
+                                      all ? INTEL_WRITE_FULL :
+                                      INTEL_WRITE_PART);
+
+               GLuint clearVal;
+               GLint pitch, cpp;
+               GLuint BR13, CMD;
+
+               ASSERT(irb_region);
+
+               pitch = irb_region->pitch;
+               cpp = irb_region->cpp;
+
+               DBG("%s dst:buf(%p)/%d+%d %d,%d sz:%dx%d\n",
+                   __FUNCTION__,
+                   irb_region->buffer, (pitch * cpp),
+                   irb_region->draw_offset,
+                   b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+
+	       BR13 = 0xf0 << 16;
+	       CMD = XY_COLOR_BLT_CMD;
+
+               /* Setup the blit command */
+               if (cpp == 4) {
+                  BR13 |= (1 << 24) | (1 << 25);
+                  if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL) {
+                     if (clearMask & BUFFER_BIT_DEPTH)
+                        CMD |= XY_BLT_WRITE_RGB;
+                     if (clearMask & BUFFER_BIT_STENCIL)
+                        CMD |= XY_BLT_WRITE_ALPHA;
+                  }
+                  else {
+                     /* clearing RGBA */
+                     CMD |= XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+                  }
+               }
+               else {
+                  ASSERT(cpp == 2 || cpp == 0);
+                  BR13 |= (1 << 24);
+               }
+d305 4
+a308 4
+	       if (irb_region->tiling != I915_TILING_NONE) {
+		  CMD |= XY_DST_TILED;
+		  pitch /= 4;
+	       }
+d310 1
+a310 1
+	       BR13 |= (pitch * cpp);
+d312 33
+a344 28
+               if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL) {
+                  clearVal = clear_depth;
+               }
+               else {
+                  clearVal = (cpp == 4)
+                     ? intel->ClearColor8888 : intel->ClearColor565;
+               }
+               /*
+                  _mesa_debug(ctx, "hardware blit clear buf %d rb id %d\n",
+                  buf, irb->Base.Name);
+                */
+
+               assert(b.x1 < b.x2);
+               assert(b.y1 < b.y2);
+
+               BEGIN_BATCH(6, REFERENCES_CLIPRECTS);
+               OUT_BATCH(CMD);
+               OUT_BATCH(BR13);
+               OUT_BATCH((b.y1 << 16) | b.x1);
+               OUT_BATCH((b.y2 << 16) | b.x2);
+               OUT_RELOC(write_buffer,
+			 I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+                         irb_region->draw_offset);
+               OUT_BATCH(clearVal);
+               ADVANCE_BATCH();
+               clearMask &= ~bufBit;    /* turn off bit, for faster loop exit */
+            }
+         }
+d346 28
+a373 1
+      intel_batchbuffer_emit_mi_flush(intel->batch);
+a374 2
+
+   UNLOCK_HARDWARE(intel);
+d377 1
+a377 1
+void
+d393 11
+d406 1
+d409 1
+a409 1
+      return;
+d420 1
+a420 2
+				    dwords * 4,
+				    REFERENCES_CLIPRECTS );
+d442 1
+a442 1
+   BEGIN_BATCH(8 + 3, REFERENCES_CLIPRECTS);
+d447 3
+a449 3
+   OUT_RELOC(dst_buffer,
+	     I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+	     dst_offset);
+d461 1
+a461 2
+			   dwords * 4,
+			   REFERENCES_CLIPRECTS );
+d464 45
+@
+
+
+1.1
+log
+@Mesa 7.2, Tested by ckuethe@@, naddy@@, oga@@, and others.
+@
+text
+@d32 3
+a34 3
+#include "mtypes.h"
+#include "context.h"
+#include "enums.h"
+a35 1
+#include "intel_batchbuffer.h"
+d42 2
+a57 1
+   int ret;
+a68 8
+   if (intel->last_swap_fence) {
+      dri_fence_wait(intel->last_swap_fence);
+      dri_fence_unreference(intel->last_swap_fence);
+      intel->last_swap_fence = NULL;
+   }
+   intel->last_swap_fence = intel->first_swap_fence;
+   intel->first_swap_fence = NULL;
+
+d84 1
+d110 1
+a110 1
+      if (src->tiled) {
+d114 1
+a114 1
+      if (dst->tiled) {
+d120 2
+a121 1
+      intel_batchbuffer_require_space(intel->batch, 8 * 4, REFERENCES_CLIPRECTS);
+d123 5
+a127 4
+      ret = dri_bufmgr_check_aperture_space(dst->buffer);
+      ret |= dri_bufmgr_check_aperture_space(src->buffer);
+      
+      if (ret) {
+d131 1
+a131 1
+      
+d155 3
+a157 1
+	 OUT_RELOC(dst->buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_WRITE, 0);
+d160 3
+a162 1
+	 OUT_RELOC(src->buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_READ, 0);
+d166 4
+a169 2
+      if (intel->first_swap_fence)
+	 dri_fence_unreference(intel->first_swap_fence);
+a170 3
+      intel->first_swap_fence = intel->batch->last_fence;
+      if (intel->first_swap_fence)
+	 dri_fence_reference(intel->first_swap_fence);
+d185 1
+a185 1
+		  GLboolean dst_tiled,
+d210 1
+a210 1
+   if (dst_tiled) {
+d227 3
+a229 1
+   OUT_RELOC(dst_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_WRITE, dst_offset);
+d266 1
+a266 1
+		  GLboolean src_tiled,
+d270 1
+a270 1
+		  GLboolean dst_tiled,
+d276 1
+a276 1
+   GLuint CMD, BR13;
+d279 1
+a279 1
+   int ret;
+d283 37
+a319 7
+   intel_batchbuffer_require_space(intel->batch, 8 * 4, NO_LOOP_CLIPRECTS);
+ again:
+   ret = dri_bufmgr_check_aperture_space(dst_buffer);
+   ret |= dri_bufmgr_check_aperture_space(src_buffer);
+   if (ret) {
+     intel_batchbuffer_flush(intel->batch);
+     goto again;
+d322 1
+d335 2
+d351 1
+a351 1
+   if (dst_tiled) {
+d355 1
+a355 1
+   if (src_tiled) {
+d365 19
+a383 41
+   /* Initial y values don't seem to work with negative pitches.  If
+    * we adjust the offsets manually (below), it seems to work fine.
+    *
+    * On the other hand, if we always adjust, the hardware doesn't
+    * know which blit directions to use, so overlapping copypixels get
+    * the wrong result.
+    */
+   if (dst_pitch > 0 && src_pitch > 0) {
+      assert(dst_x < dst_x2);
+      assert(dst_y < dst_y2);
+
+      BEGIN_BATCH(8, NO_LOOP_CLIPRECTS);
+      OUT_BATCH(CMD);
+      OUT_BATCH(BR13 | dst_pitch);
+      OUT_BATCH((dst_y << 16) | dst_x);
+      OUT_BATCH((dst_y2 << 16) | dst_x2);
+      OUT_RELOC(dst_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_WRITE,
+		dst_offset);
+      OUT_BATCH((src_y << 16) | src_x);
+      OUT_BATCH(src_pitch);
+      OUT_RELOC(src_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_READ,
+		src_offset);
+      ADVANCE_BATCH();
+   }
+   else {
+      assert(dst_x < dst_x2);
+      assert(h > 0);
+
+      BEGIN_BATCH(8, NO_LOOP_CLIPRECTS);
+      OUT_BATCH(CMD);
+      OUT_BATCH(BR13 | ((uint16_t)dst_pitch));
+      OUT_BATCH((0 << 16) | dst_x);
+      OUT_BATCH((h << 16) | dst_x2);
+      OUT_RELOC(dst_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_WRITE,
+		dst_offset + dst_y * dst_pitch);
+      OUT_BATCH((0 << 16) | src_x);
+      OUT_BATCH(src_pitch);
+      OUT_RELOC(src_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_READ,
+		src_offset + src_y * src_pitch);
+      ADVANCE_BATCH();
+   }
+d401 3
+d428 2
+a429 1
+   if (intel->numClipRects) {
+d444 1
+a444 1
+         clear.x1 = cx + intel->drawX;
+d451 2
+a452 2
+         assert(intel->numClipRects == 1);
+         assert(intel->pClipRects == &intel->fboRect);
+d460 2
+a461 2
+      for (i = 0; i < intel->numClipRects; i++) {
+         const drm_clip_rect_t *box = &intel->pClipRects[i];
+d531 1
+a531 1
+	       if (irb_region->tiled) {
+a548 1
+	       intel_wait_flips(intel);
+d558 2
+a559 1
+               OUT_RELOC(write_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_WRITE,
+d567 1
+a567 1
+      intel_batchbuffer_flush(intel->batch);
+d581 1
+a581 1
+				  GLboolean dst_tiled,
+d604 2
+a605 2
+				    dwords,
+				    NO_LOOP_CLIPRECTS );
+d611 1
+a611 1
+   if (dst_tiled) {
+d624 1
+a624 1
+   if (dst_tiled)
+d627 1
+a627 1
+   BEGIN_BATCH(8 + 3, NO_LOOP_CLIPRECTS);
+d632 3
+a634 1
+   OUT_RELOC(dst_buffer, DRM_BO_FLAG_MEM_TT | DRM_BO_FLAG_WRITE, dst_offset);
+d647 3
+a649 1
+			   NO_LOOP_CLIPRECTS );
+@
+
+
+1.1.1.1
+log
+@Import Mesa 7.10.3
+@
+text
+@d29 2
+a30 4
+#include "main/mtypes.h"
+#include "main/context.h"
+#include "main/enums.h"
+#include "main/colormac.h"
+d32 5
+a42 3
+#include "intel_batchbuffer.h"
+#include "intel_tex.h"
+#include "intel_mipmap_tree.h"
+d46 188
+a256 18
+static uint32_t
+br13_for_cpp(int cpp)
+{
+   switch (cpp) {
+   case 4:
+      return BR13_8888;
+      break;
+   case 2:
+      return BR13_565;
+      break;
+   case 1:
+      return BR13_8;
+      break;
+   default:
+      assert(0);
+      return 0;
+   }
+}
+d260 1
+a260 1
+GLboolean
+d264 1
+a264 1
+		  drm_intel_bo *src_buffer,
+d266 1
+a266 1
+		  uint32_t src_tiling,
+d268 1
+a268 1
+		  drm_intel_bo *dst_buffer,
+d270 1
+a270 1
+		  uint32_t dst_tiling,
+d276 1
+a276 1
+   GLuint CMD, BR13, pass = 0;
+d279 1
+a279 1
+   drm_intel_bo *aper_array[3];
+d282 9
+a290 25
+   if (dst_tiling != I915_TILING_NONE) {
+      if (dst_offset & 4095)
+	 return GL_FALSE;
+      if (dst_tiling == I915_TILING_Y)
+	 return GL_FALSE;
+   }
+   if (src_tiling != I915_TILING_NONE) {
+      if (src_offset & 4095)
+	 return GL_FALSE;
+      if (src_tiling == I915_TILING_Y)
+	 return GL_FALSE;
+   }
+
+   /* do space check before going any further */
+   do {
+       aper_array[0] = intel->batch->buf;
+       aper_array[1] = dst_buffer;
+       aper_array[2] = src_buffer;
+
+       if (dri_bufmgr_check_aperture_space(aper_array, 3) != 0) {
+           intel_batchbuffer_flush(intel->batch);
+           pass++;
+       } else
+           break;
+   } while (pass < 2);
+a291 4
+   if (pass >= 2)
+      return GL_FALSE;
+
+   intel_batchbuffer_require_space(intel->batch, 8 * 4, true);
+d300 1
+a300 1
+   BR13 = br13_for_cpp(cpp) | translate_raster_op(logic_op) << 16;
+d305 2
+d310 1
+d314 1
+a314 1
+      return GL_FALSE;
+d318 1
+a318 1
+   if (dst_tiling != I915_TILING_NONE) {
+d322 1
+a322 1
+   if (src_tiling != I915_TILING_NONE) {
+d329 1
+a329 1
+      return GL_TRUE;
+d332 10
+a341 2
+   assert(dst_x < dst_x2);
+   assert(dst_y < dst_y2);
+d343 16
+a358 14
+   BEGIN_BATCH_BLT(8);
+   OUT_BATCH(CMD);
+   OUT_BATCH(BR13 | (uint16_t)dst_pitch);
+   OUT_BATCH((dst_y << 16) | dst_x);
+   OUT_BATCH((dst_y2 << 16) | dst_x2);
+   OUT_RELOC_FENCED(dst_buffer,
+		    I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		    dst_offset);
+   OUT_BATCH((src_y << 16) | src_x);
+   OUT_BATCH((uint16_t)src_pitch);
+   OUT_RELOC_FENCED(src_buffer,
+		    I915_GEM_DOMAIN_RENDER, 0,
+		    src_offset);
+   ADVANCE_BATCH();
+d360 13
+a372 3
+   intel_batchbuffer_emit_mi_flush(intel->batch);
+
+   return GL_TRUE;
+d383 2
+a384 2
+GLbitfield
+intelClearWithBlit(struct gl_context *ctx, GLbitfield mask)
+d389 1
+a389 3
+   GLboolean all;
+   GLint cx, cy, cw, ch;
+   GLbitfield fail_mask = 0;
+d403 6
+a408 7
+   cx = fb->_Xmin;
+   if (fb->Name == 0)
+      cy = ctx->DrawBuffer->Height - fb->_Ymax;
+   else
+      cy = fb->_Ymin;
+   cw = fb->_Xmax - fb->_Xmin;
+   ch = fb->_Ymax - fb->_Ymin;
+d410 3
+a412 2
+   if (cw == 0 || ch == 0)
+      return 0;
+d414 4
+a417 2
+   GLuint buf;
+   all = (cw == fb->Width && ch == fb->Height);
+d419 5
+a423 31
+   /* Loop over all renderbuffers */
+   for (buf = 0; buf < BUFFER_COUNT && mask; buf++) {
+      const GLbitfield bufBit = 1 << buf;
+      struct intel_renderbuffer *irb;
+      drm_intel_bo *write_buffer;
+      int x1, y1, x2, y2;
+      uint32_t clear_val;
+      uint32_t BR13, CMD;
+      int pitch, cpp;
+      drm_intel_bo *aper_array[2];
+
+      if (!(mask & bufBit))
+	 continue;
+
+      /* OK, clear this renderbuffer */
+      irb = intel_get_renderbuffer(fb, buf);
+      write_buffer = intel_region_buffer(intel, irb->region,
+					 all ? INTEL_WRITE_FULL :
+					 INTEL_WRITE_PART);
+      x1 = cx + irb->region->draw_x;
+      y1 = cy + irb->region->draw_y;
+      x2 = cx + cw + irb->region->draw_x;
+      y2 = cy + ch + irb->region->draw_y;
+
+      pitch = irb->region->pitch;
+      cpp = irb->region->cpp;
+
+      DBG("%s dst:buf(%p)/%d %d,%d sz:%dx%d\n",
+	  __FUNCTION__,
+	  irb->region->buffer, (pitch * cpp),
+	  x1, y1, x2 - x1, y2 - y1);
+d425 2
+a426 2
+      BR13 = br13_for_cpp(cpp) | 0xf0 << 16;
+      CMD = XY_COLOR_BLT_CMD;
+d428 15
+a442 11
+      /* Setup the blit command */
+      if (cpp == 4) {
+	 if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL) {
+	    if (mask & BUFFER_BIT_DEPTH)
+	       CMD |= XY_BLT_WRITE_RGB;
+	    if (mask & BUFFER_BIT_STENCIL)
+	       CMD |= XY_BLT_WRITE_ALPHA;
+	 } else {
+	    /* clearing RGBA */
+	    CMD |= XY_BLT_WRITE_ALPHA | XY_BLT_WRITE_RGB;
+	 }
+d445 69
+a513 1
+      assert(irb->region->tiling != I915_TILING_Y);
+d516 4
+a519 4
+      if (irb->region->tiling != I915_TILING_NONE) {
+	 CMD |= XY_DST_TILED;
+	 pitch /= 4;
+      }
+d521 1
+a521 1
+      BR13 |= (pitch * cpp);
+d523 28
+a550 37
+      if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL) {
+	 clear_val = clear_depth;
+      } else {
+	 uint8_t clear[4];
+	 GLclampf *color = ctx->Color.ClearColor;
+
+	 CLAMPED_FLOAT_TO_UBYTE(clear[0], color[0]);
+	 CLAMPED_FLOAT_TO_UBYTE(clear[1], color[1]);
+	 CLAMPED_FLOAT_TO_UBYTE(clear[2], color[2]);
+	 CLAMPED_FLOAT_TO_UBYTE(clear[3], color[3]);
+
+	 switch (irb->Base.Format) {
+	 case MESA_FORMAT_ARGB8888:
+	 case MESA_FORMAT_XRGB8888:
+	    clear_val = PACK_COLOR_8888(clear[3], clear[0],
+					clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_RGB565:
+	    clear_val = PACK_COLOR_565(clear[0], clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_ARGB4444:
+	    clear_val = PACK_COLOR_4444(clear[3], clear[0],
+					clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_ARGB1555:
+	    clear_val = PACK_COLOR_1555(clear[3], clear[0],
+					clear[1], clear[2]);
+	    break;
+	 case MESA_FORMAT_A8:
+	    clear_val = PACK_COLOR_8888(clear[3], clear[3],
+					clear[3], clear[3]);
+	    break;
+	 default:
+	    fail_mask |= bufBit;
+	    mask &= ~bufBit;
+	    continue;
+	 }
+d552 1
+a552 31
+
+      assert(x1 < x2);
+      assert(y1 < y2);
+
+      /* do space check before going any further */
+      aper_array[0] = intel->batch->buf;
+      aper_array[1] = write_buffer;
+
+      if (drm_intel_bufmgr_check_aperture_space(aper_array,
+						ARRAY_SIZE(aper_array)) != 0) {
+	 intel_batchbuffer_flush(intel->batch);
+      }
+
+      BEGIN_BATCH_BLT(6);
+      OUT_BATCH(CMD);
+      OUT_BATCH(BR13);
+      OUT_BATCH((y1 << 16) | x1);
+      OUT_BATCH((y2 << 16) | x2);
+      OUT_RELOC_FENCED(write_buffer,
+		       I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		       0);
+      OUT_BATCH(clear_val);
+      ADVANCE_BATCH();
+
+      if (intel->always_flush_cache)
+	 intel_batchbuffer_emit_mi_flush(intel->batch);
+
+      if (buf == BUFFER_DEPTH || buf == BUFFER_STENCIL)
+	 mask &= ~(BUFFER_BIT_DEPTH | BUFFER_BIT_STENCIL);
+      else
+	 mask &= ~bufBit;    /* turn off bit, for faster loop exit */
+d555 1
+a555 1
+   return fail_mask;
+d558 1
+a558 1
+GLboolean
+d564 1
+a564 1
+				  drm_intel_bo *dst_buffer,
+d566 1
+a566 1
+				  uint32_t dst_tiling,
+a573 7
+   if (dst_tiling != I915_TILING_NONE) {
+      if (dst_offset & 4095)
+	 return GL_FALSE;
+      if (dst_tiling == I915_TILING_Y)
+	 return GL_FALSE;
+   }
+
+a575 1
+   assert(dst_pitch > 0);
+d578 1
+a578 1
+      return GL_TRUE;
+d589 2
+a590 1
+				    dwords * 4, true);
+d596 1
+a596 1
+   if (dst_tiling != I915_TILING_NONE) {
+d603 4
+a606 1
+   br13 |= br13_for_cpp(cpp);
+d609 1
+a609 1
+   if (dst_tiling != I915_TILING_NONE)
+d612 1
+a612 1
+   BEGIN_BATCH_BLT(8 + 3);
+d617 1
+a617 3
+   OUT_RELOC_FENCED(dst_buffer,
+		    I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		    dst_offset);
+d627 4
+a630 132
+   intel_batchbuffer_data(intel->batch,
+			  src_bits,
+			  dwords * 4, true);
+
+   intel_batchbuffer_emit_mi_flush(intel->batch);
+
+   return GL_TRUE;
+}
+
+/* We don't have a memmove-type blit like some other hardware, so we'll do a
+ * rectangular blit covering a large space, then emit 1-scanline blit at the
+ * end to cover the last if we need.
+ */
+void
+intel_emit_linear_blit(struct intel_context *intel,
+		       drm_intel_bo *dst_bo,
+		       unsigned int dst_offset,
+		       drm_intel_bo *src_bo,
+		       unsigned int src_offset,
+		       unsigned int size)
+{
+   GLuint pitch, height;
+   GLboolean ok;
+
+   /* The pitch given to the GPU must be DWORD aligned, and
+    * we want width to match pitch. Max width is (1 << 15 - 1),
+    * rounding that down to the nearest DWORD is 1 << 15 - 4
+    */
+   pitch = MIN2(size, (1 << 15) - 4);
+   height = size / pitch;
+   ok = intelEmitCopyBlit(intel, 1,
+			  pitch, src_bo, src_offset, I915_TILING_NONE,
+			  pitch, dst_bo, dst_offset, I915_TILING_NONE,
+			  0, 0, /* src x/y */
+			  0, 0, /* dst x/y */
+			  pitch, height, /* w, h */
+			  GL_COPY);
+   assert(ok);
+
+   src_offset += pitch * height;
+   dst_offset += pitch * height;
+   size -= pitch * height;
+   assert (size < (1 << 15));
+   assert ((size & 3) == 0); /* Pitch must be DWORD aligned */
+   if (size != 0) {
+      ok = intelEmitCopyBlit(intel, 1,
+			     size, src_bo, src_offset, I915_TILING_NONE,
+			     size, dst_bo, dst_offset, I915_TILING_NONE,
+			     0, 0, /* src x/y */
+			     0, 0, /* dst x/y */
+			     size, 1, /* w, h */
+			     GL_COPY);
+      assert(ok);
+   }
+}
+
+/**
+ * Used to initialize the alpha value of an ARGB8888 teximage after
+ * loading it from an XRGB8888 source.
+ *
+ * This is very common with glCopyTexImage2D().
+ */
+void
+intel_set_teximage_alpha_to_one(struct gl_context *ctx,
+				struct intel_texture_image *intel_image)
+{
+   struct intel_context *intel = intel_context(ctx);
+   unsigned int image_x, image_y;
+   uint32_t x1, y1, x2, y2;
+   uint32_t BR13, CMD;
+   int pitch, cpp;
+   drm_intel_bo *aper_array[2];
+   struct intel_region *region = intel_image->mt->region;
+   BATCH_LOCALS;
+
+   assert(intel_image->base.TexFormat == MESA_FORMAT_ARGB8888);
+
+   /* get dest x/y in destination texture */
+   intel_miptree_get_image_offset(intel_image->mt,
+				  intel_image->level,
+				  intel_image->face,
+				  0,
+				  &image_x, &image_y);
+
+   x1 = image_x;
+   y1 = image_y;
+   x2 = image_x + intel_image->base.Width;
+   y2 = image_y + intel_image->base.Height;
+
+   pitch = region->pitch;
+   cpp = region->cpp;
+
+   DBG("%s dst:buf(%p)/%d %d,%d sz:%dx%d\n",
+       __FUNCTION__,
+       intel_image->mt->region->buffer, (pitch * region->cpp),
+       x1, y1, x2 - x1, y2 - y1);
+
+   BR13 = br13_for_cpp(region->cpp) | 0xf0 << 16;
+   CMD = XY_COLOR_BLT_CMD;
+   CMD |= XY_BLT_WRITE_ALPHA;
+
+   assert(region->tiling != I915_TILING_Y);
+
+#ifndef I915
+   if (region->tiling != I915_TILING_NONE) {
+      CMD |= XY_DST_TILED;
+      pitch /= 4;
+   }
+#endif
+   BR13 |= (pitch * region->cpp);
+
+   /* do space check before going any further */
+   aper_array[0] = intel->batch->buf;
+   aper_array[1] = region->buffer;
+
+   if (drm_intel_bufmgr_check_aperture_space(aper_array,
+					     ARRAY_SIZE(aper_array)) != 0) {
+      intel_batchbuffer_flush(intel->batch);
+   }
+
+   BEGIN_BATCH_BLT(6);
+   OUT_BATCH(CMD);
+   OUT_BATCH(BR13);
+   OUT_BATCH((y1 << 16) | x1);
+   OUT_BATCH((y2 << 16) | x2);
+   OUT_RELOC_FENCED(region->buffer,
+		    I915_GEM_DOMAIN_RENDER, I915_GEM_DOMAIN_RENDER,
+		    0);
+   OUT_BATCH(0xffffffff); /* white, but only alpha gets written */
+   ADVANCE_BATCH();
+
+   intel_batchbuffer_emit_mi_flush(intel->batch);
+@
+
+

@@ -1,0 +1,409 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_2_4:1.6.0.2
+	OPENBSD_2_4_BASE:1.6
+	OPENBSD_2_3:1.5.0.2
+	OPENBSD_2_3_BASE:1.5
+	OPENBSD_2_2:1.4.0.2
+	OPENBSD_2_2_BASE:1.4
+	photurisd100:1.1.1.1
+	photuris:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	98.11.14.23.37.10;	author deraadt;	state dead;
+branches;
+next	1.6;
+
+1.6
+date	98.05.18.21.25.28;	author provos;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	98.03.04.11.43.24;	author provos;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	97.09.02.17.26.40;	author provos;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	97.07.23.12.28.50;	author provos;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	97.07.19.12.07.50;	author provos;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.07.18.22.48.51;	author provos;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.07.18.22.48.51;	author provos;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@move ipsec tools into .
+@
+text
+@/*
+ * Copyright 1997,1998 Niels Provos <provos@@physnet.uni-hamburg.de>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *      This product includes software developed by Niels Provos.
+ * 4. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+/*
+ * handle_spi_update:
+ * receive a SPI_UPDATE packet; return -1 on failure, 0 on success
+ *
+ */
+
+#ifndef lint
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.6 1998/05/18 21:25:28 provos Exp $";
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "config.h"
+#include "photuris.h"
+#include "packets.h"
+#include "state.h"
+#include "cookie.h"
+#include "buffer.h"
+#include "packet.h"
+#include "encrypt.h"
+#include "validity.h"
+#include "attributes.h"
+#include "secrets.h"
+#include "schedule.h"
+#include "scheme.h"
+#include "errlog.h"
+#include "spi.h"
+#ifdef IPSEC
+#include "kernel.h"
+#endif
+
+int
+handle_spi_update(u_char *packet, int size, char *address, 
+			char *local_address)
+{
+        struct packet_sub parts[] = {
+	     { "Verification", FLD_VARPRE, 0, 0, },
+	     { "Attributes", FLD_ATTRIB, FMD_ATT_FILL, 0, },
+	     { NULL }
+	};
+        struct packet spi_msg = {
+	     "SPI Update", 
+	     SPI_UPDATE_MIN, 0, parts
+	};
+	struct spi_update *header;
+	struct stateob *st;
+	struct spiob *spi;
+	time_t lifetime;
+	u_int8_t *attributes;
+	u_int16_t i, attribsize, tmp;
+	u_int8_t signature[22];  /* XXX - constant */
+
+	if (size < SPI_UPDATE_MIN)
+	     return -1;	/* packet too small  */
+
+	header = (struct spi_update *) packet;
+
+	st = state_find_cookies(address, header->icookie, header->rcookie);
+	if (st == NULL) {
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, BAD_COOKIE);
+	     send_packet();
+	     return 0;
+	}
+
+	if (st->phase != SPI_UPDATE && st->phase != SPI_NEEDED)
+	     return 0;     /* We don't want this packet */
+
+	/* Decrypt message */
+	tmp = size - SPI_UPDATE_MIN;
+	if (packet_decrypt(st, SPI_UPDATE_VERIFICATION(header), &tmp) == -1) {
+	     log_error(0, "packet_decrypt() in handle_spi_update()");
+	     goto verification_failed;
+	}
+
+	/* Verify message structure*/
+	if (packet_check((u_int8_t *)header, size - packet[size-1], &spi_msg) == -1) {
+	     log_error(0, "bad packet structure in handle_spi_update()");
+	     return -1;
+	}
+
+	i = get_validity_verification_size(st);
+	if (!i || i != parts[0].size || i > sizeof(signature)) {
+	     log_error(0, "verification size mismatch in handle_spi_update()");
+	     goto verification_failed;
+	}
+	bcopy(parts[0].where, signature, i);
+	
+	attributes = parts[1].where;
+	attribsize = parts[1].size;
+
+	if (!isattribsubset(st->oSPIoattrib,st->oSPIoattribsize,
+			    attributes, attribsize)) {
+	     log_error(0, "attributes are not a subset in handle_spi_update()");
+	     return 0;
+	}
+
+	if (!verify_validity_verification(st, signature, packet, size)) {
+	verification_failed:
+	     log_error(0, "verification failed in handle_spi_update()");
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+	     return 0;
+	}
+
+	lifetime = (header->lifetime[0]<<16) + (header->lifetime[1]<<8) +
+	     header->lifetime[2];
+
+	if (lifetime == 0) {
+	     /* Delete specified security association */
+	     if ((spi = spi_find(st->address, header->SPI)) == NULL) {
+		  log_error(0, "spi_find() in handle_spi_update()");
+		  return -1;
+	     }
+#ifdef IPSEC
+	     kernel_unlink_spi(spi);
+#endif
+	     spi_unlink(spi);
+	     spi_value_reset(spi);
+	     return 0;
+	} 
+
+	if ((spi = spi_new(st->address, header->SPI)) == NULL) {
+	     log_error(0, "spi_new() in handle_spi_update()"); 
+	     return -1; 
+	}
+	if ((spi->local_address = strdup(local_address)) == NULL) {
+	     log_error(1, "strdup() in handle_spi_update()");
+	     return -1;
+	}
+	if((spi->attributes = calloc(attribsize, sizeof(u_int8_t))) == NULL) {
+	     log_error(1, "calloc() in handle_spi_update()");
+	     return -1;
+	}
+	spi->flags |= st->flags & IPSEC_NOTIFY ? SPI_NOTIFY : 0;
+	bcopy(attributes, spi->attributes, attribsize);
+	spi->attribsize = attribsize;
+	bcopy(st->icookie, spi->icookie, COOKIE_SIZE);
+	spi->lifetime = time(NULL) + lifetime;
+
+	spi_set_tunnel(st, spi);
+
+	make_session_keys(st, spi);
+
+	spi_insert(spi);
+#ifdef IPSEC
+	kernel_insert_spi(st, spi);
+#endif
+	return 0;
+}
+@
+
+
+1.6
+log
+@support kernel notifies for setsockopt/getsockopt interface and fix various
+small bugs.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.5 1998/03/04 11:43:24 provos Exp $";
+@
+
+
+1.5
+log
+@compliance with draft-simpson-photuris-18.txt, better packet structure
+checking, better support for new esp and ah, documentation ...
+@
+text
+@d2 1
+a2 1
+ * Copyright 1997 Niels Provos <provos@@physnet.uni-hamburg.de>
+d37 1
+a37 1
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.4 1997/09/02 17:26:40 provos Exp $";
+d170 1
+d182 1
+a182 1
+	kernel_insert_spi(spi);
+@
+
+
+1.4
+log
+@including changes between drafts-14-16.
+update cookie and counters correctly after receiving a resource limit
+message.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.3 1997/07/23 12:28:50 provos Exp $";
+d66 9
+d79 2
+a80 2
+	u_int8_t *p, *attributes;
+	u_int16_t i, asize, attribsize, tmp;
+d108 9
+a116 2
+	/* Verify message */
+	if (!(i = get_validity_verification_size(st)))
+d118 2
+d121 2
+a122 16
+	asize = SPI_UPDATE_MIN + i;
+
+	p = SPI_UPDATE_VERIFICATION(header);
+
+	attributes = p + i;
+	asize += packet[size-1];           /* Padding size */
+	attribsize = 0;
+	while(asize + attribsize < size)
+	     attribsize += attributes[attribsize+1] + 2;
+
+	asize += attribsize;
+
+	if (asize != size) {
+	     log_error(0, "wrong packet size in handle_spi_update()");
+	     return 0;
+	}
+a128 8
+
+	if (i > sizeof(signature)) {
+	     log_error(0, "verification too long in handle_spi_update()");
+	     goto verification_failed;
+	}
+
+	bcopy(p, signature, i);
+	bzero(p, i);
+@
+
+
+1.3
+log
+@tunnel,lifetimes,hostname via startkey/startup
+errors to stderr before daemon, to syslog afterwards
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.2 1997/07/19 12:07:50 provos Exp $";
+d52 1
+@
+
+
+1.2
+log
+@minor cleanup.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.1.1.1 1997/07/18 22:48:51 provos Exp $";
+d177 2
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_spi_update.c,v 1.2 1997/06/12 17:09:20 provos Exp provos $";
+d95 1
+a95 6
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+	     return -1;
+d99 2
+a100 9
+	if (!(i = get_validity_verification_size(st))) {
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+
+	     return -1;
+	}
+d116 7
+a122 1
+	     return -1;
+d127 1
+a127 6
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+	     return -1;
+d134 1
+@
+
+
+1.1.1.1
+log
+@initial import of the photuris keymanagement daemon
+@
+text
+@@
+

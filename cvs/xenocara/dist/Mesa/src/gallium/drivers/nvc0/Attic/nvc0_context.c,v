@@ -1,0 +1,1050 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_5:1.3.0.2
+	OPENBSD_5_5_BASE:1.3
+	v9_2_5:1.1.1.2
+	v9_2_3:1.1.1.2
+	v9_2_2:1.1.1.2
+	v9_2_1:1.1.1.2
+	v9_2_0:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_4:1.1.0.4
+	OPENBSD_5_4_BASE:1.1
+	OPENBSD_5_3:1.1.0.2
+	OPENBSD_5_3_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2014.07.09.21.08.54;	author jsg;	state dead;
+branches;
+next	1.3;
+commitid	WPD6rgPryPkvXOr9;
+
+1.3
+date	2013.10.05.09.53.51;	author jsg;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2013.09.05.14.00.46;	author jsg;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.08.17.13.58.05;	author mpi;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2013.09.05.13.11.50;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2013.10.05.09.21.43;	author jsg;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Merge Mesa 10.2.3
+tested by matthieu@@ kettenis@@ mpi@@ brett@@ and myself across a
+diverse range of hardware
+@
+text
+@/*
+ * Copyright 2010 Christoph Bumiller
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#include "pipe/p_defines.h"
+#include "util/u_framebuffer.h"
+
+#ifdef NVC0_WITH_DRAW_MODULE
+#include "draw/draw_context.h"
+#endif
+
+#include "nvc0_context.h"
+#include "nvc0_screen.h"
+#include "nvc0_resource.h"
+
+static void
+nvc0_flush(struct pipe_context *pipe,
+           struct pipe_fence_handle **fence,
+           unsigned flags)
+{
+   struct nvc0_context *nvc0 = nvc0_context(pipe);
+   struct nouveau_screen *screen = &nvc0->screen->base;
+
+   if (fence)
+      nouveau_fence_ref(screen->fence.current, (struct nouveau_fence **)fence);
+
+   PUSH_KICK(nvc0->base.pushbuf); /* fencing handled in kick_notify */
+
+   nouveau_context_update_frame_stats(&nvc0->base);
+}
+
+static void
+nvc0_texture_barrier(struct pipe_context *pipe)
+{
+   struct nouveau_pushbuf *push = nvc0_context(pipe)->base.pushbuf;
+
+   IMMED_NVC0(push, NVC0_3D(SERIALIZE), 0);
+   IMMED_NVC0(push, NVC0_3D(TEX_CACHE_CTL), 0);
+}
+
+static void
+nvc0_context_unreference_resources(struct nvc0_context *nvc0)
+{
+   unsigned s, i;
+
+   nouveau_bufctx_del(&nvc0->bufctx_3d);
+   nouveau_bufctx_del(&nvc0->bufctx);
+   nouveau_bufctx_del(&nvc0->bufctx_cp);
+
+   util_unreference_framebuffer_state(&nvc0->framebuffer);
+
+   for (i = 0; i < nvc0->num_vtxbufs; ++i)
+      pipe_resource_reference(&nvc0->vtxbuf[i].buffer, NULL);
+
+   pipe_resource_reference(&nvc0->idxbuf.buffer, NULL);
+
+   for (s = 0; s < 6; ++s) {
+      for (i = 0; i < nvc0->num_textures[s]; ++i)
+         pipe_sampler_view_reference(&nvc0->textures[s][i], NULL);
+
+      for (i = 0; i < NVC0_MAX_PIPE_CONSTBUFS; ++i)
+         if (!nvc0->constbuf[s][i].user)
+            pipe_resource_reference(&nvc0->constbuf[s][i].u.buf, NULL);
+   }
+
+   for (s = 0; s < 2; ++s) {
+      for (i = 0; i < NVC0_MAX_SURFACE_SLOTS; ++i)
+         pipe_surface_reference(&nvc0->surfaces[s][i], NULL);
+   }
+
+   for (i = 0; i < nvc0->num_tfbbufs; ++i)
+      pipe_so_target_reference(&nvc0->tfbbuf[i], NULL);
+
+   for (i = 0; i < nvc0->global_residents.size / sizeof(struct pipe_resource *);
+        ++i) {
+      struct pipe_resource **res = util_dynarray_element(
+         &nvc0->global_residents, struct pipe_resource *, i);
+      pipe_resource_reference(res, NULL);
+   }
+   util_dynarray_fini(&nvc0->global_residents);
+}
+
+static void
+nvc0_destroy(struct pipe_context *pipe)
+{
+   struct nvc0_context *nvc0 = nvc0_context(pipe);
+
+   if (nvc0->screen->cur_ctx == nvc0) {
+      nvc0->base.pushbuf->kick_notify = NULL;
+      nvc0->screen->cur_ctx = NULL;
+      nouveau_pushbuf_bufctx(nvc0->base.pushbuf, NULL);
+   }
+   nouveau_pushbuf_kick(nvc0->base.pushbuf, nvc0->base.pushbuf->channel);
+
+   nvc0_context_unreference_resources(nvc0);
+   nvc0_blitctx_destroy(nvc0);
+
+#ifdef NVC0_WITH_DRAW_MODULE
+   draw_destroy(nvc0->draw);
+#endif
+
+   nouveau_context_destroy(&nvc0->base);
+}
+
+void
+nvc0_default_kick_notify(struct nouveau_pushbuf *push)
+{
+   struct nvc0_screen *screen = push->user_priv;
+
+   if (screen) {
+      nouveau_fence_next(&screen->base);
+      nouveau_fence_update(&screen->base, TRUE);
+      if (screen->cur_ctx)
+         screen->cur_ctx->state.flushed = TRUE;
+   }
+   NOUVEAU_DRV_STAT(&screen->base, pushbuf_count, 1);
+}
+
+static int
+nvc0_invalidate_resource_storage(struct nouveau_context *ctx,
+                                 struct pipe_resource *res,
+                                 int ref)
+{
+   struct nvc0_context *nvc0 = nvc0_context(&ctx->pipe);
+   unsigned s, i;
+
+   if (res->bind & PIPE_BIND_RENDER_TARGET) {
+      for (i = 0; i < nvc0->framebuffer.nr_cbufs; ++i) {
+         if (nvc0->framebuffer.cbufs[i] &&
+             nvc0->framebuffer.cbufs[i]->texture == res) {
+            nvc0->dirty |= NVC0_NEW_FRAMEBUFFER;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_FB);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_DEPTH_STENCIL) {
+      if (nvc0->framebuffer.zsbuf &&
+          nvc0->framebuffer.zsbuf->texture == res) {
+         nvc0->dirty |= NVC0_NEW_FRAMEBUFFER;
+         nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_FB);
+         if (!--ref)
+            return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_VERTEX_BUFFER) {
+      for (i = 0; i < nvc0->num_vtxbufs; ++i) {
+         if (nvc0->vtxbuf[i].buffer == res) {
+            nvc0->dirty |= NVC0_NEW_ARRAYS;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_VTX);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_INDEX_BUFFER) {
+      if (nvc0->idxbuf.buffer == res) {
+         nvc0->dirty |= NVC0_NEW_IDXBUF;
+         nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_IDX);
+         if (!--ref)
+            return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_SAMPLER_VIEW) {
+      for (s = 0; s < 5; ++s) {
+      for (i = 0; i < nvc0->num_textures[s]; ++i) {
+         if (nvc0->textures[s][i] &&
+             nvc0->textures[s][i]->texture == res) {
+            nvc0->textures_dirty[s] |= 1 << i;
+            nvc0->dirty |= NVC0_NEW_TEXTURES;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_TEX(s, i));
+            if (!--ref)
+               return ref;
+         }
+      }
+      }
+   }
+
+   if (res->bind & PIPE_BIND_CONSTANT_BUFFER) {
+      for (s = 0; s < 5; ++s) {
+      for (i = 0; i < nvc0->num_vtxbufs; ++i) {
+         if (!nvc0->constbuf[s][i].user &&
+             nvc0->constbuf[s][i].u.buf == res) {
+            nvc0->dirty |= NVC0_NEW_CONSTBUF;
+            nvc0->constbuf_dirty[s] |= 1 << i;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_CB(s, i));
+            if (!--ref)
+               return ref;
+         }
+      }
+      }
+   }
+
+   return ref;
+}
+
+static void
+nvc0_context_get_sample_position(struct pipe_context *, unsigned, unsigned,
+                                 float *);
+
+struct pipe_context *
+nvc0_create(struct pipe_screen *pscreen, void *priv)
+{
+   struct nvc0_screen *screen = nvc0_screen(pscreen);
+   struct nvc0_context *nvc0;
+   struct pipe_context *pipe;
+   int ret;
+   uint32_t flags;
+
+   nvc0 = CALLOC_STRUCT(nvc0_context);
+   if (!nvc0)
+      return NULL;
+   pipe = &nvc0->base.pipe;
+
+   if (!nvc0_blitctx_create(nvc0))
+      goto out_err;
+
+   nvc0->base.pushbuf = screen->base.pushbuf;
+   nvc0->base.client = screen->base.client;
+
+   ret = nouveau_bufctx_new(screen->base.client, 2, &nvc0->bufctx);
+   if (!ret)
+      ret = nouveau_bufctx_new(screen->base.client, NVC0_BIND_3D_COUNT,
+                               &nvc0->bufctx_3d);
+   if (!ret)
+      ret = nouveau_bufctx_new(screen->base.client, NVC0_BIND_CP_COUNT,
+                               &nvc0->bufctx_cp);
+   if (ret)
+      goto out_err;
+
+   nvc0->screen = screen;
+   nvc0->base.screen = &screen->base;
+
+   pipe->screen = pscreen;
+   pipe->priv = priv;
+
+   pipe->destroy = nvc0_destroy;
+
+   pipe->draw_vbo = nvc0_draw_vbo;
+   pipe->clear = nvc0_clear;
+   if (nvc0->screen->base.class_3d >= NVE4_3D_CLASS)
+      pipe->launch_grid = nve4_launch_grid;
+
+   pipe->flush = nvc0_flush;
+   pipe->texture_barrier = nvc0_texture_barrier;
+   pipe->get_sample_position = nvc0_context_get_sample_position;
+
+   if (!screen->cur_ctx) {
+      screen->cur_ctx = nvc0;
+      nouveau_pushbuf_bufctx(screen->base.pushbuf, nvc0->bufctx);
+   }
+   screen->base.pushbuf->kick_notify = nvc0_default_kick_notify;
+
+   nvc0_init_query_functions(nvc0);
+   nvc0_init_surface_functions(nvc0);
+   nvc0_init_state_functions(nvc0);
+   nvc0_init_transfer_functions(nvc0);
+   nvc0_init_resource_functions(pipe);
+
+   nvc0->base.invalidate_resource_storage = nvc0_invalidate_resource_storage;
+
+#ifdef NVC0_WITH_DRAW_MODULE
+   /* no software fallbacks implemented */
+   nvc0->draw = draw_create(pipe);
+   assert(nvc0->draw);
+   draw_set_rasterize_stage(nvc0->draw, nvc0_draw_render_stage(nvc0));
+#endif
+
+   pipe->create_video_decoder = nvc0_create_decoder;
+   pipe->create_video_buffer = nvc0_video_buffer_create;
+
+   /* shader builtin library is per-screen, but we need a context for m2mf */
+   nvc0_program_library_upload(nvc0);
+
+   /* add permanently resident buffers to bufctxts */
+
+   flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_RD;
+
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->text);
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->uniform_bo);
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->txc);
+   if (screen->compute) {
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->text);
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->txc);
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->parm);
+   }
+
+   flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_RDWR;
+
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->poly_cache);
+   if (screen->compute)
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->tls);
+
+   flags = NOUVEAU_BO_GART | NOUVEAU_BO_WR;
+
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->fence.bo);
+   BCTX_REFN_bo(nvc0->bufctx, FENCE, flags, screen->fence.bo);
+   if (screen->compute)
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->fence.bo);
+
+   nvc0->base.scratch.bo_size = 2 << 20;
+
+   memset(nvc0->tex_handles, ~0, sizeof(nvc0->tex_handles));
+
+   util_dynarray_init(&nvc0->global_residents);
+
+   return pipe;
+
+out_err:
+   if (nvc0) {
+      if (nvc0->bufctx_3d)
+         nouveau_bufctx_del(&nvc0->bufctx_3d);
+      if (nvc0->bufctx_cp)
+         nouveau_bufctx_del(&nvc0->bufctx_cp);
+      if (nvc0->bufctx)
+         nouveau_bufctx_del(&nvc0->bufctx);
+      if (nvc0->blit)
+         FREE(nvc0->blit);
+      FREE(nvc0);
+   }
+   return NULL;
+}
+
+void
+nvc0_bufctx_fence(struct nvc0_context *nvc0, struct nouveau_bufctx *bufctx,
+                  boolean on_flush)
+{
+   struct nouveau_list *list = on_flush ? &bufctx->current : &bufctx->pending;
+   struct nouveau_list *it;
+   NOUVEAU_DRV_STAT_IFD(unsigned count = 0);
+
+   for (it = list->next; it != list; it = it->next) {
+      struct nouveau_bufref *ref = (struct nouveau_bufref *)it;
+      struct nv04_resource *res = ref->priv;
+      if (res)
+         nvc0_resource_validate(res, (unsigned)ref->priv_data);
+      NOUVEAU_DRV_STAT_IFD(count++);
+   }
+   NOUVEAU_DRV_STAT(&nvc0->screen->base, resource_validate_count, count);
+}
+
+static void
+nvc0_context_get_sample_position(struct pipe_context *pipe,
+                                 unsigned sample_count, unsigned sample_index,
+                                 float *xy)
+{
+   static const uint8_t ms1[1][2] = { { 0x8, 0x8 } };
+   static const uint8_t ms2[2][2] = {
+      { 0x4, 0x4 }, { 0xc, 0xc } }; /* surface coords (0,0), (1,0) */
+   static const uint8_t ms4[4][2] = {
+      { 0x6, 0x2 }, { 0xe, 0x6 },   /* (0,0), (1,0) */
+      { 0x2, 0xa }, { 0xa, 0xe } }; /* (0,1), (1,1) */
+   static const uint8_t ms8[8][2] = {
+      { 0x1, 0x7 }, { 0x5, 0x3 },   /* (0,0), (1,0) */
+      { 0x3, 0xd }, { 0x7, 0xb },   /* (0,1), (1,1) */
+      { 0x9, 0x5 }, { 0xf, 0x1 },   /* (2,0), (3,0) */
+      { 0xb, 0xf }, { 0xd, 0x9 } }; /* (2,1), (3,1) */
+#if 0
+   /* NOTE: there are alternative modes for MS2 and MS8, currently not used */
+   static const uint8_t ms8_alt[8][2] = {
+      { 0x9, 0x5 }, { 0x7, 0xb },   /* (2,0), (1,1) */
+      { 0xd, 0x9 }, { 0x5, 0x3 },   /* (3,1), (1,0) */
+      { 0x3, 0xd }, { 0x1, 0x7 },   /* (0,1), (0,0) */
+      { 0xb, 0xf }, { 0xf, 0x1 } }; /* (2,1), (3,0) */
+#endif
+
+   const uint8_t (*ptr)[2];
+
+   switch (sample_count) {
+   case 0:
+   case 1: ptr = ms1; break;
+   case 2: ptr = ms2; break;
+   case 4: ptr = ms4; break;
+   case 8: ptr = ms8; break;
+   default:
+      assert(0);
+      break;
+   }
+   xy[0] = ptr[sample_index][0] * 0.0625f;
+   xy[1] = ptr[sample_index][1] * 0.0625f;
+}
+@
+
+
+1.3
+log
+@Merge Mesa 9.2.1
+@
+text
+@@
+
+
+1.2
+log
+@Merge Mesa 9.2.0
+@
+text
+@d114 1
+@
+
+
+1.1
+log
+@Upate to libGL 7.11.2
+
+Tested by jsg@@, matthieu@@ and ajacoutot@@, ok mattieu@@
+@
+text
+@d17 4
+a20 4
+ * THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+ * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+d23 4
+d28 1
+a28 1
+#include "pipe/p_defines.h"
+a33 2
+#include "nouveau/nouveau_reloc.h"
+
+d36 2
+a37 1
+           struct pipe_fence_handle **fence)
+d39 2
+a40 1
+   struct nouveau_screen *screen = &nvc0_context(pipe)->screen->base;
+d45 1
+a45 4
+   /* Try to emit before firing to avoid having to flush again right after
+    * in case we have to wait on this fence.
+    */
+   nouveau_fence_emit(screen->fence.current);
+d47 1
+a47 1
+   FIRE_RING(screen->channel);
+d53 1
+a53 1
+   struct nouveau_channel *chan = nvc0_context(pipe)->screen->base.channel;
+d55 2
+a56 2
+   IMMED_RING(chan, RING_3D(SERIALIZE), 0);
+   IMMED_RING(chan, RING_3D(TEX_CACHE_CTL), 0);
+d64 5
+a68 2
+   for (i = 0; i < NVC0_BUFCTX_COUNT; ++i)
+      nvc0_bufctx_reset(nvc0, i);
+d75 1
+a75 1
+   for (s = 0; s < 5; ++s) {
+d79 8
+a86 2
+      for (i = 0; i < 16; ++i)
+         pipe_resource_reference(&nvc0->constbuf[s][i], NULL);
+d90 9
+a98 1
+      pipe_resource_reference(&nvc0->tfbbuf[i], NULL);
+d106 7
+d115 1
+d117 1
+d119 7
+a125 2
+   if (nvc0->screen->cur_ctx == nvc0)
+      nvc0->screen->cur_ctx = NULL;
+d127 7
+a133 1
+   FREE(nvc0);
+d136 4
+a139 2
+void
+nvc0_default_flush_notify(struct nouveau_channel *chan)
+d141 42
+a182 1
+   struct nvc0_screen *screen = chan->user_private;
+d184 29
+a212 2
+   if (!screen)
+      return;
+d214 1
+a214 2
+   nouveau_fence_update(&screen->base, TRUE);
+   nouveau_fence_next(&screen->base);
+d217 4
+a223 1
+   struct pipe_winsys *pipe_winsys = pscreen->winsys;
+d227 2
+d235 16
+d252 1
+a252 3
+   nvc0->base.screen    = &screen->base;
+   nvc0->base.copy_data = nvc0_m2mf_copy_linear;
+   nvc0->base.push_data = nvc0_m2mf_push_linear;
+a253 1
+   pipe->winsys = pipe_winsys;
+d261 2
+d266 1
+d268 1
+a268 1
+   if (!screen->cur_ctx)
+d270 3
+a272 1
+   screen->base.channel->flush_notify = nvc0_default_flush_notify;
+d277 1
+d280 4
+d287 7
+d295 1
+a295 2
+   return pipe;
+}
+d297 1
+a297 4
+struct resident {
+   struct nv04_resource *res;
+   uint32_t flags;
+};
+d299 8
+a306 5
+void
+nvc0_bufctx_add_resident(struct nvc0_context *nvc0, int ctx,
+                         struct nv04_resource *resource, uint32_t flags)
+{
+   struct resident rsd = { resource, flags };
+d308 1
+a308 9
+   if (!resource->bo)
+      return;
+   nvc0->residents_size += sizeof(struct resident);
+
+   /* We don't need to reference the resource here, it will be referenced
+    * in the context/state, and bufctx will be reset when state changes.
+    */
+   util_dynarray_append(&nvc0->residents[ctx], struct resident, rsd);
+}
+d310 3
+a312 6
+void
+nvc0_bufctx_del_resident(struct nvc0_context *nvc0, int ctx,
+                         struct nv04_resource *resource)
+{
+   struct resident *rsd, *top;
+   unsigned i;
+d314 1
+a314 2
+   for (i = 0; i < nvc0->residents[ctx].size / sizeof(struct resident); ++i) {
+      rsd = util_dynarray_element(&nvc0->residents[ctx], struct resident, i);
+d316 4
+a319 9
+      if (rsd->res == resource) {
+         top = util_dynarray_pop_ptr(&nvc0->residents[ctx], struct resident);
+         if (rsd != top)
+            *rsd = *top;
+         nvc0->residents_size -= sizeof(struct resident);
+         break;
+      }
+   }
+}
+d321 1
+a321 6
+void
+nvc0_bufctx_emit_relocs(struct nvc0_context *nvc0)
+{
+   struct resident *rsd;
+   struct util_dynarray *array;
+   unsigned ctx, i, n;
+d323 1
+a323 2
+   n  = nvc0->residents_size / sizeof(struct resident);
+   n += NVC0_SCREEN_RESIDENT_BO_COUNT;
+d325 1
+a325 1
+   MARK_RING(nvc0->screen->base.channel, n, n);
+d327 1
+a327 2
+   for (ctx = 0; ctx < NVC0_BUFCTX_COUNT; ++ctx) {
+      array = &nvc0->residents[ctx];
+d329 14
+a342 3
+      n = array->size / sizeof(struct resident);
+      for (i = 0; i < n; ++i) {
+         rsd = util_dynarray_element(array, struct resident, i);
+d344 14
+a357 2
+         nvc0_resource_validate(rsd->res, rsd->flags);
+      }
+d359 2
+d362 39
+a400 1
+   nvc0_screen_make_buffers_resident(nvc0->screen);
+@
+
+
+1.1.1.1
+log
+@Import Mesa 9.2.0
+@
+text
+@d17 4
+a20 4
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+d23 1
+a24 5
+#include "util/u_framebuffer.h"
+
+#ifdef NVC0_WITH_DRAW_MODULE
+#include "draw/draw_context.h"
+#endif
+d30 2
+d34 1
+a34 2
+           struct pipe_fence_handle **fence,
+           unsigned flags)
+d36 1
+a36 2
+   struct nvc0_context *nvc0 = nvc0_context(pipe);
+   struct nouveau_screen *screen = &nvc0->screen->base;
+d41 4
+a44 1
+   PUSH_KICK(nvc0->base.pushbuf); /* fencing handled in kick_notify */
+d46 1
+a46 1
+   nouveau_context_update_frame_stats(&nvc0->base);
+d52 1
+a52 1
+   struct nouveau_pushbuf *push = nvc0_context(pipe)->base.pushbuf;
+d54 2
+a55 2
+   IMMED_NVC0(push, NVC0_3D(SERIALIZE), 0);
+   IMMED_NVC0(push, NVC0_3D(TEX_CACHE_CTL), 0);
+d63 2
+a64 5
+   nouveau_bufctx_del(&nvc0->bufctx_3d);
+   nouveau_bufctx_del(&nvc0->bufctx);
+   nouveau_bufctx_del(&nvc0->bufctx_cp);
+
+   util_unreference_framebuffer_state(&nvc0->framebuffer);
+d71 1
+a71 1
+   for (s = 0; s < 6; ++s) {
+d75 2
+a76 8
+      for (i = 0; i < NVC0_MAX_PIPE_CONSTBUFS; ++i)
+         if (!nvc0->constbuf[s][i].user)
+            pipe_resource_reference(&nvc0->constbuf[s][i].u.buf, NULL);
+   }
+
+   for (s = 0; s < 2; ++s) {
+      for (i = 0; i < NVC0_MAX_SURFACE_SLOTS; ++i)
+         pipe_surface_reference(&nvc0->surfaces[s][i], NULL);
+d80 1
+a80 9
+      pipe_so_target_reference(&nvc0->tfbbuf[i], NULL);
+
+   for (i = 0; i < nvc0->global_residents.size / sizeof(struct pipe_resource *);
+        ++i) {
+      struct pipe_resource **res = util_dynarray_element(
+         &nvc0->global_residents, struct pipe_resource *, i);
+      pipe_resource_reference(res, NULL);
+   }
+   util_dynarray_fini(&nvc0->global_residents);
+a87 7
+   if (nvc0->screen->cur_ctx == nvc0) {
+      nvc0->base.pushbuf->kick_notify = NULL;
+      nvc0->screen->cur_ctx = NULL;
+      nouveau_pushbuf_bufctx(nvc0->base.pushbuf, NULL);
+   }
+   nouveau_pushbuf_kick(nvc0->base.pushbuf, nvc0->base.pushbuf->channel);
+
+a89 1
+#ifdef NVC0_WITH_DRAW_MODULE
+a90 1
+#endif
+d92 4
+a95 1
+   nouveau_context_destroy(&nvc0->base);
+d99 1
+a99 17
+nvc0_default_kick_notify(struct nouveau_pushbuf *push)
+{
+   struct nvc0_screen *screen = push->user_priv;
+
+   if (screen) {
+      nouveau_fence_next(&screen->base);
+      nouveau_fence_update(&screen->base, TRUE);
+      if (screen->cur_ctx)
+         screen->cur_ctx->state.flushed = TRUE;
+   }
+   NOUVEAU_DRV_STAT(&screen->base, pushbuf_count, 1);
+}
+
+static int
+nvc0_invalidate_resource_storage(struct nouveau_context *ctx,
+                                 struct pipe_resource *res,
+                                 int ref)
+d101 1
+a101 42
+   struct nvc0_context *nvc0 = nvc0_context(&ctx->pipe);
+   unsigned s, i;
+
+   if (res->bind & PIPE_BIND_RENDER_TARGET) {
+      for (i = 0; i < nvc0->framebuffer.nr_cbufs; ++i) {
+         if (nvc0->framebuffer.cbufs[i] &&
+             nvc0->framebuffer.cbufs[i]->texture == res) {
+            nvc0->dirty |= NVC0_NEW_FRAMEBUFFER;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_FB);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_DEPTH_STENCIL) {
+      if (nvc0->framebuffer.zsbuf &&
+          nvc0->framebuffer.zsbuf->texture == res) {
+         nvc0->dirty |= NVC0_NEW_FRAMEBUFFER;
+         nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_FB);
+         if (!--ref)
+            return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_VERTEX_BUFFER) {
+      for (i = 0; i < nvc0->num_vtxbufs; ++i) {
+         if (nvc0->vtxbuf[i].buffer == res) {
+            nvc0->dirty |= NVC0_NEW_ARRAYS;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_VTX);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_INDEX_BUFFER) {
+      if (nvc0->idxbuf.buffer == res) {
+         nvc0->dirty |= NVC0_NEW_IDXBUF;
+         nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_IDX);
+         if (!--ref)
+            return ref;
+      }
+   }
+d103 2
+a104 29
+   if (res->bind & PIPE_BIND_SAMPLER_VIEW) {
+      for (s = 0; s < 5; ++s) {
+      for (i = 0; i < nvc0->num_textures[s]; ++i) {
+         if (nvc0->textures[s][i] &&
+             nvc0->textures[s][i]->texture == res) {
+            nvc0->textures_dirty[s] |= 1 << i;
+            nvc0->dirty |= NVC0_NEW_TEXTURES;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_TEX(s, i));
+            if (!--ref)
+               return ref;
+         }
+      }
+      }
+   }
+
+   if (res->bind & PIPE_BIND_CONSTANT_BUFFER) {
+      for (s = 0; s < 5; ++s) {
+      for (i = 0; i < nvc0->num_vtxbufs; ++i) {
+         if (!nvc0->constbuf[s][i].user &&
+             nvc0->constbuf[s][i].u.buf == res) {
+            nvc0->dirty |= NVC0_NEW_CONSTBUF;
+            nvc0->constbuf_dirty[s] |= 1 << i;
+            nouveau_bufctx_reset(nvc0->bufctx_3d, NVC0_BIND_CB(s, i));
+            if (!--ref)
+               return ref;
+         }
+      }
+      }
+   }
+d106 2
+a107 1
+   return ref;
+a109 4
+static void
+nvc0_context_get_sample_position(struct pipe_context *, unsigned, unsigned,
+                                 float *);
+
+d113 1
+a116 2
+   int ret;
+   uint32_t flags;
+a122 16
+   if (!nvc0_blitctx_create(nvc0))
+      goto out_err;
+
+   nvc0->base.pushbuf = screen->base.pushbuf;
+   nvc0->base.client = screen->base.client;
+
+   ret = nouveau_bufctx_new(screen->base.client, 2, &nvc0->bufctx);
+   if (!ret)
+      ret = nouveau_bufctx_new(screen->base.client, NVC0_BIND_3D_COUNT,
+                               &nvc0->bufctx_3d);
+   if (!ret)
+      ret = nouveau_bufctx_new(screen->base.client, NVC0_BIND_CP_COUNT,
+                               &nvc0->bufctx_cp);
+   if (ret)
+      goto out_err;
+
+d124 3
+a126 1
+   nvc0->base.screen = &screen->base;
+d128 1
+a135 2
+   if (nvc0->screen->base.class_3d >= NVE4_3D_CLASS)
+      pipe->launch_grid = nve4_launch_grid;
+a138 1
+   pipe->get_sample_position = nvc0_context_get_sample_position;
+d140 1
+a140 1
+   if (!screen->cur_ctx) {
+d142 1
+a142 3
+      nouveau_pushbuf_bufctx(screen->base.pushbuf, nvc0->bufctx);
+   }
+   screen->base.pushbuf->kick_notify = nvc0_default_kick_notify;
+a146 1
+   nvc0_init_transfer_functions(nvc0);
+a148 4
+   nvc0->base.invalidate_resource_storage = nvc0_invalidate_resource_storage;
+
+#ifdef NVC0_WITH_DRAW_MODULE
+   /* no software fallbacks implemented */
+a151 1
+#endif
+d153 2
+a154 2
+   pipe->create_video_decoder = nvc0_create_decoder;
+   pipe->create_video_buffer = nvc0_video_buffer_create;
+d156 4
+a159 2
+   /* shader builtin library is per-screen, but we need a context for m2mf */
+   nvc0_program_library_upload(nvc0);
+d161 5
+a165 1
+   /* add permanently resident buffers to bufctxts */
+d167 9
+a175 1
+   flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_RD;
+d177 6
+a182 8
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->text);
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->uniform_bo);
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->txc);
+   if (screen->compute) {
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->text);
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->txc);
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->parm);
+   }
+d184 2
+a185 1
+   flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_RDWR;
+d187 9
+a195 3
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->poly_cache);
+   if (screen->compute)
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->tls);
+d197 6
+a202 1
+   flags = NOUVEAU_BO_GART | NOUVEAU_BO_WR;
+d204 2
+a205 4
+   BCTX_REFN_bo(nvc0->bufctx_3d, SCREEN, flags, screen->fence.bo);
+   BCTX_REFN_bo(nvc0->bufctx, FENCE, flags, screen->fence.bo);
+   if (screen->compute)
+      BCTX_REFN_bo(nvc0->bufctx_cp, CP_SCREEN, flags, screen->fence.bo);
+d207 1
+a207 1
+   nvc0->base.scratch.bo_size = 2 << 20;
+d209 2
+a210 1
+   memset(nvc0->tex_handles, ~0, sizeof(nvc0->tex_handles));
+d212 3
+a214 1
+   util_dynarray_init(&nvc0->global_residents);
+d216 2
+a217 13
+   return pipe;
+
+out_err:
+   if (nvc0) {
+      if (nvc0->bufctx_3d)
+         nouveau_bufctx_del(&nvc0->bufctx_3d);
+      if (nvc0->bufctx_cp)
+         nouveau_bufctx_del(&nvc0->bufctx_cp);
+      if (nvc0->bufctx)
+         nouveau_bufctx_del(&nvc0->bufctx);
+      if (nvc0->blit)
+         FREE(nvc0->blit);
+      FREE(nvc0);
+a218 2
+   return NULL;
+}
+d220 1
+a220 57
+void
+nvc0_bufctx_fence(struct nvc0_context *nvc0, struct nouveau_bufctx *bufctx,
+                  boolean on_flush)
+{
+   struct nouveau_list *list = on_flush ? &bufctx->current : &bufctx->pending;
+   struct nouveau_list *it;
+   NOUVEAU_DRV_STAT_IFD(unsigned count = 0);
+
+   for (it = list->next; it != list; it = it->next) {
+      struct nouveau_bufref *ref = (struct nouveau_bufref *)it;
+      struct nv04_resource *res = ref->priv;
+      if (res)
+         nvc0_resource_validate(res, (unsigned)ref->priv_data);
+      NOUVEAU_DRV_STAT_IFD(count++);
+   }
+   NOUVEAU_DRV_STAT(&nvc0->screen->base, resource_validate_count, count);
+}
+
+static void
+nvc0_context_get_sample_position(struct pipe_context *pipe,
+                                 unsigned sample_count, unsigned sample_index,
+                                 float *xy)
+{
+   static const uint8_t ms1[1][2] = { { 0x8, 0x8 } };
+   static const uint8_t ms2[2][2] = {
+      { 0x4, 0x4 }, { 0xc, 0xc } }; /* surface coords (0,0), (1,0) */
+   static const uint8_t ms4[4][2] = {
+      { 0x6, 0x2 }, { 0xe, 0x6 },   /* (0,0), (1,0) */
+      { 0x2, 0xa }, { 0xa, 0xe } }; /* (0,1), (1,1) */
+   static const uint8_t ms8[8][2] = {
+      { 0x1, 0x7 }, { 0x5, 0x3 },   /* (0,0), (1,0) */
+      { 0x3, 0xd }, { 0x7, 0xb },   /* (0,1), (1,1) */
+      { 0x9, 0x5 }, { 0xf, 0x1 },   /* (2,0), (3,0) */
+      { 0xb, 0xf }, { 0xd, 0x9 } }; /* (2,1), (3,1) */
+#if 0
+   /* NOTE: there are alternative modes for MS2 and MS8, currently not used */
+   static const uint8_t ms8_alt[8][2] = {
+      { 0x9, 0x5 }, { 0x7, 0xb },   /* (2,0), (1,1) */
+      { 0xd, 0x9 }, { 0x5, 0x3 },   /* (3,1), (1,0) */
+      { 0x3, 0xd }, { 0x1, 0x7 },   /* (0,1), (0,0) */
+      { 0xb, 0xf }, { 0xf, 0x1 } }; /* (2,1), (3,0) */
+#endif
+
+   const uint8_t (*ptr)[2];
+
+   switch (sample_count) {
+   case 0:
+   case 1: ptr = ms1; break;
+   case 2: ptr = ms2; break;
+   case 4: ptr = ms4; break;
+   case 8: ptr = ms8; break;
+   default:
+      assert(0);
+      break;
+   }
+   xy[0] = ptr[sample_index][0] * 0.0625f;
+   xy[1] = ptr[sample_index][1] * 0.0625f;
+@
+
+
+1.1.1.2
+log
+@Import Mesa 9.2.1
+@
+text
+@a113 1
+   nvc0_blitctx_destroy(nvc0);
+@
+
+

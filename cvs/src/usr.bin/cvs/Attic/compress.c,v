@@ -1,0 +1,391 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_4_2:1.6.0.4
+	OPENBSD_4_2_BASE:1.6
+	OPENBSD_4_1:1.6.0.2
+	OPENBSD_4_1_BASE:1.6
+	OPENBSD_4_0:1.5.0.2
+	OPENBSD_4_0_BASE:1.5
+	OPENBSD_3_9:1.1.0.2
+	OPENBSD_3_9_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2008.03.01.22.39.22;	author joris;	state dead;
+branches;
+next	1.6;
+
+1.6
+date	2007.02.22.06.42.09;	author otto;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2006.05.29.17.10.57;	author pat;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2006.04.14.02.45.35;	author deraadt;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2006.04.12.13.42.51;	author xsa;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2006.04.05.01.38.55;	author ray;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2006.01.03.17.04.53;	author xsa;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@remove cruft that is simply rotting away, its not used for
+anything and until somebody writes -z support its shit we dont need.
+@
+text
+@/*	$OpenBSD: compress.c,v 1.6 2007/02/22 06:42:09 otto Exp $	*/
+/*
+ * Copyright (c) 2006 Patrick Latifi <pat@@openbsd.org>
+ * Copyright (c) 2005 Jean-Francois Brousseau <jfb@@openbsd.org>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+ * THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ * EXEMPLARY, OR CONSEQUENTIAL  DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <zlib.h>
+
+#include "cvs.h"
+#include "compress.h"
+
+#define CVS_ZLIB_BUFSIZE	1024
+
+struct cvs_zlib_ctx {
+	int		z_level;
+	z_stream	z_instrm;
+	z_stream	z_destrm;
+};
+
+struct zlib_ioctx {
+	z_stream *stream;
+	int	(*reset)(z_stream *);
+	int	(*io)(z_stream *, int);
+	int	ioflags;
+};
+
+static int cvs_zlib_io(struct zlib_ioctx *, BUF *, u_char *, size_t);
+
+/*
+ * cvs_zlib_newctx()
+ *
+ * Allocate a new ZLIB context structure used for both inflation and deflation
+ * of data with compression level <level>, which must be between 0 and 9.  A
+ * value of 0 means no compression, and 9 is the highest level of compression.
+ */
+CVSZCTX *
+cvs_zlib_newctx(int level)
+{
+	CVSZCTX *ctx;
+
+	if (level < 0 || level > 9)
+		fatal("invalid compression level %d (must be between 0 and 9)",
+		    level);
+
+	ctx = xcalloc(1, sizeof(*ctx));
+
+	ctx->z_level = level;
+
+	ctx->z_instrm.zalloc = Z_NULL;
+	ctx->z_instrm.zfree = Z_NULL;
+	ctx->z_instrm.opaque = Z_NULL;
+	ctx->z_destrm.zalloc = Z_NULL;
+	ctx->z_destrm.zfree = Z_NULL;
+	ctx->z_destrm.opaque = Z_NULL;
+
+	if (inflateInit(&(ctx->z_instrm)) != Z_OK ||
+	    deflateInit(&(ctx->z_destrm), level) != Z_OK)
+		fatal("failed to initialize zlib streams");
+
+	return (ctx);
+}
+
+
+/*
+ * cvs_zlib_free()
+ *
+ * Free a ZLIB context previously allocated with cvs_zlib_newctx().
+ */
+void
+cvs_zlib_free(CVSZCTX *ctx)
+{
+	if (ctx != NULL) {
+		(void)inflateEnd(&(ctx->z_instrm));
+		(void)deflateEnd(&(ctx->z_destrm));
+		xfree(ctx);
+	}
+}
+
+/*
+ * cvs_zlib_inflate()
+ *
+ * Decompress the first <slen> bytes of <src> using the zlib context <ctx> and
+ * store the resulting data in <dst>.
+ * Returns the number of bytes inflated on success, or -1 on failure.
+ */
+int
+cvs_zlib_inflate(CVSZCTX *ctx, BUF *dst, u_char *src, size_t slen)
+{
+	struct zlib_ioctx zio;
+
+	zio.stream = &ctx->z_instrm;
+	zio.reset = inflateReset;
+	zio.io = inflate;
+	zio.ioflags = Z_FINISH;
+
+	return cvs_zlib_io(&zio, dst, src, slen);
+}
+
+/*
+ * cvs_zlib_deflate()
+ *
+ * Compress the first <slen> bytes of <src> using the zlib context <ctx> and
+ * store the resulting data in <dst>.
+ * Returns the number of bytes deflated on success, or -1 on failure.
+ */
+int
+cvs_zlib_deflate(CVSZCTX *ctx, BUF *dst, u_char *src, size_t slen)
+{
+	struct zlib_ioctx zio;
+
+	zio.stream = &ctx->z_destrm;
+	zio.reset = deflateReset;
+	zio.io = deflate;
+	zio.ioflags = Z_FINISH;
+
+	return cvs_zlib_io(&zio, dst, src, slen);
+}
+
+static int
+cvs_zlib_io(struct zlib_ioctx *zio, BUF *dst, u_char *src, size_t slen)
+{
+	int bytes, ret;
+	u_char buf[CVS_ZLIB_BUFSIZE];
+	z_stream *zstream = zio->stream;
+
+	bytes = 0;
+	cvs_buf_empty(dst);
+	if ((*zio->reset)(zstream) == Z_STREAM_ERROR)
+		fatal("%s error: %s", (zio->reset == inflateReset) ?
+		    "inflate" : "deflate", zstream->msg);
+
+	zstream->next_in = src;
+	zstream->avail_in = slen;
+
+	do {
+		zstream->next_out = buf;
+		zstream->avail_out = sizeof(buf);
+		ret = (*zio->io)(zstream, zio->ioflags);
+		if (ret == Z_MEM_ERROR || ret == Z_STREAM_ERROR ||
+		    ret == Z_BUF_ERROR || ret == Z_DATA_ERROR)
+			fatal("%s error: %s", (zio->reset == inflateReset) ?
+			    "inflate" : "deflate", zstream->msg);
+
+		if (cvs_buf_append(dst, buf,
+		    sizeof(buf) - zstream->avail_out) < 0)
+			return (-1);
+		bytes += sizeof(buf) - zstream->avail_out;
+	} while (ret != Z_STREAM_END);
+
+	return (bytes);
+}
+@
+
+
+1.6
+log
+@general includes cleanup sweep. ok joris@@ niallo@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: compress.c,v 1.5 2006/05/29 17:10:57 pat Exp $	*/
+@
+
+
+1.5
+log
+@Factor out common code for zlib's inflate and deflate operations; ok joris@@ xsa@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: compress.c,v 1.4 2006/04/14 02:45:35 deraadt Exp $	*/
+d28 1
+a28 1
+#include "includes.h"
+a29 1
+#include "log.h"
+@
+
+
+1.4
+log
+@remove a metric buttload of excessive ()
+no binary change; ok ray
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: compress.c,v 1.3 2006/04/12 13:42:51 xsa Exp $	*/
+d3 1
+d42 8
+d111 1
+a111 2
+	int bytes, ret;
+	u_char buf[CVS_ZLIB_BUFSIZE];
+d113 4
+a116 11
+	bytes = 0;
+	cvs_buf_empty(dst);
+	if (inflateReset(&(ctx->z_instrm)) == Z_STREAM_ERROR)
+		fatal("inflate error: %s", ctx->z_instrm.msg);
+
+	ctx->z_instrm.next_in = src;
+	ctx->z_instrm.avail_in = slen;
+
+	do {
+		ctx->z_instrm.next_out = buf;
+		ctx->z_instrm.avail_out = sizeof(buf);
+d118 1
+a118 11
+		ret = inflate(&(ctx->z_instrm), Z_FINISH);
+		if (ret == Z_MEM_ERROR || ret == Z_BUF_ERROR ||
+		    ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR)
+			fatal("inflate error: %s", ctx->z_instrm.msg);
+
+		cvs_buf_append(dst, buf, ctx->z_instrm.avail_out);
+		bytes += sizeof(buf) - ctx->z_instrm.avail_out;
+
+	} while (ret != Z_STREAM_END);
+
+	return (bytes);
+d131 13
+d146 1
+d150 3
+a152 2
+	if (deflateReset(&(ctx->z_destrm)) == Z_STREAM_ERROR)
+		fatal("deflate error: %s", ctx->z_destrm.msg);
+d154 2
+a155 2
+	ctx->z_destrm.next_in = src;
+	ctx->z_destrm.avail_in = slen;
+d158 7
+a164 5
+		ctx->z_destrm.next_out = buf;
+		ctx->z_destrm.avail_out = sizeof(buf);
+		ret = deflate(&(ctx->z_destrm), Z_FINISH);
+		if (ret == Z_STREAM_ERROR || ret == Z_BUF_ERROR)
+			fatal("deflate error: %s", ctx->z_destrm.msg);
+d167 1
+a167 1
+		    sizeof(buf) - ctx->z_destrm.avail_out) < 0)
+d169 1
+a169 1
+		bytes += sizeof(buf) - ctx->z_destrm.avail_out;
+@
+
+
+1.3
+log
+@check for inflateReset() and deflateReset() return values; OK niallo@@.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: compress.c,v 1.2 2006/04/05 01:38:55 ray Exp $	*/
+d54 1
+a54 1
+	if ((level < 0) || (level > 9))
+d69 2
+a70 2
+	if ((inflateInit(&(ctx->z_instrm)) != Z_OK) ||
+	    (deflateInit(&(ctx->z_destrm), level) != Z_OK))
+d118 2
+a119 2
+		if ((ret == Z_MEM_ERROR) || (ret == Z_BUF_ERROR) ||
+		    (ret == Z_STREAM_ERROR) || (ret == Z_DATA_ERROR))
+d155 1
+a155 1
+		if ((ret == Z_STREAM_ERROR) || (ret == Z_BUF_ERROR))
+@
+
+
+1.2
+log
+@Use variable names for sizeof, remove casts in front of xmalloc,
+use xcalloc and xstrdup where appropriate, and other stuff.
+
+OK joris@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: compress.c,v 1.1 2006/01/03 17:04:53 xsa Exp $	*/
+d107 2
+a108 1
+	inflateReset(&(ctx->z_instrm));
+d145 2
+a146 1
+	deflateReset(&(ctx->z_destrm));
+@
+
+
+1.1
+log
+@renaming zlib.{c,h} files to compress.{c,h} and link to build;
+was pretty stupid calling them that way;
+ok joris@@ niallo@@.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d58 1
+a58 2
+	ctx = (CVSZCTX *)xmalloc(sizeof(*ctx));
+	memset(ctx, 0, sizeof(*ctx));
+@
+

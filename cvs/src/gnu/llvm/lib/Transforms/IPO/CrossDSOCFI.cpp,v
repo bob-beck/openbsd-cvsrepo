@@ -1,0 +1,341 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.02;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.23;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===-- CrossDSOCFI.cpp - Externalize this module's CFI checks ------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This pass exports all llvm.bitset's found in the module in the form of a
+// __cfi_check function, which can be used to verify cross-DSO call targets.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Transforms/IPO.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalObject.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "cross-dso-cfi"
+
+STATISTIC(TypeIds, "Number of unique type identifiers");
+
+namespace {
+
+struct CrossDSOCFI : public ModulePass {
+  static char ID;
+  CrossDSOCFI() : ModulePass(ID) {
+    initializeCrossDSOCFIPass(*PassRegistry::getPassRegistry());
+  }
+
+  Module *M;
+  MDNode *VeryLikelyWeights;
+
+  ConstantInt *extractBitSetTypeId(MDNode *MD);
+  void buildCFICheck();
+
+  bool doInitialization(Module &M) override;
+  bool runOnModule(Module &M) override;
+};
+
+} // anonymous namespace
+
+INITIALIZE_PASS_BEGIN(CrossDSOCFI, "cross-dso-cfi", "Cross-DSO CFI", false,
+                      false)
+INITIALIZE_PASS_END(CrossDSOCFI, "cross-dso-cfi", "Cross-DSO CFI", false, false)
+char CrossDSOCFI::ID = 0;
+
+ModulePass *llvm::createCrossDSOCFIPass() { return new CrossDSOCFI; }
+
+bool CrossDSOCFI::doInitialization(Module &Mod) {
+  M = &Mod;
+  VeryLikelyWeights =
+      MDBuilder(M->getContext()).createBranchWeights((1U << 20) - 1, 1);
+
+  return false;
+}
+
+/// extractBitSetTypeId - Extracts TypeId from a hash-based bitset MDNode.
+ConstantInt *CrossDSOCFI::extractBitSetTypeId(MDNode *MD) {
+  // This check excludes vtables for classes inside anonymous namespaces.
+  auto TM = dyn_cast<ValueAsMetadata>(MD->getOperand(0));
+  if (!TM)
+    return nullptr;
+  auto C = dyn_cast_or_null<ConstantInt>(TM->getValue());
+  if (!C) return nullptr;
+  // We are looking for i64 constants.
+  if (C->getBitWidth() != 64) return nullptr;
+
+  // Sanity check.
+  auto FM = dyn_cast_or_null<ValueAsMetadata>(MD->getOperand(1));
+  // Can be null if a function was removed by an optimization.
+  if (FM) {
+    auto F = dyn_cast<Function>(FM->getValue());
+    // But can never be a function declaration.
+    assert(!F || !F->isDeclaration());
+    (void)F; // Suppress unused variable warning in the no-asserts build.
+  }
+  return C;
+}
+
+/// buildCFICheck - emits __cfi_check for the current module.
+void CrossDSOCFI::buildCFICheck() {
+  // FIXME: verify that __cfi_check ends up near the end of the code section,
+  // but before the jump slots created in LowerBitSets.
+  llvm::DenseSet<uint64_t> BitSetIds;
+  NamedMDNode *BitSetNM = M->getNamedMetadata("llvm.bitsets");
+
+  if (BitSetNM)
+    for (unsigned I = 0, E = BitSetNM->getNumOperands(); I != E; ++I)
+      if (ConstantInt *TypeId = extractBitSetTypeId(BitSetNM->getOperand(I)))
+        BitSetIds.insert(TypeId->getZExtValue());
+
+  LLVMContext &Ctx = M->getContext();
+  Constant *C = M->getOrInsertFunction(
+      "__cfi_check",
+      FunctionType::get(
+          Type::getVoidTy(Ctx),
+          {Type::getInt64Ty(Ctx), PointerType::getUnqual(Type::getInt8Ty(Ctx))},
+          false));
+  Function *F = dyn_cast<Function>(C);
+  F->setAlignment(4096);
+  auto args = F->arg_begin();
+  Argument &CallSiteTypeId = *(args++);
+  CallSiteTypeId.setName("CallSiteTypeId");
+  Argument &Addr = *(args++);
+  Addr.setName("Addr");
+  assert(args == F->arg_end());
+
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+
+  BasicBlock *TrapBB = BasicBlock::Create(Ctx, "trap", F);
+  IRBuilder<> IRBTrap(TrapBB);
+  Function *TrapFn = Intrinsic::getDeclaration(M, Intrinsic::trap);
+  llvm::CallInst *TrapCall = IRBTrap.CreateCall(TrapFn);
+  TrapCall->setDoesNotReturn();
+  TrapCall->setDoesNotThrow();
+  IRBTrap.CreateUnreachable();
+
+  BasicBlock *ExitBB = BasicBlock::Create(Ctx, "exit", F);
+  IRBuilder<> IRBExit(ExitBB);
+  IRBExit.CreateRetVoid();
+
+  IRBuilder<> IRB(BB);
+  SwitchInst *SI = IRB.CreateSwitch(&CallSiteTypeId, TrapBB, BitSetIds.size());
+  for (uint64_t TypeId : BitSetIds) {
+    ConstantInt *CaseTypeId = ConstantInt::get(Type::getInt64Ty(Ctx), TypeId);
+    BasicBlock *TestBB = BasicBlock::Create(Ctx, "test", F);
+    IRBuilder<> IRBTest(TestBB);
+    Function *BitsetTestFn =
+        Intrinsic::getDeclaration(M, Intrinsic::bitset_test);
+
+    Value *Test = IRBTest.CreateCall(
+        BitsetTestFn, {&Addr, MetadataAsValue::get(
+                                  Ctx, ConstantAsMetadata::get(CaseTypeId))});
+    BranchInst *BI = IRBTest.CreateCondBr(Test, ExitBB, TrapBB);
+    BI->setMetadata(LLVMContext::MD_prof, VeryLikelyWeights);
+
+    SI->addCase(CaseTypeId, TestBB);
+    ++TypeIds;
+  }
+}
+
+bool CrossDSOCFI::runOnModule(Module &M) {
+  if (M.getModuleFlag("Cross-DSO CFI") == nullptr)
+    return false;
+  buildCFICheck();
+  return true;
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d15 1
+a15 1
+#include "llvm/Transforms/IPO/CrossDSOCFI.h"
+a32 1
+#include "llvm/Transforms/IPO.h"
+d39 1
+a39 1
+STATISTIC(NumTypeIds, "Number of unique type identifiers");
+d49 1
+d52 4
+a55 2
+  ConstantInt *extractNumericTypeId(MDNode *MD);
+  void buildCFICheck(Module &M);
+d68 10
+a77 2
+/// Extracts a numeric type identifier from an MDNode containing type metadata.
+ConstantInt *CrossDSOCFI::extractNumericTypeId(MDNode *MD) {
+d79 1
+a79 1
+  auto TM = dyn_cast<ValueAsMetadata>(MD->getOperand(1));
+d87 9
+d100 1
+a100 1
+void CrossDSOCFI::buildCFICheck(Module &M) {
+d102 16
+a117 19
+  // but before the jump slots created in LowerTypeTests.
+  llvm::DenseSet<uint64_t> TypeIds;
+  SmallVector<MDNode *, 2> Types;
+  for (GlobalObject &GO : M.global_objects()) {
+    Types.clear();
+    GO.getMetadata(LLVMContext::MD_type, Types);
+    for (MDNode *Type : Types) {
+      // Sanity check. GO must not be a function declaration.
+      assert(!isa<Function>(&GO) || !cast<Function>(&GO)->isDeclaration());
+
+      if (ConstantInt *TypeId = extractNumericTypeId(Type))
+        TypeIds.insert(TypeId->getZExtValue());
+    }
+  }
+
+  LLVMContext &Ctx = M.getContext();
+  Constant *C = M.getOrInsertFunction(
+      "__cfi_check", Type::getVoidTy(Ctx), Type::getInt64Ty(Ctx),
+      Type::getInt8PtrTy(Ctx), Type::getInt8PtrTy(Ctx), nullptr);
+d121 1
+a121 1
+  Value &CallSiteTypeId = *(args++);
+d123 1
+a123 1
+  Value &Addr = *(args++);
+a124 2
+  Value &CFICheckFailData = *(args++);
+  CFICheckFailData.setName("CFICheckFailData");
+a127 1
+  BasicBlock *ExitBB = BasicBlock::Create(Ctx, "exit", F);
+d129 7
+a135 7
+  BasicBlock *TrapBB = BasicBlock::Create(Ctx, "fail", F);
+  IRBuilder<> IRBFail(TrapBB);
+  Constant *CFICheckFailFn = M.getOrInsertFunction(
+      "__cfi_check_fail", Type::getVoidTy(Ctx), Type::getInt8PtrTy(Ctx),
+      Type::getInt8PtrTy(Ctx), nullptr);
+  IRBFail.CreateCall(CFICheckFailFn, {&CFICheckFailData, &Addr});
+  IRBFail.CreateBr(ExitBB);
+d137 1
+d142 2
+a143 2
+  SwitchInst *SI = IRB.CreateSwitch(&CallSiteTypeId, TrapBB, TypeIds.size());
+  for (uint64_t TypeId : TypeIds) {
+d147 2
+a148 1
+    Function *BitsetTestFn = Intrinsic::getDeclaration(&M, Intrinsic::type_test);
+d157 1
+a157 1
+    ++NumTypeIds;
+a161 5
+  if (skipModule(M))
+    return false;
+
+  VeryLikelyWeights =
+    MDBuilder(M.getContext()).createBranchWeights((1U << 20) - 1, 1);
+d164 1
+a164 1
+  buildCFICheck(M);
+a165 8
+}
+
+PreservedAnalyses CrossDSOCFIPass::run(Module &M, AnalysisManager<Module> &AM) {
+  CrossDSOCFI Impl;
+  bool Changed = Impl.runOnModule(M);
+  if (!Changed)
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d158 1
+a158 1
+PreservedAnalyses CrossDSOCFIPass::run(Module &M, ModuleAnalysisManager &AM) {
+@
+
+

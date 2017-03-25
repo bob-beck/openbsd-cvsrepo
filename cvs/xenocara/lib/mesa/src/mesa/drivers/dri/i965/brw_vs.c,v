@@ -1,0 +1,762 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	mesa-13_0_6:1.1.1.3
+	mesa-13_0_5:1.1.1.3
+	mesa-13_0_3:1.1.1.3
+	mesa-13_0_2:1.1.1.3
+	OPENBSD_6_0:1.1.1.2.0.4
+	OPENBSD_6_0_BASE:1.1.1.2
+	mesa-11_2_2:1.1.1.2
+	OPENBSD_5_9:1.1.1.1.0.2
+	OPENBSD_5_9_BASE:1.1.1.1
+	mesa-11_0_9:1.1.1.1
+	mesa-11_0_8:1.1.1.1
+	mesa-11_0_6:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.1
+date	2015.11.22.02.40.14;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.1
+date	2015.11.22.02.40.14;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.2
+date	2016.05.29.10.15.33;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	OwGfrJACrYJkCVJ4;
+
+1.1.1.3
+date	2016.12.11.08.37.05;	author jsg;	state Exp;
+branches;
+next	;
+commitid	uuv5VTS15jglEDZU;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@/*
+ Copyright (C) Intel Corp.  2006.  All Rights Reserved.
+ Intel funded Tungsten Graphics to
+ develop this 3D driver.
+
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this software and associated documentation files (the
+ "Software"), to deal in the Software without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sublicense, and/or sell copies of the Software, and to
+ permit persons to whom the Software is furnished to do so, subject to
+ the following conditions:
+
+ The above copyright notice and this permission notice (including the
+ next paragraph) shall be included in all copies or substantial
+ portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE COPYRIGHT OWNER(S) AND/OR ITS SUPPLIERS BE
+ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+ **********************************************************************/
+ /*
+  * Authors:
+  *   Keith Whitwell <keithw@@vmware.com>
+  */
+
+
+#include "main/compiler.h"
+#include "brw_context.h"
+#include "brw_vs.h"
+#include "brw_util.h"
+#include "brw_state.h"
+#include "program/prog_print.h"
+#include "program/prog_parameter.h"
+
+#include "util/ralloc.h"
+
+/**
+ * Decide which set of clip planes should be used when clipping via
+ * gl_Position or gl_ClipVertex.
+ */
+gl_clip_plane *brw_select_clip_planes(struct gl_context *ctx)
+{
+   if (ctx->_Shader->CurrentProgram[MESA_SHADER_VERTEX]) {
+      /* There is currently a GLSL vertex shader, so clip according to GLSL
+       * rules, which means compare gl_ClipVertex (or gl_Position, if
+       * gl_ClipVertex wasn't assigned) against the eye-coordinate clip planes
+       * that were stored in EyeUserPlane at the time the clip planes were
+       * specified.
+       */
+      return ctx->Transform.EyeUserPlane;
+   } else {
+      /* Either we are using fixed function or an ARB vertex program.  In
+       * either case the clip planes are going to be compared against
+       * gl_Position (which is in clip coordinates) so we have to clip using
+       * _ClipUserPlane, which was transformed into clip coordinates by Mesa
+       * core.
+       */
+      return ctx->Transform._ClipUserPlane;
+   }
+}
+
+
+bool
+brw_vs_prog_data_compare(const void *in_a, const void *in_b)
+{
+   const struct brw_vs_prog_data *a = in_a;
+   const struct brw_vs_prog_data *b = in_b;
+
+   /* Compare the base structure. */
+   if (!brw_stage_prog_data_compare(&a->base.base, &b->base.base))
+      return false;
+
+   /* Compare the rest of the struct. */
+   const unsigned offset = sizeof(struct brw_stage_prog_data);
+   if (memcmp(((char *) a) + offset, ((char *) b) + offset,
+              sizeof(struct brw_vs_prog_data) - offset)) {
+      return false;
+   }
+
+   return true;
+}
+
+bool
+brw_codegen_vs_prog(struct brw_context *brw,
+                    struct gl_shader_program *prog,
+                    struct brw_vertex_program *vp,
+                    struct brw_vs_prog_key *key)
+{
+   GLuint program_size;
+   const GLuint *program;
+   struct brw_vs_prog_data prog_data;
+   struct brw_stage_prog_data *stage_prog_data = &prog_data.base.base;
+   void *mem_ctx;
+   int i;
+   struct gl_shader *vs = NULL;
+
+   if (prog)
+      vs = prog->_LinkedShaders[MESA_SHADER_VERTEX];
+
+   memset(&prog_data, 0, sizeof(prog_data));
+
+   /* Use ALT floating point mode for ARB programs so that 0^0 == 1. */
+   if (!prog)
+      stage_prog_data->use_alt_mode = true;
+
+   mem_ctx = ralloc_context(NULL);
+
+   /* Allocate the references to the uniforms that will end up in the
+    * prog_data associated with the compiled program, and which will be freed
+    * by the state cache.
+    */
+   int param_count;
+   if (vs) {
+      /* We add padding around uniform values below vec4 size, with the worst
+       * case being a float value that gets blown up to a vec4, so be
+       * conservative here.
+       */
+      param_count = vs->num_uniform_components * 4 +
+                    vs->NumImages * BRW_IMAGE_PARAM_SIZE;
+      stage_prog_data->nr_image_params = vs->NumImages;
+   } else {
+      param_count = vp->program.Base.Parameters->NumParameters * 4;
+   }
+   /* vec4_visitor::setup_uniform_clipplane_values() also uploads user clip
+    * planes as uniforms.
+    */
+   param_count += key->base.nr_userclip_plane_consts * 4;
+
+   stage_prog_data->param =
+      rzalloc_array(NULL, const gl_constant_value *, param_count);
+   stage_prog_data->pull_param =
+      rzalloc_array(NULL, const gl_constant_value *, param_count);
+   stage_prog_data->image_param =
+      rzalloc_array(NULL, struct brw_image_param,
+                    stage_prog_data->nr_image_params);
+   stage_prog_data->nr_params = param_count;
+
+   GLbitfield64 outputs_written = vp->program.Base.OutputsWritten;
+   prog_data.inputs_read = vp->program.Base.InputsRead;
+
+   if (key->copy_edgeflag) {
+      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_EDGE);
+      prog_data.inputs_read |= VERT_BIT_EDGEFLAG;
+   }
+
+   if (brw->gen < 6) {
+      /* Put dummy slots into the VUE for the SF to put the replaced
+       * point sprite coords in.  We shouldn't need these dummy slots,
+       * which take up precious URB space, but it would mean that the SF
+       * doesn't get nice aligned pairs of input coords into output
+       * coords, which would be a pain to handle.
+       */
+      for (i = 0; i < 8; i++) {
+         if (key->point_coord_replace & (1 << i))
+            outputs_written |= BITFIELD64_BIT(VARYING_SLOT_TEX0 + i);
+      }
+
+      /* if back colors are written, allocate slots for front colors too */
+      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_BFC0))
+         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_COL0);
+      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_BFC1))
+         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_COL1);
+   }
+
+   /* In order for legacy clipping to work, we need to populate the clip
+    * distance varying slots whenever clipping is enabled, even if the vertex
+    * shader doesn't write to gl_ClipDistance.
+    */
+   if (key->base.userclip_active) {
+      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0);
+      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST1);
+   }
+
+   brw_compute_vue_map(brw->intelScreen->devinfo,
+                       &prog_data.base.vue_map, outputs_written);
+
+   if (0) {
+      _mesa_fprint_program_opt(stderr, &vp->program.Base, PROG_PRINT_DEBUG,
+			       true);
+   }
+
+   /* Emit GEN4 code.
+    */
+   program = brw_vs_emit(brw, mem_ctx, key, &prog_data,
+                         &vp->program, prog, &program_size);
+   if (program == NULL) {
+      ralloc_free(mem_ctx);
+      return false;
+   }
+
+   /* Scratch space is used for register spilling */
+   if (prog_data.base.base.total_scratch) {
+      brw_get_scratch_bo(brw, &brw->vs.base.scratch_bo,
+			 prog_data.base.base.total_scratch *
+                         brw->max_vs_threads);
+   }
+
+   brw_upload_cache(&brw->cache, BRW_CACHE_VS_PROG,
+		    key, sizeof(struct brw_vs_prog_key),
+		    program, program_size,
+		    &prog_data, sizeof(prog_data),
+		    &brw->vs.base.prog_offset, &brw->vs.prog_data);
+   ralloc_free(mem_ctx);
+
+   return true;
+}
+
+static bool
+key_debug(struct brw_context *brw, const char *name, int a, int b)
+{
+   if (a != b) {
+      perf_debug("  %s %d->%d\n", name, a, b);
+      return true;
+   }
+   return false;
+}
+
+void
+brw_vs_debug_recompile(struct brw_context *brw,
+                       struct gl_shader_program *prog,
+                       const struct brw_vs_prog_key *key)
+{
+   struct brw_cache_item *c = NULL;
+   const struct brw_vs_prog_key *old_key = NULL;
+   bool found = false;
+
+   perf_debug("Recompiling vertex shader for program %d\n", prog->Name);
+
+   for (unsigned int i = 0; i < brw->cache.size; i++) {
+      for (c = brw->cache.items[i]; c; c = c->next) {
+         if (c->cache_id == BRW_CACHE_VS_PROG) {
+            old_key = c->key;
+
+            if (old_key->base.program_string_id == key->base.program_string_id)
+               break;
+         }
+      }
+      if (c)
+         break;
+   }
+
+   if (!c) {
+      perf_debug("  Didn't find previous compile in the shader cache for "
+                 "debug\n");
+      return;
+   }
+
+   for (unsigned int i = 0; i < VERT_ATTRIB_MAX; i++) {
+      found |= key_debug(brw, "Vertex attrib w/a flags",
+                         old_key->gl_attrib_wa_flags[i],
+                         key->gl_attrib_wa_flags[i]);
+   }
+
+   found |= key_debug(brw, "user clip flags",
+                      old_key->base.userclip_active, key->base.userclip_active);
+
+   found |= key_debug(brw, "user clipping planes as push constants",
+                      old_key->base.nr_userclip_plane_consts,
+                      key->base.nr_userclip_plane_consts);
+
+   found |= key_debug(brw, "copy edgeflag",
+                      old_key->copy_edgeflag, key->copy_edgeflag);
+   found |= key_debug(brw, "PointCoord replace",
+                      old_key->point_coord_replace, key->point_coord_replace);
+   found |= key_debug(brw, "vertex color clamping",
+                      old_key->clamp_vertex_color, key->clamp_vertex_color);
+
+   found |= brw_debug_recompile_sampler_key(brw, &old_key->base.tex,
+                                            &key->base.tex);
+
+   if (!found) {
+      perf_debug("  Something else\n");
+   }
+}
+
+
+void
+brw_setup_vue_key_clip_info(struct brw_context *brw,
+                            struct brw_vue_prog_key *key,
+                            bool program_uses_clip_distance)
+{
+   struct gl_context *ctx = &brw->ctx;
+
+   key->userclip_active = (ctx->Transform.ClipPlanesEnabled != 0);
+   if (key->userclip_active && !program_uses_clip_distance) {
+      key->nr_userclip_plane_consts
+         = _mesa_logbase2(ctx->Transform.ClipPlanesEnabled) + 1;
+   }
+}
+
+static bool
+brw_vs_state_dirty(struct brw_context *brw)
+{
+   return brw_state_dirty(brw,
+                          _NEW_BUFFERS |
+                          _NEW_LIGHT |
+                          _NEW_POINT |
+                          _NEW_POLYGON |
+                          _NEW_TEXTURE |
+                          _NEW_TRANSFORM,
+                          BRW_NEW_VERTEX_PROGRAM |
+                          BRW_NEW_VS_ATTRIB_WORKAROUNDS);
+}
+
+static void
+brw_vs_populate_key(struct brw_context *brw,
+                    struct brw_vs_prog_key *key)
+{
+   struct gl_context *ctx = &brw->ctx;
+   /* BRW_NEW_VERTEX_PROGRAM */
+   struct brw_vertex_program *vp =
+      (struct brw_vertex_program *)brw->vertex_program;
+   struct gl_program *prog = (struct gl_program *) brw->vertex_program;
+   int i;
+
+   memset(key, 0, sizeof(*key));
+
+   /* Just upload the program verbatim for now.  Always send it all
+    * the inputs it asks for, whether they are varying or not.
+    */
+   key->base.program_string_id = vp->id;
+   brw_setup_vue_key_clip_info(brw, &key->base,
+                               vp->program.Base.UsesClipDistanceOut);
+
+   /* _NEW_POLYGON */
+   if (brw->gen < 6) {
+      key->copy_edgeflag = (ctx->Polygon.FrontMode != GL_FILL ||
+                            ctx->Polygon.BackMode != GL_FILL);
+   }
+
+   if (prog->OutputsWritten & (VARYING_BIT_COL0 | VARYING_BIT_COL1 |
+                               VARYING_BIT_BFC0 | VARYING_BIT_BFC1)) {
+      /* _NEW_LIGHT | _NEW_BUFFERS */
+      key->clamp_vertex_color = ctx->Light._ClampVertexColor;
+   }
+
+   /* _NEW_POINT */
+   if (brw->gen < 6 && ctx->Point.PointSprite) {
+      for (i = 0; i < 8; i++) {
+	 if (ctx->Point.CoordReplace[i])
+            key->point_coord_replace |= (1 << i);
+      }
+   }
+
+   /* _NEW_TEXTURE */
+   brw_populate_sampler_prog_key_data(ctx, prog, brw->vs.base.sampler_count,
+                                      &key->base.tex);
+
+   /* BRW_NEW_VS_ATTRIB_WORKAROUNDS */
+   memcpy(key->gl_attrib_wa_flags, brw->vb.attrib_wa_flags,
+          sizeof(brw->vb.attrib_wa_flags));
+}
+
+void
+brw_upload_vs_prog(struct brw_context *brw)
+{
+   struct gl_context *ctx = &brw->ctx;
+   struct gl_shader_program **current = ctx->_Shader->CurrentProgram;
+   struct brw_vs_prog_key key;
+   /* BRW_NEW_VERTEX_PROGRAM */
+   struct brw_vertex_program *vp =
+      (struct brw_vertex_program *)brw->vertex_program;
+
+   if (!brw_vs_state_dirty(brw))
+      return;
+
+   brw_vs_populate_key(brw, &key);
+
+   if (!brw_search_cache(&brw->cache, BRW_CACHE_VS_PROG,
+			 &key, sizeof(key),
+			 &brw->vs.base.prog_offset, &brw->vs.prog_data)) {
+      bool success = brw_codegen_vs_prog(brw, current[MESA_SHADER_VERTEX],
+                                         vp, &key);
+      (void) success;
+      assert(success);
+   }
+   brw->vs.base.prog_data = &brw->vs.prog_data->base.base;
+
+   if (memcmp(&brw->vs.prog_data->base.vue_map, &brw->vue_map_geom_out,
+              sizeof(brw->vue_map_geom_out)) != 0) {
+      brw->vue_map_vs = brw->vs.prog_data->base.vue_map;
+      brw->ctx.NewDriverState |= BRW_NEW_VUE_MAP_VS;
+      if (brw->gen < 6) {
+         /* No geometry shader support, so the VS VUE map is the VUE map for
+          * the output of the "geometry" portion of the pipeline.
+          */
+         brw->vue_map_geom_out = brw->vue_map_vs;
+         brw->ctx.NewDriverState |= BRW_NEW_VUE_MAP_GEOM_OUT;
+      }
+   }
+}
+
+bool
+brw_vs_precompile(struct gl_context *ctx,
+                  struct gl_shader_program *shader_prog,
+                  struct gl_program *prog)
+{
+   struct brw_context *brw = brw_context(ctx);
+   struct brw_vs_prog_key key;
+   uint32_t old_prog_offset = brw->vs.base.prog_offset;
+   struct brw_vs_prog_data *old_prog_data = brw->vs.prog_data;
+   bool success;
+
+   struct gl_vertex_program *vp = (struct gl_vertex_program *) prog;
+   struct brw_vertex_program *bvp = brw_vertex_program(vp);
+
+   memset(&key, 0, sizeof(key));
+
+   brw_vue_setup_prog_key_for_precompile(ctx, &key.base, bvp->id, &vp->Base);
+   key.clamp_vertex_color =
+      (prog->OutputsWritten & (VARYING_BIT_COL0 | VARYING_BIT_COL1 |
+                               VARYING_BIT_BFC0 | VARYING_BIT_BFC1));
+
+   success = brw_codegen_vs_prog(brw, shader_prog, bvp, &key);
+
+   brw->vs.base.prog_offset = old_prog_offset;
+   brw->vs.prog_data = old_prog_data;
+
+   return success;
+}
+@
+
+
+1.1.1.1
+log
+@import Mesa 11.0.6
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 11.2.2
+@
+text
+@a33 1
+#include "main/context.h"
+a39 2
+#include "brw_nir.h"
+#include "brw_program.h"
+d43 46
+a94 1
+   const struct brw_compiler *compiler = brw->intelScreen->compiler;
+d101 1
+a101 3
+   struct brw_shader *vs = NULL;
+   bool start_busy = false;
+   double start_time = 0;
+d104 1
+a104 1
+      vs = (struct brw_shader *) prog->_LinkedShaders[MESA_SHADER_VERTEX];
+a113 5
+   brw_assign_common_binding_table_offsets(MESA_SHADER_VERTEX,
+                                           brw->intelScreen->devinfo,
+                                           prog, &vp->program.Base,
+                                           &prog_data.base.base, 0);
+
+d118 12
+a129 7
+   int param_count = vp->program.Base.nir->num_uniforms;
+   if (!compiler->scalar_stage[MESA_SHADER_VERTEX])
+      param_count *= 4;
+
+   if (vs)
+      prog_data.base.base.nr_image_params = vs->base.NumImages;
+
+d133 1
+a133 1
+   param_count += key->nr_userclip_plane_consts * 4;
+a143 9
+   if (prog) {
+      brw_nir_setup_glsl_uniforms(vp->program.Base.nir, prog, &vp->program.Base,
+                                  &prog_data.base.base,
+                                  compiler->scalar_stage[MESA_SHADER_VERTEX]);
+   } else {
+      brw_nir_setup_arb_uniforms(vp->program.Base.nir, &vp->program.Base,
+                                 &prog_data.base.base);
+   }
+
+d175 1
+a175 1
+   if (key->nr_userclip_plane_consts > 0) {
+d181 1
+a181 4
+                       &prog_data.base.vue_map, outputs_written,
+                       prog ? prog->SeparateShader ||
+                              prog->_LinkedShaders[MESA_SHADER_TESS_EVAL]
+                            : false);
+a187 17
+   if (unlikely(brw->perf_debug)) {
+      start_busy = (brw->batch.last_bo &&
+                    drm_intel_bo_busy(brw->batch.last_bo));
+      start_time = get_time();
+   }
+
+   if (unlikely(INTEL_DEBUG & DEBUG_VS)) {
+      brw_dump_ir("vertex", prog, vs ? &vs->base : NULL, &vp->program.Base);
+
+      fprintf(stderr, "VS Output ");
+      brw_print_vue_map(stderr, &prog_data.base.vue_map);
+   }
+
+   int st_index = -1;
+   if (INTEL_DEBUG & DEBUG_SHADER_TIME)
+      st_index = brw_get_shader_time_index(brw, prog, &vp->program.Base, ST_VS);
+
+d190 2
+a191 6
+   char *error_str;
+   program = brw_compile_vs(compiler, brw, mem_ctx, key,
+                            &prog_data, vp->program.Base.nir,
+                            brw_select_clip_planes(&brw->ctx),
+                            !_mesa_is_gles3(&brw->ctx),
+                            st_index, &program_size, &error_str);
+a192 7
+      if (prog) {
+         prog->LinkStatus = false;
+         ralloc_strcat(&prog->InfoLog, error_str);
+      }
+
+      _mesa_problem(NULL, "Failed to compile vertex shader: %s\n", error_str);
+
+a196 11
+   if (unlikely(brw->perf_debug) && vs) {
+      if (vs->compiled_once) {
+         brw_vs_debug_recompile(brw, prog, key);
+      }
+      if (start_busy && !drm_intel_bo_busy(brw->batch.last_bo)) {
+         perf_debug("VS compile took %.03f ms and stalled the GPU\n",
+                    (get_time() - start_time) * 1000);
+      }
+      vs->compiled_once = true;
+   }
+
+d214 10
+d240 1
+a240 1
+            if (old_key->program_string_id == key->program_string_id)
+d260 6
+a265 3
+   found |= key_debug(brw, "legacy user clipping",
+                      old_key->nr_userclip_plane_consts,
+                      key->nr_userclip_plane_consts);
+d274 2
+a275 1
+   found |= brw_debug_recompile_sampler_key(brw, &old_key->tex, &key->tex);
+d282 15
+d327 3
+a329 9
+   key->program_string_id = vp->id;
+
+   if (ctx->Transform.ClipPlanesEnabled != 0 &&
+       (ctx->API == API_OPENGL_COMPAT ||
+        ctx->API == API_OPENGLES) &&
+       vp->program.Base.ClipDistanceArraySize == 0) {
+      key->nr_userclip_plane_consts =
+         _mesa_logbase2(ctx->Transform.ClipPlanesEnabled) + 1;
+   }
+d353 1
+a353 1
+                                      &key->tex);
+d384 13
+d415 1
+a415 2
+   brw_setup_tex_for_precompile(brw, &key.tex, prog);
+   key.program_string_id = bvp->id;
+@
+
+
+1.1.1.3
+log
+@Import Mesa 13.0.2
+@
+text
+@a45 41
+GLbitfield64
+brw_vs_outputs_written(struct brw_context *brw, struct brw_vs_prog_key *key,
+                       GLbitfield64 user_varyings)
+{
+   GLbitfield64 outputs_written = user_varyings;
+
+   if (key->copy_edgeflag) {
+      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_EDGE);
+   }
+
+   if (brw->gen < 6) {
+      /* Put dummy slots into the VUE for the SF to put the replaced
+       * point sprite coords in.  We shouldn't need these dummy slots,
+       * which take up precious URB space, but it would mean that the SF
+       * doesn't get nice aligned pairs of input coords into output
+       * coords, which would be a pain to handle.
+       */
+      for (unsigned i = 0; i < 8; i++) {
+         if (key->point_coord_replace & (1 << i))
+            outputs_written |= BITFIELD64_BIT(VARYING_SLOT_TEX0 + i);
+      }
+
+      /* if back colors are written, allocate slots for front colors too */
+      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_BFC0))
+         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_COL0);
+      if (outputs_written & BITFIELD64_BIT(VARYING_SLOT_BFC1))
+         outputs_written |= BITFIELD64_BIT(VARYING_SLOT_COL1);
+   }
+
+   /* In order for legacy clipping to work, we need to populate the clip
+    * distance varying slots whenever clipping is enabled, even if the vertex
+    * shader doesn't write to gl_ClipDistance.
+    */
+   if (key->nr_userclip_plane_consts > 0) {
+      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST0);
+      outputs_written |= BITFIELD64_BIT(VARYING_SLOT_CLIP_DIST1);
+   }
+
+   return outputs_written;
+}
+
+d52 1
+a52 2
+   const struct brw_compiler *compiler = brw->screen->compiler;
+   const struct gen_device_info *devinfo = &brw->screen->devinfo;
+d58 1
+d75 1
+a75 1
+                                           devinfo,
+d83 3
+a85 1
+   int param_count = vp->program.Base.nir->num_uniforms / 4;
+d113 2
+a114 4
+   uint64_t outputs_written =
+      brw_vs_outputs_written(brw, key,
+                             vp->program.Base.nir->info.outputs_written);
+   prog_data.inputs_read = vp->program.Base.nir->info.inputs_read;
+d117 1
+d121 18
+a138 3
+   prog_data.base.cull_distance_mask =
+      ((1 << vp->program.Base.CullDistanceArraySize) - 1) <<
+      vp->program.Base.ClipDistanceArraySize;
+d140 10
+a149 1
+   brw_compute_vue_map(devinfo,
+d209 5
+a213 3
+   brw_alloc_stage_scratch(brw, &brw->vs.base,
+                           prog_data.base.base.total_scratch,
+                           devinfo->max_vs_threads);
+d219 1
+a219 1
+		    &brw->vs.base.prog_offset, &brw->vs.base.prog_data);
+d280 1
+a280 1
+brw_vs_state_dirty(const struct brw_context *brw)
+d293 1
+a293 1
+void
+d302 1
+d319 1
+a320 1
+      /* _NEW_POLYGON */
+a322 5
+
+      /* _NEW_POINT */
+      if (ctx->Point.PointSprite) {
+         key->point_coord_replace = ctx->Point.CoordReplace & 0xff;
+      }
+d325 2
+a326 3
+   if (prog->nir->info.outputs_written &
+       (VARYING_BIT_COL0 | VARYING_BIT_COL1 | VARYING_BIT_BFC0 |
+        VARYING_BIT_BFC1)) {
+d331 8
+d340 2
+a341 1
+   brw_populate_sampler_prog_key_data(ctx, prog, &key->tex);
+d344 2
+a345 4
+   if (brw->gen < 8 && !brw->is_haswell) {
+      memcpy(key->gl_attrib_wa_flags, brw->vb.attrib_wa_flags,
+             sizeof(brw->vb.attrib_wa_flags));
+   }
+d365 1
+a365 1
+			 &brw->vs.base.prog_offset, &brw->vs.base.prog_data)) {
+d371 1
+d382 1
+a382 1
+   struct brw_stage_prog_data *old_prog_data = brw->vs.base.prog_data;
+d393 2
+a394 3
+      (prog->nir->info.outputs_written &
+       (VARYING_BIT_COL0 | VARYING_BIT_COL1 | VARYING_BIT_BFC0 |
+        VARYING_BIT_BFC1));
+d399 1
+a399 1
+   brw->vs.base.prog_data = old_prog_data;
+@
+
+

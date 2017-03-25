@@ -1,0 +1,746 @@
+head	1.5;
+access;
+symbols
+	OPENBSD_5_5:1.4.0.2
+	OPENBSD_5_5_BASE:1.4
+	v9_2_5:1.1.1.2
+	v9_2_3:1.1.1.2
+	v9_2_2:1.1.1.2
+	v9_2_1:1.1.1.2
+	v9_2_0:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_0:1.1.0.6
+	OPENBSD_5_0_BASE:1.1
+	OPENBSD_4_9:1.1.0.2
+	OPENBSD_4_9_BASE:1.1
+	OPENBSD_4_8:1.1.0.4
+	OPENBSD_4_8_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.5
+date	2014.07.09.21.08.53;	author jsg;	state dead;
+branches;
+next	1.4;
+commitid	WPD6rgPryPkvXOr9;
+
+1.4
+date	2013.10.05.09.53.51;	author jsg;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2013.09.05.14.00.39;	author jsg;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2011.10.23.13.37.33;	author matthieu;	state dead;
+branches;
+next	1.1;
+
+1.1
+date	2010.05.22.20.06.06;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2013.09.05.13.11.35;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2013.10.05.09.21.29;	author jsg;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.5
+log
+@Merge Mesa 10.2.3
+tested by matthieu@@ kettenis@@ mpi@@ brett@@ and myself across a
+diverse range of hardware
+@
+text
+@/*
+ * Copyright 2012 Red Hat Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: Ben Skeggs
+ *
+ */
+
+#include "draw/draw_context.h"
+
+#include "nouveau/nv_object.xml.h"
+#include "nv30-40_3d.xml.h"
+
+#include "nouveau/nouveau_fence.h"
+#include "nv30_context.h"
+#include "nv30_transfer.h"
+#include "nv30_state.h"
+
+static void
+nv30_context_kick_notify(struct nouveau_pushbuf *push)
+{
+   struct nouveau_screen *screen;
+   struct nv30_context *nv30;
+
+   if (!push->user_priv)
+      return;
+   nv30 = container_of(push->user_priv, nv30, bufctx);
+   screen = &nv30->screen->base;
+
+   nouveau_fence_next(screen);
+   nouveau_fence_update(screen, TRUE);
+
+   if (push->bufctx) {
+      struct nouveau_bufref *bref;
+      LIST_FOR_EACH_ENTRY(bref, &push->bufctx->current, thead) {
+         struct nv04_resource *res = bref->priv;
+         if (res && res->mm) {
+            nouveau_fence_ref(screen->fence.current, &res->fence);
+
+            if (bref->flags & NOUVEAU_BO_RD)
+               res->status |= NOUVEAU_BUFFER_STATUS_GPU_READING;
+
+            if (bref->flags & NOUVEAU_BO_WR) {
+               nouveau_fence_ref(screen->fence.current, &res->fence_wr);
+               res->status |= NOUVEAU_BUFFER_STATUS_GPU_WRITING |
+                  NOUVEAU_BUFFER_STATUS_DIRTY;
+            }
+         }
+      }
+   }
+}
+
+static void
+nv30_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
+                   unsigned flags)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+
+   if (fence)
+      nouveau_fence_ref(nv30->screen->base.fence.current,
+                        (struct nouveau_fence **)fence);
+
+   PUSH_KICK(push);
+
+   nouveau_context_update_frame_stats(&nv30->base);
+}
+
+static int
+nv30_invalidate_resource_storage(struct nouveau_context *nv,
+                                 struct pipe_resource *res,
+                                 int ref)
+{
+   struct nv30_context *nv30 = nv30_context(&nv->pipe);
+   unsigned i;
+
+   if (res->bind & PIPE_BIND_RENDER_TARGET) {
+      for (i = 0; i < nv30->framebuffer.nr_cbufs; ++i) {
+         if (nv30->framebuffer.cbufs[i] &&
+             nv30->framebuffer.cbufs[i]->texture == res) {
+            nv30->dirty |= NV30_NEW_FRAMEBUFFER;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_FB);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_DEPTH_STENCIL) {
+      if (nv30->framebuffer.zsbuf &&
+          nv30->framebuffer.zsbuf->texture == res) {
+            nv30->dirty |= NV30_NEW_FRAMEBUFFER;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_FB);
+            if (!--ref)
+               return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_VERTEX_BUFFER) {
+      for (i = 0; i < nv30->num_vtxbufs; ++i) {
+         if (nv30->vtxbuf[i].buffer == res) {
+            nv30->dirty |= NV30_NEW_ARRAYS;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_VTXBUF);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_INDEX_BUFFER) {
+      if (nv30->idxbuf.buffer == res) {
+         nouveau_bufctx_reset(nv30->bufctx, BUFCTX_IDXBUF);
+         if (!--ref)
+            return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_SAMPLER_VIEW) {
+      for (i = 0; i < nv30->fragprog.num_textures; ++i) {
+         if (nv30->fragprog.textures[i] &&
+             nv30->fragprog.textures[i]->texture == res) {
+            nv30->dirty |= NV30_NEW_FRAGTEX;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_FRAGTEX(i));
+            if (!--ref)
+               return ref;
+         }
+      }
+      for (i = 0; i < nv30->vertprog.num_textures; ++i) {
+         if (nv30->vertprog.textures[i] &&
+             nv30->vertprog.textures[i]->texture == res) {
+            nv30->dirty |= NV30_NEW_VERTTEX;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_VERTTEX(i));
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+
+   return ref;
+}
+
+static void
+nv30_context_destroy(struct pipe_context *pipe)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+
+   if (nv30->blitter)
+      util_blitter_destroy(nv30->blitter);
+
+   if (nv30->draw)
+      draw_destroy(nv30->draw);
+
+   nouveau_bufctx_del(&nv30->bufctx);
+
+   if (nv30->screen->cur_ctx == nv30)
+      nv30->screen->cur_ctx = NULL;
+
+   nouveau_context_destroy(&nv30->base);
+}
+
+#define FAIL_CONTEXT_INIT(str, err)                   \
+   do {                                               \
+      NOUVEAU_ERR(str, err);                          \
+      nv30_context_destroy(pipe);                     \
+      return NULL;                                    \
+   } while(0)
+
+struct pipe_context *
+nv30_context_create(struct pipe_screen *pscreen, void *priv)
+{
+   struct nv30_screen *screen = nv30_screen(pscreen);
+   struct nv30_context *nv30 = CALLOC_STRUCT(nv30_context);
+   struct nouveau_pushbuf *push;
+   struct pipe_context *pipe;
+   int ret;
+
+   if (!nv30)
+      return NULL;
+
+   nv30->screen = screen;
+   nv30->base.screen = &screen->base;
+   nv30->base.copy_data = nv30_transfer_copy_data;
+
+   pipe = &nv30->base.pipe;
+   pipe->screen = pscreen;
+   pipe->priv = priv;
+   pipe->destroy = nv30_context_destroy;
+   pipe->flush = nv30_context_flush;
+
+   /*XXX: *cough* per-context client */
+   nv30->base.client = screen->base.client;
+
+   /*XXX: *cough* per-context pushbufs */
+   push = screen->base.pushbuf;
+   nv30->base.pushbuf = push;
+   nv30->base.pushbuf->user_priv = &nv30->bufctx; /* hack at validate time */
+   nv30->base.pushbuf->rsvd_kick = 16; /* hack in screen before first space */
+   nv30->base.pushbuf->kick_notify = nv30_context_kick_notify;
+
+   nv30->base.invalidate_resource_storage = nv30_invalidate_resource_storage;
+
+   ret = nouveau_bufctx_new(nv30->base.client, 64, &nv30->bufctx);
+   if (ret) {
+      nv30_context_destroy(pipe);
+      return NULL;
+   }
+
+   /*XXX: make configurable with performance vs quality, these defaults
+    *     match the binary driver's defaults
+    */
+   if (screen->eng3d->oclass < NV40_3D_CLASS)
+      nv30->config.filter = 0x00000004;
+   else
+      nv30->config.filter = 0x00002dc4;
+
+   nv30->config.aniso = NV40_3D_TEX_WRAP_ANISO_MIP_FILTER_OPTIMIZATION_OFF;
+
+   if (debug_get_bool_option("NV30_SWTNL", FALSE))
+      nv30->draw_flags |= NV30_NEW_SWTNL;
+
+   /*XXX: nvfx... */
+   nv30->is_nv4x = (screen->eng3d->oclass >= NV40_3D_CLASS) ? ~0 : 0;
+   nv30->use_nv4x = (screen->eng3d->oclass >= NV40_3D_CLASS) ? ~0 : 0;
+   nv30->render_mode = HW;
+
+   nv30->sample_mask = 0xffff;
+   nv30_vbo_init(pipe);
+   nv30_query_init(pipe);
+   nv30_state_init(pipe);
+   nv30_resource_init(pipe);
+   nv30_clear_init(pipe);
+   nv30_fragprog_init(pipe);
+   nv30_vertprog_init(pipe);
+   nv30_texture_init(pipe);
+   nv30_fragtex_init(pipe);
+   nv40_verttex_init(pipe);
+   nv30_draw_init(pipe);
+
+   nv30->blitter = util_blitter_create(pipe);
+   if (!nv30->blitter) {
+      nv30_context_destroy(pipe);
+      return NULL;
+   }
+
+   return pipe;
+}
+@
+
+
+1.4
+log
+@Merge Mesa 9.2.1
+@
+text
+@@
+
+
+1.3
+log
+@Merge Mesa 9.2.0
+@
+text
+@d211 1
+a211 1
+   nv30->base.pushbuf->user_priv = push->user_priv; /* hack at validate time */
+@
+
+
+1.2
+log
+@Merge Mesa 7.10.3
+@
+text
+@d1 25
+a26 1
+#include "pipe/p_defines.h"
+d28 4
+d33 36
+a68 1
+#include "nv30_screen.h"
+d71 19
+a89 2
+nv30_flush(struct pipe_context *pipe, unsigned flags,
+	   struct pipe_fence_handle **fence)
+d91 64
+a154 15
+	struct nv30_context *nv30 = nv30_context(pipe);
+	struct nv30_screen *screen = nv30->screen;
+	struct nouveau_channel *chan = screen->base.channel;
+	struct nouveau_grobj *rankine = screen->rankine;
+
+	if (flags & PIPE_FLUSH_TEXTURE_CACHE) {
+		BEGIN_RING(chan, rankine, 0x1fd8, 1);
+		OUT_RING  (chan, 2);
+		BEGIN_RING(chan, rankine, 0x1fd8, 1);
+		OUT_RING  (chan, 1);
+	}
+
+	FIRE_RING(chan);
+	if (fence)
+		*fence = NULL;
+d158 1
+a158 1
+nv30_destroy(struct pipe_context *pipe)
+d160 1
+a160 2
+	struct nv30_context *nv30 = nv30_context(pipe);
+	unsigned i;
+d162 12
+a173 8
+	for (i = 0; i < NV30_STATE_MAX; i++) {
+		if (nv30->state.hw[i])
+			so_ref(NULL, &nv30->state.hw[i]);
+	}
+
+	if (nv30->draw)
+		draw_destroy(nv30->draw);
+	FREE(nv30);
+d176 7
+d184 1
+a184 1
+nv30_create(struct pipe_screen *pscreen, void *priv)
+d186 73
+a258 38
+	struct nv30_screen *screen = nv30_screen(pscreen);
+	struct pipe_winsys *ws = pscreen->winsys;
+	struct nv30_context *nv30;
+	struct nouveau_winsys *nvws = screen->nvws;
+
+	nv30 = CALLOC(1, sizeof(struct nv30_context));
+	if (!nv30)
+		return NULL;
+	nv30->screen = screen;
+
+	nv30->nvws = nvws;
+
+	nv30->pipe.winsys = ws;
+	nv30->pipe.screen = pscreen;
+	nv30->pipe.priv = priv;
+	nv30->pipe.destroy = nv30_destroy;
+	nv30->pipe.draw_arrays = nv30_draw_arrays;
+	nv30->pipe.draw_elements = nv30_draw_elements;
+	nv30->pipe.clear = nv30_clear;
+	nv30->pipe.flush = nv30_flush;
+
+	nv30->pipe.is_texture_referenced = nouveau_is_texture_referenced;
+	nv30->pipe.is_buffer_referenced = nouveau_is_buffer_referenced;
+
+	screen->base.channel->user_private = nv30;
+	screen->base.channel->flush_notify = nv30_state_flush_notify;
+
+	nv30_init_query_functions(nv30);
+	nv30_init_surface_functions(nv30);
+	nv30_init_state_functions(nv30);
+
+	/* Create, configure, and install fallback swtnl path */
+	nv30->draw = draw_create(&nv30->pipe);
+	draw_wide_point_threshold(nv30->draw, 9999999.0);
+	draw_wide_line_threshold(nv30->draw, 9999999.0);
+	draw_enable_line_stipple(nv30->draw, FALSE);
+	draw_enable_point_sprites(nv30->draw, FALSE);
+	draw_set_rasterize_stage(nv30->draw, nv30_draw_render_stage(nv30));
+d260 1
+a260 1
+	return &nv30->pipe;
+@
+
+
+1.1
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Import Mesa 9.2.0
+@
+text
+@a0 25
+/*
+ * Copyright 2012 Red Hat Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: Ben Skeggs
+ *
+ */
+
+d2 1
+a3 4
+#include "nouveau/nv_object.xml.h"
+#include "nv30-40_3d.xml.h"
+
+#include "nouveau/nouveau_fence.h"
+d5 1
+a5 36
+#include "nv30_transfer.h"
+#include "nv30_state.h"
+
+static void
+nv30_context_kick_notify(struct nouveau_pushbuf *push)
+{
+   struct nouveau_screen *screen;
+   struct nv30_context *nv30;
+
+   if (!push->user_priv)
+      return;
+   nv30 = container_of(push->user_priv, nv30, bufctx);
+   screen = &nv30->screen->base;
+
+   nouveau_fence_next(screen);
+   nouveau_fence_update(screen, TRUE);
+
+   if (push->bufctx) {
+      struct nouveau_bufref *bref;
+      LIST_FOR_EACH_ENTRY(bref, &push->bufctx->current, thead) {
+         struct nv04_resource *res = bref->priv;
+         if (res && res->mm) {
+            nouveau_fence_ref(screen->fence.current, &res->fence);
+
+            if (bref->flags & NOUVEAU_BO_RD)
+               res->status |= NOUVEAU_BUFFER_STATUS_GPU_READING;
+
+            if (bref->flags & NOUVEAU_BO_WR) {
+               nouveau_fence_ref(screen->fence.current, &res->fence_wr);
+               res->status |= NOUVEAU_BUFFER_STATUS_GPU_WRITING |
+                  NOUVEAU_BUFFER_STATUS_DIRTY;
+            }
+         }
+      }
+   }
+}
+d8 2
+a9 19
+nv30_context_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
+                   unsigned flags)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+
+   if (fence)
+      nouveau_fence_ref(nv30->screen->base.fence.current,
+                        (struct nouveau_fence **)fence);
+
+   PUSH_KICK(push);
+
+   nouveau_context_update_frame_stats(&nv30->base);
+}
+
+static int
+nv30_invalidate_resource_storage(struct nouveau_context *nv,
+                                 struct pipe_resource *res,
+                                 int ref)
+d11 15
+a25 64
+   struct nv30_context *nv30 = nv30_context(&nv->pipe);
+   unsigned i;
+
+   if (res->bind & PIPE_BIND_RENDER_TARGET) {
+      for (i = 0; i < nv30->framebuffer.nr_cbufs; ++i) {
+         if (nv30->framebuffer.cbufs[i] &&
+             nv30->framebuffer.cbufs[i]->texture == res) {
+            nv30->dirty |= NV30_NEW_FRAMEBUFFER;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_FB);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_DEPTH_STENCIL) {
+      if (nv30->framebuffer.zsbuf &&
+          nv30->framebuffer.zsbuf->texture == res) {
+            nv30->dirty |= NV30_NEW_FRAMEBUFFER;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_FB);
+            if (!--ref)
+               return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_VERTEX_BUFFER) {
+      for (i = 0; i < nv30->num_vtxbufs; ++i) {
+         if (nv30->vtxbuf[i].buffer == res) {
+            nv30->dirty |= NV30_NEW_ARRAYS;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_VTXBUF);
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+   if (res->bind & PIPE_BIND_INDEX_BUFFER) {
+      if (nv30->idxbuf.buffer == res) {
+         nouveau_bufctx_reset(nv30->bufctx, BUFCTX_IDXBUF);
+         if (!--ref)
+            return ref;
+      }
+   }
+
+   if (res->bind & PIPE_BIND_SAMPLER_VIEW) {
+      for (i = 0; i < nv30->fragprog.num_textures; ++i) {
+         if (nv30->fragprog.textures[i] &&
+             nv30->fragprog.textures[i]->texture == res) {
+            nv30->dirty |= NV30_NEW_FRAGTEX;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_FRAGTEX(i));
+            if (!--ref)
+               return ref;
+         }
+      }
+      for (i = 0; i < nv30->vertprog.num_textures; ++i) {
+         if (nv30->vertprog.textures[i] &&
+             nv30->vertprog.textures[i]->texture == res) {
+            nv30->dirty |= NV30_NEW_VERTTEX;
+            nouveau_bufctx_reset(nv30->bufctx, BUFCTX_VERTTEX(i));
+            if (!--ref)
+               return ref;
+         }
+      }
+   }
+
+   return ref;
+d29 1
+a29 1
+nv30_context_destroy(struct pipe_context *pipe)
+d31 2
+a32 1
+   struct nv30_context *nv30 = nv30_context(pipe);
+d34 8
+a41 12
+   if (nv30->blitter)
+      util_blitter_destroy(nv30->blitter);
+
+   if (nv30->draw)
+      draw_destroy(nv30->draw);
+
+   nouveau_bufctx_del(&nv30->bufctx);
+
+   if (nv30->screen->cur_ctx == nv30)
+      nv30->screen->cur_ctx = NULL;
+
+   nouveau_context_destroy(&nv30->base);
+a43 7
+#define FAIL_CONTEXT_INIT(str, err)                   \
+   do {                                               \
+      NOUVEAU_ERR(str, err);                          \
+      nv30_context_destroy(pipe);                     \
+      return NULL;                                    \
+   } while(0)
+
+d45 1
+a45 1
+nv30_context_create(struct pipe_screen *pscreen, void *priv)
+d47 38
+a84 73
+   struct nv30_screen *screen = nv30_screen(pscreen);
+   struct nv30_context *nv30 = CALLOC_STRUCT(nv30_context);
+   struct nouveau_pushbuf *push;
+   struct pipe_context *pipe;
+   int ret;
+
+   if (!nv30)
+      return NULL;
+
+   nv30->screen = screen;
+   nv30->base.screen = &screen->base;
+   nv30->base.copy_data = nv30_transfer_copy_data;
+
+   pipe = &nv30->base.pipe;
+   pipe->screen = pscreen;
+   pipe->priv = priv;
+   pipe->destroy = nv30_context_destroy;
+   pipe->flush = nv30_context_flush;
+
+   /*XXX: *cough* per-context client */
+   nv30->base.client = screen->base.client;
+
+   /*XXX: *cough* per-context pushbufs */
+   push = screen->base.pushbuf;
+   nv30->base.pushbuf = push;
+   nv30->base.pushbuf->user_priv = push->user_priv; /* hack at validate time */
+   nv30->base.pushbuf->rsvd_kick = 16; /* hack in screen before first space */
+   nv30->base.pushbuf->kick_notify = nv30_context_kick_notify;
+
+   nv30->base.invalidate_resource_storage = nv30_invalidate_resource_storage;
+
+   ret = nouveau_bufctx_new(nv30->base.client, 64, &nv30->bufctx);
+   if (ret) {
+      nv30_context_destroy(pipe);
+      return NULL;
+   }
+
+   /*XXX: make configurable with performance vs quality, these defaults
+    *     match the binary driver's defaults
+    */
+   if (screen->eng3d->oclass < NV40_3D_CLASS)
+      nv30->config.filter = 0x00000004;
+   else
+      nv30->config.filter = 0x00002dc4;
+
+   nv30->config.aniso = NV40_3D_TEX_WRAP_ANISO_MIP_FILTER_OPTIMIZATION_OFF;
+
+   if (debug_get_bool_option("NV30_SWTNL", FALSE))
+      nv30->draw_flags |= NV30_NEW_SWTNL;
+
+   /*XXX: nvfx... */
+   nv30->is_nv4x = (screen->eng3d->oclass >= NV40_3D_CLASS) ? ~0 : 0;
+   nv30->use_nv4x = (screen->eng3d->oclass >= NV40_3D_CLASS) ? ~0 : 0;
+   nv30->render_mode = HW;
+
+   nv30->sample_mask = 0xffff;
+   nv30_vbo_init(pipe);
+   nv30_query_init(pipe);
+   nv30_state_init(pipe);
+   nv30_resource_init(pipe);
+   nv30_clear_init(pipe);
+   nv30_fragprog_init(pipe);
+   nv30_vertprog_init(pipe);
+   nv30_texture_init(pipe);
+   nv30_fragtex_init(pipe);
+   nv40_verttex_init(pipe);
+   nv30_draw_init(pipe);
+
+   nv30->blitter = util_blitter_create(pipe);
+   if (!nv30->blitter) {
+      nv30_context_destroy(pipe);
+      return NULL;
+   }
+d86 1
+a86 1
+   return pipe;
+@
+
+
+1.1.1.2
+log
+@Import Mesa 9.2.1
+@
+text
+@d211 1
+a211 1
+   nv30->base.pushbuf->user_priv = &nv30->bufctx; /* hack at validate time */
+@
+
+

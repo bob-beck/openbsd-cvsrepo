@@ -1,0 +1,895 @@
+head	1.3;
+access;
+symbols
+	OPENBSD_5_8:1.2.0.4
+	OPENBSD_5_8_BASE:1.2
+	OPENBSD_5_7:1.2.0.2
+	OPENBSD_5_7_BASE:1.2
+	v10_2_9:1.1.1.4
+	v10_4_3:1.1.1.3
+	v10_2_7:1.1.1.2
+	OPENBSD_5_6:1.1.1.1.0.2
+	OPENBSD_5_6_BASE:1.1.1.1
+	v10_2_3:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.3
+date	2015.12.23.05.17.34;	author jsg;	state dead;
+branches;
+next	1.2;
+commitid	TnlogFl9nOv2eaRf;
+
+1.2
+date	2015.02.22.09.30.34;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	yhStanAcs6cSYmBc;
+
+1.1
+date	2014.07.09.20.34.13;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	3JhLfwcuBALP0ZR7;
+
+1.1.1.1
+date	2014.07.09.20.34.13;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	3JhLfwcuBALP0ZR7;
+
+1.1.1.2
+date	2014.09.07.15.03.10;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	dm8VnQHhowGHmemJ;
+
+1.1.1.3
+date	2015.01.25.14.08.35;	author jsg;	state Exp;
+branches;
+next	1.1.1.4;
+commitid	ce2W5rH5aF7VS9gi;
+
+1.1.1.4
+date	2015.02.20.22.45.48;	author jsg;	state Exp;
+branches;
+next	;
+commitid	F54a1i0WXHMxq7kE;
+
+
+desc
+@@
+
+
+1.3
+log
+@remove the now unused Mesa 10.2.9 code
+@
+text
+@/*
+ * Copyright 2010 Jerome Glisse <glisse@@freedesktop.org>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * on the rights to use, copy, modify, merge, publish, distribute, sub
+ * license, and/or sell copies of the Software, and to permit persons to whom
+ * the Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHOR(S) AND/OR THEIR SUPPLIERS BE LIABLE FOR ANY CLAIM,
+ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+ * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#include "si_pipe.h"
+#include "si_public.h"
+#include "sid.h"
+
+#include "radeon/radeon_uvd.h"
+#include "util/u_blitter.h"
+#include "util/u_memory.h"
+#include "util/u_simple_shaders.h"
+#include "vl/vl_decoder.h"
+
+/*
+ * pipe_context
+ */
+static void si_destroy_context(struct pipe_context *context)
+{
+	struct si_context *sctx = (struct si_context *)context;
+
+	si_release_all_descriptors(sctx);
+
+	pipe_resource_reference(&sctx->esgs_ring.buffer, NULL);
+	pipe_resource_reference(&sctx->gsvs_ring.buffer, NULL);
+	pipe_resource_reference(&sctx->null_const_buf.buffer, NULL);
+	r600_resource_reference(&sctx->border_color_table, NULL);
+
+	si_pm4_delete_state(sctx, gs_rings, sctx->gs_rings);
+	si_pm4_delete_state(sctx, gs_onoff, sctx->gs_on);
+	si_pm4_delete_state(sctx, gs_onoff, sctx->gs_off);
+
+	if (sctx->dummy_pixel_shader) {
+		sctx->b.b.delete_fs_state(&sctx->b.b, sctx->dummy_pixel_shader);
+	}
+	for (int i = 0; i < 8; i++) {
+		sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_depth_stencil[i]);
+		sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_depth[i]);
+		sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_stencil[i]);
+	}
+	sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_inplace);
+	sctx->b.b.delete_blend_state(&sctx->b.b, sctx->custom_blend_resolve);
+	sctx->b.b.delete_blend_state(&sctx->b.b, sctx->custom_blend_decompress);
+	sctx->b.b.delete_blend_state(&sctx->b.b, sctx->custom_blend_fastclear);
+	util_unreference_framebuffer_state(&sctx->framebuffer.state);
+
+	util_blitter_destroy(sctx->blitter);
+
+	si_pm4_cleanup(sctx);
+
+	r600_common_context_cleanup(&sctx->b);
+	FREE(sctx);
+}
+
+static struct pipe_context *si_create_context(struct pipe_screen *screen, void *priv)
+{
+	struct si_context *sctx = CALLOC_STRUCT(si_context);
+	struct si_screen* sscreen = (struct si_screen *)screen;
+	struct radeon_winsys *ws = sscreen->b.ws;
+	int shader, i;
+
+	if (sctx == NULL)
+		return NULL;
+
+	sctx->b.b.screen = screen; /* this must be set first */
+	sctx->b.b.priv = priv;
+	sctx->b.b.destroy = si_destroy_context;
+	sctx->screen = sscreen; /* Easy accessing of screen/winsys. */
+
+	if (!r600_common_context_init(&sctx->b, &sscreen->b))
+		goto fail;
+
+	si_init_blit_functions(sctx);
+	si_init_compute_functions(sctx);
+
+	if (sscreen->b.info.has_uvd) {
+		sctx->b.b.create_video_codec = si_uvd_create_decoder;
+		sctx->b.b.create_video_buffer = si_video_buffer_create;
+	} else {
+		sctx->b.b.create_video_codec = vl_create_decoder;
+		sctx->b.b.create_video_buffer = vl_video_buffer_create;
+	}
+
+	sctx->b.rings.gfx.cs = ws->cs_create(ws, RING_GFX, si_context_gfx_flush,
+					     sctx, NULL);
+	sctx->b.rings.gfx.flush = si_context_gfx_flush;
+
+	si_init_all_descriptors(sctx);
+
+	/* Initialize cache_flush. */
+	sctx->cache_flush = si_atom_cache_flush;
+	sctx->atoms.s.cache_flush = &sctx->cache_flush;
+
+	sctx->atoms.s.streamout_begin = &sctx->b.streamout.begin_atom;
+	sctx->atoms.s.streamout_enable = &sctx->b.streamout.enable_atom;
+
+	switch (sctx->b.chip_class) {
+	case SI:
+	case CIK:
+		si_init_state_functions(sctx);
+		si_init_config(sctx);
+		break;
+	default:
+		R600_ERR("Unsupported chip class %d.\n", sctx->b.chip_class);
+		goto fail;
+	}
+
+	sctx->blitter = util_blitter_create(&sctx->b.b);
+	if (sctx->blitter == NULL)
+		goto fail;
+
+	sctx->dummy_pixel_shader =
+		util_make_fragment_cloneinput_shader(&sctx->b.b, 0,
+						     TGSI_SEMANTIC_GENERIC,
+						     TGSI_INTERPOLATE_CONSTANT);
+	sctx->b.b.bind_fs_state(&sctx->b.b, sctx->dummy_pixel_shader);
+
+	/* these must be last */
+	si_begin_new_cs(sctx);
+	r600_query_init_backend_mask(&sctx->b); /* this emits commands and must be last */
+
+	/* CIK cannot unbind a constant buffer (S_BUFFER_LOAD is buggy
+	 * with a NULL buffer). We need to use a dummy buffer instead. */
+	if (sctx->b.chip_class == CIK) {
+		sctx->null_const_buf.buffer = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
+								 PIPE_USAGE_DEFAULT, 16);
+		sctx->null_const_buf.buffer_size = sctx->null_const_buf.buffer->width0;
+
+		for (shader = 0; shader < SI_NUM_SHADERS; shader++) {
+			for (i = 0; i < NUM_CONST_BUFFERS; i++) {
+				sctx->b.b.set_constant_buffer(&sctx->b.b, shader, i,
+							      &sctx->null_const_buf);
+			}
+		}
+
+		/* Clear the NULL constant buffer, because loads should return zeros. */
+		sctx->b.clear_buffer(&sctx->b.b, sctx->null_const_buf.buffer, 0,
+				     sctx->null_const_buf.buffer->width0, 0);
+	}
+
+	return &sctx->b.b;
+fail:
+	si_destroy_context(&sctx->b.b);
+	return NULL;
+}
+
+/*
+ * pipe_screen
+ */
+
+static int si_get_param(struct pipe_screen* pscreen, enum pipe_cap param)
+{
+	struct si_screen *sscreen = (struct si_screen *)pscreen;
+
+	switch (param) {
+	/* Supported features (boolean caps). */
+	case PIPE_CAP_TWO_SIDED_STENCIL:
+	case PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS:
+	case PIPE_CAP_ANISOTROPIC_FILTER:
+	case PIPE_CAP_POINT_SPRITE:
+	case PIPE_CAP_OCCLUSION_QUERY:
+	case PIPE_CAP_TEXTURE_SHADOW_MAP:
+	case PIPE_CAP_TEXTURE_MIRROR_CLAMP:
+	case PIPE_CAP_BLEND_EQUATION_SEPARATE:
+	case PIPE_CAP_TEXTURE_SWIZZLE:
+	case PIPE_CAP_DEPTH_CLIP_DISABLE:
+	case PIPE_CAP_SHADER_STENCIL_EXPORT:
+	case PIPE_CAP_VERTEX_ELEMENT_INSTANCE_DIVISOR:
+	case PIPE_CAP_MIXED_COLORBUFFER_FORMATS:
+	case PIPE_CAP_TGSI_FS_COORD_ORIGIN_UPPER_LEFT:
+	case PIPE_CAP_TGSI_FS_COORD_PIXEL_CENTER_HALF_INTEGER:
+	case PIPE_CAP_SM3:
+	case PIPE_CAP_SEAMLESS_CUBE_MAP:
+	case PIPE_CAP_PRIMITIVE_RESTART:
+	case PIPE_CAP_CONDITIONAL_RENDER:
+	case PIPE_CAP_TEXTURE_BARRIER:
+	case PIPE_CAP_INDEP_BLEND_ENABLE:
+	case PIPE_CAP_INDEP_BLEND_FUNC:
+	case PIPE_CAP_SEAMLESS_CUBE_MAP_PER_TEXTURE:
+	case PIPE_CAP_VERTEX_COLOR_UNCLAMPED:
+	case PIPE_CAP_VERTEX_BUFFER_OFFSET_4BYTE_ALIGNED_ONLY:
+	case PIPE_CAP_VERTEX_BUFFER_STRIDE_4BYTE_ALIGNED_ONLY:
+	case PIPE_CAP_VERTEX_ELEMENT_SRC_OFFSET_4BYTE_ALIGNED_ONLY:
+	case PIPE_CAP_USER_INDEX_BUFFERS:
+	case PIPE_CAP_USER_CONSTANT_BUFFERS:
+	case PIPE_CAP_START_INSTANCE:
+	case PIPE_CAP_NPOT_TEXTURES:
+	case PIPE_CAP_MIXED_FRAMEBUFFER_SIZES:
+        case PIPE_CAP_PREFER_BLIT_BASED_TEXTURE_TRANSFER:
+	case PIPE_CAP_TGSI_INSTANCEID:
+	case PIPE_CAP_COMPUTE:
+	case PIPE_CAP_TEXTURE_BUFFER_OBJECTS:
+        case PIPE_CAP_TGSI_VS_LAYER:
+	case PIPE_CAP_QUERY_PIPELINE_STATISTICS:
+	case PIPE_CAP_BUFFER_MAP_PERSISTENT_COHERENT:
+		return 1;
+
+	case PIPE_CAP_TEXTURE_MULTISAMPLE:
+		/* 2D tiling on CIK is supported since DRM 2.35.0 */
+		return HAVE_LLVM >= 0x0304 && (sscreen->b.chip_class < CIK ||
+					       sscreen->b.info.drm_minor >= 35);
+
+        case PIPE_CAP_MIN_MAP_BUFFER_ALIGNMENT:
+                return R600_MAP_BUFFER_ALIGNMENT;
+
+	case PIPE_CAP_CONSTANT_BUFFER_OFFSET_ALIGNMENT:
+	case PIPE_CAP_TEXTURE_BUFFER_OFFSET_ALIGNMENT:
+		return 4;
+
+	case PIPE_CAP_GLSL_FEATURE_LEVEL:
+		return (LLVM_SUPPORTS_GEOM_SHADERS) ? 330 : 140;
+
+	case PIPE_CAP_MAX_TEXTURE_BUFFER_SIZE:
+		return MIN2(sscreen->b.info.vram_size, 0xFFFFFFFF);
+
+	/* Unsupported features. */
+	case PIPE_CAP_TGSI_FS_COORD_ORIGIN_LOWER_LEFT:
+	case PIPE_CAP_TGSI_FS_COORD_PIXEL_CENTER_INTEGER:
+	case PIPE_CAP_TGSI_CAN_COMPACT_CONSTANTS:
+	case PIPE_CAP_FRAGMENT_COLOR_CLAMPED:
+	case PIPE_CAP_VERTEX_COLOR_CLAMPED:
+	case PIPE_CAP_QUADS_FOLLOW_PROVOKING_VERTEX_CONVENTION:
+	case PIPE_CAP_USER_VERTEX_BUFFERS:
+	case PIPE_CAP_CUBE_MAP_ARRAY:
+	case PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS:
+	case PIPE_CAP_TEXTURE_GATHER_SM5:
+	case PIPE_CAP_TGSI_TEXCOORD:
+	case PIPE_CAP_FAKE_SW_MSAA:
+	case PIPE_CAP_TEXTURE_QUERY_LOD:
+        case PIPE_CAP_SAMPLE_SHADING:
+		return 0;
+
+	case PIPE_CAP_TEXTURE_BORDER_COLOR_QUIRK:
+		return PIPE_QUIRK_TEXTURE_BORDER_COLOR_SWIZZLE_R600;
+
+	/* Stream output. */
+	case PIPE_CAP_MAX_STREAM_OUTPUT_BUFFERS:
+		return sscreen->b.has_streamout ? 4 : 0;
+	case PIPE_CAP_STREAM_OUTPUT_PAUSE_RESUME:
+		return sscreen->b.has_streamout ? 1 : 0;
+	case PIPE_CAP_MAX_STREAM_OUTPUT_SEPARATE_COMPONENTS:
+	case PIPE_CAP_MAX_STREAM_OUTPUT_INTERLEAVED_COMPONENTS:
+		return sscreen->b.has_streamout ? 32*4 : 0;
+
+	/* Geometry shader output. */
+	case PIPE_CAP_MAX_GEOMETRY_OUTPUT_VERTICES:
+		return 1024;
+	case PIPE_CAP_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS:
+		return 4095;
+
+	/* Texturing. */
+	case PIPE_CAP_MAX_TEXTURE_2D_LEVELS:
+	case PIPE_CAP_MAX_TEXTURE_CUBE_LEVELS:
+		return 15; /* 16384 */
+	case PIPE_CAP_MAX_TEXTURE_3D_LEVELS:
+		/* textures support 8192, but layered rendering supports 2048 */
+		return 12;
+	case PIPE_CAP_MAX_TEXTURE_ARRAY_LAYERS:
+		/* textures support 8192, but layered rendering supports 2048 */
+		return 2048;
+
+	/* Render targets. */
+	case PIPE_CAP_MAX_RENDER_TARGETS:
+		return 8;
+
+	case PIPE_CAP_MAX_VIEWPORTS:
+		return 1;
+
+	/* Timer queries, present when the clock frequency is non zero. */
+	case PIPE_CAP_QUERY_TIMESTAMP:
+	case PIPE_CAP_QUERY_TIME_ELAPSED:
+		return sscreen->b.info.r600_clock_crystal_freq != 0;
+
+ 	case PIPE_CAP_MIN_TEXTURE_GATHER_OFFSET:
+	case PIPE_CAP_MIN_TEXEL_OFFSET:
+		return -8;
+
+ 	case PIPE_CAP_MAX_TEXTURE_GATHER_OFFSET:
+	case PIPE_CAP_MAX_TEXEL_OFFSET:
+		return 7;
+	case PIPE_CAP_ENDIANNESS:
+		return PIPE_ENDIAN_LITTLE;
+
+	case PIPE_CAP_VENDOR_ID:
+		return 0x1002;
+	case PIPE_CAP_DEVICE_ID:
+		return sscreen->b.info.pci_id;
+	case PIPE_CAP_ACCELERATED:
+		return 1;
+	case PIPE_CAP_VIDEO_MEMORY:
+		return sscreen->b.info.vram_size >> 20;
+	case PIPE_CAP_UMA:
+		return 0;
+	}
+	return 0;
+}
+
+static int si_get_shader_param(struct pipe_screen* pscreen, unsigned shader, enum pipe_shader_cap param)
+{
+	switch(shader)
+	{
+	case PIPE_SHADER_FRAGMENT:
+	case PIPE_SHADER_VERTEX:
+		break;
+	case PIPE_SHADER_GEOMETRY:
+#if !(LLVM_SUPPORTS_GEOM_SHADERS)
+		return 0;
+#endif
+		break;
+	case PIPE_SHADER_COMPUTE:
+		switch (param) {
+		case PIPE_SHADER_CAP_PREFERRED_IR:
+			return PIPE_SHADER_IR_LLVM;
+		default:
+			return 0;
+		}
+	default:
+		/* TODO: support tessellation */
+		return 0;
+	}
+
+	switch (param) {
+	case PIPE_SHADER_CAP_MAX_INSTRUCTIONS:
+	case PIPE_SHADER_CAP_MAX_ALU_INSTRUCTIONS:
+	case PIPE_SHADER_CAP_MAX_TEX_INSTRUCTIONS:
+	case PIPE_SHADER_CAP_MAX_TEX_INDIRECTIONS:
+		return 16384;
+	case PIPE_SHADER_CAP_MAX_CONTROL_FLOW_DEPTH:
+		return 32;
+	case PIPE_SHADER_CAP_MAX_INPUTS:
+		return 32;
+	case PIPE_SHADER_CAP_MAX_TEMPS:
+		return 256; /* Max native temporaries. */
+	case PIPE_SHADER_CAP_MAX_ADDRS:
+		/* FIXME Isn't this equal to TEMPS? */
+		return 1; /* Max native address registers */
+	case PIPE_SHADER_CAP_MAX_CONSTS:
+		return 4096; /* actually only memory limits this */
+	case PIPE_SHADER_CAP_MAX_CONST_BUFFERS:
+		return NUM_PIPE_CONST_BUFFERS;
+	case PIPE_SHADER_CAP_MAX_PREDS:
+		return 0; /* FIXME */
+	case PIPE_SHADER_CAP_TGSI_CONT_SUPPORTED:
+		return 1;
+	case PIPE_SHADER_CAP_TGSI_SQRT_SUPPORTED:
+		return 0;
+	case PIPE_SHADER_CAP_INDIRECT_INPUT_ADDR:
+		/* Indirection of geometry shader input dimension is not
+		 * handled yet
+		 */
+		return shader < PIPE_SHADER_GEOMETRY;
+	case PIPE_SHADER_CAP_INDIRECT_OUTPUT_ADDR:
+	case PIPE_SHADER_CAP_INDIRECT_TEMP_ADDR:
+	case PIPE_SHADER_CAP_INDIRECT_CONST_ADDR:
+		return 1;
+	case PIPE_SHADER_CAP_INTEGERS:
+		return 1;
+	case PIPE_SHADER_CAP_SUBROUTINES:
+		return 0;
+	case PIPE_SHADER_CAP_MAX_TEXTURE_SAMPLERS:
+	case PIPE_SHADER_CAP_MAX_SAMPLER_VIEWS:
+		return 16;
+	case PIPE_SHADER_CAP_PREFERRED_IR:
+		return PIPE_SHADER_IR_TGSI;
+	}
+	return 0;
+}
+
+static void si_destroy_screen(struct pipe_screen* pscreen)
+{
+	struct si_screen *sscreen = (struct si_screen *)pscreen;
+
+	if (sscreen == NULL)
+		return;
+
+	if (!sscreen->b.ws->unref(sscreen->b.ws))
+		return;
+
+	r600_destroy_common_screen(&sscreen->b);
+}
+
+#define SI_TILE_MODE_COLOR_2D_8BPP  14
+
+/* Initialize pipe config. This is especially important for GPUs
+ * with 16 pipes and more where it's initialized incorrectly by
+ * the TILING_CONFIG ioctl. */
+static bool si_initialize_pipe_config(struct si_screen *sscreen)
+{
+	unsigned mode2d;
+
+	/* This is okay, because there can be no 2D tiling without
+	 * the tile mode array, so we won't need the pipe config.
+	 * Return "success".
+	 */
+	if (!sscreen->b.info.si_tile_mode_array_valid)
+		return true;
+
+	/* The same index is used for the 2D mode on CIK too. */
+	mode2d = sscreen->b.info.si_tile_mode_array[SI_TILE_MODE_COLOR_2D_8BPP];
+
+	switch (G_009910_PIPE_CONFIG(mode2d)) {
+	case V_02803C_ADDR_SURF_P2:
+		sscreen->b.tiling_info.num_channels = 2;
+		break;
+	case V_02803C_X_ADDR_SURF_P4_8X16:
+	case V_02803C_X_ADDR_SURF_P4_16X16:
+	case V_02803C_X_ADDR_SURF_P4_16X32:
+	case V_02803C_X_ADDR_SURF_P4_32X32:
+		sscreen->b.tiling_info.num_channels = 4;
+		break;
+	case V_02803C_X_ADDR_SURF_P8_16X16_8X16:
+	case V_02803C_X_ADDR_SURF_P8_16X32_8X16:
+	case V_02803C_X_ADDR_SURF_P8_32X32_8X16:
+	case V_02803C_X_ADDR_SURF_P8_16X32_16X16:
+	case V_02803C_X_ADDR_SURF_P8_32X32_16X16:
+	case V_02803C_X_ADDR_SURF_P8_32X32_16X32:
+	case V_02803C_X_ADDR_SURF_P8_32X64_32X32:
+		sscreen->b.tiling_info.num_channels = 8;
+		break;
+	case V_02803C_X_ADDR_SURF_P16_32X32_8X16:
+	case V_02803C_X_ADDR_SURF_P16_32X32_16X16:
+		sscreen->b.tiling_info.num_channels = 16;
+		break;
+	default:
+		assert(0);
+		fprintf(stderr, "radeonsi: Unknown pipe config %i.\n",
+			G_009910_PIPE_CONFIG(mode2d));
+		return false;
+	}
+	return true;
+}
+
+struct pipe_screen *radeonsi_screen_create(struct radeon_winsys *ws)
+{
+	struct si_screen *sscreen = CALLOC_STRUCT(si_screen);
+	if (sscreen == NULL) {
+		return NULL;
+	}
+
+	/* Set functions first. */
+	sscreen->b.b.context_create = si_create_context;
+	sscreen->b.b.destroy = si_destroy_screen;
+	sscreen->b.b.get_param = si_get_param;
+	sscreen->b.b.get_shader_param = si_get_shader_param;
+	sscreen->b.b.is_format_supported = si_is_format_supported;
+	sscreen->b.b.resource_create = r600_resource_create_common;
+
+	if (!r600_common_screen_init(&sscreen->b, ws) ||
+	    !si_initialize_pipe_config(sscreen)) {
+		FREE(sscreen);
+		return NULL;
+	}
+
+	sscreen->b.has_cp_dma = true;
+	sscreen->b.has_streamout = HAVE_LLVM >= 0x0304;
+
+	if (debug_get_bool_option("RADEON_DUMP_SHADERS", FALSE))
+		sscreen->b.debug_flags |= DBG_FS | DBG_VS | DBG_GS | DBG_PS | DBG_CS;
+
+	/* Create the auxiliary context. This must be done last. */
+	sscreen->b.aux_context = sscreen->b.b.context_create(&sscreen->b.b, NULL);
+
+	return &sscreen->b.b;
+}
+@
+
+
+1.2
+log
+@Backport support for GLX_MESA_query_renderer for non Intel drivers.
+This is desirable as the chromium port now uses this extension to
+obtain pci vendor/device ids for use in feature/extension blacklists.
+
+Prompted by a mail from byrnet@@, tested on r600g by krw@@
+
+The newly added os_get_total_physical_memory() was passing the length of
+a pointer rather than the type which made the sysctl call fail on
+non 64 bit archs.  And it was passing the wrong pointer for the result.
+Fixes for these problems have been submitted back upstream.
+@
+text
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d26 1
+d43 2
+d111 1
+a111 1
+	sctx->atoms.cache_flush = &sctx->cache_flush;
+d113 2
+a114 2
+	sctx->atoms.streamout_begin = &sctx->b.streamout.begin_atom;
+	sctx->atoms.streamout_enable = &sctx->b.streamout.enable_atom;
+d302 11
+d401 51
+d467 2
+a468 1
+	if (!r600_common_screen_init(&sscreen->b, ws)) {
+@
+
+
+1.1.1.1
+log
+@Import Mesa 10.2.3
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 10.2.7
+@
+text
+@a25 1
+#include "sid.h"
+d108 1
+a108 1
+	sctx->atoms.s.cache_flush = &sctx->cache_flush;
+d110 2
+a111 2
+	sctx->atoms.s.streamout_begin = &sctx->b.streamout.begin_atom;
+	sctx->atoms.s.streamout_enable = &sctx->b.streamout.enable_atom;
+a386 51
+#define SI_TILE_MODE_COLOR_2D_8BPP  14
+
+/* Initialize pipe config. This is especially important for GPUs
+ * with 16 pipes and more where it's initialized incorrectly by
+ * the TILING_CONFIG ioctl. */
+static bool si_initialize_pipe_config(struct si_screen *sscreen)
+{
+	unsigned mode2d;
+
+	/* This is okay, because there can be no 2D tiling without
+	 * the tile mode array, so we won't need the pipe config.
+	 * Return "success".
+	 */
+	if (!sscreen->b.info.si_tile_mode_array_valid)
+		return true;
+
+	/* The same index is used for the 2D mode on CIK too. */
+	mode2d = sscreen->b.info.si_tile_mode_array[SI_TILE_MODE_COLOR_2D_8BPP];
+
+	switch (G_009910_PIPE_CONFIG(mode2d)) {
+	case V_02803C_ADDR_SURF_P2:
+		sscreen->b.tiling_info.num_channels = 2;
+		break;
+	case V_02803C_X_ADDR_SURF_P4_8X16:
+	case V_02803C_X_ADDR_SURF_P4_16X16:
+	case V_02803C_X_ADDR_SURF_P4_16X32:
+	case V_02803C_X_ADDR_SURF_P4_32X32:
+		sscreen->b.tiling_info.num_channels = 4;
+		break;
+	case V_02803C_X_ADDR_SURF_P8_16X16_8X16:
+	case V_02803C_X_ADDR_SURF_P8_16X32_8X16:
+	case V_02803C_X_ADDR_SURF_P8_32X32_8X16:
+	case V_02803C_X_ADDR_SURF_P8_16X32_16X16:
+	case V_02803C_X_ADDR_SURF_P8_32X32_16X16:
+	case V_02803C_X_ADDR_SURF_P8_32X32_16X32:
+	case V_02803C_X_ADDR_SURF_P8_32X64_32X32:
+		sscreen->b.tiling_info.num_channels = 8;
+		break;
+	case V_02803C_X_ADDR_SURF_P16_32X32_8X16:
+	case V_02803C_X_ADDR_SURF_P16_32X32_16X16:
+		sscreen->b.tiling_info.num_channels = 16;
+		break;
+	default:
+		assert(0);
+		fprintf(stderr, "radeonsi: Unknown pipe config %i.\n",
+			G_009910_PIPE_CONFIG(mode2d));
+		return false;
+	}
+	return true;
+}
+
+d402 1
+a402 2
+	if (!r600_common_screen_init(&sscreen->b, ws) ||
+	    !si_initialize_pipe_config(sscreen)) {
+@
+
+
+1.1.1.3
+log
+@Import Mesa 10.4.3
+@
+text
+@d29 1
+d31 1
+a42 2
+	pipe_resource_reference(&sctx->esgs_ring, NULL);
+	pipe_resource_reference(&sctx->gsvs_ring, NULL);
+d53 6
+a58 1
+	sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush);
+d102 1
+a102 2
+					     sctx, sscreen->b.trace_bo ?
+						sscreen->b.trace_bo->cs_buf : NULL);
+a110 3
+	sctx->msaa_config = si_atom_msaa_config;
+	sctx->atoms.s.msaa_config = &sctx->msaa_config;
+
+a124 3
+	if (sscreen->b.debug_flags & DBG_FORCE_DMA)
+		sctx->b.b.resource_copy_region = sctx->b.dma_copy;
+
+d128 6
+a133 1
+	sctx->blitter->draw_rectangle = r600_draw_rectangle;
+d147 1
+a147 1
+			for (i = 0; i < SI_NUM_CONST_BUFFERS; i++) {
+d210 1
+a210 1
+        case PIPE_CAP_TGSI_VS_LAYER_VIEWPORT:
+a212 4
+	case PIPE_CAP_CUBE_MAP_ARRAY:
+	case PIPE_CAP_SAMPLE_SHADING:
+	case PIPE_CAP_DRAW_INDIRECT:
+	case PIPE_CAP_CLIP_HALFZ:
+d217 2
+a218 2
+		return sscreen->b.chip_class < CIK ||
+		       sscreen->b.info.drm_minor >= 35;
+d228 1
+a228 1
+		return 330;
+a232 6
+	case PIPE_CAP_TEXTURE_QUERY_LOD:
+	case PIPE_CAP_TEXTURE_GATHER_SM5:
+		return HAVE_LLVM >= 0x0305;
+	case PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS:
+		return HAVE_LLVM >= 0x0305 ? 4 : 0;
+
+d241 3
+d246 2
+a247 5
+	case PIPE_CAP_TEXTURE_GATHER_OFFSETS:
+	case PIPE_CAP_TGSI_VS_WINDOW_SPACE_POSITION:
+	case PIPE_CAP_TGSI_FS_FINE_DERIVATIVE:
+	case PIPE_CAP_CONDITIONAL_RENDER_INVERTED:
+	case PIPE_CAP_SAMPLER_VIEW_TARGET:
+a266 5
+	case PIPE_CAP_MAX_VERTEX_STREAMS:
+		return 1;
+
+	case PIPE_CAP_MAX_VERTEX_ATTRIB_STRIDE:
+		return 2048;
+d293 1
+a293 1
+		return -32;
+d297 1
+a297 2
+		return 31;
+
+a299 11
+
+	case PIPE_CAP_VENDOR_ID:
+		return 0x1002;
+	case PIPE_CAP_DEVICE_ID:
+		return sscreen->b.info.pci_id;
+	case PIPE_CAP_ACCELERATED:
+		return 1;
+	case PIPE_CAP_VIDEO_MEMORY:
+		return sscreen->b.info.vram_size >> 20;
+	case PIPE_CAP_UMA:
+		return 0;
+d310 1
+d312 3
+a318 1
+#if HAVE_LLVM < 0x0306
+a319 13
+#else
+			return PIPE_SHADER_IR_NATIVE;
+#endif
+		case PIPE_SHADER_CAP_DOUBLES:
+			return 0; /* XXX: Enable doubles once the compiler can
+			             handle them. */
+		case PIPE_SHADER_CAP_MAX_CONST_BUFFER_SIZE: {
+			uint64_t max_const_buffer_size;
+			pscreen->get_compute_param(pscreen,
+				PIPE_COMPUTE_CAP_MAX_MEM_ALLOC_SIZE,
+				&max_const_buffer_size);
+			return max_const_buffer_size;
+		}
+d337 1
+a337 3
+		return shader == PIPE_SHADER_VERTEX ? SI_NUM_VERTEX_BUFFERS : 32;
+	case PIPE_SHADER_CAP_MAX_OUTPUTS:
+		return shader == PIPE_SHADER_FRAGMENT ? 8 : 32;
+d340 5
+a344 2
+	case PIPE_SHADER_CAP_MAX_CONST_BUFFER_SIZE:
+		return 4096 * sizeof(float[4]); /* actually only memory limits this */
+d346 1
+a346 1
+		return SI_NUM_USER_CONST_BUFFERS;
+a370 2
+	case PIPE_SHADER_CAP_DOUBLES:
+		return 0;
+d461 1
+a461 1
+	sscreen->b.has_streamout = true;
+@
+
+
+1.1.1.4
+log
+@Import Mesa 10.2.9
+@
+text
+@a28 1
+#include "util/u_blitter.h"
+a29 1
+#include "util/u_simple_shaders.h"
+d41 2
+a42 2
+	pipe_resource_reference(&sctx->esgs_ring.buffer, NULL);
+	pipe_resource_reference(&sctx->gsvs_ring.buffer, NULL);
+d53 1
+a53 6
+	for (int i = 0; i < 8; i++) {
+		sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_depth_stencil[i]);
+		sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_depth[i]);
+		sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_stencil[i]);
+	}
+	sctx->b.b.delete_depth_stencil_alpha_state(&sctx->b.b, sctx->custom_dsa_flush_inplace);
+d97 2
+a98 1
+					     sctx, NULL);
+d107 3
+d124 3
+d130 1
+a130 6
+
+	sctx->dummy_pixel_shader =
+		util_make_fragment_cloneinput_shader(&sctx->b.b, 0,
+						     TGSI_SEMANTIC_GENERIC,
+						     TGSI_INTERPOLATE_CONSTANT);
+	sctx->b.b.bind_fs_state(&sctx->b.b, sctx->dummy_pixel_shader);
+d144 1
+a144 1
+			for (i = 0; i < NUM_CONST_BUFFERS; i++) {
+d207 1
+a207 1
+        case PIPE_CAP_TGSI_VS_LAYER:
+d210 4
+d218 2
+a219 2
+		return HAVE_LLVM >= 0x0304 && (sscreen->b.chip_class < CIK ||
+					       sscreen->b.info.drm_minor >= 35);
+d229 1
+a229 1
+		return (LLVM_SUPPORTS_GEOM_SHADERS) ? 330 : 140;
+d234 6
+a247 3
+	case PIPE_CAP_CUBE_MAP_ARRAY:
+	case PIPE_CAP_MAX_TEXTURE_GATHER_COMPONENTS:
+	case PIPE_CAP_TEXTURE_GATHER_SM5:
+d250 5
+a254 2
+	case PIPE_CAP_TEXTURE_QUERY_LOD:
+        case PIPE_CAP_SAMPLE_SHADING:
+d274 5
+d305 1
+a305 1
+		return -8;
+d309 2
+a310 1
+		return 7;
+d313 11
+a333 1
+		break;
+a334 3
+#if !(LLVM_SUPPORTS_GEOM_SHADERS)
+		return 0;
+#endif
+d339 1
+d341 13
+d371 3
+a373 1
+		return 32;
+d376 2
+a377 5
+	case PIPE_SHADER_CAP_MAX_ADDRS:
+		/* FIXME Isn't this equal to TEMPS? */
+		return 1; /* Max native address registers */
+	case PIPE_SHADER_CAP_MAX_CONSTS:
+		return 4096; /* actually only memory limits this */
+d379 1
+a379 1
+		return NUM_PIPE_CONST_BUFFERS;
+d404 2
+d496 1
+a496 1
+	sscreen->b.has_streamout = HAVE_LLVM >= 0x0304;
+@
+
+

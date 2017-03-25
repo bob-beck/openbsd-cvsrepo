@@ -1,0 +1,878 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.02;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.02;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.09;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.34;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===- FuzzerDriver.cpp - FuzzerDriver function and flags -----------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+// FuzzerDriver and flag parsing.
+//===----------------------------------------------------------------------===//
+
+#include "FuzzerInterface.h"
+#include "FuzzerInternal.h"
+
+#include <cstring>
+#include <chrono>
+#include <unistd.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <sstream>
+#include <algorithm>
+#include <iterator>
+
+namespace fuzzer {
+
+// Program arguments.
+struct FlagDescription {
+  const char *Name;
+  const char *Description;
+  int   Default;
+  int   *IntFlag;
+  const char **StrFlag;
+  unsigned int *UIntFlag;
+};
+
+struct {
+#define FUZZER_FLAG_INT(Name, Default, Description) int Name;
+#define FUZZER_FLAG_UNSIGNED(Name, Default, Description) unsigned int Name;
+#define FUZZER_FLAG_STRING(Name, Description) const char *Name;
+#include "FuzzerFlags.def"
+#undef FUZZER_FLAG_INT
+#undef FUZZER_FLAG_UNSIGNED
+#undef FUZZER_FLAG_STRING
+} Flags;
+
+static const FlagDescription FlagDescriptions [] {
+#define FUZZER_FLAG_INT(Name, Default, Description)                            \
+  {#Name, Description, Default, &Flags.Name, nullptr, nullptr},
+#define FUZZER_FLAG_UNSIGNED(Name, Default, Description)                       \
+  {#Name,   Description, static_cast<int>(Default),                            \
+   nullptr, nullptr, &Flags.Name},
+#define FUZZER_FLAG_STRING(Name, Description)                                  \
+  {#Name, Description, 0, nullptr, &Flags.Name, nullptr},
+#include "FuzzerFlags.def"
+#undef FUZZER_FLAG_INT
+#undef FUZZER_FLAG_UNSIGNED
+#undef FUZZER_FLAG_STRING
+};
+
+static const size_t kNumFlags =
+    sizeof(FlagDescriptions) / sizeof(FlagDescriptions[0]);
+
+static std::vector<std::string> *Inputs;
+static std::string *ProgName;
+
+static void PrintHelp() {
+  Printf("Usage: %s [-flag1=val1 [-flag2=val2 ...] ] [dir1 [dir2 ...] ]\n",
+         ProgName->c_str());
+  Printf("\nFlags: (strictly in form -flag=value)\n");
+  size_t MaxFlagLen = 0;
+  for (size_t F = 0; F < kNumFlags; F++)
+    MaxFlagLen = std::max(strlen(FlagDescriptions[F].Name), MaxFlagLen);
+
+  for (size_t F = 0; F < kNumFlags; F++) {
+    const auto &D = FlagDescriptions[F];
+    Printf(" %s", D.Name);
+    for (size_t i = 0, n = MaxFlagLen - strlen(D.Name); i < n; i++)
+      Printf(" ");
+    Printf("\t");
+    Printf("%d\t%s\n", D.Default, D.Description);
+  }
+  Printf("\nFlags starting with '--' will be ignored and "
+            "will be passed verbatim to subprocesses.\n");
+}
+
+static const char *FlagValue(const char *Param, const char *Name) {
+  size_t Len = strlen(Name);
+  if (Param[0] == '-' && strstr(Param + 1, Name) == Param + 1 &&
+      Param[Len + 1] == '=')
+      return &Param[Len + 2];
+  return nullptr;
+}
+
+static bool ParseOneFlag(const char *Param) {
+  if (Param[0] != '-') return false;
+  if (Param[1] == '-') {
+    static bool PrintedWarning = false;
+    if (!PrintedWarning) {
+      PrintedWarning = true;
+      Printf("WARNING: libFuzzer ignores flags that start with '--'\n");
+    }
+    return true;
+  }
+  for (size_t F = 0; F < kNumFlags; F++) {
+    const char *Name = FlagDescriptions[F].Name;
+    const char *Str = FlagValue(Param, Name);
+    if (Str)  {
+      if (FlagDescriptions[F].IntFlag) {
+        int Val = std::stol(Str);
+        *FlagDescriptions[F].IntFlag = Val;
+        if (Flags.verbosity >= 2)
+          Printf("Flag: %s %d\n", Name, Val);;
+        return true;
+      } else if (FlagDescriptions[F].UIntFlag) {
+        unsigned int Val = std::stoul(Str);
+        *FlagDescriptions[F].UIntFlag = Val;
+        if (Flags.verbosity >= 2)
+          Printf("Flag: %s %u\n", Name, Val);
+        return true;
+      } else if (FlagDescriptions[F].StrFlag) {
+        *FlagDescriptions[F].StrFlag = Str;
+        if (Flags.verbosity >= 2)
+          Printf("Flag: %s %s\n", Name, Str);
+        return true;
+      }
+    }
+  }
+  PrintHelp();
+  exit(1);
+}
+
+// We don't use any library to minimize dependencies.
+static void ParseFlags(const std::vector<std::string> &Args) {
+  for (size_t F = 0; F < kNumFlags; F++) {
+    if (FlagDescriptions[F].IntFlag)
+      *FlagDescriptions[F].IntFlag = FlagDescriptions[F].Default;
+    if (FlagDescriptions[F].UIntFlag)
+      *FlagDescriptions[F].UIntFlag =
+          static_cast<unsigned int>(FlagDescriptions[F].Default);
+    if (FlagDescriptions[F].StrFlag)
+      *FlagDescriptions[F].StrFlag = nullptr;
+  }
+  Inputs = new std::vector<std::string>;
+  for (size_t A = 1; A < Args.size(); A++) {
+    if (ParseOneFlag(Args[A].c_str())) continue;
+    Inputs->push_back(Args[A]);
+  }
+}
+
+static std::mutex Mu;
+
+static void PulseThread() {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::seconds(600));
+    std::lock_guard<std::mutex> Lock(Mu);
+    Printf("pulse...\n");
+  }
+}
+
+static void WorkerThread(const std::string &Cmd, std::atomic<int> *Counter,
+                        int NumJobs, std::atomic<bool> *HasErrors) {
+  while (true) {
+    int C = (*Counter)++;
+    if (C >= NumJobs) break;
+    std::string Log = "fuzz-" + std::to_string(C) + ".log";
+    std::string ToRun = Cmd + " > " + Log + " 2>&1\n";
+    if (Flags.verbosity)
+      Printf("%s", ToRun.c_str());
+    int ExitCode = ExecuteCommand(ToRun.c_str());
+    if (ExitCode != 0)
+      *HasErrors = true;
+    std::lock_guard<std::mutex> Lock(Mu);
+    Printf("================== Job %d exited with exit code %d ============\n",
+           C, ExitCode);
+    fuzzer::CopyFileToErr(Log);
+  }
+}
+
+static int RunInMultipleProcesses(const std::vector<std::string> &Args,
+                                  int NumWorkers, int NumJobs) {
+  std::atomic<int> Counter(0);
+  std::atomic<bool> HasErrors(false);
+  std::string Cmd;
+  for (auto &S : Args) {
+    if (FlagValue(S.c_str(), "jobs") || FlagValue(S.c_str(), "workers"))
+      continue;
+    Cmd += S + " ";
+  }
+  std::vector<std::thread> V;
+  std::thread Pulse(PulseThread);
+  Pulse.detach();
+  for (int i = 0; i < NumWorkers; i++)
+    V.push_back(std::thread(WorkerThread, Cmd, &Counter, NumJobs, &HasErrors));
+  for (auto &T : V)
+    T.join();
+  return HasErrors ? 1 : 0;
+}
+
+int RunOneTest(Fuzzer *F, const char *InputFilePath) {
+  Unit U = FileToVector(InputFilePath);
+  Unit PreciseSizedU(U);
+  assert(PreciseSizedU.size() == PreciseSizedU.capacity());
+  F->ExecuteCallback(PreciseSizedU);
+  return 0;
+}
+
+int FuzzerDriver(int argc, char **argv, UserCallback Callback) {
+  FuzzerRandomLibc Rand(0);
+  SimpleUserSuppliedFuzzer SUSF(&Rand, Callback);
+  return FuzzerDriver(argc, argv, SUSF);
+}
+
+int FuzzerDriver(int argc, char **argv, UserSuppliedFuzzer &USF) {
+  std::vector<std::string> Args(argv, argv + argc);
+  return FuzzerDriver(Args, USF);
+}
+
+int FuzzerDriver(const std::vector<std::string> &Args, UserCallback Callback) {
+  FuzzerRandomLibc Rand(0);
+  SimpleUserSuppliedFuzzer SUSF(&Rand, Callback);
+  return FuzzerDriver(Args, SUSF);
+}
+
+int FuzzerDriver(const std::vector<std::string> &Args,
+                 UserSuppliedFuzzer &USF) {
+  using namespace fuzzer;
+  assert(!Args.empty());
+  ProgName = new std::string(Args[0]);
+  ParseFlags(Args);
+  if (Flags.help) {
+    PrintHelp();
+    return 0;
+  }
+
+  if (Flags.jobs > 0 && Flags.workers == 0) {
+    Flags.workers = std::min(NumberOfCpuCores() / 2, Flags.jobs);
+    if (Flags.workers > 1)
+      Printf("Running %d workers\n", Flags.workers);
+  }
+
+  if (Flags.workers > 0 && Flags.jobs > 0)
+    return RunInMultipleProcesses(Args, Flags.workers, Flags.jobs);
+
+  Fuzzer::FuzzingOptions Options;
+  Options.Verbosity = Flags.verbosity;
+  Options.MaxLen = Flags.max_len;
+  Options.UnitTimeoutSec = Flags.timeout;
+  Options.MaxTotalTimeSec = Flags.max_total_time;
+  Options.DoCrossOver = Flags.cross_over;
+  Options.MutateDepth = Flags.mutate_depth;
+  Options.ExitOnFirst = Flags.exit_on_first;
+  Options.UseCounters = Flags.use_counters;
+  Options.UseIndirCalls = Flags.use_indir_calls;
+  Options.UseTraces = Flags.use_traces;
+  Options.ShuffleAtStartUp = Flags.shuffle;
+  Options.PreferSmallDuringInitialShuffle =
+      Flags.prefer_small_during_initial_shuffle;
+  Options.Reload = Flags.reload;
+  Options.OnlyASCII = Flags.only_ascii;
+  Options.OutputCSV = Flags.output_csv;
+  if (Flags.runs >= 0)
+    Options.MaxNumberOfRuns = Flags.runs;
+  if (!Inputs->empty())
+    Options.OutputCorpus = (*Inputs)[0];
+  if (Flags.sync_command)
+    Options.SyncCommand = Flags.sync_command;
+  Options.SyncTimeout = Flags.sync_timeout;
+  Options.ReportSlowUnits = Flags.report_slow_units;
+  if (Flags.artifact_prefix)
+    Options.ArtifactPrefix = Flags.artifact_prefix;
+  if (Flags.exact_artifact_path)
+    Options.ExactArtifactPath = Flags.exact_artifact_path;
+  std::vector<Unit> Dictionary;
+  if (Flags.dict)
+    if (!ParseDictionaryFile(FileToString(Flags.dict), &Dictionary))
+      return 1;
+  if (Flags.verbosity > 0 && !Dictionary.empty())
+    Printf("Dictionary: %zd entries\n", Dictionary.size());
+  Options.SaveArtifacts = !Flags.test_single_input;
+  Options.PrintNewCovPcs = Flags.print_new_cov_pcs;
+
+  Fuzzer F(USF, Options);
+
+  for (auto &U: Dictionary)
+    USF.GetMD().AddWordToManualDictionary(U);
+
+  // Timer
+  if (Flags.timeout > 0)
+    SetTimer(Flags.timeout / 2 + 1);
+
+  if (Flags.test_single_input) {
+    RunOneTest(&F, Flags.test_single_input);
+    exit(0);
+  }
+
+  if (Flags.save_minimized_corpus) {
+    Printf("The flag -save_minimized_corpus is deprecated; use -merge=1\n");
+    exit(1);
+  }
+
+  if (Flags.merge) {
+    F.Merge(*Inputs);
+    exit(0);
+  }
+
+  unsigned Seed = Flags.seed;
+  // Initialize Seed.
+  if (Seed == 0)
+    Seed = time(0) * 10000 + getpid();
+  if (Flags.verbosity)
+    Printf("Seed: %u\n", Seed);
+  USF.GetRand().ResetSeed(Seed);
+
+  F.RereadOutputCorpus();
+  for (auto &inp : *Inputs)
+    if (inp != Options.OutputCorpus)
+      F.ReadDir(inp, nullptr);
+
+  if (F.CorpusSize() == 0)
+    F.AddToCorpus(Unit());  // Can't fuzz empty corpus, so add an empty input.
+  F.ShuffleAndMinimize();
+  if (Flags.drill)
+    F.Drill();
+  else
+    F.Loop();
+
+  if (Flags.verbosity)
+    Printf("Done %d runs in %zd second(s)\n", F.getTotalNumberOfRuns(),
+           F.secondsSinceProcessStartUp());
+
+  exit(0);  // Don't let F destroy itself.
+}
+
+}  // namespace fuzzer
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d15 4
+a18 1
+#include <algorithm>
+a19 2
+#include <chrono>
+#include <cstring>
+d22 3
+a24 6
+#include <thread>
+#include <unistd.h>
+
+// This function should be present in the libFuzzer so that the client
+// binary can test for its existence.
+extern "C" __attribute__((used)) void __libfuzzer_is_present() {}
+a38 1
+#define FUZZER_DEPRECATED_FLAG(Name)
+a42 1
+#undef FUZZER_DEPRECATED_FLAG
+a48 2
+#define FUZZER_DEPRECATED_FLAG(Name)                                           \
+  {#Name, "Deprecated; don't use", 0, nullptr, nullptr, nullptr},
+a56 1
+#undef FUZZER_DEPRECATED_FLAG
+d69 2
+a70 8
+  Printf("Usage:\n");
+  auto Prog = ProgName->c_str();
+  Printf("\nTo run fuzzing pass 0 or more directories.\n");
+  Printf("%s [-flag1=val1 [-flag2=val2 ...] ] [dir1 [dir2 ...] ]\n", Prog);
+
+  Printf("\nTo run individual tests without fuzzing pass 1 or more files:\n");
+  Printf("%s [-flag1=val1 [-flag2=val2 ...] ] file1 [file2 ...]\n", Prog);
+
+a95 17
+// Avoid calling stol as it triggers a bug in clang/glibc build.
+static long MyStol(const char *Str) {
+  long Res = 0;
+  long Sign = 1;
+  if (*Str == '-') {
+    Str++;
+    Sign = -1;
+  }
+  for (size_t i = 0; Str[i]; i++) {
+    char Ch = Str[i];
+    if (Ch < '0' || Ch > '9')
+      return Res;
+    Res = Res * 10 + (Ch - '0');
+  }
+  return Res * Sign;
+}
+
+d102 1
+a102 1
+      Printf("INFO: libFuzzer ignores flags that start with '--'\n");
+a103 3
+    for (size_t F = 0; F < kNumFlags; F++)
+      if (FlagValue(Param + 1, FlagDescriptions[F].Name))
+        Printf("WARNING: did you mean '%s' (single dash)?\n", Param + 1);
+d111 1
+a111 1
+        int Val = MyStol(Str);
+a126 3
+      } else {  // Deprecated flag.
+        Printf("Flag: %s: deprecated, don't use\n", Name);
+        return true;
+d130 2
+a131 3
+  Printf("\n\nWARNING: unrecognized flag '%s'; "
+         "use -help=1 to list all flags\n\n", Param);
+  return true;
+d156 1
+a156 1
+    SleepSeconds(600);
+d171 1
+a171 1
+    int ExitCode = ExecuteCommand(ToRun);
+a200 15
+static void RssThread(Fuzzer *F, size_t RssLimitMb) {
+  while (true) {
+    SleepSeconds(1);
+    size_t Peak = GetPeakRSSMb();
+    if (Peak > RssLimitMb)
+      F->RssLimitCallback();
+  }
+}
+
+static void StartRssThread(Fuzzer *F, size_t RssLimitMb) {
+  if (!RssLimitMb) return;
+  std::thread T(RssThread, F, RssLimitMb);
+  T.detach();
+}
+
+d205 1
+a205 1
+  F->RunOne(PreciseSizedU.data(), PreciseSizedU.size());
+d209 9
+a217 6
+static bool AllInputsAreFiles() {
+  if (Inputs->empty()) return false;
+  for (auto &Path : *Inputs)
+    if (!IsFile(Path))
+      return false;
+  return true;
+d220 8
+a227 1
+int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
+a228 5
+  assert(argc && argv && "Argument pointers cannot be nullptr");
+  EF = new ExternalFunctions();
+  if (EF->LLVMFuzzerInitialize)
+    EF->LLVMFuzzerInitialize(argc, argv);
+  const std::vector<std::string> Args(*argv, *argv + *argc);
+a236 5
+  if (Flags.close_fd_mask & 2)
+    DupAndCloseStderr();
+  if (Flags.close_fd_mask & 1)
+    CloseStdout();
+
+d246 1
+a246 3
+  const size_t kMaxSaneLen = 1 << 20;
+  const size_t kMinDefaultLen = 64;
+  FuzzingOptions Options;
+a249 1
+  Options.TimeoutExitCode = Flags.timeout_exitcode;
+d253 1
+a256 2
+  Options.UseMemcmp = Flags.use_memcmp;
+  Options.UseMemmem = Flags.use_memmem;
+d258 2
+a259 1
+  Options.PreferSmall = Flags.prefer_small;
+a262 2
+  Options.DetectLeaks = Flags.detect_leaks;
+  Options.RssLimitMb = Flags.rss_limit_mb;
+d267 3
+d281 1
+a281 2
+  bool DoPlainRun = AllInputsAreFiles();
+  Options.SaveArtifacts = !DoPlainRun;
+a282 11
+  Options.PrintFinalStats = Flags.print_final_stats;
+  Options.TruncateUnits = Flags.truncate_units;
+  Options.PruneCorpus = Flags.prune_corpus;
+
+  unsigned Seed = Flags.seed;
+  // Initialize Seed.
+  if (Seed == 0)
+    Seed = (std::chrono::system_clock::now().time_since_epoch().count() << 10) +
+           getpid();
+  if (Flags.verbosity)
+    Printf("INFO: Seed: %u\n", Seed);
+d284 1
+a284 3
+  Random Rand(Seed);
+  MutationDispatcher MD(Rand, Options);
+  Fuzzer F(Callback, MD, Options);
+d287 1
+a287 4
+    if (U.size() <= Word::GetMaxSize())
+      MD.AddWordToManualDictionary(Word(U.data(), U.size()));
+
+  StartRssThread(&F, Flags.rss_limit_mb);
+d292 3
+a294 23
+  if (Flags.handle_segv) SetSigSegvHandler();
+  if (Flags.handle_bus) SetSigBusHandler();
+  if (Flags.handle_abrt) SetSigAbrtHandler();
+  if (Flags.handle_ill) SetSigIllHandler();
+  if (Flags.handle_fpe) SetSigFpeHandler();
+  if (Flags.handle_int) SetSigIntHandler();
+  if (Flags.handle_term) SetSigTermHandler();
+
+  if (DoPlainRun) {
+    Options.SaveArtifacts = false;
+    int Runs = std::max(1, Flags.runs);
+    Printf("%s: Running %zd inputs %d time(s) each.\n", ProgName->c_str(),
+           Inputs->size(), Runs);
+    for (auto &Path : *Inputs) {
+      auto StartTime = system_clock::now();
+      Printf("Running: %s\n", Path.c_str());
+      for (int Iter = 0; Iter < Runs; Iter++)
+        RunOneTest(&F, Path.c_str());
+      auto StopTime = system_clock::now();
+      auto MS = duration_cast<milliseconds>(StopTime - StartTime).count();
+      Printf("Executed %s in %zd ms\n", Path.c_str(), (long)MS);
+    }
+    F.PrintFinalStats();
+d298 4
+a303 2
+    if (Options.MaxLen == 0)
+      F.SetMaxLen(kMaxSaneLen);
+d308 7
+a314 1
+  size_t TemporaryMaxLen = Options.MaxLen ? Options.MaxLen : kMaxSaneLen;
+d316 1
+a316 1
+  F.RereadOutputCorpus(TemporaryMaxLen);
+d319 1
+a319 5
+      F.ReadDir(inp, nullptr, TemporaryMaxLen);
+
+  if (Options.MaxLen == 0)
+    F.SetMaxLen(
+        std::min(std::max(kMinDefaultLen, F.MaxUnitSizeInCorpus()), kMaxSaneLen));
+d321 1
+a321 1
+  if (F.CorpusSize() == 0) {
+a322 3
+    if (Options.Verbosity)
+      Printf("INFO: A corpus is not provided, starting from an empty corpus\n");
+  }
+a331 1
+  F.PrintFinalStats();
+a334 3
+
+// Storage for global ExternalFunctions object.
+ExternalFunctions *EF = nullptr;
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@a11 1
+#include "FuzzerCorpus.h"
+d14 1
+a14 4
+#include "FuzzerIO.h"
+#include "FuzzerMutate.h"
+#include "FuzzerRandom.h"
+#include "FuzzerTracePC.h"
+d22 1
+a90 1
+    if (strstr(D.Description, "internal flag") == D.Description) continue;
+d199 2
+a200 2
+static void WorkerThread(const std::string &Cmd, std::atomic<unsigned> *Counter,
+                         unsigned NumJobs, std::atomic<bool> *HasErrors) {
+d202 1
+a202 1
+    unsigned C = (*Counter)++;
+d212 1
+a212 1
+    Printf("================== Job %u exited with exit code %d ============\n",
+d218 4
+a221 2
+std::string CloneArgsWithoutX(const std::vector<std::string> &Args,
+                              const char *X1, const char *X2) {
+d224 1
+a224 1
+    if (FlagValue(S.c_str(), X1) || FlagValue(S.c_str(), X2))
+a227 8
+  return Cmd;
+}
+
+static int RunInMultipleProcesses(const std::vector<std::string> &Args,
+                                  unsigned NumWorkers, unsigned NumJobs) {
+  std::atomic<unsigned> Counter(0);
+  std::atomic<bool> HasErrors(false);
+  std::string Cmd = CloneArgsWithoutX(Args, "jobs", "workers");
+d231 1
+a231 1
+  for (unsigned i = 0; i < NumWorkers; i++)
+d253 1
+a253 1
+int RunOneTest(Fuzzer *F, const char *InputFilePath, size_t MaxLen) {
+d255 3
+a257 4
+  if (MaxLen && MaxLen < U.size())
+    U.resize(MaxLen);
+  F->RunOne(U.data(), U.size());
+  F->TryDetectingAMemoryLeak(U.data(), U.size(), true);
+a268 76
+int MinimizeCrashInput(const std::vector<std::string> &Args) {
+  if (Inputs->size() != 1) {
+    Printf("ERROR: -minimize_crash should be given one input file\n");
+    exit(1);
+  }
+  std::string InputFilePath = Inputs->at(0);
+  std::string BaseCmd =
+      CloneArgsWithoutX(Args, "minimize_crash", "exact_artifact_path");
+  auto InputPos = BaseCmd.find(" " + InputFilePath + " ");
+  assert(InputPos != std::string::npos);
+  BaseCmd.erase(InputPos, InputFilePath.size() + 1);
+  if (Flags.runs <= 0 && Flags.max_total_time == 0) {
+    Printf("INFO: you need to specify -runs=N or "
+           "-max_total_time=N with -minimize_crash=1\n"
+           "INFO: defaulting to -max_total_time=600\n");
+    BaseCmd += " -max_total_time=600";
+  }
+  // BaseCmd += " >  /dev/null 2>&1 ";
+
+  std::string CurrentFilePath = InputFilePath;
+  while (true) {
+    Unit U = FileToVector(CurrentFilePath);
+    if (U.size() < 2) {
+      Printf("CRASH_MIN: '%s' is small enough\n", CurrentFilePath.c_str());
+      return 0;
+    }
+    Printf("CRASH_MIN: minimizing crash input: '%s' (%zd bytes)\n",
+           CurrentFilePath.c_str(), U.size());
+
+    auto Cmd = BaseCmd + " " + CurrentFilePath;
+
+    Printf("CRASH_MIN: executing: %s\n", Cmd.c_str());
+    int ExitCode = ExecuteCommand(Cmd);
+    if (ExitCode == 0) {
+      Printf("ERROR: the input %s did not crash\n", CurrentFilePath.c_str());
+      exit(1);
+    }
+    Printf("CRASH_MIN: '%s' (%zd bytes) caused a crash. Will try to minimize "
+           "it further\n",
+           CurrentFilePath.c_str(), U.size());
+
+    std::string ArtifactPath = "minimized-from-" + Hash(U);
+    Cmd += " -minimize_crash_internal_step=1 -exact_artifact_path=" +
+        ArtifactPath;
+    Printf("CRASH_MIN: executing: %s\n", Cmd.c_str());
+    ExitCode = ExecuteCommand(Cmd);
+    if (ExitCode == 0) {
+      if (Flags.exact_artifact_path) {
+        CurrentFilePath = Flags.exact_artifact_path;
+        WriteToFile(U, CurrentFilePath);
+      }
+      Printf("CRASH_MIN: failed to minimize beyond %s (%d bytes), exiting\n",
+             CurrentFilePath.c_str(), U.size());
+      return 0;
+    }
+    CurrentFilePath = ArtifactPath;
+    Printf("\n\n\n\n\n\n*********************************\n");
+  }
+  return 0;
+}
+
+int MinimizeCrashInputInternalStep(Fuzzer *F, InputCorpus *Corpus) {
+  assert(Inputs->size() == 1);
+  std::string InputFilePath = Inputs->at(0);
+  Unit U = FileToVector(InputFilePath);
+  assert(U.size() > 2);
+  Printf("INFO: Starting MinimizeCrashInputInternalStep: %zd\n", U.size());
+  Corpus->AddToCorpus(U, 0);
+  F->SetMaxInputLen(U.size());
+  F->SetMaxMutationLen(U.size() - 1);
+  F->MinimizeCrashLoop(U);
+  Printf("INFO: Done MinimizeCrashInputInternalStep, no crashes found\n");
+  exit(0);
+  return 0;
+}
+
+a283 3
+  if (Flags.minimize_crash)
+    return MinimizeCrashInput(Args);
+
+d292 1
+a292 1
+      Printf("Running %u workers\n", Flags.workers);
+a302 3
+  Options.ExperimentalLenControl = Flags.experimental_len_control;
+  if (Flags.experimental_len_control && Flags.max_len == 64)
+    Options.MaxLen = 1 << 20;
+a303 1
+  Options.ErrorExitCode = Flags.error_exitcode;
+d310 1
+a312 3
+  Options.UseCmp = Flags.use_cmp;
+  Options.UseValueProfile = Flags.use_value_profile;
+  Options.Shrink = Flags.shrink;
+d315 1
+a315 1
+  Options.ReloadIntervalSec = Flags.reload;
+a318 1
+  Options.TraceMalloc = Flags.trace_malloc;
+d322 1
+a322 1
+  if (!Inputs->empty() && !Flags.minimize_crash_internal_step)
+d336 2
+a337 3
+  Options.SaveArtifacts =
+      !DoPlainRun || Flags.minimize_crash_internal_step;
+  Options.PrintNewCovPcs = Flags.print_pcs;
+d339 2
+a340 7
+  Options.PrintCorpusStats = Flags.print_corpus_stats;
+  Options.PrintCoverage = Flags.print_coverage;
+  Options.DumpCoverage = Flags.dump_coverage;
+  if (Flags.exit_on_src_pos)
+    Options.ExitOnSrcPos = Flags.exit_on_src_pos;
+  if (Flags.exit_on_item)
+    Options.ExitOnItem = Flags.exit_on_item;
+d345 2
+a346 2
+    Seed =
+        std::chrono::system_clock::now().time_since_epoch().count() + GetPid();
+d351 2
+a352 3
+  auto *MD = new MutationDispatcher(Rand, Options);
+  auto *Corpus = new InputCorpus(Options.OutputCorpus);
+  auto *F = new Fuzzer(Callback, *Corpus, *MD, Options);
+d356 1
+a356 3
+      MD->AddWordToManualDictionary(Word(U.data(), U.size()));
+
+  StartRssThread(F, Flags.rss_limit_mb);
+d358 1
+a358 9
+  Options.HandleAbrt = Flags.handle_abrt;
+  Options.HandleBus = Flags.handle_bus;
+  Options.HandleFpe = Flags.handle_fpe;
+  Options.HandleIll = Flags.handle_ill;
+  Options.HandleInt = Flags.handle_int;
+  Options.HandleSegv = Flags.handle_segv;
+  Options.HandleTerm = Flags.handle_term;
+  Options.HandleXfsz = Flags.handle_xfsz;
+  SetSignalHandler(Options);
+d360 10
+a369 2
+  if (Flags.minimize_crash_internal_step)
+    return MinimizeCrashInputInternalStep(F, Corpus);
+d380 1
+a380 1
+        RunOneTest(F, Path.c_str(), Options.MaxLen);
+d385 1
+a385 5
+    Printf("***\n"
+           "*** NOTE: fuzzing was not performed, you have only\n"
+           "***       executed the target code on a fixed set of inputs.\n"
+           "***\n");
+    F->PrintFinalStats();
+d389 1
+d392 2
+a393 9
+      F->SetMaxInputLen(kMaxSaneLen);
+    if (TPC.UsingTracePcGuard()) {
+      if (Flags.merge_control_file)
+        F->CrashResistantMergeInternalStep(Flags.merge_control_file);
+      else
+        F->CrashResistantMerge(Args, *Inputs);
+    } else {
+      F->Merge(*Inputs);
+    }
+d399 8
+a406 13
+  UnitVector InitialCorpus;
+  for (auto &Inp : *Inputs) {
+    Printf("Loading corpus dir: %s\n", Inp.c_str());
+    ReadDirToVectorOfUnits(Inp.c_str(), &InitialCorpus, nullptr,
+                           TemporaryMaxLen, /*ExitOnError=*/false);
+  }
+
+  if (Options.MaxLen == 0) {
+    size_t MaxLen = 0;
+    for (auto &U : InitialCorpus)
+      MaxLen = std::max(U.size(), MaxLen);
+    F->SetMaxInputLen(std::min(std::max(kMinDefaultLen, MaxLen), kMaxSaneLen));
+  }
+d408 2
+a409 2
+  if (InitialCorpus.empty()) {
+    InitialCorpus.push_back(Unit({'\n'}));  // Valid ASCII input.
+d413 5
+a417 3
+  F->ShuffleAndMinimize(&InitialCorpus);
+  InitialCorpus.clear();  // Don't need this memory any more.
+  F->Loop();
+d420 3
+a422 3
+    Printf("Done %d runs in %zd second(s)\n", F->getTotalNumberOfRuns(),
+           F->secondsSinceProcessStartUp());
+  F->PrintFinalStats();
+@
+
+

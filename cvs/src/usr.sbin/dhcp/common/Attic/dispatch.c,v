@@ -1,0 +1,1501 @@
+head	1.12;
+access;
+symbols
+	OPENBSD_3_5:1.11.0.2
+	OPENBSD_3_5_BASE:1.11
+	OPENBSD_3_4:1.9.0.4
+	OPENBSD_3_4_BASE:1.9
+	OPENBSD_3_3:1.9.0.2
+	OPENBSD_3_3_BASE:1.9
+	OPENBSD_3_2:1.8.0.4
+	OPENBSD_3_2_BASE:1.8
+	OPENBSD_3_1:1.8.0.2
+	OPENBSD_3_1_BASE:1.8
+	OPENBSD_3_0:1.7.0.2
+	OPENBSD_3_0_BASE:1.7
+	OPENBSD_2_9_BASE:1.4
+	OPENBSD_2_9:1.4.0.2
+	OPENBSD_2_8:1.3.0.2
+	OPENBSD_2_8_BASE:1.3
+	OPENBSD_2_7:1.2.0.2
+	OPENBSD_2_7_BASE:1.2
+	OPENBSD_2_6:1.1.0.6
+	OPENBSD_2_6_BASE:1.1
+	OPENBSD_2_5:1.1.0.4
+	OPENBSD_2_5_BASE:1.1
+	OPENBSD_2_4:1.1.0.2
+	OPENBSD_2_4_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.12
+date	2004.04.28.06.57.40;	author henning;	state dead;
+branches;
+next	1.11;
+
+1.11
+date	2004.01.26.19.18.59;	author henning;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2004.01.11.03.25.27;	author deraadt;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2003.01.30.23.41.14;	author tedu;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2002.03.05.04.25.20;	author jason;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2001.10.08.22.32.29;	author ericj;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2001.06.25.03.04.26;	author beck;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2001.06.24.06.05.07;	author beck;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2001.01.03.16.04.38;	author ericj;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2000.07.21.00.33.53;	author beck;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2000.02.09.11.55.47;	author niklas;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	98.08.18.03.43.25;	author deraadt;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.12
+log
+@It is a big pleasure for me to remove this highe pile of gunk from the tree.
+dhclient, dhcrelay and dhcpd have been factored out and cleaned up big time,
+dhcpd and dhcrelay chroot itself, drop privileges and lock their bpf
+descriptors after applyiing read/write filters now, and this pile of ISC code
+with it's lovely char ServerName; /* Name of Server */ constructs is
+obsolete.
+theo ok, I owe you some beers for this pleasure
+@
+text
+@/* dispatch.c
+
+   Network input dispatcher... */
+
+/*
+ * Copyright (c) 1995, 1996, 1997, 1998, 1999
+ * The Internet Software Consortium.   All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of The Internet Software Consortium nor the names
+ *    of its contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE INTERNET SOFTWARE CONSORTIUM AND
+ * CONTRIBUTORS ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED.  IN NO EVENT SHALL THE INTERNET SOFTWARE CONSORTIUM OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+ * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * This software has been written for the Internet Software Consortium
+ * by Ted Lemon <mellon@@fugue.com> in cooperation with Vixie
+ * Enterprises.  To learn more about the Internet Software Consortium,
+ * see ``http://www.vix.com/isc''.  To learn more about Vixie
+ * Enterprises, see ``http://www.vix.com''.
+ */
+
+#include "dhcpd.h"
+#include <ifaddrs.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <net/if_media.h>
+
+
+/* Most boxes has less than 16 interfaces, so this might be a good guess.  */
+#define INITIAL_IFREQ_COUNT 16
+
+struct interface_info *interfaces, *dummy_interfaces, *fallback_interface;
+struct protocol *protocols;
+struct timeout *timeouts;
+static struct timeout *free_timeouts;
+static int interfaces_invalidated;
+void (*bootp_packet_handler) PROTO ((struct interface_info *,
+				     struct dhcp_packet *, int, unsigned int,
+				     struct iaddr, struct hardware *));
+
+static int interface_status(struct interface_info *ifinfo);
+
+int quiet_interface_discovery;
+
+/* Use getifaddrs() to get a list of all the attached interfaces.
+   For each interface that's of type INET and not the loopback interface,
+   register that interface with the network I/O software, figure out what
+   subnet it's on, and add it to the list of interfaces. */
+
+void discover_interfaces (state)
+	int state;
+{
+	struct interface_info *tmp;
+	struct interface_info *last, *next;
+	struct subnet *subnet;
+	struct shared_network *share;
+	struct sockaddr_in foo;
+	int ir;
+	struct ifreq *tif;
+	struct ifaddrs *ifap, *ifa;
+#ifdef ALIAS_NAMES_PERMUTED
+	char *s;
+#endif
+
+	if (getifaddrs(&ifap) != 0)
+		error ("getifaddrs failed");
+
+	/* If we already have a list of interfaces, and we're running as
+	   a DHCP server, the interfaces were requested. */
+	if (interfaces && (state == DISCOVER_SERVER ||
+			   state == DISCOVER_RELAY ||
+			   state == DISCOVER_REQUESTED))
+		ir = 0;
+	else if (state == DISCOVER_UNCONFIGURED)
+		ir = INTERFACE_REQUESTED | INTERFACE_AUTOMATIC;
+	else
+		ir = INTERFACE_REQUESTED;
+
+	/* Cycle through the list of interfaces looking for IP addresses. */
+	for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+		/* See if this is the sort of interface we want to
+		   deal with.  Skip loopback, point-to-point and down
+		   interfaces, except don't skip down interfaces if we're
+		   trying to get a list of configurable interfaces. */
+		if ((ifa->ifa_flags & IFF_LOOPBACK) ||
+		    (ifa->ifa_flags & IFF_POINTOPOINT) ||
+		    (!(ifa->ifa_flags & IFF_UP) &&
+		     state != DISCOVER_UNCONFIGURED))
+			continue;
+		
+		/* See if we've seen an interface that matches this one. */
+		for (tmp = interfaces; tmp; tmp = tmp -> next)
+			if (!strcmp (tmp -> name, ifa -> ifa_name))
+				break;
+
+		/* If there isn't already an interface by this name,
+		   allocate one. */
+		if (!tmp) {
+			tmp = ((struct interface_info *)
+			       dmalloc (sizeof *tmp, "discover_interfaces"));
+			if (!tmp)
+				error ("Insufficient memory to %s %s",
+				       "record interface", ifa -> ifa_name);
+			strlcpy (tmp -> name, ifa -> ifa_name, sizeof(tmp->name));
+			tmp -> next = interfaces;
+			tmp -> flags = ir;
+			tmp -> noifmedia = tmp -> dead = tmp->errors = 0;
+			interfaces = tmp;
+		}
+
+		/* If we have the capability, extract link information
+		   and record it in a linked list. */
+		if (ifa -> ifa_addr->sa_family == AF_LINK) {
+			struct sockaddr_dl *foo = ((struct sockaddr_dl *)
+						   (ifa -> ifa_addr));
+			tmp -> index = foo->sdl_index;
+			tmp -> hw_address.hlen = foo -> sdl_alen;
+			tmp -> hw_address.htype = HTYPE_ETHER; /* XXX */
+			memcpy (tmp -> hw_address.haddr,
+				LLADDR (foo), foo -> sdl_alen);
+		} else if (ifa -> ifa_addr->sa_family == AF_INET) {
+			struct iaddr addr;
+
+			/* Get a pointer to the address... */
+			bcopy(ifa->ifa_addr, &foo, sizeof(foo));
+
+			/* We don't want the loopback interface. */
+			if (foo.sin_addr.s_addr == htonl (INADDR_LOOPBACK))
+				continue;
+
+			/* If this is the first real IP address we've
+			   found, keep a pointer to ifreq structure in
+			   which we found it. */
+			if (!tmp -> ifp) {
+				int len = (IFNAMSIZ +
+					   ifa -> ifa_addr->sa_len);
+				tif = (struct ifreq *)malloc (len);
+				if (!tif)
+					error ("no space to remember ifp.");
+				strlcpy(tif->ifr_name, ifa->ifa_name, IFNAMSIZ);
+				memcpy(&tif->ifr_addr, ifa->ifa_addr,
+				    ifa->ifa_addr->sa_len);
+				tmp -> ifp = tif;
+				tmp -> primary_address = foo.sin_addr;
+			}
+
+			/* Grab the address... */
+			addr.len = 4;
+			memcpy (addr.iabuf, &foo.sin_addr.s_addr,
+				addr.len);
+
+			/* If there's a registered subnet for this address,
+			   connect it together... */
+			if ((subnet = find_subnet (addr))) {
+				/* If this interface has multiple aliases
+				   on the same subnet, ignore all but the
+				   first we encounter. */
+				if (!subnet -> interface) {
+					subnet -> interface = tmp;
+					subnet -> interface_address = addr;
+				} else if (subnet -> interface != tmp) {
+					warn ("Multiple %s %s: %s %s", 
+					      "interfaces match the",
+					      "same subnet",
+					      subnet -> interface -> name,
+					      tmp -> name);
+				}
+				share = subnet -> shared_network;
+				if (tmp -> shared_network &&
+				    tmp -> shared_network != share) {
+					warn ("Interface %s matches %s",
+					      tmp -> name,
+					      "multiple shared networks");
+				} else {
+					tmp -> shared_network = share;
+				}
+
+				if (!share -> interface) {
+					share -> interface = tmp;
+				} else if (share -> interface != tmp) {
+					warn ("Multiple %s %s: %s %s", 
+					      "interfaces match the",
+					      "same shared network",
+					      share -> interface -> name,
+					      tmp -> name);
+				}
+			}
+		}
+	}
+
+	/* Now cycle through all the interfaces we found, looking for
+	   hardware addresses. */
+
+	/* If we're just trying to get a list of interfaces that we might
+	   be able to configure, we can quit now. */
+	if (state == DISCOVER_UNCONFIGURED)
+		return;
+
+	/* Weed out the interfaces that did not have IP addresses. */
+	last = (struct interface_info *)0;
+	for (tmp = interfaces; tmp; tmp = next) {
+		next = tmp -> next;
+		if ((tmp -> flags & INTERFACE_AUTOMATIC) &&
+		    state == DISCOVER_REQUESTED)
+			tmp -> flags &= ~(INTERFACE_AUTOMATIC |
+					  INTERFACE_REQUESTED);
+		if (!tmp -> ifp || !(tmp -> flags & INTERFACE_REQUESTED)) {
+			if ((tmp -> flags & INTERFACE_REQUESTED) != ir)
+				error ("%s: not found", tmp -> name);
+			if (!last)
+				interfaces = interfaces -> next;
+			else
+				last -> next = tmp -> next;
+
+			/* Remember the interface in case we need to know
+			   about it later. */
+			tmp -> next = dummy_interfaces;
+			dummy_interfaces = tmp;
+			continue;
+		}
+		last = tmp;
+
+		memcpy (&foo, &tmp -> ifp -> ifr_addr,
+			sizeof tmp -> ifp -> ifr_addr);
+
+		/* We must have a subnet declaration for each interface. */
+		if (!tmp -> shared_network && (state == DISCOVER_SERVER)) {
+			warn ("No subnet declaration for %s (%s).",
+			      tmp -> name, inet_ntoa (foo.sin_addr));
+			warn ("Please write a subnet declaration in your %s",
+			      "dhcpd.conf file for the");
+			error ("network segment to which interface %s %s",
+			       tmp -> name, "is attached.");
+		}
+
+		/* Find subnets that don't have valid interface
+		   addresses... */
+		for (subnet = (tmp -> shared_network
+			       ? tmp -> shared_network -> subnets
+			       : (struct subnet *)0);
+		     subnet; subnet = subnet -> next_sibling) {
+			if (!subnet -> interface_address.len) {
+				/* Set the interface address for this subnet
+				   to the first address we found. */
+				subnet -> interface_address.len = 4;
+				memcpy (subnet -> interface_address.iabuf,
+					&foo.sin_addr.s_addr, 4);
+			}
+		}
+
+		/* Register the interface... */
+		if_register_receive (tmp);
+		if_register_send (tmp);
+	}
+
+	/* Now register all the remaining interfaces as protocols. */
+	for (tmp = interfaces; tmp; tmp = tmp -> next) {
+		add_protocol (tmp -> name, tmp -> rfdesc, got_one, tmp);
+	}
+
+	freeifaddrs(ifap);
+
+	maybe_setup_fallback ();
+}
+
+struct interface_info *setup_fallback ()
+{
+	fallback_interface =
+		((struct interface_info *)
+		 dmalloc (sizeof *fallback_interface, "discover_interfaces"));
+	if (!fallback_interface)
+		error ("Insufficient memory to record fallback interface.");
+	memset (fallback_interface, 0, sizeof *fallback_interface);
+	strlcpy (fallback_interface -> name, "fallback", IFNAMSIZ);
+	fallback_interface -> shared_network =
+		new_shared_network ("parse_statement");
+	if (!fallback_interface -> shared_network)
+		error ("No memory for shared subnet");
+	memset (fallback_interface -> shared_network, 0,
+		sizeof (struct shared_network));
+	fallback_interface -> shared_network -> name = "fallback-net";
+	return fallback_interface;
+}
+
+void reinitialize_interfaces ()
+{
+	struct interface_info *ip;
+
+	for (ip = interfaces; ip; ip = ip -> next) {
+		if_reinitialize_receive (ip);
+		if_reinitialize_send (ip);
+	}
+
+	if (fallback_interface)
+		if_reinitialize_send (fallback_interface);
+
+	interfaces_invalidated = 1;
+}
+
+/* Wait for packets to come in using poll().  When a packet comes in,
+   call receive_packet to receive the packet and possibly strip hardware
+   addressing information from it, and then call through the
+   bootp_packet_handler hook to try to do something with it. */
+
+void dispatch ()
+{
+	struct protocol *l;
+	int nfds = 0;
+	struct pollfd *fds;
+	int count;
+	int i;
+	time_t howlong;
+	int to_msec;
+
+	nfds = 0;
+	for (l = protocols; l; l = l -> next) {
+		++nfds;
+	}
+	fds = (struct pollfd *)malloc ((nfds) * sizeof (struct pollfd));
+	if (fds == NULL)
+		error ("Can't allocate poll structures.");
+
+	do {
+		/* Call any expired timeouts, and then if there's
+		   still a timeout registered, time out the select
+		   call then. */
+	      another:
+		if (timeouts) {
+			struct timeout *t;
+			if (timeouts -> when <= cur_time) {
+				t = timeouts;
+				timeouts = timeouts -> next;
+				(*(t -> func)) (t -> what);
+				t -> next = free_timeouts;
+				free_timeouts = t;
+				goto another;
+			}
+			/*
+			 * Figure timeout in milliseconds, and check for
+			 * potential overflow, so we can cram into an int
+			 * for poll, while not polling with a negative 
+			 * timeout and blocking indefinetely.
+			 */
+
+			howlong = timeouts -> when - cur_time;
+			if (howlong > INT_MAX / 1000)
+				howlong = INT_MAX / 1000;
+			to_msec = howlong * 1000;
+		} else
+			to_msec = -1;
+
+		/* Set up the descriptors to be polled. */
+		i = 0;
+		
+		for (l = protocols; l; l = l -> next) {
+			struct interface_info *ip = l -> local;
+			if (ip && (l->handler != got_one || !ip->dead)) {
+				fds [i].fd = l -> fd;
+				fds [i].events = POLLIN;
+				fds [i].revents = 0;
+				++i;
+			}
+		}
+
+		if (i == 0) 
+			error("No live interfaces to poll on - exiting.");
+		
+		/* Wait for a packet or a timeout... XXX */
+		count = poll (fds, nfds, to_msec);
+
+		/* Not likely to be transitory... */
+		if (count == -1) {
+			if (errno == EAGAIN || errno == EINTR) {
+				GET_TIME (&cur_time);
+				continue;
+			}
+			else
+				error ("poll: %m");
+		}
+
+		/* Get the current time... */
+		GET_TIME (&cur_time);
+
+		i = 0;
+		for (l = protocols; l; l = l -> next) {
+		        struct interface_info *ip;
+			ip = l->local;
+			if ((fds [i].revents & POLLIN)) {
+				fds [i].revents = 0;
+				if (ip && (l->handler != got_one ||
+				     !ip->dead))
+					(*(l -> handler)) (l);
+				if (interfaces_invalidated)
+					break;
+			}
+			++i;
+		}
+		interfaces_invalidated = 0;
+	} while (1);
+}
+
+
+void got_one (l)
+	struct protocol *l;
+{
+	struct sockaddr_in from;
+	struct hardware hfrom;
+	struct iaddr ifrom;
+	size_t result;
+	union {
+		unsigned char packbuf [4095]; /* Packet input buffer.
+					 	 Must be as large as largest
+						 possible MTU. */
+		struct dhcp_packet packet;
+	} u;
+	struct interface_info *ip = l -> local;
+
+	if ((result =
+	     receive_packet (ip, u.packbuf, sizeof u, &from, &hfrom)) == -1) {
+		warn ("receive_packet failed on %s: %s", ip -> name, 
+		      strerror(errno));
+		ip->errors++;
+		if ((! interface_status(ip)) 
+		    || (ip->noifmedia && ip->errors > 20)) {
+			/* our interface has gone away. */
+			warn("Interface %s no longer appears valid.",
+			     ip->name); 
+			ip->dead = 1;
+			interfaces_invalidated = 1;
+			close(l->fd);
+			remove_protocol(l);
+			free(ip);
+		}
+		return;
+	}
+	if (result == 0)
+		return;
+
+	if (bootp_packet_handler) {
+		ifrom.len = 4;
+		memcpy (ifrom.iabuf, &from.sin_addr, ifrom.len);
+
+		(*bootp_packet_handler) (ip, &u.packet, result,
+					 from.sin_port, ifrom, &hfrom);
+	}
+}
+
+int
+interface_status(struct interface_info *ifinfo)
+{
+	char * ifname = ifinfo->name;
+	int ifsock = ifinfo->rfdesc;
+	struct ifreq ifr;
+	struct ifmediareq ifmr;
+	
+	/* get interface flags */
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+	if (ioctl(ifsock, SIOCGIFFLAGS, &ifr) < 0) {
+		syslog(LOG_ERR, "ioctl(SIOCGIFFLAGS) on %s: %m",
+		       ifname);
+		goto inactive;
+	}
+	/*
+	 * if one of UP and RUNNING flags is dropped,
+	 * the interface is not active.
+	 */
+	if ((ifr.ifr_flags & (IFF_UP|IFF_RUNNING)) != (IFF_UP|IFF_RUNNING)) {
+		goto inactive;
+	}
+	/* Next, check carrier on the interface, if possible */
+	if (ifinfo->noifmedia) 
+		goto active;
+	memset(&ifmr, 0, sizeof(ifmr));
+	strlcpy(ifmr.ifm_name, ifname, sizeof(ifmr.ifm_name));
+	if (ioctl(ifsock, SIOCGIFMEDIA, (caddr_t)&ifmr) < 0) {
+		if (errno != EINVAL) {
+			syslog(LOG_DEBUG, "ioctl(SIOCGIFMEDIA) on %s: %m",
+			       ifname);
+			ifinfo->noifmedia = 1;
+			goto active;
+		}
+		/*
+		 * EINVAL (or ENOTTY) simply means that the interface 
+		 * does not support the SIOCGIFMEDIA ioctl. We regard it alive.
+		 */
+		ifinfo->noifmedia = 1;
+		goto active;
+	}
+	if (ifmr.ifm_status & IFM_AVALID) {
+		switch(ifmr.ifm_active & IFM_NMASK) {
+		case IFM_ETHER:
+			if (ifmr.ifm_status & IFM_ACTIVE)
+				goto active;
+			else
+				goto inactive;
+			break;
+		default:
+			goto inactive;
+		}
+	}
+ inactive:
+	return(0);
+ active:
+	return(1);
+}
+
+int locate_network (packet)
+	struct packet *packet;
+{
+	struct iaddr ia;
+
+	/* If this came through a gateway, find the corresponding subnet... */
+	if (packet -> raw -> giaddr.s_addr) {
+		struct subnet *subnet;
+		ia.len = 4;
+		memcpy (ia.iabuf, &packet -> raw -> giaddr, 4);
+		subnet = find_subnet (ia);
+		if (subnet)
+			packet -> shared_network = subnet -> shared_network;
+		else
+			packet -> shared_network = (struct shared_network *)0;
+	} else {
+		packet -> shared_network =
+			packet -> interface -> shared_network;
+	}
+	if (packet -> shared_network)
+		return 1;
+	return 0;
+}
+
+void add_timeout (when, where, what)
+	TIME when;
+	void (*where) PROTO ((void *));
+	void *what;
+{
+	struct timeout *t, *q;
+
+	/* See if this timeout supersedes an existing timeout. */
+	t = (struct timeout *)0;
+	for (q = timeouts; q; q = q -> next) {
+		if (q -> func == where && q -> what == what) {
+			if (t)
+				t -> next = q -> next;
+			else
+				timeouts = q -> next;
+			break;
+		}
+		t = q;
+	}
+
+	/* If we didn't supersede a timeout, allocate a timeout
+	   structure now. */
+	if (!q) {
+		if (free_timeouts) {
+			q = free_timeouts;
+			free_timeouts = q -> next;
+			q -> func = where;
+			q -> what = what;
+		} else {
+			q = (struct timeout *)malloc (sizeof (struct timeout));
+			if (!q)
+				error ("Can't allocate timeout structure!");
+			q -> func = where;
+			q -> what = what;
+		}
+	}
+
+	q -> when = when;
+
+	/* Now sort this timeout into the timeout list. */
+
+	/* Beginning of list? */
+	if (!timeouts || timeouts -> when > q -> when) {
+		q -> next = timeouts;
+		timeouts = q;
+		return;
+	}
+
+	/* Middle of list? */
+	for (t = timeouts; t -> next; t = t -> next) {
+		if (t -> next -> when > q -> when) {
+			q -> next = t -> next;
+			t -> next = q;
+			return;
+		}
+	}
+
+	/* End of list. */
+	t -> next = q;
+	q -> next = (struct timeout *)0;
+}
+
+void cancel_timeout (where, what)
+	void (*where) PROTO ((void *));
+	void *what;
+{
+	struct timeout *t, *q;
+
+	/* Look for this timeout on the list, and unlink it if we find it. */
+	t = (struct timeout *)0;
+	for (q = timeouts; q; q = q -> next) {
+		if (q -> func == where && q -> what == what) {
+			if (t)
+				t -> next = q -> next;
+			else
+				timeouts = q -> next;
+			break;
+		}
+		t = q;
+	}
+
+	/* If we found the timeout, put it on the free list. */
+	if (q) {
+		q -> next = free_timeouts;
+		free_timeouts = q;
+	}
+}
+
+/* Add a protocol to the list of protocols... */
+void add_protocol (name, fd, handler, local)
+	char *name;
+	int fd;
+	void (*handler) PROTO ((struct protocol *));
+	void *local;
+{
+	struct protocol *p;
+
+	p = (struct protocol *)malloc (sizeof *p);
+	if (!p)
+		error ("can't allocate protocol struct for %s", name);
+
+	p -> fd = fd;
+	p -> handler = handler;
+	p -> local = local;
+
+	p -> next = protocols;
+	protocols = p;
+}
+
+void remove_protocol (proto)
+	struct protocol *proto;
+{
+	struct protocol *p, *next, *prev;
+
+	prev = (struct protocol *)0;
+	for (p = protocols; p; p = next) {
+		next = p -> next;
+		if (p == proto) {
+			if (prev)
+				prev -> next = p -> next;
+			else
+				protocols = p -> next;
+			free (p);
+		}
+	}
+}
+@
+
+
+1.11
+log
+@no more SIOCGIFCONF any more here either
+
+ok deraadt@@
+@
+text
+@@
+
+
+1.10
+log
+@listen to the routing socket.  if anyone messes with our interface by
+taking it down, or deleting or adding an address, then we attempt to
+cleanup and exit.  ok vincent mcbride, wow from hin
+@
+text
+@d66 1
+a66 1
+/* Use the SIOCGIFCONF ioctl to get a list of all the attached interfaces.
+a75 1
+	int sock;
+a85 4
+	/* Create an unbound datagram socket to do the SIOCGIFADDR ioctl on. */
+	if ((sock = socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
+		error ("Can't create addrlist socket");
+
+a281 1
+	close (sock);
+@
+
+
+1.9
+log
+@when an interface is no longer valid, remove it from the protocol list
+ok deraadt@@ millert@@
+@
+text
+@d142 1
+@
+
+
+1.8
+log
+@2nd part to make dhcpd work on sparc64:
+remove use of SIOCGIFCONF and use getifaddrs()/freeifaddrs() instead
+@
+text
+@d452 1
+a452 1
+			warn("Interface %s appears to no longer be valid",
+d456 3
+@
+
+
+1.7
+log
+@
+force alignment, makes dhcp work on alpha's
+from netbsd.
+
+deraadt@@ Ok.
+@
+text
+@d44 1
+a75 5
+	char *buf, *new_buf;
+	int len;
+	struct ifconf ic;
+	struct ifreq ifr;
+	int i;
+d82 1
+d91 2
+a92 25
+	/* Get the interface configuration information... */
+	len = sizeof (struct ifreq) * INITIAL_IFREQ_COUNT;
+	buf = 0;
+	while (1) {
+		/*
+		 * Allocate a larger buffer each time around the loop and get
+		 * the network interfaces configurations into it.
+		 */
+		ic.ifc_len = len;
+		new_buf = realloc (buf, len);
+		if (!new_buf)
+			error ("realloc: %m");
+		ic.ifc_buf = buf = new_buf;
+		if (ioctl (sock, SIOCGIFCONF, &ic) == -1)
+			error ("ioctl: SIOCGIFCONF: %m");
+
+		/*
+		 * If there is place for another ifreq we can be sure that
+		 * the buffer was big enough, otherwise double the size and
+		 * try again.
+		 */
+		if (len - ic.ifc_len >= sizeof (struct ifreq))
+			break;
+		len *= 2;
+	}
+d106 1
+a106 7
+	for (i = 0; i < ic.ifc_len;) {
+		struct ifreq *ifp = (struct ifreq *)((caddr_t)ic.ifc_req + i);
+		if (ifp -> ifr_addr.sa_len > sizeof (struct sockaddr))
+			i += (sizeof ifp -> ifr_name) + ifp -> ifr_addr.sa_len;
+		else
+			i += sizeof *ifp;
+
+d108 6
+a113 12
+		   deal with. */
+		strlcpy (ifr.ifr_name, ifp -> ifr_name, IFNAMSIZ);
+		if (ioctl (sock, SIOCGIFFLAGS, &ifr) < 0)
+			error ("Can't get interface flags for %s: %m",
+			       ifr.ifr_name);
+
+		/* Skip loopback, point-to-point and down interfaces,
+		   except don't skip down interfaces if we're trying to
+		   get a list of configurable interfaces. */
+		if ((ifr.ifr_flags & IFF_LOOPBACK) ||
+		    (ifr.ifr_flags & IFF_POINTOPOINT) ||
+		    (!(ifr.ifr_flags & IFF_UP) &&
+d119 1
+a119 1
+			if (!strcmp (tmp -> name, ifp -> ifr_name))
+d129 2
+a130 2
+				       "record interface", ifp -> ifr_name);
+			strlcpy (tmp -> name, ifp -> ifr_name, sizeof(tmp->name));
+d139 1
+a139 1
+		if (ifp -> ifr_addr.sa_family == AF_LINK) {
+d141 1
+a141 1
+						   (&ifp -> ifr_addr));
+d146 1
+a146 3
+		} else
+
+		if (ifp -> ifr_addr.sa_family == AF_INET) {
+a147 1
+			void *ptr;
+d150 1
+a150 2
+			ptr = &ifp->ifr_addr;
+			memcpy(&foo, ptr, sizeof(ifp->ifr_addr));
+a155 1
+
+d160 2
+a161 2
+				int len = ((sizeof ifp -> ifr_name) +
+					   ifp -> ifr_addr.sa_len);
+d165 3
+a167 1
+				memcpy (tif, ifp, len);
+d287 1
+@
+
+
+1.6
+log
+@fix nasty little bug in the identifaction of dead interfaces - make sure
+we only care about stuff associated with an interface.
+@
+text
+@d188 1
+d191 2
+a192 2
+			memcpy (&foo, &ifp -> ifr_addr,
+				sizeof ifp -> ifr_addr);
+@
+
+
+1.5
+log
+@dhcp 2.0pl5 merge/cleanup/deadcode slashing. still needs more eyes on this
+but appears to work better than what's been in-tree before for dealing with
+stupid dhcp servers.
+@
+text
+@d168 1
+a168 1
+			strlcpy (tmp -> name, ifp -> ifr_name, IFNAMSIZ);
+d171 1
+d322 1
+a322 1
+	for (tmp = interfaces; tmp; tmp = tmp -> next)
+d324 1
+d419 1
+d422 1
+a422 1
+			if (ip && !ip->dead) {
+d451 2
+d455 2
+a456 1
+				if (l -> handler)
+@
+
+
+1.4
+log
+@
+-Wall cleanup.
+roll a function for writing out pidfile's instead of rolling it for each
+program.
+be careful with a few more buffers
+@
+text
+@d6 2
+a7 2
+ * Copyright (c) 1995, 1996 The Internet Software Consortium.
+ * All rights reserved.
+a42 5
+#ifndef lint
+static char copyright[] =
+"$Id: dispatch.c,v 1.3 2000/07/21 00:33:53 beck Exp $ Copyright (c) 1995, 1996 The Internet Software Consortium.  All rights reserved.\n";
+#endif /* not lint */
+
+d45 1
+d48 1
+d52 1
+a52 1
+struct interface_info *interfaces, *dummy_interfaces;
+d58 1
+a58 1
+				     unsigned char *, int, unsigned short,
+d61 2
+a62 2
+int interface_status PROTO((struct interface_info *));
+static void got_one PROTO ((struct protocol *));
+d85 1
+a88 3
+#ifdef USE_FALLBACK
+	static struct shared_network fallback_network;
+#endif
+d131 1
+a131 3
+	/* Cycle through the list of interfaces looking for IP addresses.
+	   Go through twice; once to count the number of addresses, and a
+	   second time to copy them into an array of addresses. */
+d134 2
+a135 7
+#ifdef HAVE_SA_LEN
+		if (ifp -> ifr_addr.sa_len)
+			i += ((sizeof ifp -> ifr_name) +
+			      (ifp -> ifr_addr.sa_len >
+			       sizeof (struct sockaddr) ?
+			       ifp -> ifr_addr.sa_len :
+			       sizeof (struct sockaddr)));
+a136 1
+#endif
+a138 12
+#ifdef ALIAS_NAMES_PERMUTED
+		if ((s = strrchr (ifp -> ifr_name, ':'))) {
+			*s = 0;
+		}
+#endif
+
+#ifdef SKIP_DUMMY_INTERFACES
+		if (!strncmp (ifp -> ifr_name, "dummy", 5))
+			continue;
+#endif
+
+
+d141 1
+a141 1
+		strlcpy (ifr.ifr_name, ifp -> ifr_name, sizeof(ifr.ifr_name));
+a149 1
+#ifdef IFF_POINTOPOINT
+a150 1
+#endif
+d168 1
+a168 2
+			strlcpy (tmp -> name, ifp -> ifr_name, 
+				 sizeof(tmp->name));
+a170 1
+			tmp -> noifmedia = tmp -> dead = tmp->errors = 0;
+a175 1
+#ifdef AF_LINK
+a183 1
+#endif /* AF_LINK */
+a187 53
+#if defined (SIOCGIFHWADDR) && !defined (AF_LINK)
+			struct ifreq ifr;
+			struct sockaddr sa;
+			int b, sk;
+			
+			/* Read the hardware address from this interface. */
+			ifr = *ifp;
+			if (ioctl (sock, SIOCGIFHWADDR, &ifr) < 0)
+				error ("Can't get hardware address for %s: %m",
+				       ifr.ifr_name);
+
+			sa = *(struct sockaddr *)&ifr.ifr_hwaddr;
+					
+			switch (sa.sa_family) {
+#ifdef ARPHRD_LOOPBACK
+			      case ARPHRD_LOOPBACK:
+				/* ignore loopback interface */
+				break;
+#endif
+
+			      case ARPHRD_ETHER:
+				tmp -> hw_address.hlen = 6;
+				tmp -> hw_address.htype = ARPHRD_ETHER;
+				memcpy (tmp -> hw_address.haddr,
+					sa.sa_data, 6);
+				break;
+
+#ifndef ARPHRD_IEEE802
+# define ARPHRD_IEEE802 HTYPE_IEEE802
+#endif
+			      case ARPHRD_IEEE802:
+				tmp -> hw_address.hlen = 6;
+				tmp -> hw_address.htype = ARPHRD_IEEE802;
+				memcpy (tmp -> hw_address.haddr,
+					sa.sa_data, 6);
+				break;
+
+#ifdef ARPHRD_METRICOM
+			      case ARPHRD_METRICOM:
+				tmp -> hw_address.hlen = 6;
+				tmp -> hw_address.htype = ARPHRD_METRICOM;
+				memcpy (tmp -> hw_address.haddr,
+					sa.sa_data, 6);
+
+				break;
+#endif
+
+			      default:
+				error ("%s: unknown hardware address type %d",
+				       ifr.ifr_name, sa.sa_family);
+			}
+#endif /* defined (SIOCGIFHWADDR) && !defined (AF_LINK) */
+
+a200 2
+				struct ifreq *tif;
+#ifdef HAVE_SA_LEN
+a202 3
+#else
+				int len = sizeof *ifp;
+#endif
+d255 3
+d291 8
+a298 3
+		if (!tmp -> shared_network && (state == DISCOVER_SERVER))
+			error ("No subnet declaration for %s (%s).",
+			       tmp -> name, inet_ntoa (foo.sin_addr));
+d326 20
+a345 8
+#ifdef USE_FALLBACK
+	strlcpy (fallback_interface.name, "fallback", sizeof(fallback_interface.name));	
+	fallback_interface.shared_network = &fallback_network;
+	fallback_network.name = "fallback-net";
+	if_register_fallback (&fallback_interface);
+	add_protocol ("fallback", fallback_interface.wfdesc,
+		      fallback_discard, &fallback_interface);
+#endif
+d357 2
+a358 3
+#ifdef USE_FALLBACK
+	if_reinitialize_fallback (&fallback_interface);
+#endif
+d363 4
+a366 4
+/* Wait for packets to come in using select().   When one does, call
+   receive_packet to receive the packet and possibly strip hardware
+   addressing information from it, and then call do_packet to try to
+   do something with it. */
+a369 1
+	fd_set r, w, x;
+d371 2
+a372 1
+	int max = 0;
+d374 3
+a376 1
+	struct timeval tv, *tvp;
+d378 7
+a384 2
+	FD_ZERO (&w);
+	FD_ZERO (&x);
+d401 11
+a411 3
+			tv.tv_sec = timeouts -> when - cur_time;
+			tv.tv_usec = 0;
+			tvp = &tv;
+d413 1
+a413 6
+			tvp = (struct timeval *)0;
+
+		/* Set up the read mask. */
+		FD_ZERO (&r);
+
+		max = -1; 
+d415 2
+d418 7
+a424 6
+		         struct interface_info *ip = l -> local;
+		         if (ip && !ip->dead) {
+			 	FD_SET (l -> fd, &r);
+				if (l -> fd > max)
+					max = l -> fd;
+			 }
+d427 2
+a428 2
+		if (max == -1) 
+		  error("No interfaces to select on - exiting.");
+d431 11
+a441 1
+		count = select (max + 1, &r, &w, &x, tvp);
+d446 1
+a446 4
+		/* Not likely to be transitory... */
+		if (count == -1)
+			error ("select: %m");
+
+d448 8
+a455 8
+		        struct interface_info *ip;
+			if (!FD_ISSET (l -> fd, &r))
+				continue;
+			ip = l->local;
+			if (ip && !ip-> dead && l -> handler)
+				(*(l -> handler)) (l);
+			if (interfaces_invalidated)
+				break;
+d462 1
+a462 1
+static void got_one (l)
+d469 6
+a474 3
+	static unsigned char packbuf [4095]; /* Packet input buffer.
+						Must be as large as largest
+						possible MTU. */
+d477 2
+a478 3
+
+	if ((result = receive_packet (ip, packbuf, sizeof packbuf,
+				      &from, &hfrom)) == -1) {
+d499 1
+a499 1
+		(*bootp_packet_handler) (ip, packbuf, result,
+d504 60
+a712 67
+}
+
+int
+interface_status(struct interface_info *ifinfo)
+{
+        char * ifname = ifinfo->name;
+	int ifsock = ifinfo->rfdesc;
+	struct ifreq ifr;
+	struct ifmediareq ifmr;
+
+
+	
+	/* get interface flags */
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+	if (ioctl(ifsock, SIOCGIFFLAGS, &ifr) < 0) {
+		syslog(LOG_ERR, "ioctl(SIOCGIFFLAGS) on %s: %m",
+		       ifname);
+		goto inactive;
+	}
+	/*
+	 * if one of UP and RUNNING flags is dropped,
+	 * the interface is not active.
+	 */
+	if ((ifr.ifr_flags & (IFF_UP|IFF_RUNNING)) != (IFF_UP|IFF_RUNNING)) {
+		goto inactive;
+	}
+
+	/* Next, check carrier on the interface, if possible */
+	if (ifinfo->noifmedia) 
+		goto active;
+	memset(&ifmr, 0, sizeof(ifmr));
+	strlcpy(ifmr.ifm_name, ifname, sizeof(ifmr.ifm_name));
+
+	if (ioctl(ifsock, SIOCGIFMEDIA, (caddr_t)&ifmr) < 0) {
+		if (errno != EINVAL) {
+			syslog(LOG_DEBUG, "ioctl(SIOCGIFMEDIA) on %s: %m",
+			       ifname);
+			ifinfo->noifmedia = 1;
+			goto active;
+		}
+		/*
+		 * EINVAL (or ENOTTY) simply means that the interface 
+		 * does not support the SIOCGIFMEDIA ioctl. We regard it alive.
+		 */
+		ifinfo->noifmedia = 1;
+		goto active;
+	}
+
+	if (ifmr.ifm_status & IFM_AVALID) {
+		switch(ifmr.ifm_active & IFM_NMASK) {
+		 case IFM_ETHER:
+			 if (ifmr.ifm_status & IFM_ACTIVE)
+				 goto active;
+			 else
+				 goto inactive;
+			 break;
+		 default:
+			 goto inactive;
+		}
+	}
+
+  inactive:
+	return(0);
+
+  active:
+	return(1);
+@
+
+
+1.3
+log
+@Deal with a bunch of dhcp issues, ok fries@@:
+	- some minor cleanup (syscall return codes, dead code, use strlcpy,
+	  etc)
+	- sanity check dhcp option values recieved by dhclient
+	  so that things that should look like a hostname look like a
+	  hostname, and things that should look like an ip address look
+	  like an ip address, if they don't ignore the lease
+	  offer because it's bogus.
+	- Make the dhcp server attempt to ping an address when it recieves
+	  a RELEASE from it. If the address answers a ping, ignore the
+	  release offer. This helps make spoofing releases to liberate
+	  addresses more difficult.
+@
+text
+@d45 1
+a45 1
+"$Id: dispatch.c,v 1.2 2000/02/09 11:55:47 niklas Exp $ Copyright (c) 1995, 1996 The Internet Software Consortium.  All rights reserved.\n";
+d64 1
+a83 1
+	int address_count = 0;
+a517 1
+	static int death = 0;
+@
+
+
+1.2
+log
+@I need to get rid of local stuff of my tree.  Here is an old
+patch to deal with machines with many interfaces, myself, I have 256 loopbacks
+on my laptop.
+@
+text
+@d45 1
+a45 1
+"$Id: dispatch.c,v 1.1 1998/08/18 03:43:25 deraadt Exp $ Copyright (c) 1995, 1996 The Internet Software Consortium.  All rights reserved.\n";
+d50 1
+d166 1
+a166 1
+		strcpy (ifr.ifr_name, ifp -> ifr_name);
+d195 2
+a196 1
+			strcpy (tmp -> name, ifp -> ifr_name);
+d199 1
+d408 1
+a408 1
+	strcpy (fallback_interface.name, "fallback");	
+a432 96
+#ifdef USE_POLL
+/* Wait for packets to come in using poll().  Anyway, when a packet
+   comes in, call receive_packet to receive the packet and possibly
+   strip hardware addressing information from it, and then call
+   do_packet to try to do something with it. 
+
+   As you can see by comparing this with the code that uses select(),
+   below, this is gratuitously complex.  Quelle surprise, eh?  This is
+   SysV we're talking about, after all, and even in the 90's, it
+   wouldn't do for SysV to make networking *easy*, would it?  Rant,
+   rant... */
+
+void dispatch ()
+{
+	struct protocol *l;
+	int nfds = 0;
+	struct pollfd *fds;
+	int count;
+	int i;
+	int to_msec;
+
+	nfds = 0;
+	for (l = protocols; l; l = l -> next) {
+		++nfds;
+	}
+	fds = (struct pollfd *)malloc ((nfds) * sizeof (struct pollfd));
+	if (!fds)
+		error ("Can't allocate poll structures.");
+
+	do {
+		/* Call any expired timeouts, and then if there's
+		   still a timeout registered, time out the select
+		   call then. */
+	      another:
+		if (timeouts) {
+			struct timeout *t;
+			if (timeouts -> when <= cur_time) {
+				t = timeouts;
+				timeouts = timeouts -> next;
+				(*(t -> func)) (t -> what);
+				t -> next = free_timeouts;
+				free_timeouts = t;
+				goto another;
+			}
+			/* Figure timeout in milliseconds, and check for
+			   potential overflow.   We assume that integers
+			   are 32 bits, which is harmless if they're 64
+			   bits - we'll just get extra timeouts in that
+			   case.    Lease times would have to be quite
+			   long in order for a 32-bit integer to overflow,
+			   anyway. */
+			to_msec = timeouts -> when - cur_time;
+			if (to_msec > 2147483)
+				to_msec = 2147483;
+			to_msec *= 1000;
+		} else
+			to_msec = -1;
+
+		/* Set up the descriptors to be polled. */
+		i = 0;
+		for (l = protocols; l; l = l -> next) {
+			fds [i].fd = l -> fd;
+			fds [i].events = POLLIN;
+			fds [i].revents = 0;
+			++i;
+		}
+
+		/* Wait for a packet or a timeout... XXX */
+		count = poll (fds, nfds, to_msec);
+
+		/* Get the current time... */
+		GET_TIME (&cur_time);
+
+		/* Not likely to be transitory... */
+		if (count < 0) {
+			if (errno == EAGAIN || errno == EINTR)
+				continue;
+			else
+				error ("poll: %m");
+		}
+
+		i = 0;
+		for (l = protocols; l; l = l -> next) {
+			if ((fds [i].revents & POLLIN)) {
+				fds [i].revents = 0;
+				if (l -> handler)
+					(*(l -> handler)) (l);
+				if (interfaces_invalidated)
+					break;
+			}
+			++i;
+		}
+		interfaces_invalidated = 0;
+	} while (1);
+}
+#else
+d473 2
+d476 6
+a481 3
+			FD_SET (l -> fd, &r);
+			if (l -> fd > max)
+				max = l -> fd;
+d484 3
+d494 1
+a494 1
+		if (count < 0)
+d498 1
+d501 2
+a502 1
+			if (l -> handler)
+d510 1
+a510 1
+#endif /* USE_POLL */
+d518 2
+a519 1
+	int result;
+d525 1
+d527 12
+a538 2
+				      &from, &hfrom)) < 0) {
+		warn ("receive_packet failed on %s: %m", ip -> name);
+d702 67
+@
+
+
+1.1
+log
+@ISC dhcp, needs security audit for sure
+@
+text
+@d45 1
+a45 1
+"$Id: dispatch.c,v 1.1.1.6 1998/05/18 06:53:54 mellon Exp $ Copyright (c) 1995, 1996 The Internet Software Consortium.  All rights reserved.\n";
+d51 3
+d76 2
+a77 1
+	char buf [8192];
+d99 24
+a122 6
+	ic.ifc_len = sizeof buf;
+	ic.ifc_ifcu.ifcu_buf = (caddr_t)buf;
+	i = ioctl(sock, SIOCGIFCONF, &ic);
+
+	if (i < 0)
+		error ("ioctl: SIOCGIFCONF: %m");
+d142 5
+a146 1
+			i += (sizeof ifp -> ifr_name) + ifp -> ifr_addr.sa_len;
+@
+

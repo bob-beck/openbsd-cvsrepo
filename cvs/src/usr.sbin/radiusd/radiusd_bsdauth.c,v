@@ -1,0 +1,686 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_6_0:1.7.0.4
+	OPENBSD_6_0_BASE:1.7
+	OPENBSD_5_9:1.7.0.2
+	OPENBSD_5_9_BASE:1.7
+	OPENBSD_5_8:1.4.0.4
+	OPENBSD_5_8_BASE:1.4;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2015.12.05.13.22.32;	author claudio;	state Exp;
+branches;
+next	1.6;
+commitid	G9HBnOflOK1tlkXK;
+
+1.6
+date	2015.10.19.22.07.37;	author yasuoka;	state Exp;
+branches;
+next	1.5;
+commitid	Uft90CJJLrBrwwm0;
+
+1.5
+date	2015.10.19.07.58.28;	author yasuoka;	state Exp;
+branches;
+next	1.4;
+commitid	nSugwRKjAqkNvhB9;
+
+1.4
+date	2015.07.30.08.46.04;	author yasuoka;	state Exp;
+branches;
+next	1.3;
+commitid	82PsNk5qYlOvf2Ui;
+
+1.3
+date	2015.07.27.09.27.23;	author yasuoka;	state Exp;
+branches;
+next	1.2;
+commitid	mRcLKXXb9otsgfyd;
+
+1.2
+date	2015.07.27.08.58.09;	author yasuoka;	state Exp;
+branches;
+next	1.1;
+commitid	ZEkhIpJEPT3ahoT7;
+
+1.1
+date	2015.07.21.04.06.04;	author yasuoka;	state Exp;
+branches;
+next	;
+commitid	12PWkq6F1N9Umqtt;
+
+
+desc
+@@
+
+
+1.7
+log
+@EAGAIN handling for imsg_read. OK henning@@ benno@@
+@
+text
+@/*	$OpenBSD: radiusd_bsdauth.c,v 1.6 2015/10/19 22:07:37 yasuoka Exp $	*/
+
+/*
+ * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@@yasuoka.net>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+
+#include <bsd_auth.h>
+#include <err.h>
+#include <errno.h>
+#include <grp.h>
+#include <imsg.h>
+#include <login_cap.h>
+#include <pwd.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <unistd.h>
+
+#include "radiusd.h"
+#include "radiusd_module.h"
+
+struct module_bsdauth {
+	struct module_base	 *base;
+	struct imsgbuf		  ibuf;
+	char			**okgroups;
+};
+
+/* IPC between priv and main */
+enum {
+	IMSG_BSDAUTH_OK = 1000,
+	IMSG_BSDAUTH_NG,
+	IMSG_BSDAUTH_USERCHECK,
+	IMSG_BSDAUTH_GROUPCHECK
+};
+struct auth_usercheck_args {
+	size_t	userlen;
+	size_t	passlen;
+};
+struct auth_groupcheck_args {
+	size_t	userlen;
+	size_t	grouplen;
+};
+
+static void	 module_bsdauth_main(int, int);
+static void	 module_bsdauth_config_set(void *, const char *, int,
+		    char * const *);
+static void	 module_bsdauth_userpass(void *, u_int, const char *,
+		    const char *);
+__dead static void
+		 fatal(const char *);
+
+static struct module_handlers module_bsdauth_handlers = {
+	.userpass = module_bsdauth_userpass,
+	.config_set = module_bsdauth_config_set
+};
+
+int
+main(int argc, char *argv[])
+{
+	int		 pipe_chld, pairsock[2], status;
+	struct imsgbuf	 ibuf;
+	struct imsg	 imsg;
+	ssize_t		 n;
+	size_t		 datalen;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, pairsock) == -1)
+		err(EXIT_FAILURE, "socketpair");
+
+	pipe_chld = pairsock[1];
+	module_bsdauth_main(pairsock[0], pairsock[1]);
+
+	/*
+	 * Privileged process
+	 */
+	openlog(NULL, LOG_PID, LOG_DAEMON);
+	setproctitle("[priv]");
+	imsg_init(&ibuf, pipe_chld);
+
+	if (pledge("stdio getpw rpath proc exec", NULL) == -1)
+		err(EXIT_FAILURE, "pledge");
+
+	for (;;) {
+		if ((n = imsg_read(&ibuf)) <= 0 && errno != EAGAIN)
+			break;
+		for (;;) {
+			if ((n = imsg_get(&ibuf, &imsg)) == -1)
+				break;
+			if (n == 0)
+				break;
+			datalen = imsg.hdr.len - IMSG_HEADER_SIZE;
+			switch (imsg.hdr.type) {
+			case IMSG_BSDAUTH_USERCHECK:
+			    {
+				char		*user, *pass;
+				bool		 authok = false;
+				struct auth_usercheck_args
+						*args;
+
+				if (datalen < sizeof(
+				    struct auth_usercheck_args)) {
+					syslog(LOG_ERR, "Short message");
+					break;
+				}
+				args = (struct auth_usercheck_args *)imsg.data;
+
+				if (datalen < sizeof(struct auth_usercheck_args)
+				    + args->userlen + args->passlen) {
+					syslog(LOG_ERR, "Short message");
+					break;
+				}
+				user = (char *)(args + 1);
+				user[args->userlen - 1] = '\0';
+				pass = user + args->userlen;
+				pass[args->passlen - 1] = '\0';
+
+				if (auth_userokay(user, NULL, NULL, pass))
+					authok = true;
+				explicit_bzero(pass, args->passlen);
+
+				imsg_compose(&ibuf, (authok)
+				    ? IMSG_BSDAUTH_OK : IMSG_BSDAUTH_NG,
+				    0, 0, -1, NULL, 0);
+				break;
+			    }
+			case IMSG_BSDAUTH_GROUPCHECK:
+			    {
+				int		 i;
+				char		*user, *group;
+				struct passwd   *pw;
+				struct group	 gr0, *gr;
+				char		 g_buf[4096];
+				bool		 group_ok = false;
+				struct auth_groupcheck_args
+						*args;
+
+				if (datalen < sizeof(
+				    struct auth_groupcheck_args)) {
+					syslog(LOG_ERR, "Short message");
+					break;
+				}
+				args = (struct auth_groupcheck_args *)imsg.data;
+				if (datalen < sizeof(
+					    struct auth_groupcheck_args) +
+				    args->userlen + args->grouplen) {
+					syslog(LOG_ERR, "Short message");
+					break;
+				}
+				user = (char *)(args + 1);
+				user[args->userlen - 1] = '\0';
+				group = user + args->userlen;
+				group[args->grouplen - 1] = '\0';
+
+				pw = getpwnam(user);
+				if (getgrnam_r(group, &gr0, g_buf,
+				    sizeof(g_buf), &gr) == -1 || gr == NULL)
+					goto group_done;
+
+				if (gr->gr_gid == pw->pw_gid) {
+					group_ok = true;
+					goto group_done;
+				}
+				for (i = 0; gr->gr_mem[i] != NULL; i++) {
+					if (strcmp(gr->gr_mem[i], pw->pw_name)
+					    == 0) {
+						group_ok = true;
+						goto group_done;
+					}
+				}
+group_done:
+				endgrent();
+
+				imsg_compose(&ibuf, (group_ok)
+				    ? IMSG_BSDAUTH_OK : IMSG_BSDAUTH_NG,
+				    0, 0, -1, NULL, 0);
+				break;
+			    }
+			    imsg_free(&imsg);
+			}
+			imsg_flush(&ibuf);
+		}
+		imsg_flush(&ibuf);
+	}
+	imsg_clear(&ibuf);
+	wait(&status);
+
+	exit(WEXITSTATUS(status));
+}
+
+static void
+module_bsdauth_main(int pipe_prnt, int pipe_chld)
+{
+	int			 i;
+	pid_t			 pid;
+	struct module_bsdauth	 module_bsdauth;
+
+	pid = fork();
+	if (pid == -1)
+		err(EXIT_FAILURE, "fork");
+
+	if (pid > 0) {
+		close(pipe_prnt);
+		return;
+	}
+	close(pipe_chld);
+
+	/* main process */
+	setproctitle("[main]");
+	openlog(NULL, LOG_PID, LOG_DAEMON);
+	memset(&module_bsdauth, 0, sizeof(module_bsdauth));
+	if ((module_bsdauth.base = module_create(STDIN_FILENO, &module_bsdauth,
+	    &module_bsdauth_handlers)) == NULL)
+		err(1, "Could not create a module instance");
+
+	module_drop_privilege(module_bsdauth.base);
+
+	module_load(module_bsdauth.base);
+	imsg_init(&module_bsdauth.ibuf, pipe_prnt);
+
+	if (pledge("stdio proc", NULL) == -1)
+		err(EXIT_FAILURE, "pledge");
+
+	while (module_run(module_bsdauth.base) == 0)
+		;
+
+	module_destroy(module_bsdauth.base);
+	imsg_clear(&module_bsdauth.ibuf);
+
+	if (module_bsdauth.okgroups) {
+		for (i = 0; module_bsdauth.okgroups[i] != NULL; i++)
+			free(module_bsdauth.okgroups[i]);
+	}
+	free(module_bsdauth.okgroups);
+
+	_exit(EXIT_SUCCESS);
+}
+
+static void
+module_bsdauth_config_set(void *ctx, const char *name, int argc,
+    char * const * argv)
+{
+	struct module_bsdauth	 *module = ctx;
+	int			  i;
+	char			**groups = NULL;
+
+	if (strcmp(name, "restrict-group") == 0) {
+		if (module->okgroups != NULL) {
+			module_send_message(module->base, IMSG_NG,
+			    "`restrict-group' is already defined");
+			goto on_error;
+		}
+		if ((groups = calloc(sizeof(char *), argc + 1)) == NULL) {
+			module_send_message(module->base, IMSG_NG,
+			    "Out of memory");
+			goto on_error;
+		}
+		for (i = 0; i < argc; i++) {
+			if ((groups[i] = strdup(argv[i])) == NULL) {
+				module_send_message(module->base,
+				    IMSG_NG, "Out of memory");
+				goto on_error;
+			}
+		}
+		groups[i] = NULL;
+		module->okgroups = groups;
+		module_send_message(module->base, IMSG_OK, NULL);
+	} else
+		module_send_message(module->base, IMSG_NG,
+		    "Unknown config parameter `%s'", name);
+	return;
+on_error:
+	if (groups != NULL) {
+		for (i = 0; groups[i] != NULL; i++)
+			free(groups[i]);
+		free(groups);
+	}
+	return;
+}
+
+
+static void
+module_bsdauth_userpass(void *ctx, u_int q_id, const char *user,
+    const char *pass)
+{
+	struct module_bsdauth	*module = ctx;
+	struct auth_usercheck_args
+				 usercheck;
+	struct auth_groupcheck_args
+				 groupcheck;
+	struct iovec		iov[4];
+	const char		*group;
+	u_int			 i;
+	const char		*reason;
+	struct imsg		 imsg;
+	ssize_t			 n;
+
+	memset(&imsg, 0, sizeof(imsg));
+	if (pass == NULL)
+		pass = "";
+
+	usercheck.userlen = strlen(user) + 1;
+	usercheck.passlen = strlen(pass) + 1;
+	iov[0].iov_base = &usercheck;
+	iov[0].iov_len = sizeof(usercheck);
+	iov[1].iov_base = (char *)user;
+	iov[1].iov_len = usercheck.userlen;
+	iov[2].iov_base = (char *)pass;
+	iov[2].iov_len = usercheck.passlen;
+
+	imsg_composev(&module->ibuf, IMSG_BSDAUTH_USERCHECK, 0, 0, -1, iov, 3);
+	imsg_flush(&module->ibuf);
+	if ((n = imsg_read(&module->ibuf)) == -1 || n == 0)
+		fatal("imsg_read() failed in module_bsdauth_userpass()");
+	if ((n = imsg_get(&module->ibuf, &imsg)) <= 0)
+		fatal("imsg_get() failed in module_bsdauth_userpass()");
+
+	if (imsg.hdr.type != IMSG_BSDAUTH_OK) {
+		reason = "Authentication failed";
+		goto auth_ng;
+	}
+	if (module->okgroups != NULL) {
+		reason = "Group restriction is not allowed";
+		for (i = 0; module->okgroups[i] != NULL; i++) {
+			group = module->okgroups[i];
+
+			groupcheck.userlen = strlen(user) + 1;
+			groupcheck.grouplen = strlen(group) + 1;
+			iov[0].iov_base = &groupcheck;
+			iov[0].iov_len = sizeof(groupcheck);
+			iov[1].iov_base = (char *)user;
+			iov[1].iov_len = groupcheck.userlen;
+			iov[2].iov_base = (char *)group;
+			iov[2].iov_len = groupcheck.grouplen;
+			imsg_composev(&module->ibuf, IMSG_BSDAUTH_GROUPCHECK,
+			    0, 0, -1, iov, 3);
+			imsg_flush(&module->ibuf);
+			if ((n = imsg_read(&module->ibuf)) == -1 || n == 0)
+				fatal("imsg_read() failed in "
+				    "module_bsdauth_userpass()");
+			if ((n = imsg_get(&module->ibuf, &imsg)) <= 0)
+				fatal("imsg_get() failed in "
+				    "module_bsdauth_userpass()");
+			if (imsg.hdr.type == IMSG_BSDAUTH_OK)
+				goto group_ok;
+		}
+		goto auth_ng;
+	}
+group_ok:
+	module_userpass_ok(module->base, q_id, "Authentication succeeded");
+	imsg_free(&imsg);
+	return;
+auth_ng:
+	module_userpass_fail(module->base, q_id, reason);
+	imsg_free(&imsg);
+	return;
+}
+
+static void
+fatal(const char *msg)
+{
+	syslog(LOG_ERR, "%s: %m", msg);
+	abort();
+}
+@
+
+
+1.6
+log
+@Add pledge(2) for radiusctl(8) and radiusd(8).
+- radiusd: "stdio inet"
+- radiusd_radius: "stdio inet"
+- radiusd_bsdauth:
+  - "stdio proc" for the non-priviledged process
+  - "stdio getpw rpath proc exec" for the priviledged process
+- radiusctl: "stdio dns inet"
+
+"go ahead" deraadt
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: radiusd_bsdauth.c,v 1.5 2015/10/19 07:58:28 yasuoka Exp $	*/
+d27 1
+d103 1
+a103 1
+		if ((n = imsg_read(&ibuf)) <= 0)
+@
+
+
+1.5
+log
+@Avoid a NULL dereference when getgrnam_r() returns NULL for `result'.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: radiusd_bsdauth.c,v 1.4 2015/07/30 08:46:04 yasuoka Exp $	*/
+d97 4
+d237 4
+@
+
+
+1.4
+log
+@Fix typo in comment.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: radiusd_bsdauth.c,v 1.3 2015/07/27 09:27:23 yasuoka Exp $	*/
+d170 1
+a170 1
+				    sizeof(g_buf), &gr) == -1)
+@
+
+
+1.3
+log
+@Stop using _this in radiusd modules.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: radiusd_bsdauth.c,v 1.2 2015/07/27 08:58:09 yasuoka Exp $	*/
+d92 1
+a92 1
+	 * Priviledged process
+@
+
+
+1.2
+log
+@Drop the privilege from modules.  "radiusd_radius" could simply run
+without root.  "radiusd_bsdauth" uses some functions which needs root.
+So separate its process into a privileged process and a non-privileged
+process.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: radiusd_bsdauth.c,v 1.1 2015/07/21 04:06:04 yasuoka Exp $	*/
+d252 1
+a252 1
+	struct module_bsdauth	 *_this = ctx;
+d257 2
+a258 2
+		if (_this->okgroups != NULL) {
+			module_send_message(_this->base, IMSG_NG,
+d263 1
+a263 1
+			module_send_message(_this->base, IMSG_NG,
+d269 1
+a269 1
+				module_send_message(_this->base,
+d275 2
+a276 2
+		_this->okgroups = groups;
+		module_send_message(_this->base, IMSG_OK, NULL);
+d278 1
+a278 1
+		module_send_message(_this->base, IMSG_NG,
+d295 1
+a295 1
+	struct module_bsdauth	*_this = ctx;
+d320 3
+a322 3
+	imsg_composev(&_this->ibuf, IMSG_BSDAUTH_USERCHECK, 0, 0, -1, iov, 3);
+	imsg_flush(&_this->ibuf);
+	if ((n = imsg_read(&_this->ibuf)) == -1 || n == 0)
+d324 1
+a324 1
+	if ((n = imsg_get(&_this->ibuf, &imsg)) <= 0)
+d331 1
+a331 1
+	if (_this->okgroups != NULL) {
+d333 2
+a334 2
+		for (i = 0; _this->okgroups[i] != NULL; i++) {
+			group = _this->okgroups[i];
+d344 1
+a344 1
+			imsg_composev(&_this->ibuf, IMSG_BSDAUTH_GROUPCHECK,
+d346 2
+a347 2
+			imsg_flush(&_this->ibuf);
+			if ((n = imsg_read(&_this->ibuf)) == -1 || n == 0)
+d350 1
+a350 1
+			if ((n = imsg_get(&_this->ibuf, &imsg)) <= 0)
+d359 1
+a359 1
+	module_userpass_ok(_this->base, q_id, "Authentication succeeded");
+d363 1
+a363 1
+	module_userpass_fail(_this->base, q_id, reason);
+@
+
+
+1.1
+log
+@Add radiusd(8) and radiusctl(8).  They are WIP.  radiusd(8) is a RADIUS
+server and radiusctl(8) is to control the server.  radiusd(8) currently
+supports bsdauth and radius (upstream radius servers) as authentication
+backends.
+
+fixes from jsg blambert
+ok deraadt
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d21 3
+d28 1
+d32 1
+d43 1
+d47 23
+a69 3
+static void module_bsdauth_config_set(void *, const char *, int,
+    char * const *);
+static void module_bsdauth_userpass(void *, u_int, const char *, const char *);
+d79 130
+d211 9
+a219 1
+	memset(&module_bsdauth, 0, sizeof(module_bsdauth));
+d221 2
+d224 1
+a224 1
+
+d229 2
+d232 1
+d237 1
+d239 7
+a245 1
+	exit(EXIT_SUCCESS);
+d268 3
+a270 4
+			if (getgrnam(argv[i]) == NULL) {
+				module_send_message(_this->base, IMSG_NG,
+				    "group `%s' is not found", argv[i]);
+				endgrent();
+a271 7
+			} else {
+				if ((groups[i] = strdup(argv[i])) == NULL) {
+					endgrent();
+					module_send_message(_this->base,
+					    IMSG_NG, "Out of memory");
+					goto on_error;
+				}
+a275 1
+		endgrent();
+d296 7
+a302 5
+	u_int			 i, j;
+	auth_session_t		*auth = NULL;
+	struct passwd		*pw;
+	struct group   		 gr0, *gr;
+	char           		 g_buf[4096];
+d304 2
+d307 1
+d311 17
+a327 2
+	if ((auth = auth_usercheck((char *)user, NULL, NULL, (char *)pass))
+	    == NULL || (auth_getstate(auth) & AUTH_OKAY) == 0) {
+a332 6
+		auth_setpwd(auth, NULL);
+		if ((pw = auth_getpwd(auth)) == NULL) {
+			syslog(LOG_WARNING, "auth_getpwd() for user %s "
+			    "failed: %m", user);
+			goto auth_ng;
+		}
+d334 20
+a353 7
+			if (getgrnam_r(_this->okgroups[i], &gr0, g_buf,
+			    sizeof(g_buf), &gr) == -1) {
+				syslog(LOG_DEBUG, "group %s is not found",
+				    _this->okgroups[i]);
+				continue;
+			}
+			if (gr->gr_gid == pw->pw_gid)
+a354 4
+			for (j = 0; gr->gr_mem[j] != NULL; j++) {
+				if (strcmp(gr->gr_mem[j], pw->pw_name) == 0)
+					goto group_ok;
+			}
+a355 1
+		endgrent();
+d357 1
+a358 2
+		endgrent();
+	}
+d360 1
+a360 2
+	if (auth != NULL)
+		auth_close(auth);
+d364 1
+a364 2
+	if (auth != NULL)
+		auth_close(auth);
+d366 7
+@
+

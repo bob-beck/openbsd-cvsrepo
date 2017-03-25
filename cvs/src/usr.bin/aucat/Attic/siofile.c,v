@@ -1,0 +1,1176 @@
+head	1.14;
+access;
+symbols
+	OPENBSD_5_6:1.13.0.6
+	OPENBSD_5_6_BASE:1.13
+	OPENBSD_5_5:1.13.0.4
+	OPENBSD_5_5_BASE:1.13
+	OPENBSD_5_4:1.12.0.6
+	OPENBSD_5_4_BASE:1.12
+	OPENBSD_5_3:1.12.0.4
+	OPENBSD_5_3_BASE:1.12
+	OPENBSD_5_2:1.12.0.2
+	OPENBSD_5_2_BASE:1.12
+	OPENBSD_5_1_BASE:1.9
+	OPENBSD_5_1:1.9.0.2
+	OPENBSD_5_0:1.7.0.2
+	OPENBSD_5_0_BASE:1.7
+	OPENBSD_4_9:1.6.0.4
+	OPENBSD_4_9_BASE:1.6
+	OPENBSD_4_8:1.6.0.2
+	OPENBSD_4_8_BASE:1.6
+	OPENBSD_4_7:1.1.0.2
+	OPENBSD_4_7_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.14
+date	2015.01.21.08.43.55;	author ratchov;	state dead;
+branches;
+next	1.13;
+commitid	SYQcoS9jhSKqSJDL;
+
+1.13
+date	2013.11.18.17.37.45;	author ratchov;	state Exp;
+branches;
+next	1.12;
+
+1.12
+date	2012.06.27.06.46.44;	author ratchov;	state Exp;
+branches;
+next	1.11;
+
+1.11
+date	2012.05.23.19.25.11;	author ratchov;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2012.04.11.06.05.43;	author ratchov;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2011.11.20.22.54.51;	author ratchov;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2011.10.12.07.20.04;	author ratchov;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2011.06.27.07.22.00;	author ratchov;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2010.06.04.06.15.28;	author ratchov;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2010.05.02.11.54.26;	author ratchov;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2010.04.06.20.07.01;	author ratchov;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2010.04.03.17.59.17;	author ratchov;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2010.04.03.17.40.33;	author ratchov;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2010.01.13.10.02.52;	author ratchov;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.14
+log
+@Simplify internals and rewrite file header parsing code:
+- remove -M, -t, -w, -C, -x flags that don't make sense anymore
+- make "-j off" the default (sndiod already does the job)
+- don't limit the number of played/recorded files.
+- add support for floating-point encoded files.
+- add support for apple .aiff and sun/next .au files
+@
+text
+@/*	$OpenBSD: siofile.c,v 1.13 2013/11/18 17:37:45 ratchov Exp $	*/
+/*
+ * Copyright (c) 2008 Alexandre Ratchov <alex@@caoua.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/time.h>
+#include <sys/types.h>
+
+#include <poll.h>
+#include <sndio.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "aparams.h"
+#include "aproc.h"
+#include "abuf.h"
+#include "conf.h"
+#include "dev.h"
+#include "file.h"
+#include "siofile.h"
+#ifdef DEBUG
+#include "dbg.h"
+#endif
+
+struct siofile {
+	struct file file;
+	struct sio_hdl *hdl;
+	unsigned int wtickets, wbpf;
+	unsigned int rtickets, rbpf;
+	unsigned int bufsz;
+	int started;
+	void (*onmove)(void *, int);
+	void *arg;
+#ifdef DEBUG
+	long long wtime, utime;
+#endif
+};
+
+void siofile_close(struct file *);
+unsigned int siofile_read(struct file *, unsigned char *, unsigned int);
+unsigned int siofile_write(struct file *, unsigned char *, unsigned int);
+void siofile_start(struct file *, void (*)(void *, int), void *);
+void siofile_stop(struct file *);
+int siofile_nfds(struct file *);
+int siofile_pollfd(struct file *, struct pollfd *, int);
+int siofile_revents(struct file *, struct pollfd *);
+void siofile_cb(void *, int);
+
+struct fileops siofile_ops = {
+	"sio",
+	sizeof(struct siofile),
+	siofile_close,
+	siofile_read,
+	siofile_write,
+	siofile_start,
+	siofile_stop,
+	siofile_nfds,
+	siofile_pollfd,
+	siofile_revents
+};
+
+int wsio_out(struct aproc *, struct abuf *);
+int rsio_in(struct aproc *, struct abuf *);
+
+struct aproc_ops rsio_ops = {
+	"rsio",
+	rsio_in,
+	rfile_out,
+	rfile_eof,
+	rfile_hup,
+	NULL, /* newin */
+	NULL, /* newout */
+	aproc_ipos,
+	aproc_opos,
+	rfile_done
+};
+
+struct aproc_ops wsio_ops = {
+	"wsio",
+	wfile_in,
+	wsio_out,
+	wfile_eof,
+	wfile_hup,
+	NULL, /* newin */
+	NULL, /* newout */
+	aproc_ipos,
+	aproc_opos,
+	wfile_done
+};
+
+struct aproc *
+rsio_new(struct file *f)
+{
+	struct aproc *p;
+
+	p = aproc_new(&rsio_ops, f->name);
+	p->u.io.file = f;
+	p->u.io.partial = 0;
+	f->rproc = p;
+	return p;
+}
+
+struct aproc *
+wsio_new(struct file *f)
+{
+	struct aproc *p;
+
+	p = aproc_new(&wsio_ops, f->name);
+	p->u.io.file = f;
+	p->u.io.partial = 0;
+	f->wproc = p;
+	return p;
+}
+
+int
+wsio_out(struct aproc *p, struct abuf *obuf)
+{
+	struct siofile *f = (struct siofile *)p->u.io.file;
+
+	if (f->wtickets == 0) {
+#ifdef DEBUG
+		if (debug_level >= 4) {
+			file_dbg(&f->file);
+			dbg_puts(": no more write tickets\n");
+		}
+#endif
+		f->file.state &= ~FILE_WOK;
+		return 0;
+	}
+	return wfile_out(p, obuf);
+}
+
+int
+rsio_in(struct aproc *p, struct abuf *ibuf)
+{
+	struct siofile *f = (struct siofile *)p->u.io.file;
+
+	if (f->rtickets == 0) {
+#ifdef DEBUG
+		if (debug_level >= 4) {
+			file_dbg(&f->file);
+			dbg_puts(": no more read tickets\n");
+		}
+#endif
+		f->file.state &= ~FILE_ROK;
+		return 0;
+	}
+	return rfile_in(p, ibuf);
+}
+
+void
+siofile_cb(void *addr, int delta)
+{
+	struct siofile *f = (struct siofile *)addr;
+	struct aproc *p;
+
+#ifdef DEBUG
+	if (delta < 0 || delta > (60 * RATE_MAX)) {
+		file_dbg(&f->file);
+		dbg_puts(": ");
+		dbg_puti(delta);
+		dbg_puts(": bogus sndio delta");
+		dbg_panic();
+	}
+	if (debug_level >= 4) {
+		file_dbg(&f->file);
+		dbg_puts(": tick, delta = ");
+		dbg_puti(delta);
+		dbg_puts(", load = ");
+		dbg_puti((file_utime - f->utime) / 1000);
+		dbg_puts(" + ");
+		dbg_puti((file_wtime - f->wtime) / 1000);
+		dbg_puts("\n");
+	}
+	f->wtime = file_wtime;
+	f->utime = file_utime;
+#endif
+	if (delta != 0) {
+		p = f->file.wproc;
+		if (p && p->ops->opos)
+			p->ops->opos(p, NULL, delta);
+		p = f->file.rproc;
+		if (p && p->ops->ipos)
+			p->ops->ipos(p, NULL, delta);
+	}
+	if (f->onmove)
+		f->onmove(f->arg, delta);
+	f->wtickets += delta * f->wbpf;
+	f->rtickets += delta * f->rbpf;
+}
+
+/*
+ * Open the device.
+ */
+struct siofile *
+siofile_new(struct fileops *ops, char *path, unsigned int *rmode,
+    struct aparams *ipar, struct aparams *opar,
+    unsigned int *bufsz, unsigned int *round)
+{
+	struct sio_par par;
+	struct sio_hdl *hdl;
+	struct siofile *f;
+	unsigned int mode = *rmode;
+
+	hdl = sio_open(path, mode, 1);
+	if (hdl == NULL) {
+		if (mode != (SIO_PLAY | SIO_REC))
+			return NULL;
+		hdl = sio_open(path, SIO_PLAY, 1);
+		if (hdl != NULL)
+			mode = SIO_PLAY;
+		else {
+			hdl = sio_open(path, SIO_REC, 1);
+			if (hdl != NULL)
+				mode = SIO_REC;
+			else
+				return NULL;
+		}
+#ifdef DEBUG
+		if (debug_level >= 1) {
+			dbg_puts("warning, device opened in ");
+			dbg_puts(mode == SIO_PLAY ? "play-only" : "rec-only");
+			dbg_puts(" mode\n");
+		}
+#endif
+	}
+
+	sio_initpar(&par);
+	if (mode & SIO_REC) {
+		par.bits = ipar->bits;
+		par.bps = ipar->bps;
+		par.sig = ipar->sig;
+		par.le = ipar->le;
+		par.msb = ipar->msb;
+		par.rate = ipar->rate;
+		par.rchan = ipar->cmax + 1;
+	} else {
+		par.bits = opar->bits;
+		par.bps = opar->bps;
+		par.sig = opar->sig;
+		par.le = opar->le;
+		par.msb = opar->msb;
+		par.rate = opar->rate;
+	}
+	if (mode & SIO_PLAY)
+		par.pchan = opar->cmax + 1;
+	if (*bufsz)
+		par.appbufsz = *bufsz;
+	if (*round)
+		par.round = *round;
+	if (!sio_setpar(hdl, &par))
+		goto bad_close;
+	if (!sio_getpar(hdl, &par))
+		goto bad_close;
+	if (mode & SIO_REC) {
+		ipar->bits = par.bits;
+		ipar->bps = par.bps;
+		ipar->sig = par.sig;
+		ipar->le = par.le;
+		ipar->msb = par.msb;
+		ipar->rate = par.rate;
+		ipar->cmin = 0;
+		ipar->cmax = par.rchan - 1;
+	}
+	if (mode & SIO_PLAY) {
+		opar->bits = par.bits;
+		opar->bps = par.bps;
+		opar->sig = par.sig;
+		opar->le = par.le;
+		opar->msb = par.msb;
+		opar->rate = par.rate;
+		opar->cmin = 0;
+		opar->cmax = par.pchan - 1;
+	}
+	*rmode = mode;
+	*bufsz = par.bufsz;
+	*round = par.round;
+	f = (struct siofile *)file_new(ops, path, sio_nfds(hdl));
+	if (f == NULL)
+		goto bad_close;
+	f->hdl = hdl;
+	f->started = 0;
+	f->wtickets = 0;
+	f->rtickets = 0;
+	f->wbpf = par.pchan * par.bps;
+	f->rbpf = par.rchan * par.bps;
+	f->bufsz = par.bufsz;
+	sio_onmove(f->hdl, siofile_cb, f);
+	return f;
+ bad_close:
+	sio_close(hdl);
+	return NULL;
+}
+
+void
+siofile_start(struct file *file, void (*cb)(void *, int), void *arg)
+{
+	struct siofile *f = (struct siofile *)file;
+
+	if (!sio_start(f->hdl)) {
+#ifdef DEBUG
+		dbg_puts(f->file.name);
+		dbg_puts(": failed to start device\n");
+#endif
+		file_close(file);
+		return;
+	}
+	f->started = 1;
+	f->wtickets = f->bufsz * f->wbpf;
+	f->rtickets = 0;
+#ifdef DEBUG
+	f->wtime = file_wtime;
+	f->utime = file_utime;
+	if (debug_level >= 3) {
+		file_dbg(&f->file);
+		dbg_puts(": started\n");
+	}
+#endif
+	f->onmove = cb;
+	f->arg = arg;
+}
+
+void
+siofile_stop(struct file *file)
+{
+	struct siofile *f = (struct siofile *)file;
+
+	f->started = 0;
+	f->onmove = NULL;
+	if (!sio_eof(f->hdl) && !sio_stop(f->hdl)) {
+#ifdef DEBUG
+		dbg_puts(f->file.name);
+		dbg_puts(": failed to stop device\n");
+#endif
+		file_close(file);
+		return;
+	}
+#ifdef DEBUG
+	if (debug_level >= 3) {
+		file_dbg(&f->file);
+		dbg_puts(": stopped\n");
+	}
+#endif
+}
+
+unsigned int
+siofile_read(struct file *file, unsigned char *data, unsigned int count)
+{
+	struct siofile *f = (struct siofile *)file;
+	unsigned int n;
+
+#ifdef DEBUG
+	if (f->rtickets == 0) {
+		file_dbg(&f->file);
+		dbg_puts(": called with no read tickets\n");
+	}
+#endif
+	if (count > f->rtickets)
+		count = f->rtickets;
+	n = f->started ? sio_read(f->hdl, data, count) : 0;
+	if (n == 0) {
+		f->file.state &= ~FILE_ROK;
+		if (sio_eof(f->hdl)) {
+#ifdef DEBUG
+			dbg_puts(f->file.name);
+			dbg_puts(": failed to read from device\n");
+#endif
+			file_eof(&f->file);
+		} else {
+#ifdef DEBUG
+			if (debug_level >= 4) {
+				file_dbg(&f->file);
+				dbg_puts(": reading blocked\n");
+			}
+#endif
+		}
+		return 0;
+	} else {
+		f->rtickets -= n;
+		if (f->rtickets == 0) {
+			f->file.state &= ~FILE_ROK;
+#ifdef DEBUG
+			if (debug_level >= 4) {
+				file_dbg(&f->file);
+				dbg_puts(": read tickets exhausted\n");
+			}
+#endif
+		}
+	}
+	return n;
+
+}
+
+unsigned int
+siofile_write(struct file *file, unsigned char *data, unsigned int count)
+{
+	struct siofile *f = (struct siofile *)file;
+	unsigned int n;
+
+#ifdef DEBUG
+	if (f->wtickets == 0) {
+		file_dbg(&f->file);
+		dbg_puts(": called with no write tickets\n");
+	}
+#endif
+	if (count > f->wtickets)
+		count = f->wtickets;
+	n = f->started ? sio_write(f->hdl, data, count) : 0;
+	if (n == 0) {
+		f->file.state &= ~FILE_WOK;
+		if (sio_eof(f->hdl)) {
+#ifdef DEBUG
+			dbg_puts(f->file.name);
+			dbg_puts(": failed to write on device\n");
+#endif
+			file_hup(&f->file);
+		} else {
+#ifdef DEBUG
+			if (debug_level >= 4) {
+				file_dbg(&f->file);
+				dbg_puts(": writing blocked\n");
+			}
+#endif
+		}
+		return 0;
+	} else {
+		f->wtickets -= n;
+		if (f->wtickets == 0) {
+			f->file.state &= ~FILE_WOK;
+#ifdef DEBUG
+			if (debug_level >= 4) {
+				file_dbg(&f->file);
+				dbg_puts(": write tickets exhausted\n");
+			}
+#endif
+		}
+	}
+	return n;
+}
+
+int
+siofile_nfds(struct file *file)
+{
+	return sio_nfds(((struct siofile *)file)->hdl);
+}
+
+int
+siofile_pollfd(struct file *file, struct pollfd *pfd, int events)
+{
+	struct siofile *f = (struct siofile *)file;
+
+	if (!f->started)
+		events &= ~(POLLIN | POLLOUT);
+	return sio_pollfd(((struct siofile *)file)->hdl, pfd, events);
+}
+
+int
+siofile_revents(struct file *file, struct pollfd *pfd)
+{
+	return sio_revents(((struct siofile *)file)->hdl, pfd);
+}
+
+void
+siofile_close(struct file *file)
+{
+	struct siofile *f = (struct siofile *)file;
+
+	if (f->started)
+		siofile_stop(&f->file);
+	sio_close(((struct siofile *)file)->hdl);
+}
+@
+
+
+1.13
+log
+@add missing prototypes
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+@
+
+
+1.12
+log
+@Don't return void expressions in functions returning void. Removes
+warnings in clang. From dhill. Thanks!
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.11 2012/05/23 19:25:11 ratchov Exp $	*/
+d60 1
+@
+
+
+1.11
+log
+@Make the "default" string a valid device name that has the same effect
+as NULL has. This will (hopefully) simplify ports where the user
+passes the device string.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.10 2012/04/11 06:05:43 ratchov Exp $	*/
+d482 1
+a482 1
+	return sio_close(((struct siofile *)file)->hdl);
+@
+
+
+1.10
+log
+@Use "unsigned int" rather than "unsigned". No object change.
+suggested by deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.9 2011/11/20 22:54:51 ratchov Exp $	*/
+a211 1
+	char *siopath;
+d217 1
+a217 2
+	siopath = (strcmp(path, "default") == 0) ? NULL : path;
+	hdl = sio_open(siopath, mode, 1);
+d221 1
+a221 1
+		hdl = sio_open(siopath, SIO_PLAY, 1);
+d225 1
+a225 1
+			hdl = sio_open(siopath, SIO_REC, 1);
+@
+
+
+1.9
+log
+@Move mmc/mtc and volume control bits from struct aproc to struct
+dev. Allows volume settings to be saved while the device is kept
+closed. Besides that, no behabiour changes.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.8 2011/10/12 07:20:04 ratchov Exp $	*/
+d41 3
+a43 3
+	unsigned wtickets, wbpf;
+	unsigned rtickets, rbpf;
+	unsigned bufsz;
+d53 2
+a54 2
+unsigned siofile_read(struct file *, unsigned char *, unsigned);
+unsigned siofile_write(struct file *, unsigned char *, unsigned);
+d208 1
+a208 1
+siofile_new(struct fileops *ops, char *path, unsigned *rmode,
+d210 1
+a210 1
+    unsigned *bufsz, unsigned *round)
+d216 1
+a216 1
+	unsigned mode = *rmode;
+d360 2
+a361 2
+unsigned
+siofile_read(struct file *file, unsigned char *data, unsigned count)
+d364 1
+a364 1
+	unsigned n;
+d408 2
+a409 2
+unsigned
+siofile_write(struct file *file, unsigned char *data, unsigned count)
+d412 1
+a412 1
+	unsigned n;
+@
+
+
+1.8
+log
+@Simplify and improve the way options are parsed and remove ~300 lines
+of code that becomes unused. Few command line arguments changes are
+required though:
+
+  - stream definitions (-ios) now must follow devices definitions they
+    are attached to (-fMn)
+
+  - the -n option is now a special "loopback" device and is thus used
+    like -f, eg it must precede streams
+
+  - in midicat, midi thru boxes are not created automatically anymore,
+    the new "-M" option must be used for that
+
+  - channel numbers (-Cc options) correspond always to channel numbers
+    of the hardware.
+
+  - the -u option isn't needed anymore
+
+  - increase the log verbosity so user errors are logged
+    without using -d
+
+tested by many, help from jmc
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.7 2011/06/27 07:22:00 ratchov Exp $	*/
+d45 2
+d55 1
+a55 1
+void siofile_start(struct file *);
+a193 2
+	}
+	if (delta != 0) {
+d198 2
+d310 1
+a310 1
+siofile_start(struct file *file)
+d333 2
+d343 1
+@
+
+
+1.7
+log
+@Display the CPU usage when -ddddd is used, ie the time spent on
+calculations compared to the time spend on sleeping in poll().
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.6 2010/06/04 06:15:28 ratchov Exp $	*/
+d248 1
+a248 1
+		par.rchan = ipar->cmax - ipar->cmin + 1;
+d258 5
+a262 3
+		par.pchan = opar->cmax - opar->cmin + 1;
+	par.appbufsz = *bufsz;
+	par.round = *round;
+d274 2
+a275 1
+		ipar->cmax = ipar->cmin + par.rchan - 1;
+d284 2
+a285 1
+		opar->cmax = opar->cmin + par.pchan - 1;
+@
+
+
+1.6
+log
+@Allow the audio device to be opened only while it's actually used.
+This is necessary for uaudio devices, for instance to start aucat
+before the device is plugged. Or to unplug a device whithout
+having to restart aucat when another device is plugged.  This is
+controlled with the new -a option.
+
+Allow multiple audio devices to be used concurently, i.e.
+multiple ``-f devname'' options to be used; -f options must follow
+per-device options, which is what we do for other options.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.5 2010/05/02 11:54:26 ratchov Exp $	*/
+d45 3
+d179 4
+d185 2
+d320 2
+@
+
+
+1.5
+log
+@Clean up device handling code to clarify different initialization phases
+and different device states. Split initialization in two phases:
+first global variables are initialized then the audio hardware is opened.
+Allow devices that don't support full-duplex to work in play-only or
+record-only mode, even if ``-m play'' or ``-m rec'' are not specified.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.4 2010/04/06 20:07:01 ratchov Exp $	*/
+d201 1
+d207 2
+a208 1
+	hdl = sio_open(path, mode, 1);
+d212 1
+a212 1
+		hdl = sio_open(path, SIO_PLAY, 1);
+d216 1
+a216 1
+			hdl = sio_open(path, SIO_REC, 1);
+a276 2
+	if (path == NULL)
+		path = "default";
+@
+
+
+1.4
+log
+@aucat (server):
+
+  - make the ``-m mode'' option per subdevice, allowing
+    subdevices to be play-only or rec-only even if the
+    server is full-duplex
+
+  - add ``monitoring'' mode (with ``-m mon''). This is a
+    record-only stream from which played streams can be
+    recorded (kind of ``record what you hear'').
+
+  - allow MIDI devices to be subscribed to the controlling
+    MIDI port of the server, ie what midicat does (with -f
+    option), but using the -q option.
+
+  - add flow control to the protocol, and serialize clock
+    ticks (sio_onmove() calls) and data chunks.  This should
+    fix certain full-duplex programs, broken with ``magic''
+    block/buffer size combinations.
+
+  - enable 3 block latency which is the minimum theoretical.
+    Make -z and -b options correspond to device parameters.
+
+  - make sio_getcap(3) the same for aucat and sun backends,
+    ie return whatever is supported (``everything'' in the
+    aucat case, since everything is actulally supported).
+
+aucat (player):
+
+  - enable ``-m mode'' option  to select between monitoring
+    and recording when ``-o file'' is used.
+
+  - plug MIDI code to non-server codepath. The MIDI control
+    device is specified with the ``-q device'' option, as in
+    server mode.
+
+  - impliment lseek()'ing within files (controlled
+    through MIDI). Necessary to use aucat with a MIDI
+    sequencer.
+
+midicat (thrubox):
+
+  - rename ``-f'' flag to ``-q'', so it has the
+    same name as in aucat (-f is still working)
+
+ok jakemsr@@, tweaks from jmc@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.3 2010/04/03 17:59:17 ratchov Exp $	*/
+d197 1
+a197 1
+siofile_new(struct fileops *ops, char *path, unsigned mode,
+d204 1
+d207 22
+a228 2
+	if (hdl == NULL)
+		return NULL;
+d272 1
+@
+
+
+1.3
+log
+@backout last change, committed by mistake, sorry...
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: siofile.c,v 1.1 2010/01/13 10:02:52 ratchov Exp $	*/
+d29 1
+d41 3
+d69 89
+d166 1
+a166 1
+		dbg_puts(f->file.name);
+d172 6
+d189 2
+d197 1
+a197 1
+siofile_new(struct fileops *ops, char *path,
+a203 1
+	int mode;
+a204 5
+	mode = 0;
+	if (ipar)
+		mode |= SIO_REC;
+	if (opar)
+		mode |= SIO_PLAY;
+d209 1
+a209 1
+	if (ipar) {
+d225 1
+a225 1
+	if (opar)
+d233 1
+a233 1
+	if (ipar) {
+d242 1
+a242 1
+	if (opar) {
+d260 5
+d286 2
+d324 8
+d350 11
+d372 8
+d398 11
+@
+
+
+1.2
+log
+@doc fixes from jmc
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+a28 1
+#include "abuf.h"
+a39 3
+	unsigned wtickets, wbpf;
+	unsigned rtickets, rbpf;
+	unsigned bufsz;
+a64 89
+int wsio_out(struct aproc *, struct abuf *);
+int rsio_in(struct aproc *, struct abuf *);
+
+struct aproc_ops rsio_ops = {
+	"rsio",
+	rsio_in,
+	rfile_out,
+	rfile_eof,
+	rfile_hup,
+	NULL, /* newin */
+	NULL, /* newout */
+	aproc_ipos,
+	aproc_opos,
+	rfile_done
+};
+
+struct aproc_ops wsio_ops = {
+	"wsio",
+	wfile_in,
+	wsio_out,
+	wfile_eof,
+	wfile_hup,
+	NULL, /* newin */
+	NULL, /* newout */
+	aproc_ipos,
+	aproc_opos,
+	wfile_done
+};
+
+struct aproc *
+rsio_new(struct file *f)
+{
+	struct aproc *p;
+
+	p = aproc_new(&rsio_ops, f->name);
+	p->u.io.file = f;
+	p->u.io.partial = 0;
+	f->rproc = p;
+	return p;
+}
+
+struct aproc *
+wsio_new(struct file *f)
+{
+	struct aproc *p;
+
+	p = aproc_new(&wsio_ops, f->name);
+	p->u.io.file = f;
+	p->u.io.partial = 0;
+	f->wproc = p;
+	return p;
+}
+
+int
+wsio_out(struct aproc *p, struct abuf *obuf)
+{
+	struct siofile *f = (struct siofile *)p->u.io.file;
+
+	if (f->wtickets == 0) {
+#ifdef DEBUG
+		if (debug_level >= 4) {
+			file_dbg(&f->file);
+			dbg_puts(": no more write tickets\n");
+		}
+#endif
+		f->file.state &= ~FILE_WOK;
+		return 0;
+	}
+	return wfile_out(p, obuf);
+}
+
+int
+rsio_in(struct aproc *p, struct abuf *ibuf)
+{
+	struct siofile *f = (struct siofile *)p->u.io.file;
+
+	if (f->rtickets == 0) {
+#ifdef DEBUG
+		if (debug_level >= 4) {
+			file_dbg(&f->file);
+			dbg_puts(": no more read tickets\n");
+		}
+#endif
+		f->file.state &= ~FILE_ROK;
+		return 0;
+	}
+	return rfile_in(p, ibuf);
+}
+
+d73 1
+a73 1
+		file_dbg(&f->file);
+a78 6
+	if (debug_level >= 4) {
+		file_dbg(&f->file);
+		dbg_puts(": tick, delta = ");
+		dbg_puti(delta);
+		dbg_puts("\n");
+	}
+a89 2
+	f->wtickets += delta * f->wbpf;
+	f->rtickets += delta * f->rbpf;
+d96 1
+a96 1
+siofile_new(struct fileops *ops, char *path, unsigned mode,
+d103 1
+d105 5
+d114 1
+a114 1
+	if (mode & SIO_REC) {
+d130 1
+a130 1
+	if (mode & SIO_PLAY)
+d138 1
+a138 1
+	if (mode & SIO_REC) {
+d147 1
+a147 1
+	if (mode & SIO_PLAY) {
+a164 5
+	f->wtickets = 0;
+	f->rtickets = 0;
+	f->wbpf = par.pchan * par.bps;
+	f->rbpf = par.rchan * par.bps;
+	f->bufsz = par.bufsz;
+a185 2
+	f->wtickets = f->bufsz * f->wbpf;
+	f->rtickets = 0;
+a221 8
+#ifdef DEBUG
+	if (f->rtickets == 0) {
+		file_dbg(&f->file);
+		dbg_puts(": called with no read tickets\n");
+	}
+#endif
+	if (count > f->rtickets)
+		count = f->rtickets;
+a239 11
+	} else {
+		f->rtickets -= n;
+		if (f->rtickets == 0) {
+			f->file.state &= ~FILE_ROK;
+#ifdef DEBUG
+			if (debug_level >= 4) {
+				file_dbg(&f->file);
+				dbg_puts(": read tickets exhausted\n");
+			}
+#endif
+		}
+a250 8
+#ifdef DEBUG
+	if (f->wtickets == 0) {
+		file_dbg(&f->file);
+		dbg_puts(": called with no write tickets\n");
+	}
+#endif
+	if (count > f->wtickets)
+		count = f->wtickets;
+a268 11
+	} else {
+		f->wtickets -= n;
+		if (f->wtickets == 0) {
+			f->file.state &= ~FILE_WOK;
+#ifdef DEBUG
+			if (debug_level >= 4) {
+				file_dbg(&f->file);
+				dbg_puts(": write tickets exhausted\n");
+			}
+#endif
+		}
+@
+
+
+1.1
+log
+@Rename s/safile/siofile/g, missed when libsa was renamed to
+libsndio. Fixes crashes in full-duplex mode on vax and hp300.
+@
+text
+@d29 1
+d41 3
+d69 89
+d166 1
+a166 1
+		dbg_puts(f->file.name);
+d172 6
+d189 2
+d197 1
+a197 1
+siofile_new(struct fileops *ops, char *path,
+a203 1
+	int mode;
+a204 5
+	mode = 0;
+	if (ipar)
+		mode |= SIO_REC;
+	if (opar)
+		mode |= SIO_PLAY;
+d209 1
+a209 1
+	if (ipar) {
+d225 1
+a225 1
+	if (opar)
+d233 1
+a233 1
+	if (ipar) {
+d242 1
+a242 1
+	if (opar) {
+d260 5
+d286 2
+d324 8
+d350 11
+d372 8
+d398 11
+@
+

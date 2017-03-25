@@ -1,0 +1,771 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_6_0:1.4.0.10
+	OPENBSD_6_0_BASE:1.4
+	OPENBSD_5_9:1.4.0.6
+	OPENBSD_5_9_BASE:1.4
+	OPENBSD_5_8:1.4.0.8
+	OPENBSD_5_8_BASE:1.4
+	OPENBSD_5_7:1.4.0.4
+	OPENBSD_5_7_BASE:1.4
+	OPENBSD_5_6:1.4.0.2
+	OPENBSD_5_6_BASE:1.4
+	OPENBSD_5_1_BASE:1.1
+	OPENBSD_5_1:1.1.0.2;
+locks; strict;
+comment	@# @;
+
+
+1.4
+date	2014.04.06.20.13.11;	author brad;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.06.09.09.46.18;	author pascal;	state dead;
+branches;
+next	1.2;
+
+1.2
+date	2012.04.30.06.05.17;	author ajacoutot;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.08.21.16.37.08;	author jasper;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Update the avcodec plugin for newer FFmpeg API.
+
+Tested by pascal@@
+
+ajacoutot@@
+@
+text
+@$OpenBSD$
+
+Deal with newer FFmpeg API.
+
+--- src/plugins/avcodec/avcodec.c.orig	Thu Mar 27 01:42:57 2014
++++ src/plugins/avcodec/avcodec.c	Thu Mar 27 01:52:27 2014
+@@@@ -23,6 +23,7 @@@@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <glib.h>
++#include <libavutil/mem.h>
+ 
+ #include "avcodec_compat.h"
+ 
+@@@@ -36,6 +37,8 @@@@ typedef struct {
+ 	guint buffer_size;
+ 	gboolean no_demuxer;
+ 
++	AVFrame *read_out_frame;
++
+ 	guint channels;
+ 	guint samplerate;
+ 	xmms_sample_format_t sampleformat;
+@@@@ -53,10 +56,14 @@@@ typedef struct {
+ static gboolean xmms_avcodec_plugin_setup (xmms_xform_plugin_t *xform_plugin);
+ static gboolean xmms_avcodec_init (xmms_xform_t *xform);
+ static void xmms_avcodec_destroy (xmms_xform_t *xform);
++static gint xmms_avcodec_internal_read_some (xmms_xform_t *xform, xmms_avcodec_data_t *data, xmms_error_t *error);
++static gint xmms_avcodec_internal_decode_some (xmms_avcodec_data_t *data);
++static void xmms_avcodec_internal_append (xmms_avcodec_data_t *data);
+ static gint xmms_avcodec_read (xmms_xform_t *xform, xmms_sample_t *buf, gint len,
+                                xmms_error_t *error);
+ static gint64 xmms_avcodec_seek (xmms_xform_t *xform, gint64 samples,
+                                  xmms_xform_seek_mode_t whence, xmms_error_t *err);
++static xmms_sample_format_t xmms_avcodec_translate_sample_format (enum AVSampleFormat av_sample_format);
+ 
+ /*
+  * Plugin header
+@@@@ -85,13 +92,23 @@@@ xmms_avcodec_plugin_setup (xmms_xform_plugin_t *xform_
+ 	xmms_magic_add ("A/52 (AC-3) header", "audio/x-ffmpeg-ac3",
+ 	                "0 beshort 0x0b77", NULL);
+ 	xmms_magic_add ("DTS header", "audio/x-ffmpeg-dca",
+-	                "0 belong 0x7ffe8001", NULL); 
++	                "0 belong 0x7ffe8001", NULL);
+ 
+ 	xmms_xform_plugin_indata_add (xform_plugin,
+ 	                              XMMS_STREAM_TYPE_MIMETYPE,
+ 	                              "audio/x-ffmpeg-*",
+ 	                              NULL);
+ 
++	XMMS_DBG ("avcodec version at build time is %d.%d.%d",
++	          (LIBAVCODEC_VERSION_INT >> 16),
++	          (LIBAVCODEC_VERSION_INT >> 8) & 0xff,
++	          LIBAVCODEC_VERSION_INT & 0xff);
++	XMMS_DBG ("avcodec version at run time is %d.%d.%d",
++	          (avcodec_version() >> 16),
++	          (avcodec_version() >> 8) & 0xff,
++	          avcodec_version() & 0xff);
++	XMMS_DBG ("avcodec configuration is %s", avcodec_configuration());
++
+ 	return TRUE;
+ }
+ 
+@@@@ -107,6 +124,7 @@@@ xmms_avcodec_destroy (xmms_xform_t *xform)
+ 
+ 	avcodec_close (data->codecctx);
+ 	av_free (data->codecctx);
++	av_frame_free (&data->read_out_frame);
+ 
+ 	g_string_free (data->outbuf, TRUE);
+ 	g_free (data->buffer);
+@@@@ -132,9 +150,10 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 	data->buffer_size = AVCODEC_BUFFER_SIZE;
+ 	data->codecctx = NULL;
+ 
++	data->read_out_frame = av_frame_alloc ();
++
+ 	xmms_xform_private_data_set (xform, data);
+ 
+-	avcodec_init ();
+ 	avcodec_register_all ();
+ 
+ 	mimetype = xmms_xform_indata_get_str (xform,
+@@@@ -161,12 +180,12 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 		data->channels = ret;
+ 	}
+ 
+-	/* bitrate required for WMA files */
++	/* Required by WMA xform. */
+ 	xmms_xform_auxdata_get_int (xform,
+ 	                            "bitrate",
+ 	                            &data->bitrate);
+ 
+-	/* ALAC and MAC require bits per sample field to be 16 */
++	/* Required by tta and apefile xforms. */
+ 	xmms_xform_auxdata_get_int (xform,
+ 	                            "samplebits",
+ 	                            &data->samplebits);
+@@@@ -188,7 +207,8 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 		    !strcmp (data->codec_id, "adpcm_swf") ||
+ 		    !strcmp (data->codec_id, "pcm_s16le") ||
+ 		    !strcmp (data->codec_id, "ac3") ||
+-		    !strcmp (data->codec_id, "dca")) {
++		    !strcmp (data->codec_id, "dca") ||
++		    !strcmp (data->codec_id, "nellymoser")) {
+ 			/* number 1024 taken from libavformat raw.c RAW_PACKET_SIZE */
+ 			data->extradata = g_malloc0 (1024);
+ 			data->extradata_size = 1024;
+@@@@ -196,22 +216,22 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 		} else {
+ 			/* A demuxer plugin forgot to give decoder config? */
+ 			xmms_log_error ("Decoder config data not found!");
+-			return FALSE;
++			goto err;
+ 		}
+ 	}
+ 
+-	data->codecctx = avcodec_alloc_context ();
++	data->codecctx = avcodec_alloc_context3 (codec);
+ 	data->codecctx->sample_rate = data->samplerate;
+ 	data->codecctx->channels = data->channels;
+ 	data->codecctx->bit_rate = data->bitrate;
+-	CONTEXT_BPS (data->codecctx) = data->samplebits;
++	data->codecctx->bits_per_coded_sample = data->samplebits;
+ 	data->codecctx->block_align = data->block_align;
+ 	data->codecctx->extradata = data->extradata;
+ 	data->codecctx->extradata_size = data->extradata_size;
+ 	data->codecctx->codec_id = codec->id;
+ 	data->codecctx->codec_type = codec->type;
+ 
+-	if (avcodec_open (data->codecctx, codec) < 0) {
++	if (avcodec_open2 (data->codecctx, codec, NULL) < 0) {
+ 		XMMS_DBG ("Opening decoder '%s' failed", codec->name);
+ 		goto err;
+ 	} else {
+@@@@ -220,7 +240,7 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 
+ 		/* some codecs need to have something read before they set
+ 		 * the samplerate and channels correctly, unfortunately... */
+-		if ((ret = xmms_avcodec_read (xform, buf, 42, &error)) > 0) {
++		if ((ret = xmms_avcodec_read (xform, buf, sizeof (buf), &error)) > 0) {
+ 			g_string_insert_len (data->outbuf, 0, buf, ret);
+ 		} else {
+ 			XMMS_DBG ("First read failed, codec is not working...");
+@@@@ -231,19 +251,27 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 
+ 	data->samplerate = data->codecctx->sample_rate;
+ 	data->channels = data->codecctx->channels;
++	data->sampleformat = xmms_avcodec_translate_sample_format (data->codecctx->sample_fmt);
++	if (data->sampleformat == XMMS_SAMPLE_FORMAT_UNKNOWN) {
++		avcodec_close (data->codecctx);
++		goto err;
++	}
+ 
+ 	xmms_xform_outdata_type_add (xform,
+ 	                             XMMS_STREAM_TYPE_MIMETYPE,
+ 	                             "audio/pcm",
+ 	                             XMMS_STREAM_TYPE_FMT_FORMAT,
+-	                             XMMS_SAMPLE_FORMAT_S16,
++	                             data->sampleformat,
+ 	                             XMMS_STREAM_TYPE_FMT_CHANNELS,
+ 	                             data->channels,
+ 	                             XMMS_STREAM_TYPE_FMT_SAMPLERATE,
+ 	                             data->samplerate,
+ 	                             XMMS_STREAM_TYPE_END);
+ 
+-	XMMS_DBG ("Decoder '%s' initialized successfully!", codec->name);
++	XMMS_DBG ("Decoder %s at rate %d with %d channels of format %s initialized",
++	          codec->name, data->codecctx->sample_rate,
++	          data->codecctx->channels,
++	          av_get_sample_fmt_name (data->codecctx->sample_fmt));
+ 
+ 	return TRUE;
+ 
+@@@@ -251,6 +279,9 @@@@ err:
+ 	if (data->codecctx) {
+ 		av_free (data->codecctx);
+ 	}
++	if (data->read_out_frame) {
++		avcodec_free_frame (&data->read_out_frame);
++	}
+ 	g_string_free (data->outbuf, TRUE);
+ 	g_free (data->extradata);
+ 	g_free (data);
+@@@@ -263,102 +294,24 @@@@ xmms_avcodec_read (xmms_xform_t *xform, xmms_sample_t 
+                    xmms_error_t *error)
+ {
+ 	xmms_avcodec_data_t *data;
+-	char outbuf[AVCODEC_MAX_AUDIO_FRAME_SIZE];
+-	gint outbufsize, bytes_read = 0;
+ 	guint size;
+ 
+ 	data = xmms_xform_private_data_get (xform);
+ 	g_return_val_if_fail (data, -1);
+ 
+-	size = MIN (data->outbuf->len, len);
+-	while (size == 0) {
+-		AVPacket packet;
+-		av_init_packet (&packet);
++	while (0 == (size = MIN (data->outbuf->len, len))) {
++		gint res;
+ 
+ 		if (data->no_demuxer || data->buffer_length == 0) {
+-			gint read_total;
++			gint bytes_read;
+ 
+-			bytes_read = xmms_xform_read (xform,
+-			                              (gchar *) (data->buffer + data->buffer_length),
+-			                              data->buffer_size - data->buffer_length,
+-			                              error);
+-
+-			if (bytes_read < 0) {
+-				XMMS_DBG ("Error while reading data");
+-				return bytes_read;
+-			} else if (bytes_read == 0) {
+-				XMMS_DBG ("EOF");
+-				return 0;
+-			}
+-
+-			read_total = bytes_read;
+-
+-			/* If we have a demuxer plugin, make sure we read the whole packet */
+-			while (read_total == data->buffer_size && !data->no_demuxer) {
+-				/* multiply the buffer size and try to read again */
+-				data->buffer = g_realloc (data->buffer, data->buffer_size * 2);
+-				bytes_read = xmms_xform_read (xform,
+-				                              (gchar *) data->buffer +
+-				                                data->buffer_size,
+-				                              data->buffer_size,
+-				                              error);
+-				data->buffer_size *= 2;
+-
+-				if (bytes_read < 0) {
+-					XMMS_DBG ("Error while reading data");
+-					return bytes_read;
+-				}
+-
+-				read_total += bytes_read;
+-
+-				if (read_total < data->buffer_size) {
+-					/* finally double the buffer size for performance reasons, the
+-					 * hotspot handling likes to fit two frames in the buffer */
+-					data->buffer = g_realloc (data->buffer, data->buffer_size * 2);
+-					data->buffer_size *= 2;
+-					XMMS_DBG ("Reallocated avcodec internal buffer to be %d bytes",
+-					          data->buffer_size);
+-
+-					break;
+-				}
+-			}
+-
+-			/* Update the buffer length */
+-			data->buffer_length += read_total;
++			bytes_read = xmms_avcodec_internal_read_some (xform, data, error);
++			if (bytes_read <= 0) { return bytes_read; }
+ 		}
+ 
+-		packet.data = data->buffer;
+-		packet.size = data->buffer_length;
+-
+-		outbufsize = sizeof (outbuf);
+-		bytes_read = avcodec_decode_audio3 (data->codecctx, (short *) outbuf,
+-		                                    &outbufsize, &packet);
+-
+-		/* The DTS decoder of ffmpeg is buggy and always returns
+-		 * the input buffer length, get frame length from header */
+-		if (!strcmp (data->codec_id, "dca") && bytes_read > 0) {
+-			bytes_read = ((int)data->buffer[5] << 12) |
+-			             ((int)data->buffer[6] << 4) |
+-			             ((int)data->buffer[7] >> 4);
+-			bytes_read = (bytes_read & 0x3fff) + 1;
+-		}
+-
+-		if (bytes_read < 0 || bytes_read > data->buffer_length) {
+-			XMMS_DBG ("Error decoding data!");
+-			return -1;
+-		} else if (bytes_read != data->buffer_length) {
+-			g_memmove (data->buffer,
+-			           data->buffer + bytes_read,
+-			           data->buffer_length - bytes_read);
+-		}
+-
+-		data->buffer_length -= bytes_read;
+-
+-		if (outbufsize > 0) {
+-			g_string_append_len (data->outbuf, outbuf, outbufsize);
+-		}
+-
+-		size = MIN (data->outbuf->len, len);
++		res = xmms_avcodec_internal_decode_some (data);
++		if (res < 0) { return res; }
++		if (res > 0) { xmms_avcodec_internal_append (data); }
+ 	}
+ 
+ 	memcpy (buf, data->outbuf->str, size);
+@@@@ -371,8 +324,6 @@@@ static gint64
+ xmms_avcodec_seek (xmms_xform_t *xform, gint64 samples, xmms_xform_seek_mode_t whence, xmms_error_t *err)
+ {
+ 	xmms_avcodec_data_t *data;
+-	char outbuf[AVCODEC_MAX_AUDIO_FRAME_SIZE];
+-	gint outbufsize, bytes_read = 0;
+ 	gint64 ret = -1;
+ 
+ 	g_return_val_if_fail (xform, -1);
+@@@@ -390,23 +341,11 @@@@ xmms_avcodec_seek (xmms_xform_t *xform, gint64 samples
+ 
+ 	/* The buggy ape decoder doesn't flush buffers, so we need to finish decoding
+ 	 * the frame before seeking to avoid segfaults... this hack sucks */
++	/* FIXME: Is ^^^ still true? */
+ 	while (data->buffer_length > 0) {
+-		AVPacket packet;
+-		av_init_packet (&packet);
+-		packet.data = data->buffer;
+-		packet.size = data->buffer_length;
+-
+-		outbufsize = sizeof (outbuf);
+-		bytes_read = avcodec_decode_audio3 (data->codecctx, (short *) outbuf,
+-		                                    &outbufsize, &packet);
+-
+-		if (bytes_read < 0 || bytes_read > data->buffer_length) {
+-			XMMS_DBG ("Error decoding data!");
++		if (xmms_avcodec_internal_decode_some (data) < 0) {
+ 			return -1;
+ 		}
+-
+-		data->buffer_length -= bytes_read;
+-		g_memmove (data->buffer, data->buffer + bytes_read, data->buffer_length);
+ 	}
+ 
+ 	ret = xmms_xform_seek (xform, samples, whence, err);
+@@@@ -419,4 +358,179 @@@@ xmms_avcodec_seek (xmms_xform_t *xform, gint64 samples
+ 	}
+ 
+ 	return ret;
++}
++
++static xmms_sample_format_t
++xmms_avcodec_translate_sample_format (enum AVSampleFormat av_sample_format)
++{
++	switch (av_sample_format) {
++	case AV_SAMPLE_FMT_U8:
++	case AV_SAMPLE_FMT_U8P:
++		return XMMS_SAMPLE_FORMAT_U8;
++	case AV_SAMPLE_FMT_S16:
++	case AV_SAMPLE_FMT_S16P:
++		return XMMS_SAMPLE_FORMAT_S16;
++	case AV_SAMPLE_FMT_S32:
++	case AV_SAMPLE_FMT_S32P:
++		return XMMS_SAMPLE_FORMAT_S32;
++	case AV_SAMPLE_FMT_FLT:
++	case AV_SAMPLE_FMT_FLTP:
++		return XMMS_SAMPLE_FORMAT_FLOAT;
++	case AV_SAMPLE_FMT_DBL:
++	case AV_SAMPLE_FMT_DBLP:
++		return XMMS_SAMPLE_FORMAT_DOUBLE;
++	default:
++		XMMS_DBG ("AVSampleFormat (%i: %s) not supported.", av_sample_format,
++		          av_get_sample_fmt_name (av_sample_format));
++		return XMMS_SAMPLE_FORMAT_UNKNOWN;
++	}
++}
++
++/*
++Read some data from our source of data to data->buffer, updating buffer_length
++and buffer_size as needed.
++
++Returns: on error: negative
++         on EOF: zero
++         otherwise: number of bytes read.
++*/
++static gint
++xmms_avcodec_internal_read_some (xmms_xform_t *xform,
++                                 xmms_avcodec_data_t *data,
++                                 xmms_error_t *error)
++{
++	gint bytes_read, read_total;
++
++	bytes_read = xmms_xform_read (xform,
++	                              (gchar *) (data->buffer + data->buffer_length),
++	                              data->buffer_size - data->buffer_length,
++	                              error);
++
++	if (bytes_read < 0) {
++		XMMS_DBG ("Error while reading data");
++		return bytes_read;
++	} else if (bytes_read == 0) {
++		XMMS_DBG ("EOF");
++		return 0;
++	}
++
++	read_total = bytes_read;
++
++	/* If we have a demuxer plugin, make sure we read the whole packet */
++	while (read_total == data->buffer_size && !data->no_demuxer) {
++		/* multiply the buffer size and try to read again */
++		data->buffer = g_realloc (data->buffer, data->buffer_size * 2);
++		bytes_read = xmms_xform_read (xform,
++		                              (gchar *) data->buffer +
++		                                data->buffer_size,
++		                              data->buffer_size,
++		                              error);
++		data->buffer_size *= 2;
++
++		if (bytes_read < 0) {
++			XMMS_DBG ("Error while reading data");
++			return bytes_read;
++		}
++
++		read_total += bytes_read;
++
++		if (read_total < data->buffer_size) {
++			/* finally double the buffer size for performance reasons, the
++			 * hotspot handling likes to fit two frames in the buffer */
++			data->buffer = g_realloc (data->buffer, data->buffer_size * 2);
++			data->buffer_size *= 2;
++			XMMS_DBG ("Reallocated avcodec internal buffer to be %d bytes",
++			          data->buffer_size);
++
++			break;
++		}
++	}
++
++	/* Update the buffer length */
++	data->buffer_length += read_total;
++
++	return read_total;
++}
++
++/*
++Decode some data from data->buffer[0..data->buffer_length-1] to
++data->read_out_frame
++
++Returns: on error: negative
++         on no new data produced: zero
++         otherwise: positive
++
++FIXME: data->buffer should be at least data->buffer_length +
++FF_INPUT_BUFFER_PADDING_SIZE long.
++*/
++static gint
++xmms_avcodec_internal_decode_some (xmms_avcodec_data_t *data)
++{
++	int got_frame = 0;
++	gint bytes_read = 0;
++	AVPacket packet;
++
++	av_init_packet (&packet);
++	packet.data = data->buffer;
++	packet.size = data->buffer_length;
++
++	/* clear buffers and reset fields to defaults */
++	av_frame_unref (data->read_out_frame);
++
++	bytes_read = avcodec_decode_audio4 (
++		data->codecctx, data->read_out_frame, &got_frame, &packet);
++
++	/* The DTS decoder of ffmpeg is buggy and always returns
++	 * the input buffer length, get frame length from header */
++	/* FIXME: Is ^^^^ still true? */
++	if (!strcmp (data->codec_id, "dca") && bytes_read > 0) {
++		bytes_read = ((int)data->buffer[5] << 12) |
++		             ((int)data->buffer[6] << 4) |
++		             ((int)data->buffer[7] >> 4);
++		bytes_read = (bytes_read & 0x3fff) + 1;
++	}
++
++	if (bytes_read < 0 || bytes_read > data->buffer_length) {
++		XMMS_DBG ("Error decoding data!");
++		return -1;
++	}
++
++	if (bytes_read < data->buffer_length) {
++		data->buffer_length -= bytes_read;
++		g_memmove (data->buffer,
++		           data->buffer + bytes_read,
++		           data->buffer_length);
++	} else {
++		data->buffer_length = 0;
++	}
++
++	return got_frame ? 1 : 0;
++}
++
++static void
++xmms_avcodec_internal_append (xmms_avcodec_data_t *data)
++{
++	enum AVSampleFormat fmt = (enum AVSampleFormat) data->read_out_frame->format;
++	int samples = data->read_out_frame->nb_samples;
++	int channels = data->codecctx->channels;
++	int bps = av_get_bytes_per_sample (fmt);
++
++	if (av_sample_fmt_is_planar (fmt)) {
++		/* Convert from planar to packed format */
++		gint i, j;
++
++		for (i = 0; i < samples; i++) {
++			for (j = 0; j < channels; j++) {
++				g_string_append_len (
++					data->outbuf,
++					(gchar *) (data->read_out_frame->extended_data[j] + i*bps),
++					bps
++				);
++			}
++		}
++	} else {
++		g_string_append_len (data->outbuf,
++		                     (gchar *) data->read_out_frame->extended_data[0],
++		                     samples * channels * bps);
++	}
+ }
+@
+
+
+1.3
+log
+@Update to xmms2 0.8, with small tweaks from Brad.
+
+ok aja@@, maintainer timeout
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_plugins_avcodec_avcodec_c,v 1.2 2012/04/30 06:05:17 ajacoutot Exp $
+d3 1
+a3 2
+- fix libavcodec initialisation.
+- update for newer libavcodec API.
+d5 60
+a64 47
+from upstream git:
+
+http://git.xmms.se/xmms2/xmms2-devel/commit/?id=71666f5ac8465fc40c8220043174f45e7088c3f0
+http://git.xmms.se/xmms2/xmms2-devel/commit/?id=247ca0a17334b19f30ff271fa19a450dc0e5ed86
+
+--- src/plugins/avcodec/avcodec.c.orig	Fri Feb 19 12:43:54 2010
++++ src/plugins/avcodec/avcodec.c	Sat Apr 28 20:32:49 2012
+@@@@ -31,6 +31,12 @@@@
+ # include "avcodec.h"
+ #endif
+ 
++/* Map avcodec_decode_audio2 into the deprecated version
++ * avcodec_decode_audio in versions earlier than 51.28 */
++#if LIBAVCODEC_VERSION_INT < 0x331c00
++# define avcodec_decode_audio2 avcodec_decode_audio
++#endif
++
+ /* Handle API change that happened in libavcodec 52.00 */
+ #if LIBAVCODEC_VERSION_INT < 0x340000
+ # define CONTEXT_BPS(codecctx) (codecctx)->bits_per_sample
+@@@@ -38,12 +44,20 @@@@
+ # define CONTEXT_BPS(codecctx) (codecctx)->bits_per_coded_sample
+ #endif
+ 
+-/* Map avcodec_decode_audio2 into the deprecated version
+- * avcodec_decode_audio in versions earlier than 51.28 */
+-#if LIBAVCODEC_VERSION_INT < 0x331c00
+-# define avcodec_decode_audio2 avcodec_decode_audio
++/* Map avcodec_decode_audio3 into the deprecated version
++ * avcodec_decode_audio2 in versions earlier than 52.26 */
++#if LIBAVCODEC_VERSION_INT < 0x341a00
++# define avcodec_decode_audio3(avctx, samples, frame_size_ptr, avpkt) \
++    avcodec_decode_audio2(avctx, samples, frame_size_ptr, \
++                          (avpkt)->data, (avpkt)->size)
++# define AVMEDIA_TYPE_AUDIO CODEC_TYPE_AUDIO
+ #endif
+ 
++/* Handle API change that happened in libavcodec 52.64 */
++#if LIBAVCODEC_VERSION_INT < 0x344000
++# define AVMEDIA_TYPE_AUDIO CODEC_TYPE_AUDIO
++#endif
++
+ #define AVCODEC_BUFFER_SIZE 16384
+ 
+ typedef struct {
+@@@@ -121,6 +135,7 @@@@ xmms_avcodec_destroy (xmms_xform_t *xform)
+ 	g_return_if_fail (data);
+d67 2
+a68 1
++	av_free (data->codecctx);
+d72 1
+a72 12
+@@@@ -135,7 +150,7 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 	AVCodec *codec;
+ 	const gchar *mimetype;
+ 	const guchar *tmpbuf;
+-	gssize tmpbuflen;
++	gsize tmpbuflen;
+ 	gint ret;
+ 
+ 	g_return_val_if_fail (xform, FALSE);
+@@@@ -144,6 +159,7 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 	data->outbuf = g_string_new (NULL);
+ 	data->buffer = g_malloc (AVCODEC_BUFFER_SIZE);
+d74 1
+a74 1
++	data->codecctx = NULL;
+d76 2
+d80 6
+a85 2
+@@@@ -160,7 +176,7 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+ 		goto err;
+d88 27
+a114 6
+-	if (codec->type != CODEC_TYPE_AUDIO) {
++	if (codec->type != AVMEDIA_TYPE_AUDIO) {
+ 		XMMS_DBG ("Codec '%s' found but its type is not audio", data->codec_id);
+ 		goto err;
+ 	}
+@@@@ -211,7 +227,7 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+d118 2
+a119 2
+-	data->codecctx = g_new0 (AVCodecContext, 1);
++	data->codecctx = avcodec_alloc_context ();
+d123 2
+a124 1
+@@@@ -219,6 +235,8 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+d128 2
+a129 2
++	data->codecctx->codec_id = codec->id;
++	data->codecctx->codec_type = codec->type;
+d131 2
+a132 1
+ 	if (avcodec_open (data->codecctx, codec) < 0) {
+d134 39
+a172 1
+@@@@ -257,6 +275,9 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+d175 6
+a180 3
+ err:
++	if (data->codecctx) {
++		av_free (data->codecctx);
+d185 109
+a293 1
+@@@@ -278,6 +299,9 @@@@ xmms_avcodec_read (xmms_xform_t *xform, xmms_sample_t 
+d295 8
+a302 7
+ 	size = MIN (data->outbuf->len, len);
+ 	while (size == 0) {
++		AVPacket packet;
++		av_init_packet (&packet);
++
+ 		if (data->buffer_length == 0) {
+ 			gint read_total;
+d304 2
+a305 3
+@@@@ -331,10 +355,12 @@@@ xmms_avcodec_read (xmms_xform_t *xform, xmms_sample_t 
+ 			data->buffer_length = read_total;
+ 		}
+a306 13
++		packet.data = data->buffer_pos;
++		packet.size = data->buffer_length;
++
+ 		outbufsize = sizeof (outbuf);
+-		bytes_read = avcodec_decode_audio2 (data->codecctx, (short *) outbuf,
+-		                                    &outbufsize, data->buffer_pos,
+-		                                    data->buffer_length);
++		bytes_read = avcodec_decode_audio3 (data->codecctx, (short *) outbuf,
++		                                    &outbufsize, &packet);
+ 
+ 		if (bytes_read < 0 || bytes_read > data->buffer_length) {
+ 			XMMS_DBG ("Error decoding data!");
+@@@@ -381,10 +407,14 @@@@ xmms_avcodec_seek (xmms_xform_t *xform, gint64 samples
+d309 1
+d311 22
+a332 11
++		AVPacket packet;
++		av_init_packet (&packet);
++		packet.data = data->buffer;
++		packet.size = data->buffer_length;
++
+ 		outbufsize = sizeof (outbuf);
+-		bytes_read = avcodec_decode_audio2 (data->codecctx, (short *) outbuf,
+-		                                    &outbufsize, data->buffer,
+-		                                    data->buffer_length);
++		bytes_read = avcodec_decode_audio3 (data->codecctx, (short *) outbuf,
++		                                    &outbufsize, &packet);
+d334 177
+a510 2
+ 		if (bytes_read < 0 || bytes_read > data->buffer_length) {
+ 			XMMS_DBG ("Error decoding data!");
+@
+
+
+1.2
+log
+@Update xmms2 for newer libavcodec API.
+
+from Brad
+@
+text
+@d1 1
+a1 1
+$OpenBSD: patch-src_plugins_avcodec_avcodec_c,v 1.1 2011/08/21 16:37:08 jasper Exp $
+@
+
+
+1.1
+log
+@- fix libavcodec initialisation
+
+from upstream git via pascal stumpf, maintainer timed-out
+@
+text
+@d1 1
+a1 1
+$OpenBSD$
+d3 4
+a6 1
+fix libavcodec initialisation. from upstream git:
+d9 1
+d11 84
+a94 3
+--- src/plugins/avcodec/avcodec.c.orig	Thu Aug 11 17:03:17 2011
++++ src/plugins/avcodec/avcodec.c	Thu Aug 11 17:03:39 2011
+@@@@ -219,6 +219,8 @@@@ xmms_avcodec_init (xmms_xform_t *xform)
+d103 54
+@
+

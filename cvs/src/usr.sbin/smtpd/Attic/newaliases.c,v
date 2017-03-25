@@ -1,0 +1,590 @@
+head	1.9;
+access;
+symbols;
+locks; strict;
+comment	@ * @;
+
+
+1.9
+date	2008.12.17.22.59.36;	author jacekm;	state dead;
+branches;
+next	1.8;
+
+1.8
+date	2008.12.13.19.18.50;	author jacekm;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2008.12.13.19.15.48;	author jacekm;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2008.12.13.19.11.33;	author jacekm;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2008.12.13.19.05.26;	author jacekm;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2008.12.13.19.02.33;	author jacekm;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2008.12.13.18.58.28;	author jacekm;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2008.12.13.13.15.38;	author jacekm;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.12.03.21.13.18;	author gilles;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.9
+log
+@Merge newaliases into makemap.
+
+ok gilles@@
+@
+text
+@/*
+ * Copyright (c) 2008 Gilles Chehade <gilles@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/tree.h>
+#include <sys/queue.h>
+#include <sys/param.h>
+
+#include <sys/socket.h>
+
+#include <ctype.h>
+#include <db.h>
+#include <err.h>
+#include <errno.h>
+#include <event.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <util.h>
+
+#include "smtpd.h"
+
+extern char *__progname;
+
+__dead void	usage(void);
+int		parse_aliases(const char *);
+int		parse_entry(char *, size_t, size_t);
+
+DB *db;
+
+int
+main(int argc, char *argv[])
+{
+	char dbname[MAXPATHLEN];
+	int ch;
+
+	if (argc != 1)
+		usage();
+
+	if (strlcpy(dbname, PATH_ALIASESDB ".XXXXXXXXXXX", MAXPATHLEN)
+	    >= MAXPATHLEN)
+		errx(1, "path truncation");
+	if (mkstemp(dbname) == -1)
+		err(1, "mkstemp");
+
+	db = dbopen(dbname, O_EXLOCK|O_RDWR|O_SYNC, 0644, DB_HASH, NULL);
+	if (db == NULL) {
+		warn("dbopen: %s", dbname);
+		goto bad;
+	}
+
+	if (! parse_aliases(PATH_ALIASES))
+		goto bad;
+
+	if (db->close(db) == -1) {
+		warn("dbclose: %s", dbname);
+		goto bad;
+	}
+
+	if (chmod(dbname, 0644) == -1) {
+		warn("chmod: %s", dbname);
+		goto bad;
+	}
+
+	if (rename(dbname, PATH_ALIASESDB) == -1) {
+		warn("rename");
+		goto bad;
+	}
+
+	return 0;
+bad:
+	unlink(dbname);
+	return 1;
+}
+
+int
+parse_aliases(const char *filename)
+{
+	FILE *fp;
+	char *line;
+	size_t len;
+	size_t lineno = 0;
+	char delim[] = { '\\', '\\', '#' };
+
+	fp = fopen(filename, "r");
+	if (fp == NULL) {
+		warn("%s", filename);
+		return 0;
+	}
+
+	while ((line = fparseln(fp, &len, &lineno, delim, 0)) != NULL) {
+		if (len == 0)
+			continue;
+		if (! parse_entry(line, len, lineno)) {
+			free(line);
+			fclose(fp);
+			return 0;
+		}
+		free(line);
+	}
+
+	fclose(fp);
+	return 1;
+}
+
+int
+parse_entry(char *line, size_t len, size_t lineno)
+{
+	char *name;
+	char *rcpt;
+	char *endp;
+	char *subrcpt;
+	DBT key;
+	DBT val;
+
+	name = line;
+	rcpt = strchr(line, ':');
+	if (rcpt == NULL)
+		goto bad;
+	*rcpt++ = '\0';
+
+	/* name: strip initial whitespace. */
+	while (isspace(*name))
+		++name;
+	if (*name == '\0')
+		goto bad;
+
+	/* name: strip trailing whitespace. */
+	endp = name + strlen(name) - 1;
+	while (name < endp && isspace(*endp))
+		*endp-- = '\0';
+
+	/* Check for dups. */
+	key.data = name;
+	key.size = strlen(name) + 1;
+	if (db->get(db, &key, &val, 0) == 0) {
+		warnx("%s:%zd: duplicate entry for %s", PATH_ALIASES, lineno,
+		    key.data);
+		return 0;
+	}
+
+	/* At this point name and rcpt are non-zero nul-terminated strings. */
+	while ((subrcpt = strsep(&rcpt, ",")) != NULL) {
+		struct alias	 alias;
+		void		*p;
+
+		/* subrcpt: strip initial whitespace. */
+		while (isspace(*subrcpt))
+			++subrcpt;
+		if (*subrcpt == '\0')
+			goto bad;
+
+		/* subrcpt: strip trailing whitespace. */
+		endp = subrcpt + strlen(subrcpt) - 1;
+		while (subrcpt < endp && isspace(*endp))
+			*endp-- = '\0';
+
+		if (! alias_parse(&alias, subrcpt))
+			goto bad;
+
+		key.data = name;
+		key.size = strlen(name) + 1;
+		val.data = NULL;
+		val.size = 0;
+		if (db->get(db, &key, &val, 0) == -1) {
+			warn("dbget");
+			return 0;
+		}
+
+		p = calloc(1, val.size + sizeof(struct alias));
+		if (p == NULL) {
+			warn("calloc");
+			return 0;
+		}
+		memcpy(p, val.data, val.size);
+		memcpy((u_int8_t *)p + val.size, &alias, sizeof(struct alias));
+
+		val.data = p;
+		val.size += sizeof(struct alias);
+		if (db->put(db, &key, &val, 0) == -1) {
+			warn("dbput");
+			free(p);
+			return 0;
+		}
+
+		free(p);
+	}
+
+	return 1;
+
+bad:
+	/* The actual line is not printed; it may be mangled by above code. */
+	warnx("%s:%zd: invalid entry", PATH_ALIASES, lineno);
+	return 0;
+}
+
+void
+usage(void)
+{
+	fprintf(stderr, "usage: %s\n", __progname);
+	exit(1);
+}
+@
+
+
+1.8
+log
+@Detect alias duplicates.
+
+ok gilles@@
+@
+text
+@@
+
+
+1.7
+log
+@Fix few parsing bugs in parse_entry, most severe of which was
+segv on lines consisting exclusively of whitespace.
+
+ok gilles@@
+@
+text
+@d150 9
+@
+
+
+1.6
+log
+@Simplify parse_entry; streamline the code to call db->put in one
+place, regardless of number of preexisting aliases.
+
+Don't call db->sync; it's covered by db->close shortly before rename.
+
+ok chl@@ gilles@@
+@
+text
+@a126 1
+	char *delim;
+d128 1
+d134 7
+a140 1
+	while (*name && isspace(*name))
+d142 2
+d145 4
+a148 12
+	rcpt = delim = strchr(name, ':');
+	if (name == rcpt)
+		goto bad;
+	*delim-- = 0;
+	rcpt++;
+	while (isspace(*delim))
+		*delim-- = '\0';
+	rcpt++;
+	while (*rcpt && isspace(*rcpt))
+		++rcpt;
+	if (*rcpt == '\0')
+		goto bad;
+d150 1
+a150 1
+	/* At this point, name points to nul-terminate name */
+d155 2
+a156 1
+		while (*subrcpt && isspace(*subrcpt))
+d159 6
+a164 5
+			continue;
+		delim = subrcpt + strlen(subrcpt);
+		delim--;
+		while (isspace(*delim))
+			*delim-- = '\0';
+d200 2
+a201 1
+	warnx("line %zd: invalid entry: %s", lineno, line);
+@
+
+
+1.5
+log
+@If parse_aliases fails, don't warn about syntax errors; it may fail
+for other reasons.
+
+Never exit outside main; we need to return to main to clean the
+temp file.
+
+Check parse_entry return code; otherwise $? == 0 even when invalid
+entries were found.
+
+ok gilles@@
+@
+text
+@a129 2
+	struct alias alias;
+	int ret;
+d151 4
+a154 1
+	for (; (subrcpt = strsep(&rcpt, ",")) != NULL;) {
+d164 3
+d169 3
+a171 2
+
+		if ((ret = db->get(db, &key, &val, 0)) == -1) {
+d176 4
+a179 3
+		if (ret == 1) {
+			val.data = NULL;
+			val.size = 0;
+d181 2
+d184 4
+a187 31
+		if (! alias_parse(&alias, subrcpt))
+			goto bad;
+
+		if (val.size == 0) {
+			val.size = sizeof(struct alias);
+			val.data = &alias;
+
+			if ((ret = db->put(db, &key, &val, 0)) == -1) {
+				warn("dbput");
+				return 0;
+			}
+		}
+		else {
+			void *p;
+
+			p = calloc(val.size + sizeof(alias), 1);
+			if (p == NULL) {
+				warn("calloc");
+				return 0;
+			}
+			memcpy(p, val.data, val.size);
+			memcpy((u_int8_t *)p + val.size, &alias, sizeof(alias));
+
+			val.data = p;
+			val.size += sizeof(alias);
+
+			if ((ret = db->put(db, &key, &val, 0)) == -1) {
+				warn("dbput");
+				return 0;
+			}
+
+d189 1
+d192 1
+a192 1
+		db->sync(db, 0);
+@
+
+
+1.4
+log
+@Use mkstemp instead of mkdtemp; also, add more X's.
+
+Do chmod before rename to eliminate short time window when aliases.db
+is "official" but not readable.
+
+Use PATH_ALIASESDB instead of hardcoding "/etc/mail/.."
+
+Check db->close return code.
+
+ok gilles@@ henning@@
+@
+text
+@d69 1
+a69 2
+	if (! parse_aliases(PATH_ALIASES)) {
+		warnx("syntax error in aliases file");
+a70 1
+	}
+d103 4
+a106 3
+	if (fp == NULL)
+		errx(1, "failed to open aliases file");
+
+d111 5
+a115 1
+		parse_entry(line, len, lineno);
+d166 4
+a169 2
+		if ((ret = db->get(db, &key, &val, 0)) == -1)
+			errx(1, "db->get()");
+d183 4
+a186 2
+			if ((ret = db->put(db, &key, &val, 0)) == -1)
+				errx(1, "db->get()");
+d192 4
+a195 2
+			if (p == NULL)
+				errx(1, "calloc: memory exhausted");
+d202 4
+a205 2
+			if ((ret = db->put(db, &key, &val, 0)) == -1)
+				errx(1, "db->get()");
+@
+
+
+1.3
+log
+@- Correct usage text.
+- Drop static qualifiers.
+- Drop unused -d switch.
+- Use 0/1 exit codes instead of <sysexits.h> defines.
+
+ok gilles@@
+@
+text
+@d51 1
+a52 2
+	char pathname[MAXPATHLEN];
+	char dbname[MAXPATHLEN];
+d57 7
+a63 9
+	bzero(pathname, MAXPATHLEN);
+	snprintf(pathname, MAXPATHLEN, "/etc/mail/aliases.XXXXX");
+	if (mkdtemp(pathname) == NULL)
+		errx(1, "failed to create temporary directory");
+
+	bzero(dbname, MAXPATHLEN);
+	snprintf(dbname, MAXPATHLEN, "%s/aliases.db", pathname);
+	db = dbopen(dbname, O_CREAT|O_EXLOCK|O_RDWR|O_SYNC, 0644, DB_HASH,
+		NULL);
+d65 1
+a65 1
+		warn("dbopen");
+d74 9
+a82 1
+	db->close(db);
+a88 6
+	if (chmod(PATH_ALIASESDB, 0644) == -1)
+		err(1, "chmod");
+
+	if (rmdir(pathname) == -1)
+		err(1, "rmdir");
+
+d91 1
+a91 5
+	if (dbname[0] != '\0')
+		if (unlink(dbname) == -1)
+			err(1, "unlink: %s", dbname);
+	if (rmdir(pathname) == -1)
+		err(1, "rmdir: %s", pathname);
+@
+
+
+1.2
+log
+@Declare alias_parse in smtpd.h, and fix callers that pass it wrong
+number of arguments.
+
+ok gilles@@
+@
+text
+@a34 1
+#include <sysexits.h>
+d42 3
+a44 3
+static int usage(void);
+int parse_aliases(const char *);
+int parse_entry(char *, size_t, size_t);
+a46 1
+static int dflag;
+d55 2
+a56 15
+	while ((ch = getopt(argc, argv, "dh")) != -1) {
+		switch (ch) {
+		case 'd':
+			dflag = 1;
+			break;
+		case 'h':
+		default:
+			return usage();
+		}
+	}
+	argc -= optind;
+	argv += optind;
+
+	if (argc != 0)
+		return usage();
+d90 1
+a90 1
+	return EX_OK;
+a99 7
+static int
+usage(void)
+{
+	fprintf(stderr, "usage: %s filename\n", __progname);
+	return EX_USAGE;
+}
+
+d212 7
+@
+
+
+1.1
+log
+@smtpd's aliases db is incompatible with sendmail's and requires a distinct
+	newaliases utility. newaliases links to the aliases.c file from
+	smtpd and only provides a frontend to parse aliases file.
+	contains code from pyr@@, chl@@ and I, it should have been imported
+	with smtpd.
+@
+text
+@a46 2
+int alias_parse(struct alias *, char *, size_t);
+
+d198 1
+a198 1
+		if (! alias_parse(&alias, subrcpt, strlen(subrcpt)))
+@
+

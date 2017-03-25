@@ -1,0 +1,1332 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_2_9:1.2.0.2
+	OPENBSD_2_9_BASE:1.2
+	SENDMAIL_8_11_2:1.1.1.2
+	OPENBSD_2_8:1.1.1.1.0.4
+	OPENBSD_2_8_BASE:1.1.1.1
+	OPENBSD_2_7:1.1.1.1.0.2
+	OPENBSD_2_7_BASE:1.1.1.1
+	SENDMAIL_8_10_0:1.1.1.1
+	SENDMAIL_INC:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2001.09.11.18.59.19;	author millert;	state dead;
+branches;
+next	1.5;
+
+1.5
+date	2001.08.21.16.31.45;	author millert;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2001.08.01.01.01.41;	author millert;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2001.05.29.01.31.14;	author millert;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2001.01.15.21.09.07;	author millert;	state Exp;
+branches
+	1.2.2.1;
+next	1.1;
+
+1.1
+date	2000.04.02.19.05.43;	author millert;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2000.04.02.19.05.43;	author millert;	state Exp;
+branches
+	1.1.1.1.4.1;
+next	1.1.1.2;
+
+1.1.1.2
+date	2001.01.15.20.52.11;	author millert;	state Exp;
+branches;
+next	;
+
+1.1.1.1.4.1
+date	2001.05.31.00.31.30;	author miod;	state Exp;
+branches;
+next	;
+
+1.2.2.1
+date	2001.05.31.01.47.55;	author jason;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@remove unused files
+@
+text
+@/*
+ * Copyright (c) 1998-2001 Sendmail, Inc. and its suppliers.
+ *	All rights reserved.
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman.  All rights reserved.
+ * Copyright (c) 1988, 1993
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * By using this file, you agree to the terms and conditions set
+ * forth in the LICENSE file which can be found at the top level of
+ * the sendmail distribution.
+ *
+ */
+
+#ifndef lint
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52.18.18 2001/08/14 16:07:04 ca Exp $";
+#endif /* ! lint */
+
+#include <sendmail.h>
+
+#ifndef sigmask
+# define sigmask(s)	(1 << ((s) - 1))
+#endif /* ! sigmask */
+
+static SIGFUNC_DECL	sm_tick __P((int));
+static void		endsleep __P((void));
+
+
+/*
+**  SETEVENT -- set an event to happen at a specific time.
+**
+**	Events are stored in a sorted list for fast processing.
+**	An event only applies to the process that set it.
+**
+**	Parameters:
+**		intvl -- intvl until next event occurs.
+**		func -- function to call on event.
+**		arg -- argument to func on event.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		none.
+*/
+
+static EVENT	*volatile EventQueue;		/* head of event queue */
+static EVENT	*volatile FreeEventList;	/* list of free events */
+
+EVENT *
+setevent(intvl, func, arg)
+	time_t intvl;
+	void (*func)();
+	int arg;
+{
+	register EVENT *ev;
+
+	if (intvl <= 0)
+	{
+		syserr("554 5.3.0 setevent: intvl=%ld\n", intvl);
+		return NULL;
+	}
+
+	ENTER_CRITICAL();
+	if (FreeEventList == NULL)
+	{
+		FreeEventList = (EVENT *) xalloc(sizeof *FreeEventList);
+		FreeEventList->ev_link = NULL;
+	}
+	LEAVE_CRITICAL();
+
+	ev = sigsafe_setevent(intvl, func, arg);
+
+	if (tTd(5, 5))
+		dprintf("setevent: intvl=%ld, for=%ld, func=%lx, arg=%d, ev=%lx\n",
+			(long) intvl, (long) (curtime() + intvl),
+			(u_long) func, arg,
+			ev == NULL ? 0 : (u_long) ev);
+
+	return ev;
+}
+
+/*
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+EVENT *
+sigsafe_setevent(intvl, func, arg)
+	time_t intvl;
+	void (*func)();
+	int arg;
+{
+	register EVENT **evp;
+	register EVENT *ev;
+	auto time_t now;
+	int wasblocked;
+
+	if (intvl <= 0)
+		return NULL;
+
+	wasblocked = blocksignal(SIGALRM);
+	now = curtime();
+
+	/* search event queue for correct position */
+	for (evp = (EVENT **) (&EventQueue);
+	     (ev = *evp) != NULL;
+	     evp = &ev->ev_link)
+	{
+		if (ev->ev_time >= now + intvl)
+			break;
+	}
+
+	ENTER_CRITICAL();
+	if (FreeEventList == NULL)
+	{
+		/*
+		**  This shouldn't happen.  If called from setevent(),
+		**  we have just malloced a FreeEventList entry.  If
+		**  called from a signal handler, it should have been
+		**  from an existing event which sm_tick() just added to the
+		**  FreeEventList.
+		*/
+
+		LEAVE_CRITICAL();
+		return NULL;
+	}
+	else
+	{
+		ev = FreeEventList;
+		FreeEventList = ev->ev_link;
+	}
+	LEAVE_CRITICAL();
+
+	/* insert new event */
+	ev->ev_time = now + intvl;
+	ev->ev_func = func;
+	ev->ev_arg = arg;
+	ev->ev_pid = getpid();
+	ENTER_CRITICAL();
+	ev->ev_link = *evp;
+	*evp = ev;
+	LEAVE_CRITICAL();
+
+	(void) setsignal(SIGALRM, sm_tick);
+	intvl = EventQueue->ev_time - now;
+	(void) alarm((unsigned) intvl < 1 ? 1 : intvl);
+	if (wasblocked == 0)
+		(void) releasesignal(SIGALRM);
+	return ev;
+}
+/*
+**  CLREVENT -- remove an event from the event queue.
+**
+**	Parameters:
+**		ev -- pointer to event to remove.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		arranges for event ev to not happen.
+*/
+
+void
+clrevent(ev)
+	register EVENT *ev;
+{
+	register EVENT **evp;
+	int wasblocked;
+
+	if (tTd(5, 5))
+		dprintf("clrevent: ev=%lx\n", (u_long) ev);
+	if (ev == NULL)
+		return;
+
+	/* find the parent event */
+	wasblocked = blocksignal(SIGALRM);
+	for (evp = (EVENT **) (&EventQueue);
+	     *evp != NULL;
+	     evp = &(*evp)->ev_link)
+	{
+		if (*evp == ev)
+			break;
+	}
+
+	/* now remove it */
+	if (*evp != NULL)
+	{
+		ENTER_CRITICAL();
+		*evp = ev->ev_link;
+		ev->ev_link = FreeEventList;
+		FreeEventList = ev;
+		LEAVE_CRITICAL();
+	}
+
+	/* restore clocks and pick up anything spare */
+	if (wasblocked == 0)
+		(void) releasesignal(SIGALRM);
+	if (EventQueue != NULL)
+		(void) kill(getpid(), SIGALRM);
+	else
+	{
+		/* nothing left in event queue, no need for an alarm */
+		(void) alarm(0);
+	}
+}
+/*
+**  CLEAR_EVENTS -- remove all events from the event queue.
+**
+**	Parameters:
+**		none.
+**
+**	Returns:
+**		none.
+*/
+
+void
+clear_events()
+{
+	register EVENT *ev;
+	int wasblocked;
+
+	if (tTd(5, 5))
+		dprintf("clear_events: EventQueue=%lx\n", (u_long) EventQueue);
+
+	if (EventQueue == NULL)
+		return;
+
+	/* nothing will be left in event queue, no need for an alarm */
+	(void) alarm(0);
+	wasblocked = blocksignal(SIGALRM);
+
+	/* find the end of the EventQueue */
+	for (ev = EventQueue; ev->ev_link != NULL; ev = ev->ev_link)
+		continue;
+
+	ENTER_CRITICAL();
+	ev->ev_link = FreeEventList;
+	FreeEventList = EventQueue;
+	EventQueue = NULL;
+	LEAVE_CRITICAL();
+
+	/* restore clocks and pick up anything spare */
+	if (wasblocked == 0)
+		(void) releasesignal(SIGALRM);
+}
+/*
+**  SM_TICK -- take a clock sm_tick
+**
+**	Called by the alarm clock.  This routine runs events as needed.
+**	Always called as a signal handler, so we assume that SIGALRM
+**	has been blocked.
+**
+**	Parameters:
+**		One that is ignored; for compatibility with signal handlers.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		calls the next function in EventQueue.
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+/* ARGSUSED */
+static SIGFUNC_DECL
+sm_tick(sig)
+	int sig;
+{
+	register time_t now;
+	register EVENT *ev;
+	pid_t mypid;
+	int save_errno = errno;
+
+	(void) alarm(0);
+
+	FIX_SYSV_SIGNAL(sig, sm_tick);
+
+	errno = save_errno;
+	CHECK_CRITICAL(sig);
+
+	mypid = getpid();
+	while (PendingSignal != 0)
+	{
+		int sigbit = 0;
+		int sig = 0;
+
+		if (bitset(PEND_SIGHUP, PendingSignal))
+		{
+			sigbit = PEND_SIGHUP;
+			sig = SIGHUP;
+		}
+		else if (bitset(PEND_SIGINT, PendingSignal))
+		{
+			sigbit = PEND_SIGINT;
+			sig = SIGINT;
+		}
+		else if (bitset(PEND_SIGTERM, PendingSignal))
+		{
+			sigbit = PEND_SIGTERM;
+			sig = SIGTERM;
+		}
+		else if (bitset(PEND_SIGUSR1, PendingSignal))
+		{
+			sigbit = PEND_SIGUSR1;
+			sig = SIGUSR1;
+		}
+		else
+		{
+			/* If we get here, we are in trouble */
+			abort();
+		}
+		PendingSignal &= ~sigbit;
+		kill(mypid, sig);
+	}
+
+	now = curtime();
+	if (tTd(5, 4))
+		dprintf("sm_tick: now=%ld\n", (long) now);
+
+	while ((ev = EventQueue) != NULL &&
+	       (ev->ev_time <= now || ev->ev_pid != mypid))
+	{
+		void (*f)();
+		int arg;
+		pid_t pid;
+
+		/* process the event on the top of the queue */
+		ENTER_CRITICAL();
+		ev = EventQueue;
+		EventQueue = EventQueue->ev_link;
+		LEAVE_CRITICAL();
+		if (tTd(5, 6))
+			dprintf("sm_tick: ev=%lx, func=%lx, arg=%d, pid=%d\n",
+				(u_long) ev, (u_long) ev->ev_func,
+				ev->ev_arg, ev->ev_pid);
+
+		/* we must be careful in here because ev_func may not return */
+		f = ev->ev_func;
+		arg = ev->ev_arg;
+		pid = ev->ev_pid;
+		ENTER_CRITICAL();
+		ev->ev_link = FreeEventList;
+		FreeEventList = ev;
+		LEAVE_CRITICAL();
+		if (pid != mypid)
+			continue;
+		if (EventQueue != NULL)
+		{
+			if (EventQueue->ev_time > now)
+				(void) alarm((unsigned) (EventQueue->ev_time - now));
+			else
+				(void) alarm(3);
+		}
+
+		/* call ev_func */
+		errno = save_errno;
+		(*f)(arg);
+		(void) alarm(0);
+		now = curtime();
+	}
+	if (EventQueue != NULL)
+		(void) alarm((unsigned) (EventQueue->ev_time - now));
+	errno = save_errno;
+	return SIGFUNC_RETURN;
+}
+/*
+**  PEND_SIGNAL -- Add a signal to the pending signal list
+**
+**	Parameters:
+**		sig -- signal to add
+**
+**	Returns:
+**		none.
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+void
+pend_signal(sig)
+	int sig;
+{
+	int sigbit;
+	int save_errno = errno;
+
+	/*
+	**  Don't want to interrupt something critical, hence delay
+	**  the alarm for one second.  Hopefully, by then we
+	**  will be out of the critical section.  If not, then
+	**  we will just delay again.  The events to be run will
+	**  still all be run, maybe just a little bit late.
+	*/
+
+	switch (sig)
+	{
+	  case SIGHUP:
+		sigbit = PEND_SIGHUP;
+		break;
+
+	  case SIGINT:
+		sigbit = PEND_SIGINT;
+		break;
+
+	  case SIGTERM:
+		sigbit = PEND_SIGTERM;
+		break;
+
+	  case SIGUSR1:
+		sigbit = PEND_SIGUSR1;
+		break;
+
+	  case SIGALRM:
+		/* don't have to pend these */
+		sigbit = 0;
+		break;
+
+	  default:
+		/* If we get here, we are in trouble */
+		abort();
+
+		/* NOTREACHED */
+		/* shut up stupid compiler warning on HP-UX 11 */
+		sigbit = 0;
+		break;
+	}
+
+	if (sigbit != 0)
+		PendingSignal |= sigbit;
+	(void) setsignal(SIGALRM, sm_tick);
+	(void) alarm(1);
+	errno = save_errno;
+}
+/*
+**  SM_SIGNAL_NOOP -- A signal no-op function
+**
+**	Parameters:
+**		sig -- signal received
+**
+**	Returns:
+**		SIGFUNC_RETURN
+*/
+
+/* ARGSUSED */
+SIGFUNC_DECL
+sm_signal_noop(sig)
+	int sig;
+{
+	int save_errno = errno;
+
+	FIX_SYSV_SIGNAL(sig, sm_signal_noop);
+	errno = save_errno;
+	return SIGFUNC_RETURN;
+}
+/*
+**  SLEEP -- a version of sleep that works with this stuff
+**
+**	Because sleep uses the alarm facility, I must reimplement
+**	it here.
+**
+**	Parameters:
+**		intvl -- time to sleep.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		waits for intvl time.  However, other events can
+**		be run during that interval.
+*/
+
+
+static bool	volatile SleepDone;
+
+#ifndef SLEEP_T
+# define SLEEP_T	unsigned int
+#endif /* ! SLEEP_T */
+
+SLEEP_T
+sleep(intvl)
+	unsigned int intvl;
+{
+	int was_held;
+
+	if (intvl == 0)
+		return (SLEEP_T) 0;
+	SleepDone = FALSE;
+	(void) setevent((time_t) intvl, endsleep, 0);
+	was_held = releasesignal(SIGALRM);
+	while (!SleepDone)
+		(void) pause();
+	if (was_held > 0)
+		(void) blocksignal(SIGALRM);
+	return (SLEEP_T) 0;
+}
+
+static void
+endsleep()
+{
+	/*
+	**  NOTE: THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+	**	ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+	**	DOING.
+	*/
+
+	SleepDone = TRUE;
+}
+@
+
+
+1.5
+log
+@Update to sendmail 8.11.6, from the release notes:
+
+SECURITY: Fix a possible memory access violation when specifying
+	out-of-bounds debug parameters.  Problem detected by
+	Cade Cairns of SecurityFocus.
+Avoid leaking recipient information in unrelated DSNs.  This could
+	happen if a connection is aborted, several mails had been
+	scheduled for delivery via that connection, and the timeout
+	is reached such that several DSNs are sent next.  Problem
+	noted by Dileepan Moorkanat of Hewlett-Packard.
+Fix a possible segmentation violation when specifying too many
+	wildcard operators in a rule.  Problem detected by
+	Werner Wiethege.
+Avoid a segmentation fault on non-matching Hesiod lookups.  Problem
+	noted by Russell McOrmond of flora.ca
+@
+text
+@@
+
+
+1.4
+log
+@update to sendmail 8.11.5
+@
+text
+@d15 1
+a15 1
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52.18.17 2001/07/31 23:04:59 ca Exp $";
+d429 2
+@
+
+
+1.3
+log
+@Update to sendmail 8.11.4:
+    8.11.4 revamps signal handling within the MTA in order to reduce
+    the likelihood of a race condition that can lead to heap
+    corruption as described in Michal Zalewski's advisory.  The
+    problems discussed in the advisory are not currently known to
+    be exploitable but we recommend upgrading to 8.11.4 in case a
+    method is found to exploit the signal handling race condition.
+    8.11.4 also fixes other bugs found since the release of 8.11.3.
+
+See the RELEASE_NOTES file for more details.
+@
+text
+@d15 1
+a15 1
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52.18.14 2001/05/17 18:12:28 gshapiro Exp $";
+d24 2
+a25 2
+static SIGFUNC_DECL	tick __P((int));
+static void	endsleep __P((void));
+d122 1
+a122 1
+		**  from an existing event which tick() just added to the
+d146 1
+a146 1
+	(void) setsignal(SIGALRM, tick);
+d250 1
+a250 1
+**  TICK -- take a clock tick
+d271 2
+a272 2
+SIGFUNC_DECL
+tick(sig)
+d282 1
+a282 1
+	FIX_SYSV_SIGNAL(sig, tick);
+d290 2
+a291 2
+		int sigbit;
+		int sig;
+d324 1
+a324 1
+		dprintf("tick: now=%ld\n", (long) now);
+d339 1
+a339 1
+			dprintf("tick: ev=%lx, func=%lx, arg=%d, pid=%d\n",
+d434 1
+a434 1
+	(void) setsignal(SIGALRM, tick);
+d437 21
+@
+
+
+1.2
+log
+@sendmail 8.11.2 with BSD Makefiles
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1998-2000 Sendmail, Inc. and its suppliers.
+d15 1
+a15 1
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52.18.3 2000/09/17 17:04:26 gshapiro Exp $";
+d24 1
+d46 2
+a47 1
+EVENT	*FreeEventList;		/* list of free events */
+d55 40
+a100 2
+	{
+		syserr("554 5.3.0 setevent: intvl=%ld\n", intvl);
+a101 1
+	}
+d107 3
+a109 1
+	for (evp = &EventQueue; (ev = *evp) != NULL; evp = &ev->ev_link)
+d115 14
+a128 4
+	/* insert new event */
+	ev = FreeEventList;
+	if (ev == NULL)
+		ev = (EVENT *) xalloc(sizeof *ev);
+d130 2
+d133 4
+d141 1
+d144 1
+a144 5
+
+	if (tTd(5, 5))
+		dprintf("setevent: intvl=%ld, for=%ld, func=%lx, arg=%d, ev=%lx\n",
+			(long) intvl, (long)(now + intvl), (u_long) func,
+			arg, (u_long) ev);
+d180 3
+a182 1
+	for (evp = &EventQueue; *evp != NULL; evp = &(*evp)->ev_link)
+d191 1
+d195 1
+d239 1
+d243 1
+d264 4
+d277 1
+a277 1
+	int mypid = getpid();
+d281 41
+a322 1
+
+a325 2
+	/* reset signal in case System V semantics */
+	(void) setsignal(SIGALRM, tick);
+d331 1
+a331 1
+		int pid;
+d334 1
+d337 1
+d347 1
+d350 2
+a351 1
+		if (pid != getpid())
+d373 66
+d456 1
+a456 1
+static bool	SleepDone;
+d483 6
+@
+
+
+1.2.2.1
+log
+@Pull in patch from current:
+Fix (millert), Errata 001:
+Update to sendmail 8.11.4:
+    8.11.4 revamps signal handling within the MTA in order to reduce
+    the likelihood of a race condition that can lead to heap
+    corruption as described in Michal Zalewski's advisory.  The
+    problems discussed in the advisory are not currently known to
+    be exploitable but we recommend upgrading to 8.11.4 in case a
+    method is found to exploit the signal handling race condition.
+    8.11.4 also fixes other bugs found since the release of 8.11.3.
+
+See the RELEASE_NOTES file for more details.
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1998-2001 Sendmail, Inc. and its suppliers.
+d15 1
+a15 1
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52.18.14 2001/05/17 18:12:28 gshapiro Exp $";
+a23 1
+static SIGFUNC_DECL	tick __P((int));
+d45 1
+a45 2
+static EVENT	*volatile EventQueue;		/* head of event queue */
+static EVENT	*volatile FreeEventList;	/* list of free events */
+d53 1
+d55 2
+a63 40
+	ENTER_CRITICAL();
+	if (FreeEventList == NULL)
+	{
+		FreeEventList = (EVENT *) xalloc(sizeof *FreeEventList);
+		FreeEventList->ev_link = NULL;
+	}
+	LEAVE_CRITICAL();
+
+	ev = sigsafe_setevent(intvl, func, arg);
+
+	if (tTd(5, 5))
+		dprintf("setevent: intvl=%ld, for=%ld, func=%lx, arg=%d, ev=%lx\n",
+			(long) intvl, (long) (curtime() + intvl),
+			(u_long) func, arg,
+			ev == NULL ? 0 : (u_long) ev);
+
+	return ev;
+}
+
+/*
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+EVENT *
+sigsafe_setevent(intvl, func, arg)
+	time_t intvl;
+	void (*func)();
+	int arg;
+{
+	register EVENT **evp;
+	register EVENT *ev;
+	auto time_t now;
+	int wasblocked;
+
+	if (intvl <= 0)
+		return NULL;
+
+d68 1
+a68 3
+	for (evp = (EVENT **) (&EventQueue);
+	     (ev = *evp) != NULL;
+	     evp = &ev->ev_link)
+d74 4
+a77 14
+	ENTER_CRITICAL();
+	if (FreeEventList == NULL)
+	{
+		/*
+		**  This shouldn't happen.  If called from setevent(),
+		**  we have just malloced a FreeEventList entry.  If
+		**  called from a signal handler, it should have been
+		**  from an existing event which tick() just added to the
+		**  FreeEventList.
+		*/
+
+		LEAVE_CRITICAL();
+		return NULL;
+	}
+a78 2
+	{
+		ev = FreeEventList;
+a79 4
+	}
+	LEAVE_CRITICAL();
+
+	/* insert new event */
+a83 1
+	ENTER_CRITICAL();
+d86 5
+a90 1
+	LEAVE_CRITICAL();
+d126 1
+a126 3
+	for (evp = (EVENT **) (&EventQueue);
+	     *evp != NULL;
+	     evp = &(*evp)->ev_link)
+a134 1
+		ENTER_CRITICAL();
+a137 1
+		LEAVE_CRITICAL();
+a180 1
+	ENTER_CRITICAL();
+a183 1
+	LEAVE_CRITICAL();
+a203 4
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+d213 1
+a213 1
+	pid_t mypid;
+d217 1
+a218 41
+	FIX_SYSV_SIGNAL(sig, tick);
+
+	errno = save_errno;
+	CHECK_CRITICAL(sig);
+
+	mypid = getpid();
+	while (PendingSignal != 0)
+	{
+		int sigbit;
+		int sig;
+
+		if (bitset(PEND_SIGHUP, PendingSignal))
+		{
+			sigbit = PEND_SIGHUP;
+			sig = SIGHUP;
+		}
+		else if (bitset(PEND_SIGINT, PendingSignal))
+		{
+			sigbit = PEND_SIGINT;
+			sig = SIGINT;
+		}
+		else if (bitset(PEND_SIGTERM, PendingSignal))
+		{
+			sigbit = PEND_SIGTERM;
+			sig = SIGTERM;
+		}
+		else if (bitset(PEND_SIGUSR1, PendingSignal))
+		{
+			sigbit = PEND_SIGUSR1;
+			sig = SIGUSR1;
+		}
+		else
+		{
+			/* If we get here, we are in trouble */
+			abort();
+		}
+		PendingSignal &= ~sigbit;
+		kill(mypid, sig);
+	}
+
+	now = curtime();
+d222 2
+d229 1
+a229 1
+		pid_t pid;
+a231 1
+		ENTER_CRITICAL();
+a233 1
+		LEAVE_CRITICAL();
+a242 1
+		ENTER_CRITICAL();
+d245 1
+a245 2
+		LEAVE_CRITICAL();
+		if (pid != mypid)
+a266 66
+**  PEND_SIGNAL -- Add a signal to the pending signal list
+**
+**	Parameters:
+**		sig -- signal to add
+**
+**	Returns:
+**		none.
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+void
+pend_signal(sig)
+	int sig;
+{
+	int sigbit;
+	int save_errno = errno;
+
+	/*
+	**  Don't want to interrupt something critical, hence delay
+	**  the alarm for one second.  Hopefully, by then we
+	**  will be out of the critical section.  If not, then
+	**  we will just delay again.  The events to be run will
+	**  still all be run, maybe just a little bit late.
+	*/
+
+	switch (sig)
+	{
+	  case SIGHUP:
+		sigbit = PEND_SIGHUP;
+		break;
+
+	  case SIGINT:
+		sigbit = PEND_SIGINT;
+		break;
+
+	  case SIGTERM:
+		sigbit = PEND_SIGTERM;
+		break;
+
+	  case SIGUSR1:
+		sigbit = PEND_SIGUSR1;
+		break;
+
+	  case SIGALRM:
+		/* don't have to pend these */
+		sigbit = 0;
+		break;
+
+	  default:
+		/* If we get here, we are in trouble */
+		abort();
+
+		/* NOTREACHED */
+		break;
+	}
+
+	if (sigbit != 0)
+		PendingSignal |= sigbit;
+	(void) setsignal(SIGALRM, tick);
+	(void) alarm(1);
+	errno = save_errno;
+}
+/*
+d284 1
+a284 1
+static bool	volatile SleepDone;
+a310 6
+	/*
+	**  NOTE: THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+	**	ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+	**	DOING.
+	*/
+
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1998, 1999 Sendmail, Inc. and its suppliers.
+d15 1
+a15 1
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52 1999/10/13 22:16:42 ca Exp $";
+d26 1
+d282 1
+@
+
+
+1.1.1.1
+log
+@stock sendmail 8.10.0 with $Id -> $Sendmail
+@
+text
+@@
+
+
+1.1.1.1.4.1
+log
+@Pull in patch from current:
+Errata(028):
+The signal handlers in sendmail contain code that is unsafe in the
+context of a signal handler.  This leads to potentially serious race
+conditions.  At the moment this is a theoretical attack only and can
+only be exploited on the local host (if at all).
+Fix(millert):
+Update to sendmail 8.11.4:
+8.11.4 revamps signal handling within the MTA in order to reduce
+the likelihood of a race condition that can lead to heap
+corruption as described in Michal Zalewski's advisory.  The
+problems discussed in the advisory are not currently known to
+be exploitable but we recommend upgrading to 8.11.4 in case a
+method is found to exploit the signal handling race condition.
+8.11.4 also fixes other bugs found since the release of 8.11.3.
+
+See the RELEASE_NOTES file for more details.
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1998-2001 Sendmail, Inc. and its suppliers.
+d15 1
+a15 1
+static char id[] = "@@(#)$Sendmail: clock.c,v 8.52.18.14 2001/05/17 18:12:28 gshapiro Exp $";
+a23 1
+static SIGFUNC_DECL	tick __P((int));
+a25 1
+
+d44 1
+a44 2
+static EVENT	*volatile EventQueue;		/* head of event queue */
+static EVENT	*volatile FreeEventList;	/* list of free events */
+d52 1
+d54 2
+a62 40
+	ENTER_CRITICAL();
+	if (FreeEventList == NULL)
+	{
+		FreeEventList = (EVENT *) xalloc(sizeof *FreeEventList);
+		FreeEventList->ev_link = NULL;
+	}
+	LEAVE_CRITICAL();
+
+	ev = sigsafe_setevent(intvl, func, arg);
+
+	if (tTd(5, 5))
+		dprintf("setevent: intvl=%ld, for=%ld, func=%lx, arg=%d, ev=%lx\n",
+			(long) intvl, (long) (curtime() + intvl),
+			(u_long) func, arg,
+			ev == NULL ? 0 : (u_long) ev);
+
+	return ev;
+}
+
+/*
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+EVENT *
+sigsafe_setevent(intvl, func, arg)
+	time_t intvl;
+	void (*func)();
+	int arg;
+{
+	register EVENT **evp;
+	register EVENT *ev;
+	auto time_t now;
+	int wasblocked;
+
+	if (intvl <= 0)
+		return NULL;
+
+d67 1
+a67 3
+	for (evp = (EVENT **) (&EventQueue);
+	     (ev = *evp) != NULL;
+	     evp = &ev->ev_link)
+d73 4
+a76 14
+	ENTER_CRITICAL();
+	if (FreeEventList == NULL)
+	{
+		/*
+		**  This shouldn't happen.  If called from setevent(),
+		**  we have just malloced a FreeEventList entry.  If
+		**  called from a signal handler, it should have been
+		**  from an existing event which tick() just added to the
+		**  FreeEventList.
+		*/
+
+		LEAVE_CRITICAL();
+		return NULL;
+	}
+a77 2
+	{
+		ev = FreeEventList;
+a78 4
+	}
+	LEAVE_CRITICAL();
+
+	/* insert new event */
+a82 1
+	ENTER_CRITICAL();
+d85 5
+a89 1
+	LEAVE_CRITICAL();
+d125 1
+a125 3
+	for (evp = (EVENT **) (&EventQueue);
+	     *evp != NULL;
+	     evp = &(*evp)->ev_link)
+a133 1
+		ENTER_CRITICAL();
+a136 1
+		LEAVE_CRITICAL();
+a179 1
+	ENTER_CRITICAL();
+a182 1
+	LEAVE_CRITICAL();
+a202 4
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+d212 1
+a212 1
+	pid_t mypid;
+d216 1
+a217 41
+	FIX_SYSV_SIGNAL(sig, tick);
+
+	errno = save_errno;
+	CHECK_CRITICAL(sig);
+
+	mypid = getpid();
+	while (PendingSignal != 0)
+	{
+		int sigbit;
+		int sig;
+
+		if (bitset(PEND_SIGHUP, PendingSignal))
+		{
+			sigbit = PEND_SIGHUP;
+			sig = SIGHUP;
+		}
+		else if (bitset(PEND_SIGINT, PendingSignal))
+		{
+			sigbit = PEND_SIGINT;
+			sig = SIGINT;
+		}
+		else if (bitset(PEND_SIGTERM, PendingSignal))
+		{
+			sigbit = PEND_SIGTERM;
+			sig = SIGTERM;
+		}
+		else if (bitset(PEND_SIGUSR1, PendingSignal))
+		{
+			sigbit = PEND_SIGUSR1;
+			sig = SIGUSR1;
+		}
+		else
+		{
+			/* If we get here, we are in trouble */
+			abort();
+		}
+		PendingSignal &= ~sigbit;
+		kill(mypid, sig);
+	}
+
+	now = curtime();
+d221 2
+d228 1
+a228 1
+		pid_t pid;
+a230 1
+		ENTER_CRITICAL();
+a232 1
+		LEAVE_CRITICAL();
+a241 1
+		ENTER_CRITICAL();
+d244 1
+a244 2
+		LEAVE_CRITICAL();
+		if (pid != mypid)
+a265 66
+**  PEND_SIGNAL -- Add a signal to the pending signal list
+**
+**	Parameters:
+**		sig -- signal to add
+**
+**	Returns:
+**		none.
+**
+**	NOTE:	THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+**		ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+**		DOING.
+*/
+
+void
+pend_signal(sig)
+	int sig;
+{
+	int sigbit;
+	int save_errno = errno;
+
+	/*
+	**  Don't want to interrupt something critical, hence delay
+	**  the alarm for one second.  Hopefully, by then we
+	**  will be out of the critical section.  If not, then
+	**  we will just delay again.  The events to be run will
+	**  still all be run, maybe just a little bit late.
+	*/
+
+	switch (sig)
+	{
+	  case SIGHUP:
+		sigbit = PEND_SIGHUP;
+		break;
+
+	  case SIGINT:
+		sigbit = PEND_SIGINT;
+		break;
+
+	  case SIGTERM:
+		sigbit = PEND_SIGTERM;
+		break;
+
+	  case SIGUSR1:
+		sigbit = PEND_SIGUSR1;
+		break;
+
+	  case SIGALRM:
+		/* don't have to pend these */
+		sigbit = 0;
+		break;
+
+	  default:
+		/* If we get here, we are in trouble */
+		abort();
+
+		/* NOTREACHED */
+		break;
+	}
+
+	if (sigbit != 0)
+		PendingSignal |= sigbit;
+	(void) setsignal(SIGALRM, tick);
+	(void) alarm(1);
+	errno = save_errno;
+}
+/*
+d282 1
+a282 2
+
+static bool	volatile SleepDone;
+a308 6
+	/*
+	**  NOTE: THIS CAN BE CALLED FROM A SIGNAL HANDLER.  DO NOT ADD
+	**	ANYTHING TO THIS ROUTINE UNLESS YOU KNOW WHAT YOU ARE
+	**	DOING.
+	*/
+
+@
+
+
+1.1.1.2
+log
+@sendmail 8.11.2
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1998-2000 Sendmail, Inc. and its suppliers.
+d15 1
+a15 1
+static char id[] = "@@(#)$Id: clock.c,v 8.52.18.3 2000/09/17 17:04:26 gshapiro Exp $";
+a25 1
+
+a280 1
+
+@
+

@@ -1,0 +1,267 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.01;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.01;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.08;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.30;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===-- AArch64CleanupLocalDynamicTLSPass.cpp ---------------------*- C++ -*-=//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// Local-dynamic access to thread-local variables proceeds in three stages.
+//
+// 1. The offset of this Module's thread-local area from TPIDR_EL0 is calculated
+//    in much the same way as a general-dynamic TLS-descriptor access against
+//    the special symbol _TLS_MODULE_BASE.
+// 2. The variable's offset from _TLS_MODULE_BASE_ is calculated using
+//    instructions with "dtprel" modifiers.
+// 3. These two are added, together with TPIDR_EL0, to obtain the variable's
+//    true address.
+//
+// This is only better than general-dynamic access to the variable if two or
+// more of the first stage TLS-descriptor calculations can be combined. This
+// pass looks through a function and performs such combinations.
+//
+//===----------------------------------------------------------------------===//
+#include "AArch64.h"
+#include "AArch64InstrInfo.h"
+#include "AArch64MachineFunctionInfo.h"
+#include "AArch64TargetMachine.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+using namespace llvm;
+
+namespace {
+struct LDTLSCleanup : public MachineFunctionPass {
+  static char ID;
+  LDTLSCleanup() : MachineFunctionPass(ID) {}
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    AArch64FunctionInfo *AFI = MF.getInfo<AArch64FunctionInfo>();
+    if (AFI->getNumLocalDynamicTLSAccesses() < 2) {
+      // No point folding accesses if there isn't at least two.
+      return false;
+    }
+
+    MachineDominatorTree *DT = &getAnalysis<MachineDominatorTree>();
+    return VisitNode(DT->getRootNode(), 0);
+  }
+
+  // Visit the dominator subtree rooted at Node in pre-order.
+  // If TLSBaseAddrReg is non-null, then use that to replace any
+  // TLS_base_addr instructions. Otherwise, create the register
+  // when the first such instruction is seen, and then use it
+  // as we encounter more instructions.
+  bool VisitNode(MachineDomTreeNode *Node, unsigned TLSBaseAddrReg) {
+    MachineBasicBlock *BB = Node->getBlock();
+    bool Changed = false;
+
+    // Traverse the current block.
+    for (MachineBasicBlock::iterator I = BB->begin(), E = BB->end(); I != E;
+         ++I) {
+      switch (I->getOpcode()) {
+      case AArch64::TLSDESC_CALLSEQ:
+        // Make sure it's a local dynamic access.
+        if (!I->getOperand(0).isSymbol() ||
+            strcmp(I->getOperand(0).getSymbolName(), "_TLS_MODULE_BASE_"))
+          break;
+
+        if (TLSBaseAddrReg)
+          I = replaceTLSBaseAddrCall(I, TLSBaseAddrReg);
+        else
+          I = setRegister(I, &TLSBaseAddrReg);
+        Changed = true;
+        break;
+      default:
+        break;
+      }
+    }
+
+    // Visit the children of this block in the dominator tree.
+    for (MachineDomTreeNode *N : *Node) {
+      Changed |= VisitNode(N, TLSBaseAddrReg);
+    }
+
+    return Changed;
+  }
+
+  // Replace the TLS_base_addr instruction I with a copy from
+  // TLSBaseAddrReg, returning the new instruction.
+  MachineInstr *replaceTLSBaseAddrCall(MachineInstr *I,
+                                       unsigned TLSBaseAddrReg) {
+    MachineFunction *MF = I->getParent()->getParent();
+    const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+
+    // Insert a Copy from TLSBaseAddrReg to x0, which is where the rest of the
+    // code sequence assumes the address will be.
+    MachineInstr *Copy = BuildMI(*I->getParent(), I, I->getDebugLoc(),
+                                 TII->get(TargetOpcode::COPY),
+                                 AArch64::X0).addReg(TLSBaseAddrReg);
+
+    // Erase the TLS_base_addr instruction.
+    I->eraseFromParent();
+
+    return Copy;
+  }
+
+  // Create a virtal register in *TLSBaseAddrReg, and populate it by
+  // inserting a copy instruction after I. Returns the new instruction.
+  MachineInstr *setRegister(MachineInstr *I, unsigned *TLSBaseAddrReg) {
+    MachineFunction *MF = I->getParent()->getParent();
+    const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+
+    // Create a virtual register for the TLS base address.
+    MachineRegisterInfo &RegInfo = MF->getRegInfo();
+    *TLSBaseAddrReg = RegInfo.createVirtualRegister(&AArch64::GPR64RegClass);
+
+    // Insert a copy from X0 to TLSBaseAddrReg for later.
+    MachineInstr *Copy =
+        BuildMI(*I->getParent(), ++I->getIterator(), I->getDebugLoc(),
+                TII->get(TargetOpcode::COPY), *TLSBaseAddrReg)
+            .addReg(AArch64::X0);
+
+    return Copy;
+  }
+
+  const char *getPassName() const override {
+    return "Local Dynamic TLS Access Clean-up";
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    AU.addRequired<MachineDominatorTree>();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+};
+}
+
+char LDTLSCleanup::ID = 0;
+FunctionPass *llvm::createAArch64CleanupLocalDynamicTLSPass() {
+  return new LDTLSCleanup();
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@a41 3
+    if (skipFunction(*MF.getFunction()))
+      return false;
+
+d72 1
+a72 1
+          I = replaceTLSBaseAddrCall(*I, TLSBaseAddrReg);
+d74 1
+a74 1
+          I = setRegister(*I, &TLSBaseAddrReg);
+d92 1
+a92 1
+  MachineInstr *replaceTLSBaseAddrCall(MachineInstr &I,
+d94 1
+a94 1
+    MachineFunction *MF = I.getParent()->getParent();
+d99 3
+a101 3
+    MachineInstr *Copy = BuildMI(*I.getParent(), I, I.getDebugLoc(),
+                                 TII->get(TargetOpcode::COPY), AArch64::X0)
+                             .addReg(TLSBaseAddrReg);
+d104 1
+a104 1
+    I.eraseFromParent();
+d111 2
+a112 2
+  MachineInstr *setRegister(MachineInstr &I, unsigned *TLSBaseAddrReg) {
+    MachineFunction *MF = I.getParent()->getParent();
+d121 1
+a121 1
+        BuildMI(*I.getParent(), ++I.getIterator(), I.getDebugLoc(),
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@a35 2
+#define TLSCLEANUP_PASS_NAME "AArch64 Local Dynamic TLS Access Clean-up"
+
+d39 1
+a39 3
+  LDTLSCleanup() : MachineFunctionPass(ID) {
+    initializeLDTLSCleanupPass(*PassRegistry::getPassRegistry());
+  }
+d131 3
+a133 1
+  StringRef getPassName() const override { return TLSCLEANUP_PASS_NAME; }
+a141 3
+
+INITIALIZE_PASS(LDTLSCleanup, "aarch64-local-dynamic-tls-cleanup",
+                TLSCLEANUP_PASS_NAME, false, false)
+@
+
+

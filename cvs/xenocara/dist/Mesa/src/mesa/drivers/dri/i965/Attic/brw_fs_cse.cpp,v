@@ -1,0 +1,768 @@
+head	1.2;
+access;
+symbols
+	OPENBSD_5_8:1.1.1.4.0.4
+	OPENBSD_5_8_BASE:1.1.1.4
+	OPENBSD_5_7:1.1.1.4.0.2
+	OPENBSD_5_7_BASE:1.1.1.4
+	v10_2_9:1.1.1.4
+	v10_4_3:1.1.1.3
+	v10_2_7:1.1.1.2
+	OPENBSD_5_6:1.1.1.2.0.2
+	OPENBSD_5_6_BASE:1.1.1.2
+	v10_2_3:1.1.1.2
+	OPENBSD_5_5:1.1.1.1.0.2
+	OPENBSD_5_5_BASE:1.1.1.1
+	v9_2_5:1.1.1.1
+	v9_2_3:1.1.1.1
+	v9_2_2:1.1.1.1
+	v9_2_1:1.1.1.1
+	v9_2_0:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@// @;
+expand	@o@;
+
+
+1.2
+date	2015.12.23.05.17.49;	author jsg;	state dead;
+branches;
+next	1.1;
+commitid	TnlogFl9nOv2eaRf;
+
+1.1
+date	2013.09.05.13.15.33;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2013.09.05.13.15.33;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2014.07.09.20.34.50;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	3JhLfwcuBALP0ZR7;
+
+1.1.1.3
+date	2015.01.25.14.11.37;	author jsg;	state Exp;
+branches;
+next	1.1.1.4;
+commitid	ce2W5rH5aF7VS9gi;
+
+1.1.1.4
+date	2015.02.20.22.48.43;	author jsg;	state Exp;
+branches;
+next	;
+commitid	F54a1i0WXHMxq7kE;
+
+
+desc
+@@
+
+
+1.2
+log
+@remove the now unused Mesa 10.2.9 code
+@
+text
+@/*
+ * Copyright © 2012 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+#include "brw_fs.h"
+#include "brw_cfg.h"
+
+/** @@file brw_fs_cse.cpp
+ *
+ * Support for local common subexpression elimination.
+ *
+ * See Muchnik's Advanced Compiler Design and Implementation, section
+ * 13.1 (p378).
+ */
+
+namespace {
+struct aeb_entry : public exec_node {
+   /** The instruction that generates the expression value. */
+   fs_inst *generator;
+
+   /** The temporary where the value is stored. */
+   fs_reg tmp;
+};
+}
+
+static bool
+is_expression(const fs_inst *const inst)
+{
+   switch (inst->opcode) {
+   case BRW_OPCODE_SEL:
+   case BRW_OPCODE_NOT:
+   case BRW_OPCODE_AND:
+   case BRW_OPCODE_OR:
+   case BRW_OPCODE_XOR:
+   case BRW_OPCODE_SHR:
+   case BRW_OPCODE_SHL:
+   case BRW_OPCODE_RSR:
+   case BRW_OPCODE_RSL:
+   case BRW_OPCODE_ASR:
+   case BRW_OPCODE_ADD:
+   case BRW_OPCODE_MUL:
+   case BRW_OPCODE_FRC:
+   case BRW_OPCODE_RNDU:
+   case BRW_OPCODE_RNDD:
+   case BRW_OPCODE_RNDE:
+   case BRW_OPCODE_RNDZ:
+   case BRW_OPCODE_LINE:
+   case BRW_OPCODE_PLN:
+   case BRW_OPCODE_MAD:
+   case BRW_OPCODE_LRP:
+   case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD:
+   case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD_GEN7:
+   case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD:
+   case FS_OPCODE_CINTERP:
+   case FS_OPCODE_LINTERP:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+operands_match(fs_reg *xs, fs_reg *ys)
+{
+   return xs[0].equals(ys[0]) && xs[1].equals(ys[1]) && xs[2].equals(ys[2]);
+}
+
+bool
+fs_visitor::opt_cse_local(bblock_t *block, exec_list *aeb)
+{
+   bool progress = false;
+
+   void *mem_ctx = ralloc_context(this->mem_ctx);
+
+   int ip = block->start_ip;
+   for (fs_inst *inst = (fs_inst *)block->start;
+	inst != block->end->next;
+	inst = (fs_inst *) inst->next) {
+
+      /* Skip some cases. */
+      if (is_expression(inst) && !inst->is_partial_write() &&
+          !inst->conditional_mod)
+      {
+	 bool found = false;
+
+	 aeb_entry *entry;
+	 foreach_list(entry_node, aeb) {
+	    entry = (aeb_entry *) entry_node;
+
+	    /* Match current instruction's expression against those in AEB. */
+	    if (inst->opcode == entry->generator->opcode &&
+		inst->saturate == entry->generator->saturate &&
+                inst->dst.type == entry->generator->dst.type &&
+                operands_match(entry->generator->src, inst->src)) {
+
+	       found = true;
+	       progress = true;
+	       break;
+	    }
+	 }
+
+	 if (!found) {
+	    /* Our first sighting of this expression.  Create an entry. */
+	    aeb_entry *entry = ralloc(mem_ctx, aeb_entry);
+	    entry->tmp = reg_undef;
+	    entry->generator = inst;
+	    aeb->push_tail(entry);
+	 } else {
+	    /* This is at least our second sighting of this expression.
+	     * If we don't have a temporary already, make one.
+	     */
+	    bool no_existing_temp = entry->tmp.file == BAD_FILE;
+	    if (no_existing_temp) {
+               int written = entry->generator->regs_written;
+
+               fs_reg orig_dst = entry->generator->dst;
+               fs_reg tmp = fs_reg(GRF, virtual_grf_alloc(written),
+                                   orig_dst.type);
+               entry->tmp = tmp;
+               entry->generator->dst = tmp;
+
+               for (int i = 0; i < written; i++) {
+                  fs_inst *copy = MOV(orig_dst, tmp);
+                  copy->force_writemask_all =
+                     entry->generator->force_writemask_all;
+                  entry->generator->insert_after(copy);
+
+                  orig_dst.reg_offset++;
+                  tmp.reg_offset++;
+               }
+	    }
+
+	    /* dest <- temp */
+            int written = inst->regs_written;
+            assert(written == entry->generator->regs_written);
+            assert(inst->dst.type == entry->tmp.type);
+            fs_reg dst = inst->dst;
+            fs_reg tmp = entry->tmp;
+            fs_inst *copy = NULL;
+            for (int i = 0; i < written; i++) {
+               copy = MOV(dst, tmp);
+               copy->force_writemask_all = inst->force_writemask_all;
+               inst->insert_before(copy);
+
+               dst.reg_offset++;
+               tmp.reg_offset++;
+            }
+            inst->remove();
+
+	    /* Appending an instruction may have changed our bblock end. */
+	    if (inst == block->end) {
+	       block->end = copy;
+	    }
+
+	    /* Continue iteration with copy->next */
+	    inst = copy;
+	 }
+      }
+
+      foreach_list_safe(entry_node, aeb) {
+	 aeb_entry *entry = (aeb_entry *)entry_node;
+
+	 for (int i = 0; i < 3; i++) {
+            fs_reg *src_reg = &entry->generator->src[i];
+
+            /* Kill all AEB entries that use the destination we just
+             * overwrote.
+             */
+            if (inst->overwrites_reg(entry->generator->src[i])) {
+	       entry->remove();
+	       ralloc_free(entry);
+	       break;
+	    }
+
+            /* Kill any AEB entries using registers that don't get reused any
+             * more -- a sure sign they'll fail operands_match().
+             */
+            if (src_reg->file == GRF && virtual_grf_end[src_reg->reg] < ip) {
+               entry->remove();
+               ralloc_free(entry);
+	       break;
+            }
+	 }
+      }
+
+      ip++;
+   }
+
+   ralloc_free(mem_ctx);
+
+   if (progress)
+      this->live_intervals_valid = false;
+
+   return progress;
+}
+
+bool
+fs_visitor::opt_cse()
+{
+   bool progress = false;
+
+   calculate_live_intervals();
+
+   cfg_t cfg(this);
+
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+      exec_list aeb;
+
+      progress = opt_cse_local(block, &aeb) || progress;
+   }
+
+   return progress;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Import Mesa 9.2.0
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 10.2.3
+@
+text
+@d31 1
+a31 1
+ * See Muchnick's Advanced Compiler Design and Implementation, section
+d56 2
+a58 2
+   case BRW_OPCODE_CMP:
+   case BRW_OPCODE_CMPN:
+d82 1
+a82 1
+is_expression_commutative(enum opcode op)
+d84 1
+a84 33
+   switch (op) {
+   case BRW_OPCODE_AND:
+   case BRW_OPCODE_OR:
+   case BRW_OPCODE_XOR:
+   case BRW_OPCODE_ADD:
+   case BRW_OPCODE_MUL:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+operands_match(enum opcode op, fs_reg *xs, fs_reg *ys)
+{
+   if (!is_expression_commutative(op)) {
+      return xs[0].equals(ys[0]) && xs[1].equals(ys[1]) && xs[2].equals(ys[2]);
+   } else {
+      return (xs[0].equals(ys[0]) && xs[1].equals(ys[1])) ||
+             (xs[1].equals(ys[0]) && xs[0].equals(ys[1]));
+   }
+}
+
+static bool
+instructions_match(fs_inst *a, fs_inst *b)
+{
+   return a->opcode == b->opcode &&
+          a->saturate == b->saturate &&
+          a->predicate == b->predicate &&
+          a->predicate_inverse == b->predicate_inverse &&
+          a->conditional_mod == b->conditional_mod &&
+          a->dst.type == b->dst.type &&
+          operands_match(a->opcode, a->src, b->src);
+d92 1
+a92 1
+   void *cse_ctx = ralloc_context(NULL);
+d101 1
+a101 1
+          (inst->dst.file != HW_REG || inst->dst.is_null()))
+d110 5
+a114 1
+	    if (instructions_match(inst, entry->generator)) {
+d123 1
+a123 1
+	    aeb_entry *entry = ralloc(cse_ctx, aeb_entry);
+d132 1
+a132 1
+	    if (no_existing_temp && !entry->generator->dst.is_null()) {
+d153 10
+a162 11
+            if (!inst->dst.is_null()) {
+               int written = inst->regs_written;
+               assert(written == entry->generator->regs_written);
+               assert(inst->dst.type == entry->tmp.type);
+               fs_reg dst = inst->dst;
+               fs_reg tmp = entry->tmp;
+               fs_inst *copy = NULL;
+               for (int i = 0; i < written; i++) {
+                  copy = MOV(dst, tmp);
+                  copy->force_writemask_all = inst->force_writemask_all;
+                  inst->insert_before(copy);
+d164 2
+a165 3
+                  dst.reg_offset++;
+                  tmp.reg_offset++;
+               }
+a166 7
+
+            /* Set our iterator so that next time through the loop inst->next
+             * will get the instruction in the basic block after the one we've
+             * removed.
+             */
+            fs_inst *prev = (fs_inst *)inst->prev;
+
+d171 1
+a171 1
+	       block->end = prev;
+d174 2
+a175 1
+            inst = prev;
+a181 13
+         /* Kill all AEB entries that write a different value to or read from
+          * the flag register if we just wrote it.
+          */
+         if (inst->writes_flag()) {
+            if (entry->generator->reads_flag() ||
+                (entry->generator->writes_flag() &&
+                 !instructions_match(inst, entry->generator))) {
+               entry->remove();
+               ralloc_free(entry);
+               continue;
+            }
+         }
+
+d208 1
+a208 1
+   ralloc_free(cse_ctx);
+d211 1
+a211 1
+      invalidate_live_intervals();
+d223 1
+a223 1
+   cfg_t cfg(&instructions);
+@
+
+
+1.1.1.3
+log
+@Import Mesa 10.4.3
+@
+text
+@a45 16
+is_copy_payload(const fs_inst *inst)
+{
+   const int reg = inst->src[0].reg;
+   if (inst->src[0].reg_offset != 0)
+      return false;
+
+   for (int i = 1; i < inst->sources; i++) {
+      if (inst->src[i].reg != reg ||
+          inst->src[i].reg_offset != i) {
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+a75 13
+   case SHADER_OPCODE_RCP:
+   case SHADER_OPCODE_RSQ:
+   case SHADER_OPCODE_SQRT:
+   case SHADER_OPCODE_EXP2:
+   case SHADER_OPCODE_LOG2:
+   case SHADER_OPCODE_POW:
+   case SHADER_OPCODE_INT_QUOTIENT:
+   case SHADER_OPCODE_INT_REMAINDER:
+   case SHADER_OPCODE_SIN:
+   case SHADER_OPCODE_COS:
+      return inst->mlen < 2;
+   case SHADER_OPCODE_LOAD_PAYLOAD:
+      return !is_copy_payload(inst);
+d77 1
+a77 1
+      return inst->is_send_from_grf() && !inst->has_side_effects();
+d97 1
+a97 1
+operands_match(fs_inst *a, fs_inst *b)
+d99 2
+a100 16
+   fs_reg *xs = a->src;
+   fs_reg *ys = b->src;
+
+   if (a->opcode == BRW_OPCODE_MAD) {
+      return xs[0].equals(ys[0]) &&
+             ((xs[1].equals(ys[1]) && xs[2].equals(ys[2])) ||
+              (xs[2].equals(ys[1]) && xs[1].equals(ys[2])));
+   } else if (!is_expression_commutative(a->opcode)) {
+      bool match = true;
+      for (int i = 0; i < a->sources; i++) {
+         if (!xs[i].equals(ys[i])) {
+            match = false;
+            break;
+         }
+      }
+      return match;
+d116 1
+a116 10
+          a->sources == b->sources &&
+          (a->is_tex() ? (a->texture_offset == b->texture_offset &&
+                          a->mlen == b->mlen &&
+                          a->regs_written == b->regs_written &&
+                          a->base_mrf == b->base_mrf &&
+                          a->eot == b->eot &&
+                          a->header_present == b->header_present &&
+                          a->shadow_compare == b->shadow_compare)
+                       : true) &&
+          operands_match(a, b);
+d120 1
+a120 1
+fs_visitor::opt_cse_local(bblock_t *block)
+a122 1
+   exec_list aeb;
+d127 4
+a130 1
+   foreach_inst_in_block(fs_inst, inst, block) {
+d135 1
+a135 1
+         bool found = false;
+d137 24
+a160 21
+         foreach_in_list_use_after(aeb_entry, entry, &aeb) {
+            /* Match current instruction's expression against those in AEB. */
+            if (instructions_match(inst, entry->generator)) {
+               found = true;
+               progress = true;
+               break;
+            }
+         }
+
+         if (!found) {
+            /* Our first sighting of this expression.  Create an entry. */
+            aeb_entry *entry = ralloc(cse_ctx, aeb_entry);
+            entry->tmp = reg_undef;
+            entry->generator = inst;
+            aeb.push_tail(entry);
+         } else {
+            /* This is at least our second sighting of this expression.
+             * If we don't have a temporary already, make one.
+             */
+            bool no_existing_temp = entry->tmp.file == BAD_FILE;
+            if (no_existing_temp && !entry->generator->dst.is_null()) {
+a161 2
+               int dst_width = entry->generator->dst.width / 8;
+               assert(written % dst_width == 0);
+d165 1
+a165 1
+                                   orig_dst.type, orig_dst.width);
+d169 2
+a170 8
+               fs_inst *copy;
+               if (written > dst_width) {
+                  fs_reg *sources = ralloc_array(mem_ctx, fs_reg, written / dst_width);
+                  for (int i = 0; i < written / dst_width; i++)
+                     sources[i] = offset(tmp, i);
+                  copy = LOAD_PAYLOAD(orig_dst, sources, written / dst_width);
+               } else {
+                  copy = MOV(orig_dst, tmp);
+d173 4
+d178 1
+a178 2
+               entry->generator->insert_after(block, copy);
+            }
+d180 1
+a180 1
+            /* dest <- temp */
+a182 1
+               int dst_width = inst->dst.width / 8;
+a183 1
+               assert(dst_width == entry->generator->dst.width / 8);
+d187 2
+a188 7
+               fs_inst *copy;
+               if (written > dst_width) {
+                  fs_reg *sources = ralloc_array(mem_ctx, fs_reg, written / dst_width);
+                  for (int i = 0; i < written / dst_width; i++)
+                     sources[i] = offset(tmp, i);
+                  copy = LOAD_PAYLOAD(dst, sources, written / dst_width);
+               } else {
+d191 4
+a195 1
+               inst->insert_before(block, copy);
+d204 7
+a210 1
+            inst->remove(block);
+d212 1
+a212 1
+         }
+d215 3
+a217 1
+      foreach_in_list_safe(aeb_entry, entry, &aeb) {
+d231 1
+a231 1
+         for (int i = 0; i < entry->generator->sources; i++) {
+d238 4
+a241 4
+               entry->remove();
+               ralloc_free(entry);
+               break;
+            }
+d249 1
+a249 1
+               break;
+d251 1
+a251 1
+         }
+d259 3
+d272 7
+a278 2
+   foreach_block (block, cfg) {
+      progress = opt_cse_local(block) || progress;
+a279 3
+
+   if (progress)
+      invalidate_live_intervals();
+@
+
+
+1.1.1.4
+log
+@Import Mesa 10.2.9
+@
+text
+@d46 16
+d92 13
+d106 1
+a106 1
+      return false;
+d126 1
+a126 1
+operands_match(enum opcode op, fs_reg *xs, fs_reg *ys)
+d128 16
+a143 2
+   if (!is_expression_commutative(op)) {
+      return xs[0].equals(ys[0]) && xs[1].equals(ys[1]) && xs[2].equals(ys[2]);
+d159 10
+a168 1
+          operands_match(a->opcode, a->src, b->src);
+d172 1
+a172 1
+fs_visitor::opt_cse_local(bblock_t *block, exec_list *aeb)
+d175 1
+d180 1
+a180 4
+   for (fs_inst *inst = (fs_inst *)block->start;
+	inst != block->end->next;
+	inst = (fs_inst *) inst->next) {
+
+d185 1
+a185 1
+	 bool found = false;
+d187 21
+a207 24
+	 aeb_entry *entry;
+	 foreach_list(entry_node, aeb) {
+	    entry = (aeb_entry *) entry_node;
+
+	    /* Match current instruction's expression against those in AEB. */
+	    if (instructions_match(inst, entry->generator)) {
+	       found = true;
+	       progress = true;
+	       break;
+	    }
+	 }
+
+	 if (!found) {
+	    /* Our first sighting of this expression.  Create an entry. */
+	    aeb_entry *entry = ralloc(cse_ctx, aeb_entry);
+	    entry->tmp = reg_undef;
+	    entry->generator = inst;
+	    aeb->push_tail(entry);
+	 } else {
+	    /* This is at least our second sighting of this expression.
+	     * If we don't have a temporary already, make one.
+	     */
+	    bool no_existing_temp = entry->tmp.file == BAD_FILE;
+	    if (no_existing_temp && !entry->generator->dst.is_null()) {
+d209 2
+d214 1
+a214 1
+                                   orig_dst.type);
+d218 8
+a225 2
+               for (int i = 0; i < written; i++) {
+                  fs_inst *copy = MOV(orig_dst, tmp);
+a227 4
+                  entry->generator->insert_after(copy);
+
+                  orig_dst.reg_offset++;
+                  tmp.reg_offset++;
+d229 2
+a230 1
+	    }
+d232 1
+a232 1
+	    /* dest <- temp */
+d235 1
+d237 1
+d241 7
+a247 2
+               fs_inst *copy = NULL;
+               for (int i = 0; i < written; i++) {
+a249 4
+                  inst->insert_before(copy);
+
+                  dst.reg_offset++;
+                  tmp.reg_offset++;
+d251 1
+d260 1
+a260 7
+            inst->remove();
+
+	    /* Appending an instruction may have changed our bblock end. */
+	    if (inst == block->end) {
+	       block->end = prev;
+	    }
+
+d262 1
+a262 1
+	 }
+d265 1
+a265 3
+      foreach_list_safe(entry_node, aeb) {
+	 aeb_entry *entry = (aeb_entry *)entry_node;
+
+d279 1
+a279 1
+	 for (int i = 0; i < 3; i++) {
+d286 4
+a289 4
+	       entry->remove();
+	       ralloc_free(entry);
+	       break;
+	    }
+d297 1
+a297 1
+	       break;
+d299 1
+a299 1
+	 }
+a306 3
+   if (progress)
+      invalidate_live_intervals();
+
+d317 3
+a319 1
+   cfg_t cfg(&instructions);
+d321 2
+a322 6
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+      exec_list aeb;
+
+      progress = opt_cse_local(block, &aeb) || progress;
+   }
+@
+
+

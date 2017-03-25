@@ -1,0 +1,505 @@
+head	1.5;
+access;
+symbols;
+locks; strict;
+comment	@ * @;
+
+
+1.5
+date	2012.09.01.16.09.14;	author gilles;	state dead;
+branches;
+next	1.4;
+
+1.4
+date	2012.08.31.22.40.56;	author fgsch;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.08.30.22.38.22;	author chl;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.08.30.21.59.46;	author chl;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.08.29.16.26.17;	author gilles;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.5
+log
+@- remove crypto_backend
+- remove support for encrypted queue, it will be reintroduced later after
+  pouring more thinking into it
+
+if you had it enabled, flush your queue before updating
+@
+text
+@/*	$OpenBSD: crypto_backend.c,v 1.4 2012/08/31 22:40:56 fgsch Exp $	*/
+
+/*
+ * Copyright (c) 2012 Gilles Chehade <gilles@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/tree.h>
+#include <sys/param.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+
+#include <imsg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <openssl/evp.h>
+
+#include "smtpd.h"
+#include "log.h"
+
+
+#define	CRYPTO_BUFFER_SIZE	16384
+
+
+static struct crypto_params {
+	const EVP_CIPHER	*cipher;
+	const EVP_MD		*digest;
+	uint8_t			 key[EVP_MAX_MD_SIZE];
+} cp;
+
+
+int
+crypto_setup(const char *cipher, const char *digest, const char *key)
+{
+	EVP_MD_CTX	*mdctx;
+	int		 mdlen;
+
+	log_info("crypto: setting up crypto parameters");
+	bzero(&cp, sizeof cp);
+
+	cp.cipher = EVP_get_cipherbyname(cipher);
+	if (cp.cipher == NULL) {
+		log_warnx("crypto: unknown cipher: %s", cipher);
+		return 0;
+	}
+	log_info("crypto: cipher: %s", cipher);
+
+	cp.digest = EVP_get_digestbyname(digest);
+	if (cp.digest == NULL) {
+		log_warnx("crypto: unknown digest: %s", digest);
+		return 0;
+	}
+	log_info("crypto: digest: %s", digest);
+
+	mdctx = EVP_MD_CTX_create();
+	if (mdctx == NULL) {
+		log_warnx("crypto: unable to create digest context");
+		return 0;
+	}
+
+	EVP_DigestInit_ex(mdctx, cp.digest, NULL);
+	EVP_DigestUpdate(mdctx, key, strlen(key));
+	EVP_DigestFinal_ex(mdctx, cp.key, &mdlen);
+
+	EVP_MD_CTX_destroy(mdctx);
+
+	log_info("crypto: crypto parameters set");
+	return 1;
+}
+
+void
+crypto_clear(void)
+{
+	/* to be called in EVERY process *but* queue before event dispatch */
+	bzero(&cp, sizeof cp);
+}
+
+int
+crypto_encrypt_file(FILE *in, FILE *out)
+{
+	EVP_CIPHER_CTX	ctx;
+	uint8_t		ibuf[CRYPTO_BUFFER_SIZE];
+	uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+	size_t		r,w;
+	size_t		bs = EVP_CIPHER_block_size(cp.cipher);
+	int		olen;
+	int		ret = 0;
+
+	log_debug("crypto_encrypt_file");
+
+	/* generate IV and encrypt it */
+	for (r = 0; r < (size_t)EVP_CIPHER_iv_length(cp.cipher); ++r)
+		ibuf[r] = arc4random_uniform(0xff+1);
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_EncryptInit(&ctx, cp.cipher, cp.key, NULL);
+	if (! EVP_EncryptUpdate(&ctx, obuf, &olen, ibuf, r))
+		goto end;
+	if (olen && (w = fwrite(obuf, 1, olen, out)) != (size_t)olen)
+		goto end;
+	if (! EVP_EncryptFinal(&ctx, obuf, &olen))
+		goto end;
+	if (olen && (w = fwrite(obuf, 1, olen, out)) != (size_t)olen)
+		goto end;
+
+	/* encrypt real content */
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_EncryptInit(&ctx, cp.cipher, cp.key, ibuf);
+	while ((r = fread(ibuf, 1, CRYPTO_BUFFER_SIZE-bs, in)) != 0) {
+		if (! EVP_EncryptUpdate(&ctx, obuf, &olen, ibuf, r))
+			goto end;
+		if (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+			goto end;
+	}
+	if (! feof(in))
+		goto end;
+
+	if (! EVP_EncryptFinal(&ctx, obuf, &olen))
+		goto end;
+	if (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+		goto end;
+	fflush(out);
+
+	ret = 1;
+
+end:
+	EVP_CIPHER_CTX_cleanup(&ctx);
+	log_debug("crypto_encrypt_file: ret=%d", ret);
+	return ret;
+}
+
+int
+crypto_decrypt_file(FILE *in, FILE *out)
+{
+	EVP_CIPHER_CTX	ctx;
+	uint8_t		ibuf[CRYPTO_BUFFER_SIZE];
+	uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+	size_t		r,w;
+	size_t		bs = EVP_CIPHER_block_size(cp.cipher);
+	int		olen;
+	int		ret = 0;
+
+	log_debug("crypto_decrypt_file");
+
+	/* extract and decrypt IV */
+	r = fread(ibuf, 1, EVP_CIPHER_block_size(cp.cipher)*2, in);
+	if (r != (size_t)EVP_CIPHER_block_size(cp.cipher)*2)
+		goto end;
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_DecryptInit(&ctx, cp.cipher, cp.key, NULL);
+	if (! EVP_DecryptUpdate(&ctx, obuf, &olen, ibuf, r))
+		goto end;
+	if (! EVP_DecryptFinal(&ctx, obuf+olen, &olen))
+		goto end;
+
+	/* decrypt real content */
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_DecryptInit(&ctx, cp.cipher, cp.key, obuf);
+	while ((r = fread(ibuf, 1, CRYPTO_BUFFER_SIZE-bs, in)) != 0) {
+		if (! EVP_DecryptUpdate(&ctx, obuf, &olen, ibuf, r))
+			goto end;
+		if (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+			goto end;
+	}
+	if (! feof(in))
+		goto end;
+
+	if (! EVP_DecryptFinal(&ctx, obuf, &olen))
+		goto end;
+	if (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+		goto end;
+	fflush(out);
+	ret = 1;
+
+end:
+	log_debug("crypto_decrypt_file: ret=%d", ret);
+	EVP_CIPHER_CTX_cleanup(&ctx);
+	return ret;
+}
+
+size_t
+crypto_encrypt_buffer(const char *in, size_t inlen, char *out, size_t outlen)
+{
+	EVP_CIPHER_CTX	ctx;
+	uint8_t		ibuf[CRYPTO_BUFFER_SIZE];
+	uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+	int		olen;
+	ssize_t		r;
+	int		len = 0;
+	int		ret = 0;
+
+	log_debug("crypto_encrypt_buffer");
+
+	/* out does not have enough room */
+	if (outlen < inlen + (EVP_CIPHER_block_size(cp.cipher) * 4))
+		goto end;
+
+	bzero(ibuf, sizeof ibuf);
+	bzero(obuf, sizeof obuf);
+
+	/* generate IV and encrypt it */
+	for (r = 0; r < EVP_CIPHER_iv_length(cp.cipher); ++r)
+		ibuf[r] = arc4random_uniform(0xff+1);
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_EncryptInit(&ctx, cp.cipher, cp.key, NULL);
+	if (! EVP_EncryptUpdate(&ctx, out, &olen, ibuf, r))
+		goto end;
+	if (! EVP_EncryptFinal(&ctx, out+olen, &olen))
+		goto end;
+	len += EVP_CIPHER_block_size(cp.cipher)*2;
+
+	/* encrypt real content */
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_EncryptInit(&ctx, cp.cipher, cp.key, ibuf);
+	if (! EVP_EncryptUpdate(&ctx, out+len, &olen, in, inlen))
+		goto end;
+	len += olen;
+	if (! EVP_EncryptFinal(&ctx, out+len, &olen))
+		goto end;
+	ret = len + olen;
+
+end:
+	log_debug("crypto_encrypt_buffer: ret=%d", ret);
+	EVP_CIPHER_CTX_cleanup(&ctx);
+	return ret;
+}
+
+size_t
+crypto_decrypt_buffer(const char *in, size_t inlen, char *out, size_t outlen)
+{
+	EVP_CIPHER_CTX	ctx;
+	uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+	int		olen;
+	int		len = 0;
+	int		ret = 0;
+
+	log_debug("crypto_decrypt_buffer");
+
+	/* out does not have enough room */
+	if (outlen < inlen + (EVP_CIPHER_block_size(cp.cipher) * 4))
+		goto end;
+
+	bzero(obuf, sizeof obuf);
+
+	/* extract and decrypt IV */
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_DecryptInit(&ctx, cp.cipher, cp.key, NULL);
+	if (! EVP_DecryptUpdate(&ctx, obuf, &olen, in,
+		EVP_CIPHER_block_size(cp.cipher)*2))
+		goto end;
+	if (! EVP_DecryptFinal(&ctx, obuf+olen, &olen))
+		goto end;
+	inlen -= EVP_CIPHER_block_size(cp.cipher)*2;
+	in    += EVP_CIPHER_block_size(cp.cipher)*2;
+
+	/* decrypt real content */
+	EVP_CIPHER_CTX_init(&ctx);
+	EVP_DecryptInit(&ctx, cp.cipher, cp.key, obuf);
+	if (! EVP_DecryptUpdate(&ctx, out, &olen, in, inlen))
+		goto end;
+	len += olen;
+	if (! EVP_DecryptFinal(&ctx, out+len, &olen))
+		goto end;
+	len += olen;
+
+	ret = len;
+
+end:
+	log_debug("crypto_decrypt_buffer: ret=%d", ret);
+	EVP_CIPHER_CTX_cleanup(&ctx);
+	return ret;
+}
+@
+
+
+1.4
+log
+@Use EVP_MAX_MD_SIZE for the key size for now as discussed on icb.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: crypto_backend.c,v 1.3 2012/08/30 22:38:22 chl Exp $	*/
+@
+
+
+1.3
+log
+@increase fread()/fwrite() buffer from 8k to 16k
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: crypto_backend.c,v 1.2 2012/08/30 21:59:46 chl Exp $	*/
+d44 1
+a44 1
+	uint8_t			 key[];
+@
+
+
+1.2
+log
+@change crypto_setup() prototype to use const char * instead of uint8_t *
+
+while there do some KNF:
+- change 8 spaces to tab
+- add/remove some missing/extra space after if's
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: crypto_backend.c,v 1.1 2012/08/29 16:26:17 gilles Exp $	*/
+d38 1
+a38 1
+#define	CRYPTO_BUFFER_SIZE	8192
+@
+
+
+1.1
+log
+@Introduce the crypto_backend API and provide support for... encrypted queue
+using the new API. By default, OpenSMTPD does not provide queue encryption,
+but it can be enabled with "queue encryption [args]" and will transparently
+encrypt/decrypt envelopes/messages as they hit the queue.
+
+By default, it will use Blowfish in CBC mode with a different random IV for
+each envelope and message. User provided key is expanded using sha256 but a
+different cipher and digest may be specified in smtpd.conf
+
+Queue encryption is compatible with compression and if both options are set
+it will do them in correct order and transparently.
+
+tested by chl@@, a few users and myself
+ok chl@@ and I
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d49 1
+a49 1
+crypto_setup(uint8_t *cipher, uint8_t *digest, uint8_t *key)
+d97 3
+a99 3
+        EVP_CIPHER_CTX	ctx;
+        uint8_t		ibuf[CRYPTO_BUFFER_SIZE];
+        uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+d110 2
+a111 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_EncryptInit(&ctx, cp.cipher, cp.key, NULL);
+d116 1
+a116 1
+        if (! EVP_EncryptFinal(&ctx, obuf, &olen))
+d122 2
+a123 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_EncryptInit(&ctx, cp.cipher, cp.key, ibuf);
+d127 1
+a127 1
+		if  (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+d133 1
+a133 1
+        if (! EVP_EncryptFinal(&ctx, obuf, &olen))
+d135 1
+a135 1
+	if  (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+d142 1
+a142 1
+        EVP_CIPHER_CTX_cleanup(&ctx);
+d150 3
+a152 3
+        EVP_CIPHER_CTX	ctx;
+        uint8_t		ibuf[CRYPTO_BUFFER_SIZE];
+        uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+d164 2
+a165 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_DecryptInit(&ctx, cp.cipher, cp.key, NULL);
+d168 1
+a168 1
+        if (! EVP_DecryptFinal(&ctx, obuf+olen, &olen))
+d172 2
+a173 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_DecryptInit(&ctx, cp.cipher, cp.key, obuf);
+d183 1
+a183 1
+        if(! EVP_DecryptFinal(&ctx, obuf, &olen))
+d185 1
+a185 1
+	if  (olen && (w = fwrite(obuf, olen, 1, out)) != 1)
+d192 1
+a192 1
+        EVP_CIPHER_CTX_cleanup(&ctx);
+d199 3
+a201 3
+        EVP_CIPHER_CTX	ctx;
+        uint8_t		ibuf[CRYPTO_BUFFER_SIZE];
+        uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+d219 2
+a220 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_EncryptInit(&ctx, cp.cipher, cp.key, NULL);
+d223 1
+a223 1
+        if (! EVP_EncryptFinal(&ctx, out+olen, &olen))
+d228 2
+a229 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_EncryptInit(&ctx, cp.cipher, cp.key, ibuf);
+d233 1
+a233 1
+        if (! EVP_EncryptFinal(&ctx, out+len, &olen))
+d239 1
+a239 1
+        EVP_CIPHER_CTX_cleanup(&ctx);
+d246 2
+a247 2
+        EVP_CIPHER_CTX	ctx;
+        uint8_t		obuf[CRYPTO_BUFFER_SIZE];
+d261 2
+a262 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_DecryptInit(&ctx, cp.cipher, cp.key, NULL);
+d266 1
+a266 1
+        if (! EVP_DecryptFinal(&ctx, obuf+olen, &olen))
+d272 2
+a273 2
+        EVP_CIPHER_CTX_init(&ctx);
+        EVP_DecryptInit(&ctx, cp.cipher, cp.key, obuf);
+d277 1
+a277 1
+        if (! EVP_DecryptFinal(&ctx, out+len, &olen))
+d285 1
+a285 1
+        EVP_CIPHER_CTX_cleanup(&ctx);
+@
+

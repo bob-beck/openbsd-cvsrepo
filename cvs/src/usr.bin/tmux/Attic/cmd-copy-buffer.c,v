@@ -1,0 +1,436 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_4_8:1.7.0.4
+	OPENBSD_4_8_BASE:1.7
+	OPENBSD_4_7:1.7.0.2
+	OPENBSD_4_7_BASE:1.7
+	OPENBSD_4_6:1.1.0.4
+	OPENBSD_4_6_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2010.12.30.23.16.18;	author nicm;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	2009.11.26.21.37.13;	author nicm;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2009.11.13.19.53.29;	author nicm;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2009.09.21.15.32.06;	author nicm;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2009.09.07.18.50.45;	author nicm;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2009.07.26.12.58.44;	author nicm;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.07.13.23.11.35;	author nicm;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.06.01.22.58.49;	author nicm;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@Change from a per-session stack of buffers to one global stack which is
+much more convenient and also simplifies lot of code. This renders
+copy-buffer useless and makes buffer-limit now a server option.
+
+By Tiago Cunha.
+@
+text
+@/* $OpenBSD: cmd-copy-buffer.c,v 1.7 2009/11/26 21:37:13 nicm Exp $ */
+
+/*
+ * Copyright (c) 2009 Tiago Cunha <me@@tiagocunha.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
+ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "tmux.h"
+
+/*
+ * Copies a session paste buffer to another session.
+ */
+
+int	cmd_copy_buffer_parse(struct cmd *, int, char **, char **);
+int	cmd_copy_buffer_exec(struct cmd *, struct cmd_ctx *);
+void	cmd_copy_buffer_free(struct cmd *);
+void	cmd_copy_buffer_init(struct cmd *, int);
+size_t	cmd_copy_buffer_print(struct cmd *, char *, size_t);
+
+struct cmd_copy_buffer_data {
+	char	*dst_session;
+	char	*src_session;
+	int	 dst_idx;
+	int	 src_idx;
+};
+
+const struct cmd_entry cmd_copy_buffer_entry = {
+	"copy-buffer", "copyb",
+	"[-a src-index] [-b dst-index] [-s src-session] [-t dst-session]",
+	0, "",
+	cmd_copy_buffer_init,
+	cmd_copy_buffer_parse,
+	cmd_copy_buffer_exec,
+	cmd_copy_buffer_free,
+	cmd_copy_buffer_print
+};
+
+/* ARGSUSED */
+void
+cmd_copy_buffer_init(struct cmd *self, unused int arg)
+{
+	struct cmd_copy_buffer_data	*data;
+
+	self->data = data = xmalloc(sizeof *data);
+	data->dst_session = NULL;
+	data->src_session = NULL;
+	data->dst_idx = -1;
+	data->src_idx = -1;
+}
+
+int
+cmd_copy_buffer_parse(struct cmd *self, int argc, char **argv, char **cause)
+{
+	struct cmd_copy_buffer_data	*data;
+	const char			*errstr;
+	int				 n, opt;
+
+	self->entry->init(self, KEYC_NONE);
+	data = self->data;
+
+	while ((opt = getopt(argc, argv, "a:b:s:t:")) != -1) {
+		switch (opt) {
+		case 'a':
+			if (data->src_idx == -1) {
+				n = strtonum(optarg, 0, INT_MAX, &errstr);
+				if (errstr != NULL) {
+					xasprintf(cause, "buffer %s", errstr);
+					goto error;
+				}
+				data->src_idx = n;
+			}
+			break;
+		case 'b':
+			if (data->dst_idx == -1) {
+				n = strtonum(optarg, 0, INT_MAX, &errstr);
+				if (errstr != NULL) {
+					xasprintf(cause, "buffer %s", errstr);
+					goto error;
+				}
+				data->dst_idx = n;
+			}
+			break;
+		case 's':
+			if (data->src_session == NULL)
+				data->src_session = xstrdup(optarg);
+			break;
+		case 't':
+			if (data->dst_session == NULL)
+				data->dst_session = xstrdup(optarg);
+			break;
+		default:
+			goto usage;
+		}
+	}
+	argc -= optind;
+	argv += optind;
+
+	return (0);
+
+usage:
+	xasprintf(cause, "usage: %s %s", self->entry->name, self->entry->usage);
+
+error:
+	self->entry->free(self);
+	return (-1);
+}
+
+int
+cmd_copy_buffer_exec(struct cmd *self, struct cmd_ctx *ctx)
+{
+	struct cmd_copy_buffer_data	*data = self->data;
+	struct paste_buffer		*pb;
+	struct paste_stack		*dst_ps, *src_ps;
+	u_char				*pdata;
+	struct session			*dst_session, *src_session;
+	u_int				 limit;
+
+	if ((dst_session = cmd_find_session(ctx, data->dst_session)) == NULL ||
+	    (src_session = cmd_find_session(ctx, data->src_session)) == NULL)
+	    	return (-1);
+	dst_ps = &dst_session->buffers;
+	src_ps = &src_session->buffers;
+
+	if (data->src_idx == -1) {
+		if ((pb = paste_get_top(src_ps)) == NULL) {
+			ctx->error(ctx, "no buffers");
+			return (-1);
+		}
+	} else {
+		if ((pb = paste_get_index(src_ps, data->src_idx)) == NULL) {
+		    	ctx->error(ctx, "no buffer %d", data->src_idx);
+		    	return (-1);
+		}
+	}
+	limit = options_get_number(&dst_session->options, "buffer-limit");
+
+	pdata = xmalloc(pb->size);
+	memcpy(pdata, pb->data, pb->size);
+
+	if (data->dst_idx == -1)
+		paste_add(dst_ps, pdata, pb->size, limit);
+	else if (paste_replace(dst_ps, data->dst_idx, pdata, pb->size) != 0) {
+		ctx->error(ctx, "no buffer %d", data->dst_idx);
+		xfree(pdata);
+		return (-1);
+	}
+
+	return (0);
+}
+
+void
+cmd_copy_buffer_free(struct cmd *self)
+{
+	struct cmd_copy_buffer_data	*data = self->data;
+
+	if (data->dst_session != NULL)
+		xfree(data->dst_session);
+	if (data->src_session != NULL)
+		xfree(data->src_session);
+	xfree(data);
+}
+
+size_t
+cmd_copy_buffer_print(struct cmd *self, char *buf, size_t len)
+{
+	struct cmd_copy_buffer_data	*data = self->data;
+	size_t				off = 0;
+
+	off += xsnprintf(buf, len, "%s", self->entry->name);
+	if (data == NULL)
+		return (off);
+	if (off < len && data->src_idx != -1) {
+		off += xsnprintf(buf + off, len - off, " -a %d",
+				 data->src_idx);
+	}
+	if (off < len && data->dst_idx != -1) {
+		off += xsnprintf(buf + off, len - off, " -b %d",
+				 data->dst_idx);
+	}
+	if (off < len && data->src_session != NULL) {
+		off += cmd_prarg(buf + off, len - off, " -s ",
+				 data->src_session);
+	}
+	if (off < len && data->dst_session != NULL) {
+		off += cmd_prarg(buf + off, len - off, " -t ",
+				 data->dst_session);
+	}
+	return (off);
+}
+@
+
+
+1.7
+log
+@Remove a couple of unused arguments where possible, and add /* ARGSUSED */ to
+the rest to reduce lint output.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cmd-copy-buffer.c,v 1.6 2009/11/13 19:53:29 nicm Exp $ */
+@
+
+
+1.6
+log
+@Get rid of the ugly CMD_CHFLAG macro and use a const string (eg "dDU") in the
+command entry structs and a couple of functions to check/set the flags.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cmd-copy-buffer.c,v 1.5 2009/09/21 15:32:06 nicm Exp $ */
+d54 1
+@
+
+
+1.5
+log
+@Use KEYC_NONE constant instead of 0 on init.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cmd-copy-buffer.c,v 1.4 2009/09/07 18:50:45 nicm Exp $ */
+d46 1
+a46 1
+	0, 0,
+@
+
+
+1.4
+log
+@Give each paste buffer a size member instead of requiring them to be
+zero-terminated.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cmd-copy-buffer.c,v 1.3 2009/07/26 12:58:44 nicm Exp $ */
+d73 1
+a73 1
+	self->entry->init(self, 0);
+@
+
+
+1.3
+log
+@Make all messages sent between the client and server fixed size.
+
+This is the first of two changes to make the protocol more resilient and less
+sensitive to other changes in the code, particularly with commands. The client
+now packs argv into a buffer and sends it to the server for parsing, rather
+than doing it itself and sending the parsed command data.
+
+As a side-effect this also removes a lot of now-unused command marshalling
+code.
+
+Mixing a server without this change and a client with or vice versa will cause
+tmux to hang or crash, please ensure that tmux is entirely killed before
+upgrading.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cmd-copy-buffer.c,v 1.2 2009/07/13 23:11:35 nicm Exp $ */
+d19 2
+d22 1
+d128 2
+d136 2
+d140 1
+a140 1
+		if ((pb = paste_get_top(&src_session->buffers)) == NULL) {
+d145 1
+a145 2
+		if ((pb = paste_get_index(&src_session->buffers,
+		    data->src_idx)) == NULL) {
+d150 4
+d155 3
+a157 7
+	limit = options_get_number(&dst_session->options, "buffer-limit");
+	if (data->dst_idx == -1) {
+		paste_add(&dst_session->buffers, xstrdup(pb->data), limit);
+		return (0);
+	}
+	if (paste_replace(&dst_session->buffers, data->dst_idx,
+	    xstrdup(pb->data)) != 0) {
+d159 1
+@
+
+
+1.2
+log
+@Having fixed flags for single-character getopt options is a bit hard to
+maintain and is only going to get worse as more are used. So instead, add a new
+uint64_t member to cmd_entry which is a bitmask of upper and lowercase options
+accepted by the command.
+
+This means new single character options can be used without the need to add it
+explicitly to the list.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cmd-copy-buffer.c,v 1.1 2009/06/01 22:58:49 nicm Exp $ */
+a28 2
+void	cmd_copy_buffer_send(struct cmd *, struct buffer *);
+void	cmd_copy_buffer_recv(struct cmd *, struct buffer *);
+a46 2
+	cmd_copy_buffer_send,
+	cmd_copy_buffer_recv,
+a156 21
+}
+
+void
+cmd_copy_buffer_send(struct cmd *self, struct buffer *b)
+{
+	struct cmd_copy_buffer_data	*data = self->data;
+
+	buffer_write(b, data, sizeof *data);
+	cmd_send_string(b, data->dst_session);
+	cmd_send_string(b, data->src_session);
+}
+
+void
+cmd_copy_buffer_recv(struct cmd *self, struct buffer *b)
+{
+	struct cmd_copy_buffer_data	*data;
+
+	self->data = data = xmalloc(sizeof *data);
+	buffer_read(b, data, sizeof *data);
+	data->dst_session = cmd_recv_string(b);
+	data->src_session = cmd_recv_string(b);
+@
+
+
+1.1
+log
+@Import tmux, a terminal multiplexor allowing (among other things) a single
+terminal to be switched between several different windows and programs
+displayed on one terminal be detached from one terminal and moved to another.
+
+ok deraadt pirofti
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD$ */
+d45 1
+a45 1
+	0,
+@
+

@@ -1,0 +1,272 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_6_0:1.4.0.4
+	OPENBSD_6_0_BASE:1.4
+	OPENBSD_5_9:1.4.0.2
+	OPENBSD_5_9_BASE:1.4
+	OPENBSD_5_8:1.3.0.14
+	OPENBSD_5_8_BASE:1.3
+	OPENBSD_5_7:1.3.0.6
+	OPENBSD_5_7_BASE:1.3
+	OPENBSD_5_6:1.3.0.10
+	OPENBSD_5_6_BASE:1.3
+	OPENBSD_5_5:1.3.0.8
+	OPENBSD_5_5_BASE:1.3
+	OPENBSD_5_4:1.3.0.4
+	OPENBSD_5_4_BASE:1.3
+	OPENBSD_5_3:1.3.0.2
+	OPENBSD_5_3_BASE:1.3;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2015.12.20.11.38.33;	author ratchov;	state Exp;
+branches;
+next	1.3;
+commitid	PJvo9au8yzagFJ6z;
+
+1.3
+date	2012.11.30.22.26.34;	author ratchov;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.11.30.20.30.24;	author ratchov;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.11.23.07.03.28;	author ratchov;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@In case of a bug in sndiod, an attacker (a local user) could run
+arbitrary code as user _sndio, i.e. get a second uid.
+
+Mitigate the risk by implementing initial privilege separation as
+follows. Break sndiod in two processes: a chroot()ed "worker" process
+processing input, and a non-chroot()ed "helper" process opening
+devices and passing descriptors to the worker.
+
+With help from benno, claudio, semarie and gilles.
+
+ok benno, semarie and tb
+@
+text
+@/*	$OpenBSD: miofile.c,v 1.3 2012/11/30 22:26:34 ratchov Exp $	*/
+/*
+ * Copyright (c) 2008-2012 Alexandre Ratchov <alex@@caoua.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/time.h>
+
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sndio.h>
+#include "defs.h"
+#include "fdpass.h"
+#include "file.h"
+#include "midi.h"
+#include "miofile.h"
+#include "utils.h"
+
+int  port_mio_pollfd(void *, struct pollfd *);
+int  port_mio_revents(void *, struct pollfd *);
+void port_mio_in(void *);
+void port_mio_out(void *);
+void port_mio_hup(void *);
+
+struct fileops port_mio_ops = {
+	"mio",
+	port_mio_pollfd,
+	port_mio_revents,
+	port_mio_in,
+	port_mio_out,
+	port_mio_hup
+};
+
+int
+port_mio_open(struct port *p)
+{
+	p->mio.hdl = fdpass_mio_open(p->num, p->midi->mode);
+	if (p->mio.hdl == NULL)
+		return 0;
+	p->mio.file = file_new(&port_mio_ops, p, p->path, mio_nfds(p->mio.hdl));
+	return 1;
+}
+
+void
+port_mio_close(struct port *p)
+{
+	file_del(p->mio.file);
+	mio_close(p->mio.hdl);
+}
+
+int
+port_mio_pollfd(void *addr, struct pollfd *pfd)
+{
+	struct port *p = addr;
+	struct midi *ep = p->midi;
+	int events = 0;
+
+	if (ep->mode & MODE_MIDIIN)
+		events |= POLLIN;
+	if ((ep->mode & MODE_MIDIOUT) && ep->obuf.used > 0)
+		events |= POLLOUT;
+	return mio_pollfd(p->mio.hdl, pfd, events);
+}
+
+int
+port_mio_revents(void *addr, struct pollfd *pfd)
+{
+	struct port *p = addr;
+
+	return mio_revents(p->mio.hdl, pfd);
+}
+
+void
+port_mio_in(void *arg)
+{
+	unsigned char data[MIDI_BUFSZ];
+	struct port *p = arg;
+	struct midi *ep = p->midi;
+	int n;
+
+	for (;;) {
+		n = mio_read(p->mio.hdl, data, MIDI_BUFSZ);
+		if (n == 0)
+			break;
+		midi_in(ep, data, n);
+	}
+}
+
+void
+port_mio_out(void *arg)
+{
+	struct port *p = arg;
+	struct midi *ep = p->midi;
+	unsigned char *data;
+	int n, count;
+
+	for (;;) {
+		data = abuf_rgetblk(&ep->obuf, &count);
+		if (count == 0)
+			break;
+		n = mio_write(p->mio.hdl, data, count);
+		if (n == 0)
+			break;
+		abuf_rdiscard(&ep->obuf, n);
+		if (n < count)
+			break;
+	}
+	if (p->state == PORT_DRAIN && ep->obuf.used == 0)
+		port_close(p);
+	midi_fill(ep);
+}
+
+void
+port_mio_hup(void *arg)
+{
+	struct port *p = arg;
+
+	port_close(p);
+}
+@
+
+
+1.3
+log
+@drain midi port output buffer before closing it ensuring the last
+few bytes are not lost
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: miofile.c,v 1.2 2012/11/30 20:30:24 ratchov Exp $	*/
+d27 1
+d51 1
+a51 1
+	p->mio.hdl = mio_open(p->path, p->midi->mode, 1);
+@
+
+
+1.2
+log
+@Process incoming MIDI data on the fly rather than using an
+input fifo; besides being simpler, this way there's no data
+to drain when a connection is dropped.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: miofile.c,v 1.1 2012/11/23 07:03:28 ratchov Exp $	*/
+d121 2
+@
+
+
+1.1
+log
+@Remplace aucat server by a new sndiod daemon aimed to be simpler
+smaller and faster than aucat. It's a drop in replacement with the
+following exceptions that don't affect the default setup:
+  - The sample rate and the encoding are a per-device parameters
+    thus -r and -e options must precede the corresponding -f option
+  - MIDI thru boxes are dynamically created and no -M option
+    is required anymore, so -M was removed.
+  - MIDI ports are exposed with a new ``midi/N'' name, rather
+    than abusing MIDI thru boxes.
+with help from armani@@, ok deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d71 1
+a71 1
+	if ((ep->mode & MODE_MIDIIN) && ep->ibuf.used < ep->ibuf.len)
+d89 1
+d92 1
+a92 2
+	unsigned char *data;
+	int n, count;
+d95 1
+a95 4
+		data = abuf_wgetblk(&ep->ibuf, &count);
+		if (count == 0)
+			break;
+		n = mio_read(p->mio.hdl, data, count);
+d98 1
+a98 4
+		abuf_wcommit(&ep->ibuf, n);
+		midi_in(ep);
+		if (n < count)
+			break;
+a119 1
+		midi_fill(ep);
+d121 1
+@
+

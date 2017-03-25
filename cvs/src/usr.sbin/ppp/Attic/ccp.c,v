@@ -1,0 +1,947 @@
+head	1.12;
+access;
+symbols
+	OPENBSD_2_3:1.11.0.2
+	OPENBSD_2_3_BASE:1.11
+	PPP1_5:1.1.1.1
+	BRIAN:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.12
+date	98.08.31.00.20.21;	author brian;	state dead;
+branches;
+next	1.11;
+
+1.11
+date	98.02.18.19.31.42;	author brian;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	98.01.21.02.13.29;	author brian;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	98.01.20.22.46.21;	author brian;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	98.01.10.01.55.13;	author brian;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	98.01.04.20.29.21;	author brian;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	97.12.24.09.30.23;	author brian;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	97.12.17.21.17.59;	author brian;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	97.12.15.22.44.50;	author brian;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	97.12.06.12.09.12;	author brian;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	97.12.06.12.08.55;	author brian;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.11.23.20.27.33;	author brian;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.11.23.20.27.33;	author brian;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.12
+log
+@Upgrade ppp to version 2.0
+
+This adds a number of features including:
+o Multilink
+o Callback (including CBCP)
+o DNS negotiation (client & server)
+o Easy to configure masquerading/packet aliasing
+o Any number of diagnostic socket connections (limits DOS attacks)
+o Sticky routes (ppp updates the routing table when the IP number is changed)
+
+See the file README.changes for things that effect current
+configurations.
+@
+text
+@/*
+ *	   PPP Compression Control Protocol (CCP) Module
+ *
+ *	    Written by Toshiharu OHNO (tony-o@@iij.ad.jp)
+ *
+ *   Copyright (C) 1994, Internet Initiative Japan, Inc. All rights reserverd.
+ *
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the Internet Initiative Japan, Inc.  The name of the
+ * IIJ may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * $Id: ccp.c,v 1.11 1998/02/18 19:31:42 brian Exp $
+ *
+ *	TODO:
+ *		o Support other compression protocols
+ */
+#include <sys/param.h>
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include "command.h"
+#include "mbuf.h"
+#include "log.h"
+#include "defs.h"
+#include "timer.h"
+#include "fsm.h"
+#include "lcpproto.h"
+#include "lcp.h"
+#include "ccp.h"
+#include "phase.h"
+#include "loadalias.h"
+#include "vars.h"
+#include "pred.h"
+#include "deflate.h"
+
+struct ccpstate CcpInfo = { -1, -1, -1, -1 };
+
+static void CcpSendConfigReq(struct fsm *);
+static void CcpSendTerminateReq(struct fsm *);
+static void CcpSendTerminateAck(struct fsm *);
+static void CcpDecodeConfig(u_char *, int, int);
+static void CcpLayerStart(struct fsm *);
+static void CcpLayerFinish(struct fsm *);
+static void CcpLayerUp(struct fsm *);
+static void CcpLayerDown(struct fsm *);
+static void CcpInitRestartCounter(struct fsm *);
+
+struct fsm CcpFsm = {
+  "CCP",
+  PROTO_CCP,
+  CCP_MAXCODE,
+  0,
+  ST_INITIAL,
+  0, 0, 0,
+  {0, 0, 0, NULL, NULL, NULL},	/* FSM timer */
+  {0, 0, 0, NULL, NULL, NULL},	/* Open timer */
+  {0, 0, 0, NULL, NULL, NULL},	/* Stopped timer */
+  LogCCP,
+
+  CcpLayerUp,
+  CcpLayerDown,
+  CcpLayerStart,
+  CcpLayerFinish,
+  CcpInitRestartCounter,
+  CcpSendConfigReq,
+  CcpSendTerminateReq,
+  CcpSendTerminateAck,
+  CcpDecodeConfig,
+};
+
+static char const *cftypes[] = {
+  /* Check out the latest ``Compression Control Protocol'' rfc (rfc1962.txt) */
+  "OUI",		/* 0: OUI */
+  "PRED1",		/* 1: Predictor type 1 */
+  "PRED2",		/* 2: Predictor type 2 */
+  "PUDDLE",		/* 3: Puddle Jumber */
+  "???", "???", "???", "???", "???", "???",
+  "???", "???", "???", "???", "???", "???",
+  "HWPPC",		/* 16: Hewlett-Packard PPC */
+  "STAC",		/* 17: Stac Electronics LZS (rfc1974) */
+  "MSPPC",		/* 18: Microsoft PPC */
+  "GAND",		/* 19: Gandalf FZA (rfc1993) */
+  "V42BIS",		/* 20: ARG->DATA.42bis compression */
+  "BSD",		/* 21: BSD LZW Compress */
+  "???",
+  "LZS-DCP",		/* 23: LZS-DCP Compression Protocol (rfc1967) */
+  "MAGNALINK/DEFLATE",	/* 24: Magnalink Variable Resource (rfc1975) */
+			/* 24: Deflate (according to pppd-2.3.1) */
+  "DCE",		/* 25: Data Circuit-Terminating Equip (rfc1976) */
+  "DEFLATE",		/* 26: Deflate (rfc1979) */
+};
+
+#define NCFTYPES (sizeof cftypes/sizeof cftypes[0])
+
+static const char *
+protoname(int proto)
+{
+  if (proto < 0 || proto > NCFTYPES)
+    return "none";
+  return cftypes[proto];
+}
+
+/* We support these algorithms, and Req them in the given order */
+static const struct ccp_algorithm *algorithm[] = {
+  &DeflateAlgorithm,
+  &Pred1Algorithm,
+  &PppdDeflateAlgorithm
+};
+
+static int in_algorithm = -1;
+static int out_algorithm = -1;
+#define NALGORITHMS (sizeof algorithm/sizeof algorithm[0])
+
+int
+ReportCcpStatus(struct cmdargs const *arg)
+{
+  if (VarTerm) {
+    fprintf(VarTerm, "%s [%s]\n", CcpFsm.name, StateNames[CcpFsm.state]);
+    fprintf(VarTerm, "My protocol = %s, His protocol = %s\n",
+            protoname(CcpInfo.my_proto), protoname(CcpInfo.his_proto));
+    fprintf(VarTerm, "Output: %ld --> %ld,  Input: %ld --> %ld\n",
+            CcpInfo.uncompout, CcpInfo.compout,
+            CcpInfo.compin, CcpInfo.uncompin);
+  }
+  return 0;
+}
+
+static void
+ccpstateInit(void)
+{
+  if (CcpInfo.in_init)
+    (*algorithm[in_algorithm]->i.Term)();
+  if (CcpInfo.out_init)
+    (*algorithm[out_algorithm]->o.Term)();
+  in_algorithm = -1;
+  out_algorithm = -1;
+  memset(&CcpInfo, '\0', sizeof CcpInfo);
+  CcpInfo.his_proto = CcpInfo.my_proto = -1;
+  CcpInfo.reset_sent = CcpInfo.last_reset = -1;
+}
+
+void
+CcpInit()
+{
+  FsmInit(&CcpFsm);
+  ccpstateInit();
+  CcpFsm.maxconfig = 10;
+}
+
+static void
+CcpInitRestartCounter(struct fsm *fp)
+{
+  fp->FsmTimer.load = VarRetryTimeout * SECTICKS;
+  fp->restart = 5;
+}
+
+static void
+CcpSendConfigReq(struct fsm *fp)
+{
+  u_char *cp;
+  int f;
+
+  LogPrintf(LogCCP, "CcpSendConfigReq\n");
+  cp = ReqBuff;
+  CcpInfo.my_proto = -1;
+  out_algorithm = -1;
+  for (f = 0; f < NALGORITHMS; f++)
+    if (Enabled(algorithm[f]->Conf) && !REJECTED(&CcpInfo, algorithm[f]->id)) {
+      struct lcp_opt o;
+
+      (*algorithm[f]->o.Get)(&o);
+      cp += LcpPutConf(LogCCP, cp, &o, cftypes[o.id],
+                       (*algorithm[f]->Disp)(&o));
+      CcpInfo.my_proto = o.id;
+      out_algorithm = f;
+    }
+  FsmOutput(fp, CODE_CONFIGREQ, fp->reqid++, ReqBuff, cp - ReqBuff);
+}
+
+void
+CcpSendResetReq(struct fsm *fp)
+{
+  LogPrintf(LogCCP, "SendResetReq(%d)\n", fp->reqid);
+  CcpInfo.reset_sent = fp->reqid;
+  CcpInfo.last_reset = -1;
+  FsmOutput(fp, CODE_RESETREQ, fp->reqid, NULL, 0);
+}
+
+static void
+CcpSendTerminateReq(struct fsm *fp)
+{
+  /* XXX: No code yet */
+}
+
+static void
+CcpSendTerminateAck(struct fsm *fp)
+{
+  LogPrintf(LogCCP, "CcpSendTerminateAck\n");
+  FsmOutput(fp, CODE_TERMACK, fp->reqid++, NULL, 0);
+}
+
+void
+CcpRecvResetReq(struct fsm *fp)
+{
+  if (out_algorithm >= 0 && out_algorithm < NALGORITHMS)
+    (*algorithm[out_algorithm]->o.Reset)();
+}
+
+static void
+CcpLayerStart(struct fsm *fp)
+{
+  LogPrintf(LogCCP, "CcpLayerStart.\n");
+}
+
+static void
+CcpLayerFinish(struct fsm *fp)
+{
+  LogPrintf(LogCCP, "CcpLayerFinish.\n");
+  ccpstateInit();
+}
+
+static void
+CcpLayerDown(struct fsm *fp)
+{
+  LogPrintf(LogCCP, "CcpLayerDown.\n");
+  ccpstateInit();
+}
+
+/*
+ *  Called when CCP has reached the OPEN state
+ */
+static void
+CcpLayerUp(struct fsm *fp)
+{
+  LogPrintf(LogCCP, "CcpLayerUp(%d).\n", fp->state);
+  LogPrintf(LogCCP, "Out = %s[%d], In = %s[%d]\n",
+            protoname(CcpInfo.my_proto), CcpInfo.my_proto,
+            protoname(CcpInfo.his_proto), CcpInfo.his_proto);
+  if (!CcpInfo.in_init && in_algorithm >= 0 && in_algorithm < NALGORITHMS) {
+    (*algorithm[in_algorithm]->i.Init)();
+    CcpInfo.in_init = 1;
+  }
+  if (!CcpInfo.out_init && out_algorithm >= 0 && out_algorithm < NALGORITHMS) {
+    (*algorithm[out_algorithm]->o.Init)();
+    CcpInfo.out_init = 1;
+  }
+}
+
+void
+CcpUp()
+{
+  FsmUp(&CcpFsm);
+  LogPrintf(LogCCP, "CCP Up event!!\n");
+}
+
+void
+CcpOpen()
+{
+  int f;
+
+  for (f = 0; f < NALGORITHMS; f++)
+    if (Enabled(algorithm[f]->Conf)) {
+      CcpFsm.open_mode = 0;
+      FsmOpen(&CcpFsm);
+      break;
+    }
+
+  if (f == NALGORITHMS)
+    for (f = 0; f < NALGORITHMS; f++)
+      if (Acceptable(algorithm[f]->Conf)) {
+        CcpFsm.open_mode = OPEN_PASSIVE;
+        FsmOpen(&CcpFsm);
+        break;
+      }
+}
+
+static void
+CcpDecodeConfig(u_char *cp, int plen, int mode_type)
+{
+  int type, length;
+  int f;
+
+  ackp = AckBuff;
+  nakp = NakBuff;
+  rejp = RejBuff;
+
+  while (plen >= sizeof(struct fsmconfig)) {
+    type = *cp;
+    length = cp[1];
+    if (type < NCFTYPES)
+      LogPrintf(LogCCP, " %s[%d]\n", cftypes[type], length);
+    else
+      LogPrintf(LogCCP, " ???[%d]\n", length);
+
+    for (f = NALGORITHMS-1; f > -1; f--)
+      if (algorithm[f]->id == type)
+        break;
+
+    if (f == -1) {
+      /* Don't understand that :-( */
+      if (mode_type == MODE_REQ) {
+        CcpInfo.my_reject |= (1 << type);
+        memcpy(rejp, cp, length);
+        rejp += length;
+      }
+    } else {
+      struct lcp_opt o;
+
+      switch (mode_type) {
+      case MODE_REQ:
+	if (Acceptable(algorithm[f]->Conf) && in_algorithm == -1) {
+	  memcpy(&o, cp, length);
+          switch ((*algorithm[f]->i.Set)(&o)) {
+          case MODE_REJ:
+	    memcpy(rejp, &o, o.len);
+	    rejp += o.len;
+            break;
+          case MODE_NAK:
+	    memcpy(nakp, &o, o.len);
+	    nakp += o.len;
+            break;
+          case MODE_ACK:
+	    memcpy(ackp, cp, length);
+	    ackp += length;
+	    CcpInfo.his_proto = type;
+            in_algorithm = f;		/* This one'll do ! */
+            break;
+          }
+	} else {
+	  memcpy(rejp, cp, length);
+	  rejp += length;
+	}
+	break;
+      case MODE_NAK:
+	memcpy(&o, cp, length);
+        if ((*algorithm[f]->o.Set)(&o) == MODE_ACK)
+          CcpInfo.my_proto = algorithm[f]->id;
+        else {
+	  CcpInfo.his_reject |= (1 << type);
+	  CcpInfo.my_proto = -1;
+        }
+        break;
+      case MODE_REJ:
+	CcpInfo.his_reject |= (1 << type);
+	CcpInfo.my_proto = -1;
+	break;
+      }
+    }
+
+    plen -= length;
+    cp += length;
+  }
+
+  if (rejp != RejBuff) {
+    ackp = AckBuff;	/* let's not send both ! */
+    CcpInfo.his_proto = -1;
+    in_algorithm = -1;
+  }
+}
+
+void
+CcpInput(struct mbuf *bp)
+{
+  if (phase == PHASE_NETWORK)
+    FsmInput(&CcpFsm, bp);
+  else {
+    if (phase > PHASE_NETWORK)
+      LogPrintf(LogCCP, "Error: Unexpected CCP in phase %d\n", phase);
+    pfree(bp);
+  }
+}
+
+void
+CcpResetInput(u_char id)
+{
+  if (CcpInfo.reset_sent != -1) {
+    if (id != CcpInfo.reset_sent) {
+      LogPrintf(LogWARN, "CCP: Incorrect ResetAck (id %d, not %d) ignored\n",
+                id, CcpInfo.reset_sent);
+      return;
+    }
+    /* Whaddaya know - a correct reset ack */
+  } else if (id == CcpInfo.last_reset)
+    LogPrintf(LogCCP, "Duplicate ResetAck (resetting again)\n");
+  else {
+    LogPrintf(LogWARN, "CCP: Unexpected ResetAck (id %d) ignored\n", id);
+    return;
+  }
+
+  CcpInfo.last_reset = CcpInfo.reset_sent;
+  CcpInfo.reset_sent = -1;
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS)
+    (*algorithm[in_algorithm]->i.Reset)();
+}
+
+int
+CcpOutput(int pri, u_short proto, struct mbuf *m)
+{
+  if (out_algorithm >= 0 && out_algorithm < NALGORITHMS)
+    return (*algorithm[out_algorithm]->o.Write)(pri, proto, m);
+  return 0;
+}
+
+struct mbuf *
+CompdInput(u_short *proto, struct mbuf *m)
+{
+  if (CcpInfo.reset_sent != -1) {
+    /* Send another REQ and put the packet in the bit bucket */
+    LogPrintf(LogCCP, "ReSendResetReq(%d)\n", CcpInfo.reset_sent);
+    FsmOutput(&CcpFsm, CODE_RESETREQ, CcpInfo.reset_sent, NULL, 0);
+  } else if (in_algorithm >= 0 && in_algorithm < NALGORITHMS)
+    return (*algorithm[in_algorithm]->i.Read)(proto, m);
+  pfree(m);
+  return NULL;
+}
+
+void
+CcpDictSetup(u_short proto, struct mbuf *m)
+{
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS)
+    (*algorithm[in_algorithm]->i.DictSetup)(proto, m);
+}
+@
+
+
+1.11
+log
+@Don't leak memory when the peer sends PROTO_COMPD packets
+without negotiating compression first.
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.10 1998/01/21 02:13:29 brian Exp $
+@
+
+
+1.10
+log
+@Remove unused #includes.
+Make various bits static.
+Remove unused variables.
+Submitted by: eivind
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.9 1998/01/20 22:46:21 brian Exp $
+a420 1
+    pfree(m);
+d423 1
+@
+
+
+1.9
+log
+@Allow an optional delay when specifying "set openmode active".
+The delay defaults to 1 sec (as it always has) unless we've done
+a ~p in interactive mode or we've actually detected a HDLC frame.
+This is now cleanly implemented (via async timers) so that it is
+possible for LCP to come up despite the delay if an LCP REQ is
+received.
+
+This will hopefully solve situations with slow servers or slirp
+scenarios (where ECHO is left on the port for a second or so before
+the peer enters packet mode).
+
+Also, ~p in interactive mode no longer changes the value of the default
+openmode delay and -dedicated mode enters packet mode in the right state
+according to the value of openmode.
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.8 1998/01/10 01:55:13 brian Exp $
+a64 1
+  0,
+@
+
+
+1.8
+log
+@Implement Reset{Req,Ack} properly, as per rfc 1962.
+(I completely mis-read the rfc last time 'round!)
+
+This means:
+  o Better CCP/WARN Reset diagnostics.
+  o After we've sent a REQ and before we've received an ACK, we drop
+    incoming compressed data and send another REQ.
+  o Before sending an ACK, re-sequence all pending PRI_NORMAL data in
+    the modem queue so that pending packets won't get to the peer
+    *after* the ResetAck.
+  o Send ACKs with the `identifier' from the REQ frame.
+  o After we've received a correct ACK, duplicate ACKs are ok (and will
+    reset our history).
+  o Incorrect ACKs (not matching the last REQ) are moaned about and dropped.
+
+Also,
+
+  o Calculate the correct FCS after compressing a packet.  DEFLATE
+    *may* produce an mbuf with more than a single link in the chain,
+    but HdlcOutput didn't know how to calculate the FCS :-(
+  o Make `struct fsm'::reqid a u_char, not an int.
+    This fix will prevent us from sending id `255' 2,000,000,000 times
+    before wrapping to `0' for another 2,000,000,000 sends :-/
+  o Bump the version number a little (it should already have been at 1.6).
+
+The end result:  DEFLATE now works over an unreliable link layer.
+                 I can txfr a 1.5Mb kernel over a (rather bad) null-modem
+                 cable at an average of 21679 bytes per second using rcp.
+Repeat after me: Don't test compression using a loopback ppp/tcp setup as
+                 we never lose packets and therefore never have to reset!
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.7 1998/01/04 20:29:21 brian Exp $
+d62 1
+a62 1
+  OPEN_ACTIVE,
+d66 3
+a68 2
+  {0, 0, 0, NULL, NULL, NULL},
+  {0, 0, 0, NULL, NULL, NULL},
+d274 1
+a274 1
+      CcpFsm.open_mode = OPEN_ACTIVE;
+@
+
+
+1.7
+log
+@Initialize CcpInfo protocols to -1 (none, not OUI).
+Don't Call Term() for an algorithm that hasn't been Init()d.
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.6 1997/12/24 09:30:23 brian Exp $
+d46 1
+a46 1
+struct ccpstate CcpInfo = { -1, -1 };
+d149 1
+d193 3
+a195 1
+  LogPrintf(LogCCP, "CcpSendResetReq\n");
+d384 1
+a384 1
+CcpResetInput()
+d386 16
+d417 6
+a422 1
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS)
+@
+
+
+1.6
+log
+@Cosmetic (style):
+  sizeof(var) -> sizeof var
+  sizeof type -> sizeof(type)
+
+Suggested by: J Wunsch <j@@uriah.heep.sax.de>
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.5 1997/12/17 21:17:59 brian Exp $
+d46 1
+a46 1
+struct ccpstate CcpInfo;
+d141 6
+a148 8
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS) {
+    (*algorithm[in_algorithm]->i.Term)();
+    in_algorithm = -1;
+  }
+  if (out_algorithm >= 0 && out_algorithm < NALGORITHMS) {
+    (*algorithm[out_algorithm]->o.Term)();
+    out_algorithm = -1;
+  }
+d246 1
+a246 1
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS)
+d248 3
+a250 1
+  if (out_algorithm >= 0 && out_algorithm < NALGORITHMS)
+d252 2
+@
+
+
+1.5
+log
+@Remove useless comparison.
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.4 1997/12/15 22:44:50 brian Exp $
+d103 1
+a103 1
+#define NCFTYPES (sizeof(cftypes)/sizeof(char *))
+d122 1
+a122 1
+#define NALGORITHMS (sizeof(algorithm)/sizeof(algorithm[0]))
+d141 1
+a141 1
+  memset(&CcpInfo, '\0', sizeof(struct ccpstate));
+@
+
+
+1.4
+log
+@Allow random IP number allocation to peer.
+Validate the peers suggested IP by attempting to make a routing table
+entry.
+Give up IPCP negotiation if the peer NAKs us with an unusable IP.
+Always SIOCDIFADDR then SIOCAIFADDR when configuring the tun device.
+Using SIOCSIFDSTADDR allows duplicate dst addresses (which we don't
+want)!!!
+Allow up to 200 interface names (was 50) (now that ppp can play server
+properly).
+
+Cosmetic:
+  Log unexpected CCP packets in the CCP log rather than the ERROR log.
+  Log unexpected Config Reqs in the appropriate LCP/IPCP/CCP log rather
+  than the ERROR log.
+  Log failed route additions and deletions with WARN, not TCPIP.
+  Log the option id and length for unrecognised IPCP options.
+  Change some .Sq to .Ar in the man page.
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.3 1997/12/06 12:09:12 brian Exp $
+a292 2
+    if (plen < 0)
+      break;
+@
+
+
+1.3
+log
+@Initialize ccpstate when CCP comes down.
+Remove extraneous pointers.
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.2 1997/12/06 12:08:55 brian Exp $
+d375 1
+a375 1
+      LogPrintf(LogERROR, "Unexpected CCP in phase %d\n", phase);
+@
+
+
+1.2
+log
+@Add DEFLATE capabilities (rfc1979).
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.1.1.1 1997/11/23 20:27:33 brian Exp $
+a126 3
+  struct ccpstate *icp = &CcpInfo;
+  struct fsm *fp = &CcpFsm;
+
+d128 1
+a128 1
+    fprintf(VarTerm, "%s [%s]\n", fp->name, StateNames[fp->state]);
+d130 1
+a130 1
+            protoname(icp->my_proto), protoname(icp->his_proto));
+d132 2
+a133 1
+            icp->uncompout, icp->compout, icp->compin, icp->uncompin);
+d138 2
+a139 2
+void
+CcpInit()
+d141 2
+a142 5
+  struct ccpstate *icp = &CcpInfo;
+
+  FsmInit(&CcpFsm);
+  memset(icp, '\0', sizeof(struct ccpstate));
+  icp->his_proto = icp->my_proto = -1;
+d151 7
+a171 1
+  struct ccpstate *icp = &CcpInfo;
+d179 1
+a179 1
+    if (Enabled(algorithm[f]->Conf) && !REJECTED(icp, algorithm[f]->id)) {
+d228 1
+a228 8
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS) {
+    (*algorithm[in_algorithm]->i.Term)();
+    in_algorithm = -1;
+  }
+  if (out_algorithm >= 0 && out_algorithm < NALGORITHMS) {
+    (*algorithm[out_algorithm]->o.Term)();
+    out_algorithm = -1;
+  }
+d235 1
+a235 8
+  if (in_algorithm >= 0 && in_algorithm < NALGORITHMS) {
+    (*algorithm[in_algorithm]->i.Term)();
+    in_algorithm = -1;
+  }
+  if (out_algorithm >= 0 && out_algorithm < NALGORITHMS) {
+    (*algorithm[out_algorithm]->o.Term)();
+    out_algorithm = -1;
+  }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d20 1
+a20 1
+ * $Id: ccp.c,v 1.20 1997/11/22 03:37:25 brian Exp $
+d44 1
+a57 2
+#define	REJECTED(p, x)	(p->his_reject & (1<<x))
+
+d83 18
+a100 12
+   "OUI",	/* 0: OUI */
+   "PRED1",	/* 1: Predictor type 1 */
+   "PRED2",	/* 2: Predictor type 2 */
+   "PUDDLE",	/* 3: Puddle Jumber */
+   "???", "???", "???", "???", "???", "???",
+   "???", "???", "???", "???", "???", "???",
+   "HWPPC",	/* 16: Hewlett-Packard PPC */
+   "STAC",	/* 17: Stac Electronics LZS */
+   "MSPPC",	/* 18: Microsoft PPC */
+   "GAND",	/* 19: Gandalf FZA */
+   "V42BIS",	/* 20: ARG->DATA.42bis compression */
+   "BSD",	/* BSD LZW Compress */
+d105 19
+d132 4
+a135 4
+    fprintf(VarTerm, "myproto = %s, hisproto = %s\n",
+	    cftypes[icp->want_proto], cftypes[icp->his_proto]);
+    fprintf(VarTerm, "Input: %ld --> %ld,  Output: %ld --> %ld\n",
+	    icp->orgin, icp->compin, icp->orgout, icp->compout);
+d147 9
+a155 2
+  if (Enabled(ConfPred1))
+    icp->want_proto = TY_PRED1;
+d171 1
+d173 1
+d175 12
+a186 5
+  LogPrintf(LogCCP, "CcpSendConfigReq\n");
+  if (icp->want_proto && !REJECTED(icp, TY_PRED1)) {
+    *cp++ = TY_PRED1;
+    *cp++ = 2;
+  }
+d213 2
+a214 1
+  Pred1Init(2);			/* Initialize Output part */
+d227 8
+d241 8
+d252 1
+a252 1
+ *  Called when CCP has reached to OPEN state
+d258 7
+a264 3
+  LogPrintf(LogCCP, "myproto = %d, hisproto = %d\n",
+	    CcpInfo.want_proto, CcpInfo.his_proto);
+  Pred1Init(3);			/* Initialize Input and Output */
+d277 16
+a292 2
+  if (Enabled(ConfPred1))
+    FsmOpen(&CcpFsm);
+d299 1
+a299 1
+  char tbuff[100];
+d311 1
+a311 1
+      snprintf(tbuff, sizeof(tbuff), " %s[%d] ", cftypes[type], length);
+d313 1
+a313 1
+      snprintf(tbuff, sizeof(tbuff), " ");
+d315 13
+a327 1
+    LogPrintf(LogCCP, "%s\n", tbuff);
+a328 2
+    switch (type) {
+    case TY_PRED1:
+d331 18
+a348 4
+	if (Acceptable(ConfPred1)) {
+	  memcpy(ackp, cp, length);
+	  ackp += length;
+	  CcpInfo.his_proto = type;
+d355 8
+d365 1
+a365 1
+	CcpInfo.want_proto = 0;
+a367 7
+      break;
+    case TY_BSD:
+    default:
+      CcpInfo.my_reject |= (1 << type);
+      memcpy(rejp, cp, length);
+      rejp += length;
+      break;
+d369 1
+d373 6
+d391 30
+@
+
+
+1.1.1.1
+log
+@Import version 1.5 of ppp.
+
+<sales>
+This is a user-level ppp implementation that uses the
+tun driver.  It was originally created by a Japanese
+ISP.  It's now piled with features.  Check the man pages
+for details.
+</sales>
+
+The sources are identical to the ones in FreeBSD, except
+for the Makefile.
+
+IP aliasing (NAT) is disabled, and can be enabled by simply
+doing a ``make install'' of libalias, then rebuilding
+ppp.  I'll create libalias as a port soon.
+@
+text
+@@

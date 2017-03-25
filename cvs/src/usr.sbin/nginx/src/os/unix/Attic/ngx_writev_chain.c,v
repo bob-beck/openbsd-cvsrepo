@@ -1,0 +1,311 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_6:1.3.0.12
+	OPENBSD_5_6_BASE:1.3
+	OPENBSD_5_5:1.3.0.10
+	OPENBSD_5_5_BASE:1.3
+	OPENBSD_5_4:1.3.0.6
+	OPENBSD_5_4_BASE:1.3
+	OPENBSD_5_3:1.3.0.4
+	OPENBSD_5_3_BASE:1.3
+	OPENBSD_5_2:1.3.0.2
+	OPENBSD_5_2_BASE:1.3
+	NGINX_1_0_14:1.1.1.2
+	NGINX:1.1.1
+	OPENBSD_5_1_BASE:1.1.1.1
+	OPENBSD_5_1:1.1.1.1.0.2
+	nginx_1_0_6:1.1.1.1
+	nginx:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2014.08.26.19.35.34;	author robert;	state dead;
+branches;
+next	1.3;
+commitid	sO1mMs3aGJWmnMM1;
+
+1.3
+date	2012.05.13.09.14.58;	author robert;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.02.18.11.20.22;	author robert;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.09.22.23.32.24;	author robert;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.09.22.23.32.24;	author robert;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2012.03.15.16.48.18;	author sthen;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@remove nginx from the base system in favor of OpenBSD's own httpd(8)
+@
+text
+@
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
+ */
+
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+
+
+#if (IOV_MAX > 64)
+#define NGX_IOVS  64
+#else
+#define NGX_IOVS  IOV_MAX
+#endif
+
+
+ngx_chain_t *
+ngx_writev_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
+{
+    u_char        *prev;
+    ssize_t        n, size, sent;
+    off_t          send, prev_send;
+    ngx_uint_t     eintr, complete;
+    ngx_err_t      err;
+    ngx_array_t    vec;
+    ngx_chain_t   *cl;
+    ngx_event_t   *wev;
+    struct iovec  *iov, iovs[NGX_IOVS];
+
+    wev = c->write;
+
+    if (!wev->ready) {
+        return in;
+    }
+
+#if (NGX_HAVE_KQUEUE)
+
+    if ((ngx_event_flags & NGX_USE_KQUEUE_EVENT) && wev->pending_eof) {
+        (void) ngx_connection_error(c, wev->kq_errno,
+                               "kevent() reported about an closed connection");
+        wev->error = 1;
+        return NGX_CHAIN_ERROR;
+    }
+
+#endif
+
+    /* the maximum limit size is the maximum size_t value - the page size */
+
+    if (limit == 0 || limit > (off_t) (NGX_MAX_SIZE_T_VALUE - ngx_pagesize)) {
+        limit = NGX_MAX_SIZE_T_VALUE - ngx_pagesize;
+    }
+
+    send = 0;
+
+    vec.elts = iovs;
+    vec.size = sizeof(struct iovec);
+    vec.nalloc = NGX_IOVS;
+    vec.pool = c->pool;
+
+    for ( ;; ) {
+        prev = NULL;
+        iov = NULL;
+        eintr = 0;
+        complete = 0;
+        prev_send = send;
+
+        vec.nelts = 0;
+
+        /* create the iovec and coalesce the neighbouring bufs */
+
+        for (cl = in; cl && send < limit; cl = cl->next) {
+
+            if (ngx_buf_special(cl->buf)) {
+                continue;
+            }
+
+#if 1
+            if (!ngx_buf_in_memory(cl->buf)) {
+                ngx_debug_point();
+            }
+#endif
+
+            size = cl->buf->last - cl->buf->pos;
+
+            if (send + size > limit) {
+                size = (ssize_t) (limit - send);
+            }
+
+            if (prev == cl->buf->pos) {
+                iov->iov_len += size;
+
+            } else {
+                if (vec.nelts >= IOV_MAX) {
+                    break;
+                }
+
+                iov = ngx_array_push(&vec);
+                if (iov == NULL) {
+                    return NGX_CHAIN_ERROR;
+                }
+
+                iov->iov_base = (void *) cl->buf->pos;
+                iov->iov_len = size;
+            }
+
+            prev = cl->buf->pos + size;
+            send += size;
+        }
+
+        n = writev(c->fd, vec.elts, vec.nelts);
+
+        if (n == -1) {
+            err = ngx_errno;
+
+            switch (err) {
+            case NGX_EAGAIN:
+                break;
+
+            case NGX_EINTR:
+                eintr = 1;
+                break;
+
+            default:
+                wev->error = 1;
+                (void) ngx_connection_error(c, err, "writev() failed");
+                return NGX_CHAIN_ERROR;
+            }
+
+            ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, err,
+                           "writev() not ready");
+        }
+
+        sent = n > 0 ? n : 0;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0, "writev: %z", sent);
+
+        if (send - prev_send == sent) {
+            complete = 1;
+        }
+
+        c->sent += sent;
+
+        for (cl = in; cl; cl = cl->next) {
+
+            if (ngx_buf_special(cl->buf)) {
+                continue;
+            }
+
+            if (sent == 0) {
+                break;
+            }
+
+            size = cl->buf->last - cl->buf->pos;
+
+            if (sent >= size) {
+                sent -= size;
+                cl->buf->pos = cl->buf->last;
+
+                continue;
+            }
+
+            cl->buf->pos += sent;
+
+            break;
+        }
+
+        if (eintr) {
+            continue;
+        }
+
+        if (!complete) {
+            wev->ready = 0;
+            return cl;
+        }
+
+        if (send >= limit || cl == NULL) {
+            return cl;
+        }
+
+        in = cl;
+    }
+}
+@
+
+
+1.3
+log
+@update to nginx-1.2.0
+@
+text
+@@
+
+
+1.2
+log
+@update to 1.0.12
+@
+text
+@a56 1
+    complete = 0;
+d67 1
+d74 2
+a75 2
+        for (cl = in; cl && vec.nelts < IOV_MAX && send < limit; cl = cl->next)
+        {
+d96 4
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d4 1
+@
+
+
+1.1.1.1
+log
+@import of nginx 1.0.6 with a bundled libpcre needed for pcre to work
+properly.
+this is not yet linked to the build but we would like to work on it
+in tree to provide an apache replacement for base
+@
+text
+@@
+
+
+1.1.1.2
+log
+@update to nginx 1.0.14
+
+SECURITY fix: contents of previously freed memory might be sent
+to a client if backend returned specially crafted response.
+
+ok robert@@
+@
+text
+@a3 1
+ * Copyright (C) Nginx, Inc.
+@
+

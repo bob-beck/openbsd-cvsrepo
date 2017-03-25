@@ -1,0 +1,780 @@
+head	1.13;
+access;
+symbols
+	OPENBSD_5_2:1.4.0.2
+	OPENBSD_5_2_BASE:1.4
+	OPENBSD_5_1_BASE:1.1
+	OPENBSD_5_1:1.1.0.2;
+locks; strict;
+comment	@ * @;
+
+
+1.13
+date	2013.01.26.09.42.46;	author gilles;	state dead;
+branches;
+next	1.12;
+
+1.12
+date	2012.11.12.14.58.53;	author eric;	state Exp;
+branches;
+next	1.11;
+
+1.11
+date	2012.10.14.11.58.23;	author gilles;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2012.09.27.17.58.56;	author chl;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2012.09.21.16.40.20;	author eric;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2012.09.21.10.22.29;	author eric;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2012.09.19.12.59.59;	author eric;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2012.09.19.12.45.04;	author eric;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2012.09.19.09.06.35;	author eric;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2012.05.29.19.53.10;	author gilles;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.05.13.00.10.49;	author gilles;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.05.12.15.29.16;	author gilles;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.12.13.23.00.52;	author eric;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.13
+log
+@these are no longer used, maps were replaced with something better
+@
+text
+@/*	$OpenBSD: map_db.c,v 1.12 2012/11/12 14:58:53 eric Exp $	*/
+
+/*
+ * Copyright (c) 2011 Gilles Chehade <gilles@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/tree.h>
+#include <sys/param.h>
+#include <sys/socket.h>
+
+#include <db.h>
+#include <ctype.h>
+#include <err.h>
+#include <event.h>
+#include <fcntl.h>
+#include <imsg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "smtpd.h"
+#include "log.h"
+
+
+/* db(3) backend */
+static void *map_db_open(struct map *);
+static void *map_db_lookup(void *, const char *, enum map_kind);
+static int   map_db_compare(void *, const char *, enum map_kind,
+    int (*)(const char *, const char *));
+static void  map_db_close(void *);
+
+static char *map_db_get_entry(void *, const char *, size_t *);
+static void *map_db_credentials(const char *, char *, size_t);
+static void *map_db_alias(const char *, char *, size_t);
+static void *map_db_virtual(const char *, char *, size_t);
+static void *map_db_netaddr(const char *, char *, size_t);
+
+
+struct map_backend map_backend_db = {
+	map_db_open,
+	NULL,
+	map_db_close,
+	map_db_lookup,
+	map_db_compare
+};
+
+
+static void *
+map_db_open(struct map *map)
+{
+	return dbopen(map->m_config, O_RDONLY, 0600, DB_HASH, NULL);
+}
+
+static void
+map_db_close(void *hdl)
+{
+	DB *db = hdl;
+
+	db->close(db);
+}
+
+static void *
+map_db_lookup(void *hdl, const char *key, enum map_kind kind)
+{
+	char *line;
+	size_t len;
+	void *ret;
+
+	line = map_db_get_entry(hdl, key, &len);
+	if (line == NULL)
+		return NULL;
+
+	ret = 0;
+	switch (kind) {
+	case K_ALIAS:
+		ret = map_db_alias(key, line, len);
+		break;
+
+	case K_CREDENTIALS:
+		ret = map_db_credentials(key, line, len);
+		break;
+
+	case K_VIRTUAL:
+		ret = map_db_virtual(key, line, len);
+		break;
+
+	case K_NETADDR:
+		ret = map_db_netaddr(key, line, len);
+		break;
+
+	default:
+		break;
+	}
+
+	free(line);
+
+	return ret;
+}
+
+static int
+map_db_compare(void *hdl, const char *key, enum map_kind kind,
+    int (*func)(const char *, const char *))
+{
+	int ret = 0;
+	DB *db = hdl;
+	DBT dbk;
+	DBT dbd;
+	int r;
+	char *buf = NULL;
+
+	for (r = db->seq(db, &dbk, &dbd, R_FIRST); !r;
+	     r = db->seq(db, &dbk, &dbd, R_NEXT)) {
+		buf = xmemdup(dbk.data, dbk.size + 1, "map_db_compare");
+		log_debug("debug: key: %s, buf: %s", key, buf);
+		if (func(key, buf))
+			ret = 1;
+		free(buf);
+		if (ret)
+			break;
+	}
+	return ret;
+}
+
+static char *
+map_db_get_entry(void *hdl, const char *key, size_t *len)
+{
+	int ret;
+	DBT dbk;
+	DBT dbv;
+	DB *db = hdl;
+	char pkey[MAX_LINE_SIZE];
+
+	/* workaround the stupidity of the DB interface */
+	if (strlcpy(pkey, key, sizeof pkey) >= sizeof pkey)
+		errx(1, "map_db_get_entry: key too long");
+	dbk.data = pkey;
+	dbk.size = strlen(pkey) + 1;
+
+	if ((ret = db->get(db, &dbk, &dbv, 0)) != 0)
+		return NULL;
+
+	*len = dbv.size;
+
+	return xmemdup(dbv.data, dbv.size, "map_db_get_entry");
+}
+
+static void *
+map_db_credentials(const char *key, char *line, size_t len)
+{
+	struct map_credentials *map_credentials = NULL;
+	char *p;
+
+	/* credentials are stored as user:password */
+	if (len < 3)
+		return NULL;
+
+	/* too big to fit in a smtp session line */
+	if (len >= MAX_LINE_SIZE)
+		return NULL;
+
+	p = strchr(line, ':');
+	if (p == NULL)
+		return NULL;
+
+	if (p == line || p == line + len - 1)
+		return NULL;
+	*p++ = '\0';
+
+	map_credentials = xcalloc(1, sizeof *map_credentials,
+	    "map_db_credentials");
+
+	if (strlcpy(map_credentials->username, line,
+		sizeof(map_credentials->username)) >=
+	    sizeof(map_credentials->username))
+		goto err;
+
+	if (strlcpy(map_credentials->password, p,
+		sizeof(map_credentials->password)) >=
+	    sizeof(map_credentials->password))
+		goto err;
+
+	return map_credentials;
+
+err:
+	free(map_credentials);
+	return NULL;
+}
+
+static void *
+map_db_alias(const char *key, char *line, size_t len)
+{
+	char	       	*subrcpt;
+	char	       	*endp;
+	struct map_alias	*map_alias = NULL;
+	struct expandnode	 xn;
+
+	map_alias = xcalloc(1, sizeof *map_alias, "map_db_alias");
+
+	while ((subrcpt = strsep(&line, ",")) != NULL) {
+		/* subrcpt: strip initial whitespace. */
+		while (isspace((int)*subrcpt))
+			++subrcpt;
+		if (*subrcpt == '\0')
+			goto error;
+
+		/* subrcpt: strip trailing whitespace. */
+		endp = subrcpt + strlen(subrcpt) - 1;
+		while (subrcpt < endp && isspace((int)*endp))
+			*endp-- = '\0';
+
+		if (! alias_parse(&xn, subrcpt))
+			goto error;
+
+		expand_insert(&map_alias->expand, &xn);
+		map_alias->nbnodes++;
+	}
+
+	return map_alias;
+
+error:
+	expand_free(&map_alias->expand);
+	free(map_alias);
+	return NULL;
+}
+
+static void *
+map_db_virtual(const char *key, char *line, size_t len)
+{
+	char	       	*subrcpt;
+	char	       	*endp;
+	struct map_virtual	*map_virtual = NULL;
+	struct expandnode	 xn;
+
+	map_virtual = xcalloc(1, sizeof *map_virtual, "map_db_virtual");
+
+	/* domain key, discard value */
+	if (strchr(key, '@@') == NULL)
+		return map_virtual;
+
+	while ((subrcpt = strsep(&line, ",")) != NULL) {
+		/* subrcpt: strip initial whitespace. */
+		while (isspace((int)*subrcpt))
+			++subrcpt;
+		if (*subrcpt == '\0')
+			goto error;
+
+		/* subrcpt: strip trailing whitespace. */
+		endp = subrcpt + strlen(subrcpt) - 1;
+		while (subrcpt < endp && isspace((int)*endp))
+			*endp-- = '\0';
+
+		if (! alias_parse(&xn, subrcpt))
+			goto error;
+
+		expand_insert(&map_virtual->expand, &xn);
+		map_virtual->nbnodes++;
+	}
+
+	return map_virtual;
+
+error:
+	expand_free(&map_virtual->expand);
+	free(map_virtual);
+	return NULL;
+}
+
+
+static void *
+map_db_netaddr(const char *key, char *line, size_t len)
+{
+	struct map_netaddr	*map_netaddr = NULL;
+
+	map_netaddr = xcalloc(1, sizeof *map_netaddr, "map_db_netaddr");
+
+	if (! text_to_netaddr(&map_netaddr->netaddr, line))
+	    goto error;
+
+	return map_netaddr;
+
+error:
+	free(map_netaddr);
+	return NULL;
+}
+@
+
+
+1.12
+log
+@Cleanups and improvements:
+
+* Log more events (especially client session) and use a better scheme
+  for that: each messages is prefixed with a token to easily identify
+  its class:
+    - info/warn/debug: general server messages
+    - smtp-in: smtp client connections
+    - relay: status update for relayed messages
+    - delivery: status update for local deliveries
+
+* Implement "smtpctl monitor" to display updates of selected internal
+  counters.
+
+* When reloading the on-disk queue at startup do not commit a message
+  if no envelope was submitted for that message.
+
+* Remove unused stuff in the config parser.
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.11 2012/10/14 11:58:23 gilles Exp $	*/
+@
+
+
+1.11
+log
+@introduce map_file.c which will deprecate map_stdio.c
+
+The idea is to have a file-backed map but to have smtpd(8) cache the maps
+so that it cannot be partially read if edited while mail is received. The
+file is read and converted to a static map (map_static.c), changes aren't
+visible to smtpd until an explicit: smtpctl update map  which reads file,
+builds a new static map and invalidates the former.
+
+partial-read issue discussed with beck@@ and halex@@
+idea to convert internally to a static map by eric@@
+
+diff ok eric@@ and chl@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.10 2012/09/27 17:58:56 chl Exp $	*/
+d128 1
+a128 1
+		log_debug("key: %s, buf: %s", key, buf);
+@
+
+
+1.10
+log
+@simplify calloc() + strlcpy()/memcpy() dance with xmemdup()
+use xcalloc() helper
+remove newly unused variable
+
+ok gilles@@ eric@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.9 2012/09/21 16:40:20 eric Exp $	*/
+d55 1
+@
+
+
+1.9
+log
+@wrap expandtree into a "struct expand".
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.8 2012/09/21 10:22:29 eric Exp $	*/
+d126 1
+a126 4
+		buf = calloc(dbk.size+1, 1);
+		if (buf == NULL)
+			fatalx("calloc");
+		strlcpy(buf, dbk.data, dbk.size+1);
+a143 1
+	char *result = NULL;
+a154 5
+	result = calloc(dbv.size, 1);
+	if (result == NULL)
+		fatal("calloc");
+	(void)strlcpy(result, dbv.data, dbv.size);
+
+d157 1
+a157 1
+	return result;
+d182 2
+a183 3
+	map_credentials = calloc(1, sizeof(struct map_credentials));
+	if (map_credentials == NULL)
+		fatalx("calloc");
+d210 1
+a210 3
+	map_alias = calloc(1, sizeof(struct map_alias));
+	if (map_alias == NULL)
+		fatalx("calloc");
+d247 1
+a247 3
+	map_virtual = calloc(1, sizeof(struct map_virtual));
+	if (map_virtual == NULL)
+		fatalx("calloc");
+d286 1
+a286 3
+	map_netaddr = calloc(1, sizeof(struct map_netaddr));
+	if (map_netaddr == NULL)
+		fatalx("calloc");
+@
+
+
+1.8
+log
+@Move ruleset_match() prototype to smtpd.h and make the envelope const.
+Adapt a lot of functions in chain to use const args where required.
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.7 2012/09/19 12:59:59 eric Exp $	*/
+d239 1
+a239 1
+		expand_insert(&map_alias->expandtree, &xn);
+d246 1
+a246 2
+	/* free elements in map_alias->expandtree */
+	expand_free(&map_alias->expandtree);
+d282 1
+a282 1
+		expand_insert(&map_virtual->expandtree, &xn);
+d289 1
+a289 2
+	/* free elements in map_virtual->expandtree */
+	expand_free(&map_virtual->expandtree);
+@
+
+
+1.7
+log
+@expandnodes must be bzero()'d before parsing to be sure there is no bogus
+data left on return, since the RB compare functions uses memcmp().  While
+there, remove all calls to bzero() before alias_parse().
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.6 2012/09/19 12:45:04 eric Exp $	*/
+d41 3
+a43 3
+static void *map_db_lookup(void *, char *, enum map_kind);
+static int   map_db_compare(void *, char *, enum map_kind,
+    int (*)(char *, char *));
+d46 5
+a50 5
+static char *map_db_get_entry(void *, char *, size_t *);
+static void *map_db_credentials(char *, char *, size_t);
+static void *map_db_alias(char *, char *, size_t);
+static void *map_db_virtual(char *, char *, size_t);
+static void *map_db_netaddr(char *, char *, size_t);
+d76 1
+a76 1
+map_db_lookup(void *hdl, char *key, enum map_kind kind)
+d114 2
+a115 2
+map_db_compare(void *hdl, char *key, enum map_kind kind,
+    int (*func)(char *, char *))
+d141 1
+a141 1
+map_db_get_entry(void *hdl, char *key, size_t *len)
+d148 1
+d150 5
+a154 2
+	dbk.data = key;
+	dbk.size = strlen(dbk.data) + 1;
+d170 1
+a170 1
+map_db_credentials(char *key, char *line, size_t len)
+d213 1
+a213 1
+map_db_alias(char *key, char *line, size_t len)
+d253 1
+a253 1
+map_db_virtual(char *key, char *line, size_t len)
+d298 1
+a298 1
+map_db_netaddr(char *key, char *line, size_t len)
+@
+
+
+1.6
+log
+@rename variables for consistency
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.5 2012/09/19 09:06:35 eric Exp $	*/
+a231 1
+		bzero(&xn, sizeof (struct expandnode));
+a275 1
+		bzero(&xn, sizeof (struct expandnode));
+@
+
+
+1.5
+log
+@start cleaning the expansion code:
+
+- change expandtree_* prefix to expand_ for better readability and
+  because the structure might change at some point
+- rename <>_free_nodes() to <>_free()
+- remove unused <>_remove_node()
+- refcounting has no purpose at all; just remove it as well as the
+  decrement/increment functions, and replace the latter with <>_insert
+- expandnode flags is only used to know if it's been processed or not,
+  don't make it a flag but a simple field with clear name.
+
+ok gilles@@ chl@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.4 2012/05/29 19:53:10 gilles Exp $	*/
+d214 1
+a214 1
+	struct expandnode	 expnode;
+d232 2
+a233 2
+		bzero(&expnode, sizeof (struct expandnode));
+		if (! alias_parse(&expnode, subrcpt))
+d236 1
+a236 1
+		expand_insert(&map_alias->expandtree, &expnode);
+d255 1
+a255 1
+	struct expandnode	 expnode;
+d277 2
+a278 2
+		bzero(&expnode, sizeof (struct expandnode));
+		if (! alias_parse(&expnode, subrcpt))
+d281 1
+a281 1
+		expand_insert(&map_virtual->expandtree, &expnode);
+@
+
+
+1.4
+log
+@- introduce map_static.c as a backend to static maps in parse.y, this has
+  the benefit that we no longer have two code paths whenever we deal with
+  maps, we can always use the backend mechanism.
+
+I have not plugged this in yet, I'll do it in a later commit, just get it
+out of my sandbox
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.3 2012/05/13 00:10:49 gilles Exp $	*/
+d236 1
+a236 1
+		expandtree_increment_node(&map_alias->expandtree, &expnode);
+d244 1
+a244 1
+	expandtree_free_nodes(&map_alias->expandtree);
+d281 1
+a281 1
+		expandtree_increment_node(&map_virtual->expandtree, &expnode);
+d289 1
+a289 1
+	expandtree_free_nodes(&map_virtual->expandtree);
+@
+
+
+1.3
+log
+@- cleanup parse.y by removing lots of code that should not have been there,
+  but in ruleset.c and util.c instead.
+
+- introduce the new map_compare() map API call to allow iterating over keys
+  and comparing them with provided key using provided function. this allows
+  checking a partial key in a key set, very useful for comparing an address
+  to a set of netmask.
+
+- introduce new map kind K_NETADDR
+- implement K_NETADDR for map_db and map_stdio
+- teach ruleset checking how to use the map_compare() with K_NETADDR
+
+we can now do the following:
+
+   map "srcaddr" source plain "/etc/mail/srcaddr.txt"
+
+   accept from map srcaddr for domain "openbsd.org" [...]
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.2 2012/05/12 15:29:16 gilles Exp $	*/
+d40 1
+a40 1
+static void *map_db_open(char *);
+d62 1
+a62 1
+map_db_open(char *src)
+d64 1
+a64 1
+	return dbopen(src, O_RDONLY, 0600, DB_HASH, NULL);
+@
+
+
+1.2
+log
+@- rename all occurences of K_SECRET to K_CREDENTIALS
+- rename all occurences of struct map_secret to map_credentials
+- do not fatal if the credentials map has disappeared, instead make the
+  auth fail with a lookup failure. the mail will be temporary failed so
+  it stays in queue until admin fixes smtpd.conf, removes mail, or lets
+  it expires
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_db.c,v 1.1 2011/12/13 23:00:52 eric Exp $	*/
+d42 2
+d50 1
+d56 2
+a57 1
+	map_db_lookup
+d100 4
+d113 26
+d291 20
+@
+
+
+1.1
+log
+@rename files for consistency.
+
+ok gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: map_backend_db.c,v 1.1 2011/05/21 18:43:08 gilles Exp $	*/
+d45 1
+a45 1
+static void *map_db_secret(char *, char *, size_t);
+d88 2
+a89 2
+	case K_SECRET:
+		ret = map_db_secret(key, line, len);
+d132 1
+a132 1
+map_db_secret(char *key, char *line, size_t len)
+d134 1
+a134 1
+	struct map_secret *map_secret = NULL;
+d153 2
+a154 2
+	map_secret = calloc(1, sizeof(struct map_secret));
+	if (map_secret == NULL)
+d157 3
+a159 3
+	if (strlcpy(map_secret->username, line,
+		sizeof(map_secret->username)) >=
+	    sizeof(map_secret->username))
+d162 3
+a164 3
+	if (strlcpy(map_secret->password, p,
+		sizeof(map_secret->password)) >=
+	    sizeof(map_secret->password))
+d167 1
+a167 1
+	return map_secret;
+d170 1
+a170 1
+	free(map_secret);
+@
+

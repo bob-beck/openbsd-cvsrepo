@@ -1,0 +1,1000 @@
+head	1.16;
+access;
+symbols
+	OPENBSD_6_0:1.12.0.2
+	OPENBSD_6_0_BASE:1.12
+	OPENBSD_5_9:1.11.0.2
+	OPENBSD_5_9_BASE:1.11
+	OPENBSD_5_8:1.5.0.4
+	OPENBSD_5_8_BASE:1.5;
+locks; strict;
+comment	@ * @;
+
+
+1.16
+date	2017.01.10.17.16.39;	author reyk;	state Exp;
+branches;
+next	1.15;
+commitid	P8LvESj9qwBhTMCf;
+
+1.15
+date	2016.12.06.10.38.08;	author reyk;	state Exp;
+branches;
+next	1.14;
+commitid	O3CdJo7bLGWiO18v;
+
+1.14
+date	2016.10.27.16.17.43;	author reyk;	state Exp;
+branches;
+next	1.13;
+commitid	VJXy6cr7QEiJ2DIz;
+
+1.13
+date	2016.09.21.16.00.01;	author reyk;	state Exp;
+branches;
+next	1.12;
+commitid	QmCH68iJbhxY7aBJ;
+
+1.12
+date	2016.06.06.17.17.54;	author mikeb;	state Exp;
+branches;
+next	1.11;
+commitid	0WLroaAFB64UlKZN;
+
+1.11
+date	2016.01.27.09.04.19;	author reyk;	state Exp;
+branches;
+next	1.10;
+commitid	xjeRSSQ0SXSd3nFz;
+
+1.10
+date	2015.12.12.12.47.49;	author reyk;	state Exp;
+branches;
+next	1.9;
+commitid	HuODwNgBiXhEggLU;
+
+1.9
+date	2015.12.12.12.33.49;	author reyk;	state Exp;
+branches;
+next	1.8;
+commitid	BGb3xaQZJ9ACCtNF;
+
+1.8
+date	2015.11.16.10.16.07;	author dlg;	state Exp;
+branches;
+next	1.7;
+commitid	RsyvSVWqUpVjDzV5;
+
+1.7
+date	2015.11.13.22.41.34;	author deraadt;	state Exp;
+branches;
+next	1.6;
+commitid	zHaq7oHN3k9oCpGu;
+
+1.6
+date	2015.11.13.07.52.20;	author mlarkin;	state Exp;
+branches;
+next	1.5;
+commitid	KdsjYlqLpqhwOUHf;
+
+1.5
+date	2015.07.29.17.08.46;	author mikeb;	state Exp;
+branches;
+next	1.4;
+commitid	TDnomBAdbdDE3Q0B;
+
+1.4
+date	2015.07.28.09.48.52;	author reyk;	state Exp;
+branches;
+next	1.3;
+commitid	DsGre19herlItbcd;
+
+1.3
+date	2015.07.23.12.08.42;	author reyk;	state Exp;
+branches;
+next	1.2;
+commitid	zfD59P8hohVRmERs;
+
+1.2
+date	2015.07.21.17.59.58;	author reyk;	state Exp;
+branches;
+next	1.1;
+commitid	M3PVBA9XssLCo5BI;
+
+1.1
+date	2015.07.21.03.38.22;	author reyk;	state Exp;
+branches;
+next	;
+commitid	t8p39jbat5DBrbFu;
+
+
+desc
+@@
+
+
+1.16
+log
+@Introduce pvbus_reboot() and pvbus_shutdown() to move the repeated
+tasks from the PV drivers into a central place.  While here, we
+figured out that it is not needed to check for allowpowerdown on the
+hypervisor-initiated shutdown requests.
+
+OK mikeb@@
+@
+text
+@/*	$OpenBSD: pvbus.c,v 1.15 2016/12/06 10:38:08 reyk Exp $	*/
+
+/*
+ * Copyright (c) 2015 Reyk Floeter <reyk@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#if !defined(__i386__) && !defined(__amd64__)
+#error pvbus(4) is currently only supported on i386 and amd64
+#endif
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/malloc.h>
+#include <sys/timeout.h>
+#include <sys/signalvar.h>
+#include <sys/syslog.h>
+#include <sys/proc.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/fcntl.h>
+
+#include <machine/specialreg.h>
+#include <machine/cpu.h>
+#include <machine/conf.h>
+#include <machine/bus.h>
+#include <machine/vmmvar.h>
+
+#include <dev/rndvar.h>
+
+#include <dev/pv/pvvar.h>
+#include <dev/pv/pvreg.h>
+
+#include "vmt.h"
+
+int has_hv_cpuid = 0;
+
+extern char *hw_vendor;
+extern void rdrand(void *);
+
+int	 pvbus_activate(struct device *, int);
+int	 pvbus_match(struct device *, void *, void *);
+void	 pvbus_attach(struct device *, struct device *, void *);
+int	 pvbus_print(void *, const char *);
+int	 pvbus_search(struct device *, void *, void *);
+
+void	 pvbus_kvm(struct pvbus_hv *);
+void	 pvbus_hyperv(struct pvbus_hv *);
+void	 pvbus_hyperv_print(struct pvbus_hv *);
+void	 pvbus_xen(struct pvbus_hv *);
+void	 pvbus_xen_print(struct pvbus_hv *);
+
+int	 pvbus_minor(struct pvbus_softc *, dev_t);
+int	 pvbusgetstr(size_t, const char *, char **);
+
+struct cfattach pvbus_ca = {
+	sizeof(struct pvbus_softc),
+	pvbus_match,
+	pvbus_attach,
+	NULL,
+	pvbus_activate
+};
+
+struct cfdriver pvbus_cd = {
+	NULL,
+	"pvbus",
+	DV_DULL
+};
+
+struct pvbus_type {
+	const char	*signature;
+	const char	*name;
+	void		(*init)(struct pvbus_hv *);
+	void		(*print)(struct pvbus_hv *);
+} pvbus_types[PVBUS_MAX] = {
+	{ "KVMKVMKVM\0\0\0",	"KVM",	pvbus_kvm },
+	{ "Microsoft Hv",	"Hyper-V", pvbus_hyperv, pvbus_hyperv_print },
+	{ "VMwareVMware",	"VMware" },
+	{ "XenVMMXenVMM",	"Xen",	pvbus_xen, pvbus_xen_print },
+	{ "bhyve bhyve ",	"bhyve" },
+	{ VMM_HV_SIGNATURE,	"OpenBSD" },
+};
+
+struct bus_dma_tag pvbus_dma_tag = {
+	NULL,
+	_bus_dmamap_create,
+	_bus_dmamap_destroy,
+	_bus_dmamap_load,
+	_bus_dmamap_load_mbuf,
+	_bus_dmamap_load_uio,
+	_bus_dmamap_load_raw,
+	_bus_dmamap_unload,
+	_bus_dmamap_sync,
+	_bus_dmamem_alloc,
+	_bus_dmamem_alloc_range,
+	_bus_dmamem_free,
+	_bus_dmamem_map,
+	_bus_dmamem_unmap,
+	_bus_dmamem_mmap,
+};
+
+struct pvbus_hv pvbus_hv[PVBUS_MAX];
+struct pvbus_softc *pvbus_softc;
+
+int
+pvbus_probe(void)
+{
+	/* Must be set in identcpu */
+	if (!has_hv_cpuid)
+		return (0);
+	return (1);
+}
+
+int
+pvbus_match(struct device *parent, void *match, void *aux)
+{
+	const char **busname = (const char **)aux;
+	return (strcmp(*busname, pvbus_cd.cd_name) == 0);
+}
+
+void
+pvbus_attach(struct device *parent, struct device *self, void *aux)
+{
+	struct pvbus_softc *sc = (struct pvbus_softc *)self;
+	int i, cnt;
+
+	sc->pvbus_hv = pvbus_hv;
+	pvbus_softc = sc;
+
+	printf(":");
+	for (i = 0, cnt = 0; i < PVBUS_MAX; i++) {
+		if (pvbus_hv[i].hv_base == 0)
+			continue;
+		if (cnt++)
+			printf(",");
+		printf(" %s", pvbus_types[i].name);
+		if (pvbus_types[i].print != NULL)
+			(pvbus_types[i].print)(&pvbus_hv[i]);
+	}
+
+	printf("\n");
+	config_search(pvbus_search, self, sc);
+}
+
+void
+pvbus_identify(void)
+{
+	struct pvbus_hv *hv;
+	uint32_t reg0, base;
+	union {
+		uint32_t	regs[3];
+		char		str[CPUID_HV_SIGNATURE_STRLEN];
+	} r;
+	int i, cnt;
+	const char *pv_name;
+
+	for (base = CPUID_HV_SIGNATURE_START, cnt = 0;
+	    base < CPUID_HV_SIGNATURE_END;
+	    base += CPUID_HV_SIGNATURE_STEP) {
+		CPUID(base, reg0, r.regs[0], r.regs[1], r.regs[2]);
+		for (i = 0; i < 4; i++) {
+			/*
+			 * Check if first 4 chars are printable ASCII as
+			 * minimal validity check
+			 */
+			if (r.str[i] < 32 || r.str[i] > 126)
+				goto out;
+		}
+
+		for (i = 0; i < PVBUS_MAX; i++) {
+			if (pvbus_types[i].signature == NULL ||
+			    memcmp(pvbus_types[i].signature, r.str,
+			    CPUID_HV_SIGNATURE_STRLEN) != 0)
+				continue;
+			hv = &pvbus_hv[i];
+			hv->hv_base = base;
+			if (pvbus_types[i].init != NULL)
+				(pvbus_types[i].init)(hv);
+			if (hw_vendor == NULL) {
+				pv_name = pvbus_types[i].name;
+
+				/*
+				 * Use the HV name as a fallback if we didn't
+				 * get the vendor name from the firmware/BIOS.
+				 */
+				if ((hw_vendor = malloc(strlen(pv_name) + 1,
+	                            M_DEVBUF, M_NOWAIT)) != NULL) {
+					strlcpy(hw_vendor, pv_name,
+					    strlen(pv_name) + 1);
+				}
+			}
+			cnt++;
+		}
+	}
+
+ out:
+	if (cnt)
+		has_hv_cpuid = 1;
+}
+
+int
+pvbus_activate(struct device *self, int act)
+{
+	int rv = 0;
+
+	switch (act) {
+	case DVACT_SUSPEND:
+		rv = config_activate_children(self, act);
+		break;
+	case DVACT_RESUME:
+		rv = config_activate_children(self, act);
+		break;
+	case DVACT_POWERDOWN:
+		rv = config_activate_children(self, act);
+		break;
+	default:
+		rv = config_activate_children(self, act);
+		break;
+	}
+
+	return (rv);
+}
+
+int
+pvbus_search(struct device *parent, void *arg, void *aux)
+{
+	struct pvbus_softc *sc = (struct pvbus_softc *)aux;
+	struct cfdata		*cf = arg;
+	struct pv_attach_args	 pva;
+
+	pva.pva_busname = cf->cf_driver->cd_name;
+	pva.pva_hv = sc->pvbus_hv;
+	pva.pva_dmat = &pvbus_dma_tag;
+
+	if (cf->cf_attach->ca_match(parent, cf, &pva) > 0)
+		config_attach(parent, cf, &pva, pvbus_print);
+
+	return (0);
+}
+
+int
+pvbus_print(void *aux, const char *pnp)
+{
+	struct pv_attach_args	*pva = aux;
+	if (pnp)
+		printf("%s at %s", pva->pva_busname, pnp);
+	return (UNCONF);
+}
+
+void
+pvbus_shutdown(struct device *dev)
+{
+	suspend_randomness();
+
+	log(LOG_KERN | LOG_NOTICE, "Shutting down in response to request"
+	    " from %s host\n", dev->dv_xname);
+	prsignal(initprocess, SIGUSR2);
+}
+
+void
+pvbus_reboot(struct device *dev)
+{
+	suspend_randomness();
+
+	log(LOG_KERN | LOG_NOTICE, "Rebooting in response to request"
+	    " from %s host\n", dev->dv_xname);
+	prsignal(initprocess, SIGINT);
+}
+
+void
+pvbus_kvm(struct pvbus_hv *hv)
+{
+	uint32_t regs[4];
+
+	CPUID(hv->hv_base + CPUID_OFFSET_KVM_FEATURES,
+	    regs[0], regs[1], regs[2], regs[3]);
+	hv->hv_features = regs[0];
+}
+
+void
+pvbus_hyperv(struct pvbus_hv *hv)
+{
+	uint32_t regs[4];
+
+	CPUID(hv->hv_base + CPUID_OFFSET_HYPERV_FEATURES,
+	    regs[0], regs[1], regs[2], regs[3]);
+	hv->hv_features = regs[0];
+
+	CPUID(hv->hv_base + CPUID_OFFSET_HYPERV_VERSION,
+	    regs[0], regs[1], regs[2], regs[3]);
+	hv->hv_major = (regs[1] & HYPERV_VERSION_EBX_MAJOR_M) >>
+	    HYPERV_VERSION_EBX_MAJOR_S;
+	hv->hv_minor = (regs[1] & HYPERV_VERSION_EBX_MINOR_M) >>
+	    HYPERV_VERSION_EBX_MINOR_S;
+}
+
+void
+pvbus_hyperv_print(struct pvbus_hv *hv)
+{
+	printf(" %u.%u", hv->hv_major, hv->hv_minor);
+}
+
+void
+pvbus_xen(struct pvbus_hv *hv)
+{
+	uint32_t regs[4];
+
+	CPUID(hv->hv_base + CPUID_OFFSET_XEN_VERSION,
+	    regs[0], regs[1], regs[2], regs[3]);
+	hv->hv_major = regs[0] >> XEN_VERSION_MAJOR_S;
+	hv->hv_minor = regs[0] & XEN_VERSION_MINOR_M;
+
+	/* x2apic is broken in Xen 4.2 or older */
+	if ((hv->hv_major < 4) ||
+	    (hv->hv_major == 4 && hv->hv_minor < 3)) {
+		/* Remove CPU flag for x2apic */
+		cpu_ecxfeature &= ~CPUIDECX_X2APIC;
+	}
+}
+
+void
+pvbus_xen_print(struct pvbus_hv *hv)
+{
+	printf(" %u.%u", hv->hv_major, hv->hv_minor);
+}
+
+int
+pvbus_minor(struct pvbus_softc *sc, dev_t dev)
+{
+	int hvid, cnt;
+	struct pvbus_hv *hv;
+
+	for (hvid = 0, cnt = 0; hvid < PVBUS_MAX; hvid++) {
+		hv = &sc->pvbus_hv[hvid];
+		if (hv->hv_base == 0)
+			continue;
+		if (minor(dev) == cnt++)
+			return (hvid);
+	}
+
+	return (-1);
+}
+
+int
+pvbusopen(dev_t dev, int flags, int mode, struct proc *p)
+{
+	if (pvbus_softc == NULL)
+		return (ENODEV);
+	if (pvbus_minor(pvbus_softc, dev) == -1)
+		return (ENXIO);
+	return (0);
+}
+
+int
+pvbusclose(dev_t dev, int flags, int mode, struct proc *p)
+{
+	if (pvbus_softc == NULL)
+		return (ENODEV);
+	if (pvbus_minor(pvbus_softc, dev) == -1)
+		return (ENXIO);
+	return (0);
+}
+
+int
+pvbusgetstr(size_t srclen, const char *src, char **dstp)
+{
+	int error = 0;
+	char *dst;
+
+	/*
+	 * Reject size that is too short or obviously too long:
+	 * - at least one byte for the nul terminator.
+	 * - PAGE_SIZE is an arbitrary value, but known pv backends seem
+	 *   to have a hard (PAGE_SIZE - x) limit in their messaging.
+	 */
+	if (srclen < 1)
+		return (EINVAL);
+	else if (srclen > PAGE_SIZE)
+		return (ENAMETOOLONG);
+
+	*dstp = dst = malloc(srclen + 1, M_TEMP|M_ZERO, M_WAITOK);
+	if (src != NULL) {
+		error = copyin(src, dst, srclen);
+		dst[srclen] = '\0';
+	}
+
+	return (error);
+}
+
+int
+pvbusioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
+{
+	struct pvbus_req *pvr = (struct pvbus_req *)data;
+	struct pvbus_softc *sc = pvbus_softc;
+	char *value = NULL, *key = NULL;
+	const char *str = NULL;
+	size_t valuelen = 0, keylen = 0, sz;
+	int hvid, error = 0, op;
+	struct pvbus_hv *hv;
+
+	if (sc == NULL)
+		return (ENODEV);
+	if ((hvid = pvbus_minor(sc, dev)) == -1)
+		return (ENXIO);
+
+	switch (cmd) {
+	case PVBUSIOC_KVWRITE:
+		if ((flags & FWRITE) == 0)
+			return (EPERM);
+	case PVBUSIOC_KVREAD:
+		hv = &sc->pvbus_hv[hvid];
+		if (hv->hv_base == 0 || hv->hv_kvop == NULL)
+			return (ENXIO);
+		break;
+	case PVBUSIOC_TYPE:
+		str = pvbus_types[hvid].name;
+		sz = strlen(str) + 1;
+		if (sz > pvr->pvr_keylen)
+			return (ENOMEM);
+		error = copyout(str, pvr->pvr_key, sz);
+		return (error);
+	default:
+		return (ENOTTY);
+	}
+
+	str = NULL;
+	op = PVBUS_KVREAD;
+
+	switch (cmd) {
+	case PVBUSIOC_KVWRITE:
+		str = pvr->pvr_value;
+		op = PVBUS_KVWRITE;
+
+		/* FALLTHROUGH */
+	case PVBUSIOC_KVREAD:
+		keylen = pvr->pvr_keylen;
+		if ((error = pvbusgetstr(keylen, pvr->pvr_key, &key)) != 0)
+			break;
+
+		valuelen = pvr->pvr_valuelen;
+		if ((error = pvbusgetstr(valuelen, str, &value)) != 0)
+			break;
+
+		/* Call driver-specific callback */
+		if ((error = (hv->hv_kvop)(hv->hv_arg, op,
+		    key, value, valuelen)) != 0)
+			break;
+
+		sz = strlen(value) + 1;
+		if ((error = copyout(value, pvr->pvr_value, sz)) != 0)
+			break;
+		break;
+	default:
+		error = ENOTTY;
+		break;
+	}
+
+	free(key, M_TEMP, keylen);
+	free(value, M_TEMP, valuelen);
+
+	return (error);
+}
+@
+
+
+1.15
+log
+@The kvop is not mandatory to query the type, fixes hostctl -t on vmm(4) VMs.
+
+OK mikeb@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.14 2016/10/27 16:17:43 reyk Exp $	*/
+d260 20
+@
+
+
+1.14
+log
+@vmm is also available on i386 now, so don't restrict it to amd64.
+
+OK mikeb@@ mlarkin@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.13 2016/09/21 16:00:01 reyk Exp $	*/
+d327 1
+a327 1
+		if (hv->hv_base == 0 || hv->hv_kvop == NULL)
+@
+
+
+1.13
+log
+@If not set, set hw_vendor to the name of the first pvbus.
+This sets hw.vendor to "OpenBSD" if running on vmm(4) because it
+doesn't provide an SMBIOS.
+
+OK mikeb@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.12 2016/06/06 17:17:54 mikeb Exp $	*/
+a38 1
+#ifdef __amd64__
+a39 1
+#endif
+a92 1
+#ifdef __amd64__
+a93 1
+#endif
+@
+
+
+1.12
+log
+@Provide a bus_dma tag as part of the pvbus attach arguments
+
+ok reyk (a while ago)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.11 2016/01/27 09:04:19 reyk Exp $	*/
+d52 1
+d171 1
+d195 13
+@
+
+
+1.11
+log
+@Add a key-value interface to pvbus(4) that allows to get or set values
+in the underlying information store of the host from the OpenBSD-VM's
+userspace.  OpenBSD did not provide access to these stores before,
+mostly because we did not want to add a custom tool and interface for
+each hypervisor.  The pvbus(4) interface provides backends for
+xen(4)'s XenStore and vmt(4)'s VMware Tools "guestinfo".  These
+information stores are fairly different, XenStore is a "filesystem"
+while vmt is a RPC, and the key-value abstraction limits them a bit
+but provides the most wanted functionality.
+
+Discussed with many
+OK mikeb@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.10 2015/12/12 12:47:49 reyk Exp $	*/
+d38 1
+d99 18
+d234 1
+@
+
+
+1.10
+log
+@x2APIC is currently enabled on HV guests only, not on bare metal, to
+speedup interrupt handling on virtual machines.  Unfortunately it is
+broken on Xen 4.2 or older, so use the early pvbus detection to drop
+the advertised x2APIC CPU feature.  Xen has fixed this in late 2013,
+but the problem still shows up in "the Cloud" (it doesn't seem to
+affect others as they either use legacy APIC or Xen IPIs).
+
+OK mlarkin@@ mikeb@@
+Cvs: ----------------------------------------------------------------------
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.9 2015/12/12 12:33:49 reyk Exp $	*/
+d32 2
+d37 1
+d65 3
+d99 1
+d124 1
+d286 137
+@
+
+
+1.9
+log
+@Identify hypervisors before configuring other children of the mainbus
+(bios, CPU, interrupt handlers, pvbus).  This splits the pvbus attach
+function into two parts: pvbus_identify() to scan the CPUID registers
+for supported hypervisors and pvbus_attach() to attach the bus, print
+information, and configure the children.
+
+This will be needed for Xen and KVM, as discussed with mikeb@@ and sf@@
+OK mlarkin@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.8 2015/11/16 10:16:07 dlg Exp $	*/
+d265 7
+@
+
+
+1.8
+log
+@pvbus_types isnt full on i386 cos the openbsd vmm entry is only set
+on amd64.  make sure the signature is not null before using it in
+pvbus_attach.
+
+fixes a panic on i386 under vmware.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.7 2015/11/13 22:41:34 deraadt Exp $	*/
+d34 1
+d56 5
+a60 3
+void	 pvbus_kvm(struct pvbus_softc *, struct pvbus_hv *);
+void	 pvbus_hyperv(struct pvbus_softc *, struct pvbus_hv *);
+void	 pvbus_xen(struct pvbus_softc *, struct pvbus_hv *);
+d79 2
+a80 1
+	void		(*init)(struct pvbus_softc *, struct pvbus_hv *);
+d82 5
+a86 5
+	{ "KVMKVMKVM\0\0\0",	"KVM",		pvbus_kvm },
+	{ "Microsoft Hv",	"Hyper-V",	pvbus_hyperv },
+	{ "VMwareVMware",	"VMware",	NULL },
+	{ "XenVMMXenVMM",	"Xen",		pvbus_xen },
+	{ "bhyve bhyve ",	"bhyve",	NULL },
+d88 1
+a88 1
+	{ VMM_HV_SIGNATURE,	"OpenBSD",	NULL },
+d92 2
+d114 22
+a143 2
+	printf(":");
+
+d162 1
+a162 1
+			hv = &sc->pvbus_hv[i];
+a163 4
+
+			if (cnt++)
+				printf(",");
+			printf(" %s", pvbus_types[i].name);
+d165 2
+a166 1
+				(pvbus_types[i].init)(sc, hv);
+d171 2
+a172 2
+	printf("\n");
+	config_search(pvbus_search, self, sc);
+d224 1
+a224 1
+pvbus_kvm(struct pvbus_softc *sc, struct pvbus_hv *hv)
+d234 1
+a234 1
+pvbus_hyperv(struct pvbus_softc *sc, struct pvbus_hv *hv)
+d244 5
+a248 1
+	hv->hv_version = regs[1];
+d250 4
+a253 6
+	printf(" %u.%u.%u",
+	    (regs[1] & HYPERV_VERSION_EBX_MAJOR_M) >>
+	    HYPERV_VERSION_EBX_MAJOR_S,
+	    (regs[1] & HYPERV_VERSION_EBX_MINOR_M) >>
+	    HYPERV_VERSION_EBX_MINOR_S,
+	    regs[0]);
+d257 1
+a257 1
+pvbus_xen(struct pvbus_softc *sc, struct pvbus_hv *hv)
+d263 3
+a265 1
+	hv->hv_version = regs[0];
+d267 4
+a270 2
+	printf(" %u.%u", regs[0] >> XEN_VERSION_MAJOR_S,
+	    regs[0] & XEN_VERSION_MINOR_M);
+@
+
+
+1.7
+log
+@vmm is i386 only for now
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.6 2015/11/13 07:52:20 mlarkin Exp $	*/
+d132 2
+a133 1
+			if (memcmp(pvbus_types[i].signature, r.str,
+@
+
+
+1.6
+log
+@
+vmm(4) kernel code
+
+circulated on hackers@@, no objections. Disabled by default.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.5 2015/07/29 17:08:46 mikeb Exp $	*/
+d34 1
+d36 1
+d83 1
+d85 1
+@
+
+
+1.5
+log
+@Determine and print Xen hypervisor version.
+
+ok reyk, with deraadt@@'s permission
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.4 2015/07/28 09:48:52 reyk Exp $	*/
+d34 1
+d80 2
+a81 1
+	{ "bhyve bhyve ",	"bhyve",	NULL }
+@
+
+
+1.4
+log
+@Add callbacks for supported hypervisors in pvbus(4) to print more
+information and for some generic CPUID/MSR-level initialization.  This
+changes the attach/match path a bit.
+
+Hypervisor informatiom may include a version number, for example:
+pvbus0 at mainbus0: Hyper-V 6.3.9600
+
+OK mlarkin@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.3 2015/07/23 12:08:42 reyk Exp $	*/
+d54 1
+d78 1
+a78 1
+	{ "XenVMMXenVMM",	"Xen",		NULL },
+d222 13
+@
+
+
+1.3
+log
+@Add the bhyve id to recognize if we're running under this hypervisor.
+
+OK mlarkin@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.2 2015/07/21 17:59:58 reyk Exp $	*/
+d52 3
+d72 7
+a78 8
+	unsigned int	 type;
+} pvbus_types[] = {
+	{ "KVMKVMKVM\0\0\0",	"KVM",		PVBUS_KVM },
+	{ "Microsoft Hv",	"Hyper-V",	PVBUS_HYPERV },
+	{ "VMwareVMware",	"VMware",	PVBUS_VMWARE },
+	{ "XenVMMXenVMM",	"Xen",		PVBUS_XEN },
+	{ "bhyve bhyve ",	"bhyve",	PVBUS_BHYVE },
+	{ NULL }
+d101 1
+d107 1
+a107 1
+	int i;
+d111 1
+a111 1
+	for (base = CPUID_HV_SIGNATURE_START;
+d124 1
+a124 1
+		for (i = 0; pvbus_types[i].signature != NULL; i++) {
+d128 2
+a129 1
+			sc->pvbus_types |= pvbus_types[i].type;
+d131 2
+d134 2
+a140 14
+
+#ifdef notyet
+	/* XXX get hypervisor-specific features */
+	if (sc->pvbus_types & PVBUS_KVM) {
+		kvm_cpuid_base = base;
+		CPUID(base + CPUID_OFFSET_KVM_FEATURES,
+		    reg0, r.regs[0], r.regs[1], r.regs[2]);
+		kvm_features = reg0;
+	}
+	if (sc->pvbus_types & PVBUS_HYPERV) {
+		/* XXX */
+	}
+#endif
+
+d175 1
+a175 1
+	pva.pva_types = sc->pvbus_types;
+d190 31
+@
+
+
+1.2
+log
+@Switch pvbus(4) to fully dynamic autoconf - drivers don't have to be
+listed in pvbus.c anymore and are defined by the config only.
+
+OK mlarkin@@ sf@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pvbus.c,v 1.1 2015/07/21 03:38:22 reyk Exp $	*/
+d75 1
+@
+
+
+1.1
+log
+@Add pvbus(4), a pseudo-bus to attach non-PCI paravirtual devices and buses.
+vmt(4) is moved from mainbus0 to pvbus0, more devices will follow.
+
+OK sf@@ deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d50 1
+a77 7
+struct pv_attach_args pvbus_devices[] = {
+#if NVMT > 0
+	{ "vmt",	PVBUS_VMWARE	},
+#endif
+	{ NULL }
+};
+
+a97 1
+	struct pv_attach_args *pva;
+d146 1
+a146 8
+	/* Attach drivers */
+	for (i = 0; pvbus_devices[i].pva_busname != NULL; i++) {
+		pva = &pvbus_devices[i];
+		pva->pva_types = sc->pvbus_types;
+		if (sc->pvbus_types & pva->pva_type)
+			config_found(self, &pva->pva_busname,
+			    pvbus_print);
+	}
+d170 16
+@
+

@@ -1,0 +1,668 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_6_0:1.2.0.2
+	OPENBSD_6_0_BASE:1.2;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2017.01.17.22.10.56;	author krw;	state Exp;
+branches;
+next	1.7;
+commitid	nf3UdaW8au6U0a03;
+
+1.7
+date	2017.01.09.14.49.22;	author reyk;	state Exp;
+branches;
+next	1.6;
+commitid	eA8b246voAapPTkX;
+
+1.6
+date	2017.01.09.14.04.31;	author krw;	state Exp;
+branches;
+next	1.5;
+commitid	KJkQGNLsnMxWc9MG;
+
+1.5
+date	2016.10.12.19.07.42;	author reyk;	state Exp;
+branches;
+next	1.4;
+commitid	3O0CWeyo2kl0zVpd;
+
+1.4
+date	2016.09.14.13.46.51;	author rzalamena;	state Exp;
+branches;
+next	1.3;
+commitid	JePtimnIRHuPUx14;
+
+1.3
+date	2016.08.08.16.49.17;	author rzalamena;	state Exp;
+branches;
+next	1.2;
+commitid	pzbawwV6nOXZbSkv;
+
+1.2
+date	2016.07.20.21.01.06;	author reyk;	state Exp;
+branches;
+next	1.1;
+commitid	Rumwj01zEH37kIh7;
+
+1.1
+date	2016.07.19.16.54.26;	author reyk;	state Exp;
+branches;
+next	;
+commitid	NvD0Bp0qm4zs28YJ;
+
+
+desc
+@@
+
+
+1.8
+log
+@Nuke some whitespace that keeps poking me in the eye as I try to
+steal code.
+@
+text
+@/*	$OpenBSD: control.c,v 1.7 2017/01/09 14:49:22 reyk Exp $	*/
+
+/*
+ * Copyright (c) 2010-2016 Reyk Floeter <reyk@@openbsd.org>
+ * Copyright (c) 2003, 2004 Henning Brauer <henning@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/queue.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/tree.h>
+
+#include <net/if.h>
+
+#include <errno.h>
+#include <event.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <imsg.h>
+
+#include "proc.h"
+#include "switchd.h"
+
+#define	CONTROL_BACKLOG	5
+
+struct ctl_connlist ctl_conns;
+
+void
+	 control_accept(int, short, void *);
+struct ctl_conn
+	*control_connbyfd(int);
+void	 control_close(int, struct control_sock *);
+void	 control_dispatch_imsg(int, short, void *);
+void	 control_imsg_forward(struct imsg *);
+void	 control_run(struct privsep *, struct privsep_proc *, void *);
+
+int	 control_dispatch_ofp(int, struct privsep_proc *, struct imsg *);
+
+static struct privsep_proc procs[] = {
+	{ "ofp",	PROC_OFP,	control_dispatch_ofp },
+	{ "parent",	PROC_PARENT,	NULL },
+	{ "ofcconn",	PROC_OFCCONN,	NULL }
+};
+
+void
+control(struct privsep *ps, struct privsep_proc *p)
+{
+	proc_run(ps, p, procs, nitems(procs), control_run, NULL);
+}
+
+void
+control_run(struct privsep *ps, struct privsep_proc *p, void *arg)
+{
+	/*
+	 * pledge in the control process:
+	 * stdio - for malloc and basic I/O including events.
+	 * cpath - for managing the control socket.
+	 * unix - for the control socket.
+	 * recvfd - for the proc fd exchange.
+	 */
+	if (pledge("stdio cpath unix recvfd", NULL) == -1)
+		fatal("pledge");
+}
+
+int
+control_dispatch_ofp(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	int		 cfd;
+	struct ctl_conn	*c;
+	uint8_t		*d = imsg->data;
+	size_t		 s;
+
+	switch (imsg->hdr.type) {
+	case IMSG_CTL_SWITCH:
+	case IMSG_CTL_MAC:
+		IMSG_SIZE_CHECK(imsg, &cfd);
+		memcpy(&cfd, d, sizeof(cfd));
+
+		if ((c = control_connbyfd(cfd)) == NULL)
+			fatalx("invalid control connection");
+
+		s = IMSG_DATA_SIZE(imsg) - sizeof(cfd);
+		d += sizeof(cfd);
+		imsg_compose_event(&c->iev, imsg->hdr.type, 0, 0, -1, d, s);
+		return (0);
+	case IMSG_CTL_END:
+		IMSG_SIZE_CHECK(imsg, &cfd);
+		memcpy(&cfd, d, sizeof(cfd));
+
+		if ((c = control_connbyfd(cfd)) == NULL)
+			fatalx("invalid control connection");
+
+		imsg_compose_event(&c->iev, IMSG_CTL_END, 0, 0, -1, NULL, 0);
+		return (0);
+
+	default:
+		break;
+	}
+
+	return (-1);
+}
+
+int
+control_init(struct privsep *ps, struct control_sock *cs)
+{
+	struct switchd		*env = ps->ps_env;
+	struct sockaddr_un	 sun;
+	int			 fd;
+	mode_t			 old_umask, mode;
+
+	if (cs->cs_name == NULL)
+		return (0);
+
+	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+		log_warn("%s: socket", __func__);
+		return (-1);
+	}
+
+	sun.sun_family = AF_UNIX;
+	if (strlcpy(sun.sun_path, cs->cs_name,
+	    sizeof(sun.sun_path)) >= sizeof(sun.sun_path)) {
+		log_warn("%s: %s name too long", __func__, cs->cs_name);
+		close(fd);
+		return (-1);
+	}
+
+	if (unlink(cs->cs_name) == -1)
+		if (errno != ENOENT) {
+			log_warn("%s: unlink %s", __func__, cs->cs_name);
+			close(fd);
+			return (-1);
+		}
+
+	if (cs->cs_restricted) {
+		old_umask = umask(S_IXUSR|S_IXGRP|S_IXOTH);
+		mode = S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH;
+	} else {
+		old_umask = umask(S_IXUSR|S_IXGRP|S_IWOTH|S_IROTH|S_IXOTH);
+		mode = S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP;
+	}
+
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
+		log_warn("%s: bind: %s", __func__, cs->cs_name);
+		close(fd);
+		(void)umask(old_umask);
+		return (-1);
+	}
+	(void)umask(old_umask);
+
+	if (chmod(cs->cs_name, mode) == -1) {
+		log_warn("%s: chmod", __func__);
+		close(fd);
+		(void)unlink(cs->cs_name);
+		return (-1);
+	}
+
+	socket_set_blockmode(fd, BM_NONBLOCK);
+	cs->cs_fd = fd;
+	cs->cs_env = env;
+
+	return (0);
+}
+
+int
+control_listen(struct control_sock *cs)
+{
+	if (cs->cs_name == NULL)
+		return (0);
+
+	if (listen(cs->cs_fd, CONTROL_BACKLOG) == -1) {
+		log_warn("%s: listen", __func__);
+		return (-1);
+	}
+
+	event_set(&cs->cs_ev, cs->cs_fd, EV_READ,
+	    control_accept, cs);
+	event_add(&cs->cs_ev, NULL);
+	evtimer_set(&cs->cs_evt, control_accept, cs);
+
+	return (0);
+}
+
+void
+control_cleanup(struct control_sock *cs)
+{
+	if (cs->cs_name == NULL)
+		return;
+	event_del(&cs->cs_ev);
+	event_del(&cs->cs_evt);
+	(void)unlink(cs->cs_name);
+}
+
+/* ARGSUSED */
+void
+control_accept(int listenfd, short event, void *arg)
+{
+	struct control_sock	*cs = arg;
+	int			 connfd;
+	socklen_t		 len;
+	struct sockaddr_un	 sun;
+	struct ctl_conn		*c;
+
+	event_add(&cs->cs_ev, NULL);
+	if ((event & EV_TIMEOUT))
+		return;
+
+	len = sizeof(sun);
+	if ((connfd = accept(listenfd,
+	    (struct sockaddr *)&sun, &len)) == -1) {
+		/*
+		 * Pause accept if we are out of file descriptors, or
+		 * libevent will haunt us here too.
+		 */
+		if (errno == ENFILE || errno == EMFILE) {
+			struct timeval evtpause = { 1, 0 };
+
+			event_del(&cs->cs_ev);
+			evtimer_add(&cs->cs_evt, &evtpause);
+		} else if (errno != EWOULDBLOCK && errno != EINTR &&
+		    errno != ECONNABORTED)
+			log_warn("%s: accept", __func__);
+		return;
+	}
+
+	socket_set_blockmode(connfd, BM_NONBLOCK);
+
+	if ((c = calloc(1, sizeof(struct ctl_conn))) == NULL) {
+		log_warn("%s", __func__);
+		close(connfd);
+		return;
+	}
+
+	imsg_init(&c->iev.ibuf, connfd);
+	c->iev.handler = control_dispatch_imsg;
+	c->iev.events = EV_READ;
+	c->iev.data = cs;
+	event_set(&c->iev.ev, c->iev.ibuf.fd, c->iev.events,
+	    c->iev.handler, c->iev.data);
+	event_add(&c->iev.ev, NULL);
+
+	TAILQ_INSERT_TAIL(&ctl_conns, c, entry);
+}
+
+struct ctl_conn *
+control_connbyfd(int fd)
+{
+	struct ctl_conn	*c;
+
+	TAILQ_FOREACH(c, &ctl_conns, entry) {
+		if (c->iev.ibuf.fd == fd)
+			break;
+	}
+
+	return (c);
+}
+
+void
+control_close(int fd, struct control_sock *cs)
+{
+	struct ctl_conn	*c;
+
+	if ((c = control_connbyfd(fd)) == NULL) {
+		log_warn("%s: fd %d: not found", __func__, fd);
+		return;
+	}
+
+	msgbuf_clear(&c->iev.ibuf.w);
+	TAILQ_REMOVE(&ctl_conns, c, entry);
+
+	event_del(&c->iev.ev);
+	close(c->iev.ibuf.fd);
+
+	/* Some file descriptors are available again. */
+	if (evtimer_pending(&cs->cs_evt, NULL)) {
+		evtimer_del(&cs->cs_evt);
+		event_add(&cs->cs_ev, NULL);
+	}
+
+	free(c);
+}
+
+/* ARGSUSED */
+void
+control_dispatch_imsg(int fd, short event, void *arg)
+{
+	struct control_sock	*cs = arg;
+	struct switchd		*env = cs->cs_env;
+	struct ctl_conn		*c;
+	struct imsg		 imsg;
+	int			 n, v;
+
+	if ((c = control_connbyfd(fd)) == NULL) {
+		log_warn("%s: fd %d: not found", __func__, fd);
+		return;
+	}
+
+	if (event & EV_READ) {
+		if (((n = imsg_read(&c->iev.ibuf)) == -1 && errno != EAGAIN) ||
+		    n == 0) {
+			control_close(fd, cs);
+			return;
+		}
+	}
+	if (event & EV_WRITE) {
+		if (msgbuf_write(&c->iev.ibuf.w) <= 0 && errno != EAGAIN) {
+			control_close(fd, cs);
+			return;
+		}
+	}
+
+	for (;;) {
+		if ((n = imsg_get(&c->iev.ibuf, &imsg)) == -1) {
+			control_close(fd, cs);
+			return;
+		}
+
+		if (n == 0)
+			break;
+
+		control_imsg_forward(&imsg);
+
+		switch (imsg.hdr.type) {
+		case IMSG_CTL_SHOW_SUM:
+			/* Forward request and use control fd as _id_ */
+			proc_compose(&env->sc_ps, PROC_OFP,
+			    imsg.hdr.type, &fd, sizeof(fd));
+			break;
+		case IMSG_CTL_CONNECT:
+		case IMSG_CTL_DISCONNECT:
+			proc_compose(&env->sc_ps, PROC_PARENT,
+			    imsg.hdr.type, imsg.data, IMSG_DATA_SIZE(&imsg));
+			break;
+		case IMSG_CTL_NOTIFY:
+			if (c->flags & CTL_CONN_NOTIFY) {
+				log_debug("%s: "
+				    "client requested notify more than once",
+				    __func__);
+				imsg_compose_event(&c->iev, IMSG_CTL_FAIL,
+				    0, 0, -1, NULL, 0);
+				break;
+			}
+			c->flags |= CTL_CONN_NOTIFY;
+			break;
+		case IMSG_CTL_VERBOSE:
+			IMSG_SIZE_CHECK(&imsg, &v);
+
+			memcpy(&v, imsg.data, sizeof(v));
+			log_setverbose(v);
+
+			proc_forward_imsg(&env->sc_ps, &imsg, PROC_PARENT, -1);
+			proc_forward_imsg(&env->sc_ps, &imsg, PROC_OFP, -1);
+			break;
+		default:
+			log_debug("%s: error handling imsg %d",
+			    __func__, imsg.hdr.type);
+			break;
+		}
+		imsg_free(&imsg);
+	}
+
+	imsg_event_add(&c->iev);
+}
+
+void
+control_imsg_forward(struct imsg *imsg)
+{
+	struct ctl_conn *c;
+
+	TAILQ_FOREACH(c, &ctl_conns, entry)
+		if (c->flags & CTL_CONN_NOTIFY)
+			imsg_compose(&c->iev.ibuf, imsg->hdr.type,
+			    0, imsg->hdr.pid, -1, imsg->data,
+			    imsg->hdr.len - IMSG_HEADER_SIZE);
+}
+@
+
+
+1.7
+log
+@Stop accessing verbose and debug variables from log.c directly.
+
+This replaces log_verbose() and "extern int verbose" with the two functions
+log_setverbose() and log_getverbose().
+
+Pointed out by benno@@
+OK krw@@ eric@@ gilles@@ (OK gilles@@ for the snmpd bits as well)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.6 2017/01/09 14:04:31 krw Exp $	*/
+d72 1
+a72 1
+ 	 * stdio - for malloc and basic I/O including events.
+@
+
+
+1.6
+log
+@Replace hand-rolled for(;;) traversal of ctl_conns TAILQ with
+TAILQ_FOREACH().
+
+No intentional functional change.
+
+ok reyk@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.5 2016/10/12 19:07:42 reyk Exp $	*/
+d364 1
+a364 1
+			log_verbose(v);
+@
+
+
+1.5
+log
+@Start reworking the "device" support in switchd: Once connected, a
+device is just an fd that is connected to a switch, either via TCP or
+via /dev/switch.  Change the switchctl from "device add" to "connect"
+etc.  This change is an intermediate step towards other changes,
+including the configuration grammar, so a few things will be left
+undocumented for now.
+
+switchctl(8) examples,
+switchctl connect /dev/switch0
+switchctl connect /dev/switch0 forward-to 10.1.1.1
+switchctl connect 127.0.0.1
+switchctl connect 127.0.0.1 forward-to 10.1.1.1
+switchctl disconnect /dev/switch0
+
+Discussed with rzalamena@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.4 2016/09/14 13:46:51 rzalamena Exp $	*/
+d265 4
+a268 3
+	for (c = TAILQ_FIRST(&ctl_conns); c != NULL && c->iev.ibuf.fd != fd;
+	    c = TAILQ_NEXT(c, entry))
+		;	/* nothing */
+@
+
+
+1.4
+log
+@Teach switchd(8) how to fork+exec.
+
+Note: this daemon has the -Wcast-qual compilation flag which trigger a
+warning that wasn't enable in httpd(8) or relayd(8). This will be fixed
+in a next diff and then synchronized with other daemons.
+
+ok reyk@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.3 2016/08/08 16:49:17 rzalamena Exp $	*/
+d343 2
+a344 2
+		case IMSG_CTL_DEVICE_CONNECT:
+		case IMSG_CTL_DEVICE_DISCONNECT:
+@
+
+
+1.3
+log
+@Handle imsg_read() EAGAIN like the man page code example.
+
+ok reyk@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.2 2016/07/20 21:01:06 reyk Exp $	*/
+d61 1
+a61 1
+pid_t
+d64 1
+a64 1
+	return (proc_run(ps, p, procs, nitems(procs), control_run, NULL));
+d75 1
+d77 1
+a77 1
+	if (pledge("stdio cpath unix", NULL) == -1)
+@
+
+
+1.2
+log
+@pledge(2) all the switchd processes.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.1 2016/07/19 16:54:26 reyk Exp $	*/
+d312 2
+a313 1
+		if ((n = imsg_read(&c->iev.ibuf)) == -1 || n == 0) {
+@
+
+
+1.1
+log
+@Import switchd(8), a basic WIP OpenFlow implementation for OpenBSD.
+
+switchd consists of two parts:
+1. switchd(8) and switchctl(8), an OpenFlow controller or "vswitch".
+2. switch(4), an OpenFlow-aware kernel "bridge".
+
+This the 1st part, the driver will be imported later.  The code will
+remain disabled for a while, but it helps development to have it in
+the tree.  switchd currently supports partial OpenFlow 1.0, but the
+goal is to use OpenFlow 1.3.5 instead (switch(4) already does 1.3.5).
+
+For more background information see:
+http://www.openbsd.org/papers/bsdcan2016-switchd.pdf
+https://youtu.be/Cuo0qT-lqig
+
+With help from yasuoka@@ goda@@
+Import discussed with deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: control.c,v 1.16 2015/01/16 06:39:58 deraadt Exp $	*/
+d51 66
+a386 52
+}
+
+int control_dispatch_ofp(int, struct privsep_proc *, struct imsg *);
+
+static struct privsep_proc procs[] = {
+	{ "ofp",	PROC_OFP,	control_dispatch_ofp },
+	{ "parent",	PROC_PARENT,	NULL },
+	{ "ofcconn",	PROC_OFCCONN,	NULL }
+};
+
+pid_t
+control(struct privsep *ps, struct privsep_proc *p)
+{
+	return (proc_run(ps, p, procs, nitems(procs), NULL, NULL));
+}
+
+int
+control_dispatch_ofp(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	int		 cfd;
+	struct ctl_conn	*c;
+	uint8_t		*d = imsg->data;
+	size_t		 s;
+
+	switch (imsg->hdr.type) {
+	case IMSG_CTL_SWITCH:
+	case IMSG_CTL_MAC:
+		IMSG_SIZE_CHECK(imsg, &cfd);
+		memcpy(&cfd, d, sizeof(cfd));
+
+		if ((c = control_connbyfd(cfd)) == NULL)
+			fatalx("invalid control connection");
+
+		s = IMSG_DATA_SIZE(imsg) - sizeof(cfd);
+		d += sizeof(cfd);
+		imsg_compose_event(&c->iev, imsg->hdr.type, 0, 0, -1, d, s);
+		return (0);
+	case IMSG_CTL_END:
+		IMSG_SIZE_CHECK(imsg, &cfd);
+		memcpy(&cfd, d, sizeof(cfd));
+
+		if ((c = control_connbyfd(cfd)) == NULL)
+			fatalx("invalid control connection");
+
+		imsg_compose_event(&c->iev, IMSG_CTL_END, 0, 0, -1, NULL, 0);
+		return (0);
+
+	default:
+		break;
+	}
+
+	return (-1);
+@
+

@@ -1,0 +1,472 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_6_0:1.6.0.2
+	OPENBSD_6_0_BASE:1.6
+	OPENBSD_5_9:1.5.0.4
+	OPENBSD_5_9_BASE:1.5
+	OPENBSD_5_8:1.5.0.6
+	OPENBSD_5_8_BASE:1.5
+	OPENBSD_5_7:1.5.0.2
+	OPENBSD_5_7_BASE:1.5
+	OPENBSD_5_6:1.3.0.6
+	OPENBSD_5_6_BASE:1.3
+	OPENBSD_5_5:1.3.0.4
+	OPENBSD_5_5_BASE:1.3;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2016.07.27.11.45.02;	author patrick;	state Exp;
+branches;
+next	1.6;
+commitid	yc14meyJgxIAcvAg;
+
+1.6
+date	2016.06.26.05.16.33;	author jsg;	state Exp;
+branches;
+next	1.5;
+commitid	f0l6MGjSmDe958Pt;
+
+1.5
+date	2014.12.10.12.27.56;	author mikeb;	state Exp;
+branches;
+next	1.4;
+commitid	v6PAeA18rydwc5Vx;
+
+1.4
+date	2014.11.01.07.08.43;	author jsg;	state Exp;
+branches;
+next	1.3;
+commitid	Ipx6m0KXI8Srntav;
+
+1.3
+date	2013.11.06.19.03.07;	author syl;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2013.11.01.12.15.15;	author fgsch;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2013.09.04.14.38.31;	author patrick;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@Instead of passing the raw reg property to simplebus nodes,
+pass a pre-processed array of fdt_reg structs.  This means
+that the drivers don't have to understand the cell properties
+themselves but can rely on the 64-bit addr/size pairs.
+
+ok kettenis@@
+@
+text
+@/*	$OpenBSD: omdog.c,v 1.6 2016/06/26 05:16:33 jsg Exp $	*/
+/*
+ * Copyright (c) 2013 Federico G. Schwindt <fgsch@@openbsd.org>
+ * Copyright (c) 2007,2009 Dale Rahn <drahn@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/queue.h>
+#include <sys/malloc.h>
+#include <sys/device.h>
+#include <sys/evcount.h>
+#include <sys/socket.h>
+#include <sys/timeout.h>
+
+#include <machine/intr.h>
+#include <machine/bus.h>
+#include <machine/fdt.h>
+
+#include <dev/ofw/openfirm.h>
+#include <dev/ofw/fdt.h>
+
+#include <armv7/armv7/armv7var.h>
+
+#define WIDR		0x00			/* Identification Register */
+#define WCLR		0x24			/* Control Register */
+#define  WCLR_PRE		(1 << 5)
+#define  WCLR_PTV		(0 << 2)
+#define WCRR		0x28			/* Counter Register */
+#define WLDR		0x2c			/* Load Register */
+#define WTGR		0x30			/* Trigger Register */
+#define WWPS		0x34			/* Write Posting Bits Reg. */
+#define  WWPS_WSPR		(1 << 4)
+#define  WWPS_WTGR		(1 << 3)
+#define  WWPS_WLDR		(1 << 2)
+#define  WWPS_WCRR		(1 << 1)
+#define  WWPS_WCLR		(1 << 0)
+#define WSPR		0x48			/* Start/Stop Register */
+
+#define OMDOG_VAL(secs)	(0xffffffff - ((secs) * (32768 / (1 << 0))) + 1)
+
+
+struct omdog_softc {
+	struct device		sc_dev;
+	bus_space_tag_t		sc_iot;
+	bus_space_handle_t	sc_ioh;
+
+	int			sc_period;
+};
+
+struct omdog_softc *omdog_sc;
+
+int	omdog_match(struct device *, void *, void *);
+void	omdog_attach(struct device *, struct device *, void *);
+int	omdog_activate(struct device *, int);
+void	omdog_start(struct omdog_softc *);
+void	omdog_stop(struct omdog_softc *);
+void	omdog_sync(struct omdog_softc *);
+int	omdog_cb(void *, int);
+void	omdog_reset(void);
+
+struct cfattach	omdog_ca = {
+	sizeof (struct omdog_softc), omdog_match, omdog_attach, NULL,
+	omdog_activate
+};
+
+struct cfdriver omdog_cd = {
+	NULL, "omdog", DV_DULL
+};
+
+int
+omdog_match(struct device *parent, void *match, void *aux)
+{
+	struct fdt_attach_args *faa = aux;
+
+	return OF_is_compatible(faa->fa_node, "ti,omap3-wdt");
+}
+
+void
+omdog_attach(struct device *parent, struct device *self, void *aux)
+{
+	struct fdt_attach_args *faa = aux;
+	struct omdog_softc *sc = (struct omdog_softc *) self;
+	u_int32_t rev;
+
+	if (faa->fa_nreg < 1)
+		return;
+
+	sc->sc_iot = faa->fa_iot;
+	if (bus_space_map(sc->sc_iot, faa->fa_reg[0].addr,
+	    faa->fa_reg[0].size, 0, &sc->sc_ioh))
+		panic("%s: bus_space_map failed!", __func__);
+
+	rev = bus_space_read_4(sc->sc_iot, sc->sc_ioh, WIDR);
+
+	printf(" rev %d.%d\n", rev >> 4 & 0xf, rev & 0xf);
+	omdog_sc = sc;
+
+	omdog_stop(sc);
+
+#ifndef SMALL_KERNEL
+	wdog_register(omdog_cb, sc);
+#endif
+}
+
+int
+omdog_activate(struct device *self, int act)
+{
+	switch (act) {
+	case DVACT_POWERDOWN:
+#ifndef SMALL_KERNEL
+		wdog_shutdown(self);
+#endif
+		break;
+	}
+
+	return (0);
+}
+
+void
+omdog_start(struct omdog_softc *sc)
+{
+	/* Write the enable sequence data BBBBh followed by 4444h */
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, WSPR, 0xbbbb);
+	omdog_sync(sc);
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, WSPR, 0x4444);
+	omdog_sync(sc);
+}
+
+void
+omdog_stop(struct omdog_softc *sc)
+{
+	/* Write the disable sequence data AAAAh followed by 5555h */
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, WSPR, 0xaaaa);
+	omdog_sync(sc);
+	bus_space_write_4(sc->sc_iot, sc->sc_ioh, WSPR, 0x5555);
+	omdog_sync(sc);
+}
+
+void
+omdog_sync(struct omdog_softc *sc)
+{
+	while (bus_space_read_4(sc->sc_iot, sc->sc_ioh, WWPS) &
+	    (WWPS_WSPR|WWPS_WTGR|WWPS_WLDR|WWPS_WCRR|WWPS_WCLR))
+		delay(10);
+}
+
+int
+omdog_cb(void *self, int period)
+{
+	struct omdog_softc *sc = self;
+
+	if (sc->sc_period != 0 && sc->sc_period != period)
+		omdog_stop(sc);
+
+	if (period != 0) {
+		if (sc->sc_period != period) {
+			/* Set the prescaler */
+			bus_space_write_4(sc->sc_iot, sc->sc_ioh, WCLR,
+			    (WCLR_PRE|WCLR_PTV));
+
+			/* Set the reload counter */
+			bus_space_write_4(sc->sc_iot, sc->sc_ioh, WLDR,
+			    OMDOG_VAL(period));
+		}
+
+		omdog_sync(sc);
+
+		/* Trigger the reload */
+		bus_space_write_4(sc->sc_iot, sc->sc_ioh, WTGR,
+		    ~bus_space_read_4(sc->sc_iot, sc->sc_ioh, WTGR));
+
+		if (sc->sc_period != period)
+			omdog_start(sc);
+	}
+
+	sc->sc_period = period;
+
+	return (period);
+}
+
+void
+omdog_reset(void)
+{
+	if (omdog_sc == NULL)
+		return;
+
+	if (omdog_sc->sc_period != 0)
+		omdog_stop(omdog_sc);
+
+	bus_space_write_4(omdog_sc->sc_iot, omdog_sc->sc_ioh, WCRR,
+	    0xffffff80);
+
+	omdog_start(omdog_sc);
+
+	delay(100000);
+}
+@
+
+
+1.6
+log
+@Dynamically attach omdog(4) using the FDT.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: omdog.c,v 1.5 2014/12/10 12:27:56 mikeb Exp $	*/
+d33 1
+d98 1
+a98 1
+	if (faa->fa_nreg < 2)
+d102 2
+a103 2
+	if (bus_space_map(sc->sc_iot, faa->fa_reg[0],
+	    faa->fa_reg[1], 0, &sc->sc_ioh))
+@
+
+
+1.5
+log
+@Convert watchdog(4) devices to use autoconf(9) framework.
+
+ok deraadt, tests on glxpcib and ok mpi
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: omdog.c,v 1.4 2014/11/01 07:08:43 jsg Exp $	*/
+d27 1
+d30 4
+d64 1
+d74 2
+a75 1
+	sizeof (struct omdog_softc), NULL, omdog_attach, NULL, omdog_activate
+d82 8
+d91 1
+a91 1
+omdog_attach(struct device *parent, struct device *self, void *args)
+d93 1
+a93 1
+	struct armv7_attach_args *aa = args;
+d97 6
+a102 3
+	sc->sc_iot = aa->aa_iot;
+	if (bus_space_map(sc->sc_iot, aa->aa_dev->mem[0].addr,
+	    aa->aa_dev->mem[0].size, 0, &sc->sc_ioh))
+@
+
+
+1.4
+log
+@Now the armv7 ramdisks are compiled with SMALL_KERNEL
+the omap and sunxi ramdisks won't build because they
+call wdog_register() and kern_watchdog.c is !small_kernel
+in config.
+
+Leaving the watchdog devices out of the ramdisks won't
+work either as armv7_machdep.c uses platform_watchdog_reset()
+to reboot.
+
+Deal with this by only calling wdog_register() when
+not compiled with SMALL_KERNEL.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: omdog.c,v 1.3 2013/11/06 19:03:07 syl Exp $	*/
+d60 1
+d68 1
+a68 1
+	sizeof (struct omdog_softc), NULL, omdog_attach
+d97 14
+@
+
+
+1.3
+log
+@After factorizing armv7_machdep code here is an effort to factorize all
+the code present in omap/omap.c imx/imx.c and sunxi/sunxi.c
+
+All this code looks quite the same, so we move it in a generic armv7/armv7.c
+
+This is a step closer to only one kernel for all armv7 boards.
+
+ok patrick@@, rapha@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: omdog.c,v 1.2 2013/11/01 12:15:15 fgsch Exp $	*/
+d93 1
+d95 1
+@
+
+
+1.2
+log
+@rewrite omdog somewhat and hook it into the watchdog framework.
+tested by syl@@ and myself. syl@@ ok.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: omdog.c,v 1.1 2013/09/04 14:38:31 patrick Exp $	*/
+d29 1
+a29 1
+#include <armv7/omap/omapvar.h>
+d77 1
+a77 1
+	struct omap_attach_args *oa = args;
+d81 3
+a83 3
+	sc->sc_iot = oa->oa_iot;
+	if (bus_space_map(sc->sc_iot, oa->oa_dev->mem[0].addr,
+	    oa->oa_dev->mem[0].size, 0, &sc->sc_ioh))
+@
+
+
+1.1
+log
+@In the future, we shouldn't have one port port ARM SoC, that's just
+ridiculous.  This is the first step for a common and generic ARM port
+for ARMv7 SoCs.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: omdog.c,v 1.5 2011/11/15 23:01:11 drahn Exp $ */
+d3 1
+a29 1
+#include <armv7/omap/omgpiovar.h>
+d31 16
+a46 13
+/* registers */
+#define WIDR		0x00
+#define WD_SYSCONFIG	0x10
+#define WD_SYSSTATUS	0x14
+#define WISR		0x18
+#define WIER		0x1C
+#define WCLR		0x24
+#define WCRR		0x28
+#define WLDR		0x2C
+#define WTGR		0x30
+#define WWPS		0x34
+#define		WWPS_PEND_ALL	0x1f
+#define WSPR		0x48
+d53 2
+d59 6
+a64 7
+/* 
+ * to enable  the watchdog, write 0xXXXXbbbb then 0xXXXX4444 to WSPR
+ * to disable the watchdog, write 0xXXXXaaaa then 0xXXXX5555 to WSPR
+ */
+
+void omdog_attach(struct device *parent, struct device *self, void *args);
+void omdog_wpending(int flags);
+d84 1
+a84 1
+		panic("gptimer_attach: bus_space_map failed!");
+d90 24
+d117 1
+a117 1
+omdog_wpending(int flags)
+d119 3
+a121 3
+	struct omdog_softc *sc = omdog_sc;
+	while (bus_space_read_4(sc->sc_iot, sc->sc_ioh, WWPS) & flags)
+		;
+d124 33
+a156 1
+void omdog_reset(void); 	/* XXX */
+d159 1
+a159 1
+omdog_reset()
+d164 7
+a170 2
+	bus_space_write_4(omdog_sc->sc_iot, omdog_sc->sc_ioh, WCRR, 0xffffff80);
+	omdog_wpending(WWPS_PEND_ALL);
+a171 5
+	/* this sequence will start the watchdog. */
+	bus_space_write_4(omdog_sc->sc_iot, omdog_sc->sc_ioh, WSPR, 0xbbbb);
+	omdog_wpending(WWPS_PEND_ALL);
+	bus_space_write_4(omdog_sc->sc_iot, omdog_sc->sc_ioh, WSPR, 0x4444);
+	omdog_wpending(WWPS_PEND_ALL);
+@
+

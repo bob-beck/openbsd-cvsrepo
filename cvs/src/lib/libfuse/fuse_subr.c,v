@@ -1,0 +1,517 @@
+head	1.11;
+access;
+symbols
+	OPENBSD_6_0:1.10.0.2
+	OPENBSD_6_0_BASE:1.10
+	OPENBSD_5_9:1.9.0.2
+	OPENBSD_5_9_BASE:1.9
+	OPENBSD_5_8:1.9.0.4
+	OPENBSD_5_8_BASE:1.9
+	OPENBSD_5_7:1.8.0.2
+	OPENBSD_5_7_BASE:1.8
+	OPENBSD_5_6:1.8.0.4
+	OPENBSD_5_6_BASE:1.8
+	OPENBSD_5_5:1.7.0.4
+	OPENBSD_5_5_BASE:1.7
+	OPENBSD_5_4:1.2.0.2
+	OPENBSD_5_4_BASE:1.2;
+locks; strict;
+comment	@ * @;
+
+
+1.11
+date	2016.09.07.17.53.35;	author natano;	state Exp;
+branches;
+next	1.10;
+commitid	bTUYWm2clD2A9qNB;
+
+1.10
+date	2016.05.24.19.24.46;	author okan;	state Exp;
+branches;
+next	1.9;
+commitid	eVCm0GHQHDffS3hd;
+
+1.9
+date	2015.06.03.19.51.16;	author reyk;	state Exp;
+branches;
+next	1.8;
+commitid	jLqgY0OWDj6Yi91A;
+
+1.8
+date	2014.04.28.13.08.34;	author syl;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2014.02.05.20.13.58;	author syl;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2013.12.03.09.59.40;	author syl;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2013.10.07.18.41.01;	author syl;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2013.09.21.22.21.14;	author syl;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2013.08.10.00.30.43;	author syl;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2013.06.03.16.21.08;	author tedu;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2013.06.03.16.00.50;	author tedu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.11
+log
+@Fix fuse node lookups. Currently fusefs nodes in the kernel remember the
+parent inode number for ".." lookups. This only works until the kernel
+starts to reuse vnodes and the parent's vnode is reclaimed and the ino
+to path mapping is removed from the userland process by libfuse. Fix
+this by using reference counting in libfuse, so that parent mapping are
+retained as long as a child uses them. Also, don't free the root node.
+
+This commit resolves following issue:
+
+$ doas fuse-zip ~/Downloads/foo.zip /mnt
+$ ls /mnt
+openbsd-www
+$ grep -IR foo /usr/src > /dev/null	# force vfs to reclaim vnodes
+$ ls /mnt
+ls: /mnt: No such file or directory
+$
+
+ok tedu
+@
+text
+@/* $OpenBSD: fuse_subr.c,v 1.10 2016/05/24 19:24:46 okan Exp $ */
+/*
+ * Copyright (c) 2013 Sylvestre Gallon <ccna.syl@@gmail.com>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "fuse_private.h"
+#include "debug.h"
+
+struct fuse_vnode *
+alloc_vn(struct fuse *f, const char *path, ino_t ino, ino_t pino)
+{
+	struct fuse_vnode *vn;
+
+	if ((vn = malloc(sizeof(*vn))) == NULL) {
+		DPERROR(__func__);
+		return (NULL);
+	}
+
+	vn->ino = ino;
+	vn->ref = 1;
+	if (strlcpy(vn->path, path, sizeof(vn->path)) >= sizeof(vn->path)) {
+		DPRINTF("%s: strlcpy name too long\n", __func__);
+		free(vn);
+		return (NULL);
+	}
+
+	if (pino == (ino_t)0)
+		vn->parent = NULL;
+	else {
+		if ((vn->parent = tree_get(&f->vnode_tree, pino)) == NULL) {
+			DPRINTF("%s: parent vnode %llu not in the vnode tree\n",
+			    __func__, pino);
+			free(vn);
+			errno = ENOENT;
+			return (NULL);
+		}
+		ref_vn(vn->parent);
+	}
+
+	if (ino == (ino_t)-1) {
+		f->max_ino++;
+		vn->ino = f->max_ino;
+	}
+
+	return (vn);
+}
+
+void
+ref_vn(struct fuse_vnode *vn)
+{
+	vn->ref++;
+}
+
+void
+unref_vn(struct fuse *f, struct fuse_vnode *vn)
+{
+	if (--vn->ref == 0) {
+		tree_pop(&f->vnode_tree, vn->ino);
+		remove_vnode_from_name_tree(f, vn);
+		if (vn->parent != NULL)
+			unref_vn(f, vn->parent);
+		free(vn);
+	}
+}
+
+int
+set_vn(struct fuse *f, struct fuse_vnode *v)
+{
+	struct fuse_vn_head *vn_head;
+	struct fuse_vnode *vn;
+
+	DPRINTF("%s: create or update vnode %llu@@%llu = %s\n", __func__,
+	    (unsigned long long)v->ino,
+	    v->parent ? (unsigned long long)v->parent->ino : 0,
+	    v->path);
+
+	if (tree_set(&f->vnode_tree, v->ino, v) == NULL)
+		return (0);
+
+	if (!dict_check(&f->name_tree, v->path)) {
+		vn_head = malloc(sizeof(*vn_head));
+		if (vn_head == NULL)
+			return (0);
+		SIMPLEQ_INIT(vn_head);
+	} else {
+		vn_head = dict_get(&f->name_tree, v->path);
+		if (vn_head == NULL)
+			return (0);
+	}
+
+	SIMPLEQ_FOREACH(vn, vn_head, node) {
+		if (v->parent == vn->parent && v->ino == vn->ino)
+			return (1);
+	}
+
+	SIMPLEQ_INSERT_TAIL(vn_head, v, node);
+	dict_set(&f->name_tree, v->path, vn_head);
+
+	return (1);
+}
+
+void
+remove_vnode_from_name_tree(struct fuse *f, struct fuse_vnode *vn)
+{
+	struct fuse_vn_head *vn_head;
+	struct fuse_vnode *v;
+	struct fuse_vnode *lastv;
+
+	vn_head = dict_get(&f->name_tree, vn->path);
+	if (vn_head == NULL)
+		return;
+
+	lastv = NULL;
+	SIMPLEQ_FOREACH(v, vn_head, node) {
+		if (v->parent == vn->parent)
+			break;
+
+		lastv = v;
+	}
+	if (v == NULL)
+		return;
+
+	/* if we found the vnode remove it */
+	if (v == SIMPLEQ_FIRST(vn_head))
+		SIMPLEQ_REMOVE_HEAD(vn_head, node);
+	else
+		SIMPLEQ_REMOVE_AFTER(vn_head, lastv, node);
+
+	/* if the queue is empty we need to remove it from the dict */
+	if (SIMPLEQ_EMPTY(vn_head)) {
+		vn_head = dict_pop(&f->name_tree, vn->path);
+		free(vn_head);
+	}
+}
+
+struct fuse_vnode *
+get_vn_by_name_and_parent(struct fuse *f, uint8_t *xpath, ino_t pino)
+{
+	struct fuse_vn_head *vn_head;
+	struct fuse_vnode *v = NULL;
+	const char *path = (const char *)xpath;
+
+	vn_head = dict_get(&f->name_tree, path);
+
+	if (vn_head == NULL)
+		goto fail;
+
+	SIMPLEQ_FOREACH(v, vn_head, node)
+		if (v->parent && v->parent->ino == pino)
+			return (v);
+
+fail:
+	errno = ENOENT;
+	return (NULL);
+}
+
+char *
+build_realname(struct fuse *f, ino_t ino)
+{
+	struct fuse_vnode *vn;
+	char *name;
+	char *tmp = NULL;
+	int firstshot = 0, ret;
+
+	name = strdup("/");
+	if (name == NULL)
+		return (NULL);
+
+	vn = tree_get(&f->vnode_tree, ino);
+	if (!vn || !name) {
+		free(name);
+		return (NULL);
+	}
+
+	while (vn->parent != NULL) {
+		if (firstshot++)
+			ret = asprintf(&tmp, "/%s%s", vn->path, name);
+		else
+			ret = asprintf(&tmp, "/%s", vn->path);
+
+		if (ret == -1) {
+			free(name);
+			return (NULL);
+		}
+
+		free(name);
+		name = tmp;
+		tmp = NULL;
+		vn = vn->parent;
+	}
+
+	if (ino == (ino_t)0)
+		DPRINTF("%s: NULL ino\n", __func__);
+
+	DPRINTF("realname %s\n", name);
+	return (name);
+}
+@
+
+
+1.10
+log
+@Add missing strdup NULL checks; from Ray Lai.
+
+ok mpi@@ beck@@ mlarkin@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.9 2015/06/03 19:51:16 reyk Exp $ */
+d27 1
+a27 1
+alloc_vn(struct fuse *f, const char *path, ino_t ino, ino_t parent)
+d37 1
+a37 1
+	vn->parent = parent;
+d44 13
+d65 18
+d90 2
+a91 1
+	    (unsigned long long)v->ino, (unsigned long long)v->parent,
+d154 1
+a154 1
+get_vn_by_name_and_parent(struct fuse *f, uint8_t *xpath, ino_t parent)
+d166 1
+a166 1
+		if (v->parent == parent)
+d192 1
+a192 1
+	while (vn->parent != 0) {
+d206 1
+a206 4
+		vn = tree_get(&f->vnode_tree, vn->parent);
+
+		if (!vn)
+			return (NULL);
+@
+
+
+1.9
+log
+@It is better to check the asprintf return value for -1 instead of the
+input buffer for NULL.
+Found by adding __attribute((__warn_unused_result__)) to asprintf.
+
+OK deraadt@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.8 2014/04/28 13:08:34 syl Exp $ */
+d146 1
+a146 1
+	char *name = strdup("/");
+d149 4
+@
+
+
+1.8
+log
+@Add support for 255 character file names in fuse.
+
+from Helg Bredow, thanks!
+input/OK reyk@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.7 2014/02/05 20:13:58 syl Exp $ */
+d148 1
+a148 1
+	int firstshot = 0;
+d158 1
+a158 1
+			asprintf(&tmp, "/%s%s", vn->path, name);
+d160 1
+a160 1
+			asprintf(&tmp, "/%s", vn->path);
+d162 1
+a162 1
+		if (tmp == NULL) {
+@
+
+
+1.7
+log
+@check return values in libfuse.
+
+inputs from stsp@@.
+ok stsp@@.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.6 2013/12/03 09:59:40 syl Exp $ */
+d32 1
+a32 1
+		DPERROR("alloc_vn:");
+d38 6
+a43 2
+	strncpy(vn->path, path, NAME_MAX);
+	vn->path[NAME_MAX - 1] =  '\0';
+@
+
+
+1.6
+log
+@Add support for FBT_RECLAIM that allow us to free the representation
+of vnode in userspace.
+
+"I think it's right" from tedu@@.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.5 2013/10/07 18:41:01 syl Exp $ */
+d127 1
+a127 1
+		return (NULL);
+d133 2
+@
+
+
+1.5
+log
+@Fix some different signedness error. this commit make clang happier.
+
+Thanks to Pedro Martelletto.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.4 2013/09/21 22:21:14 syl Exp $ */
+d81 34
+@
+
+
+1.4
+log
+@Fix an ino_t inconsistency in libfuse. This commit unbreak
+the build for libfuse.
+
+ok guenther@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.3 2013/08/10 00:30:43 syl Exp $ */
+d84 1
+a84 1
+get_vn_by_name_and_parent(struct fuse *f, const char *path, ino_t parent)
+d88 1
+@
+
+
+1.3
+log
+@Remove some useless DPRINTF.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: fuse_subr.c,v 1.2 2013/06/03 16:21:08 tedu Exp $ */
+d54 3
+a56 2
+	DPRINTF("%s: create or update vnode %i%i = %s\n", __func__, v->ino,
+	    v->parent, v->path);
+@
+
+
+1.2
+log
+@rcsids
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD$ */
+a30 1
+	DPRINTF("%s %i@@%i = %s\n", __func__, ino, parent, path);
+a87 1
+	DPRINTF("%s %i = %s\n", __func__, parent, path);
+@
+
+
+1.1
+log
+@add userland fuse library. ok beck deraadt
+from Sylvestre Gallon ccna.syl gmail.com
+@
+text
+@d1 1
+@
+

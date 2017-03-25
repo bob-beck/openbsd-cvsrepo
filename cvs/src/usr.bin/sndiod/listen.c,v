@@ -1,0 +1,649 @@
+head	1.12;
+access;
+symbols
+	OPENBSD_6_0:1.11.0.4
+	OPENBSD_6_0_BASE:1.11
+	OPENBSD_5_9:1.11.0.2
+	OPENBSD_5_9_BASE:1.11
+	OPENBSD_5_8:1.2.0.12
+	OPENBSD_5_8_BASE:1.2
+	OPENBSD_5_7:1.2.0.4
+	OPENBSD_5_7_BASE:1.2
+	OPENBSD_5_6:1.2.0.8
+	OPENBSD_5_6_BASE:1.2
+	OPENBSD_5_5:1.2.0.6
+	OPENBSD_5_5_BASE:1.2
+	OPENBSD_5_4:1.2.0.2
+	OPENBSD_5_4_BASE:1.2
+	OPENBSD_5_3:1.1.0.2
+	OPENBSD_5_3_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.12
+date	2017.01.03.06.51.56;	author ratchov;	state Exp;
+branches;
+next	1.11;
+commitid	gxDiGLO8VliwE5xM;
+
+1.11
+date	2016.01.08.16.22.09;	author ratchov;	state Exp;
+branches;
+next	1.10;
+commitid	mafe4T7cL7kxGjGJ;
+
+1.10
+date	2016.01.08.16.17.31;	author ratchov;	state Exp;
+branches;
+next	1.9;
+commitid	LWS9HDcDMBciqd8t;
+
+1.9
+date	2016.01.08.13.28.08;	author ratchov;	state Exp;
+branches;
+next	1.8;
+commitid	6liRTScN5FcUpkpG;
+
+1.8
+date	2016.01.08.13.14.11;	author ratchov;	state Exp;
+branches;
+next	1.7;
+commitid	8QDtrFXNKcGztDUI;
+
+1.7
+date	2015.12.25.17.16.43;	author ratchov;	state Exp;
+branches;
+next	1.6;
+commitid	SGNVXC7khKQorcu2;
+
+1.6
+date	2015.12.21.22.03.47;	author ratchov;	state Exp;
+branches;
+next	1.5;
+commitid	bNjmDyo6yDzTC2yr;
+
+1.5
+date	2015.12.20.11.38.33;	author ratchov;	state Exp;
+branches;
+next	1.4;
+commitid	PJvo9au8yzagFJ6z;
+
+1.4
+date	2015.12.14.17.44.29;	author ratchov;	state Exp;
+branches;
+next	1.3;
+commitid	Qw0YgCKL1YQErNbL;
+
+1.3
+date	2015.11.18.08.36.20;	author ratchov;	state Exp;
+branches;
+next	1.2;
+commitid	IIXiV87F8cFgHqty;
+
+1.2
+date	2013.03.13.08.28.33;	author ratchov;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.11.23.07.03.28;	author ratchov;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.12
+log
+@Use a goto to factor all calls to close() when listen_in() returns
+an error. From Michael W. Bombardieri. Thanks.
+@
+text
+@/*	$OpenBSD: listen.c,v 1.4 2015/12/14 17:44:29 ratchov Exp $	*/
+/*
+ * Copyright (c) 2008 Alexandre Ratchov <alex@@caoua.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/signal.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "listen.h"
+#include "file.h"
+#include "sock.h"
+#include "utils.h"
+
+int listen_pollfd(void *, struct pollfd *);
+int listen_revents(void *, struct pollfd *);
+void listen_in(void *);
+void listen_out(void *);
+void listen_hup(void *);
+
+struct fileops listen_fileops = {
+	"listen",
+	listen_pollfd,
+	listen_revents,
+	listen_in,
+	listen_out,
+	listen_hup
+};
+
+struct listen *listen_list = NULL;
+
+void
+listen_close(struct listen *f)
+{
+	struct listen **pf;
+
+	for (pf = &listen_list; *pf != f; pf = &(*pf)->next) {
+#ifdef DEBUG
+		if (*pf == NULL) {
+			log_puts("listen_close: not on list\n");
+			panic();
+		}
+#endif
+	}
+	*pf = f->next;
+
+	if (f->path != NULL) {
+		xfree(f->path);
+	}
+	file_del(f->file);
+	close(f->fd);
+	xfree(f);
+}
+
+int
+listen_new_un(char *path)
+{
+	int sock, oldumask;
+	struct sockaddr_un sockname;
+	struct listen *f;
+
+	sock = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock < 0) {
+		log_puts(path);
+		log_puts(": failed to create socket\n");
+		return 0;
+	}
+	if (unlink(path) < 0 && errno != ENOENT) {
+		log_puts(path);
+		log_puts(": failed to unlink socket\n");
+		goto bad_close;
+	}
+	sockname.sun_family = AF_UNIX;
+	strlcpy(sockname.sun_path, path, sizeof(sockname.sun_path));
+	oldumask = umask(0111);
+	if (bind(sock, (struct sockaddr *)&sockname,
+		sizeof(struct sockaddr_un)) < 0) {
+		log_puts(path);
+		log_puts(": failed to bind socket\n");
+		goto bad_close;
+	}
+	if (listen(sock, 1) < 0) {
+		log_puts(path);
+		log_puts(": failed to listen\n");
+		goto bad_close;
+	}
+	umask(oldumask);
+	f = xmalloc(sizeof(struct listen));
+	f->file = file_new(&listen_fileops, f, path, 1);
+	if (f->file == NULL)
+		goto bad_close;
+	f->path = xstrdup(path);
+	f->fd = sock;
+	f->next = listen_list;
+	listen_list = f;
+	return 1;
+ bad_close:
+	close(sock);
+	return 0;
+}
+
+int
+listen_new_tcp(char *addr, unsigned int port)
+{
+	char *host, serv[sizeof(unsigned int) * 3 + 1];
+	struct addrinfo *ailist, *ai, aihints;
+	struct listen *f;
+	int s, error, opt = 1, n = 0;
+
+	/*
+	 * obtain a list of possible addresses for the host/port
+	 */
+	memset(&aihints, 0, sizeof(struct addrinfo));
+	snprintf(serv, sizeof(serv), "%u", port);
+	host = strcmp(addr, "-") == 0 ? NULL : addr;
+	aihints.ai_flags |= AI_PASSIVE;
+	aihints.ai_socktype = SOCK_STREAM;
+	aihints.ai_protocol = IPPROTO_TCP;
+	error = getaddrinfo(host, serv, &aihints, &ailist);
+	if (error) {
+		log_puts(addr);
+		log_puts(": failed to resolve address\n");
+		return 0;
+	}
+
+	/*
+	 * for each address, try create a listening socket bound on
+	 * that address
+	 */
+	for (ai = ailist; ai != NULL; ai = ai->ai_next) {
+		s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (s < 0) {
+			log_puts(addr);
+			log_puts(": failed to create socket\n");
+			continue;
+		}
+		opt = 1;
+		if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+			&opt, sizeof(int)) < 0) {
+			log_puts(addr);
+			log_puts(": failed to set SO_REUSEADDR\n");
+			goto bad_close;
+		}
+		if (bind(s, ai->ai_addr, ai->ai_addrlen) < 0) {
+			log_puts(addr);
+			log_puts(": failed to bind socket\n");
+			goto bad_close;
+		}
+		if (listen(s, 1) < 0) {
+			log_puts(addr);
+			log_puts(": failed to listen\n");
+			goto bad_close;
+		}
+		f = xmalloc(sizeof(struct listen));
+		f->file = file_new(&listen_fileops, f, addr, 1);
+		if (f == NULL) {
+		bad_close:
+			close(s);
+			continue;
+		}
+		f->path = NULL;
+		f->fd = s;
+		f->next = listen_list;
+		listen_list = f;
+		n++;
+	}
+	freeaddrinfo(ailist);
+	return n;
+}
+
+int
+listen_init(struct listen *f)
+{
+	return 1;
+}
+
+int
+listen_pollfd(void *arg, struct pollfd *pfd)
+{
+	struct listen *f = arg;
+
+	f->slowaccept = file_slowaccept;
+	if (f->slowaccept)
+		return 0;
+	pfd->fd = f->fd;
+	pfd->events = POLLIN;
+	return 1;
+}
+
+int
+listen_revents(void *arg, struct pollfd *pfd)
+{
+	struct listen *f = arg;
+
+	if (f->slowaccept)
+		return 0;
+	return pfd->revents;
+}
+
+void
+listen_in(void *arg)
+{
+	struct listen *f = arg;
+	struct sockaddr caddr;
+	socklen_t caddrlen;
+	int sock, opt;
+
+	caddrlen = sizeof(caddrlen);
+	while ((sock = accept(f->fd, &caddr, &caddrlen)) < 0) {
+		if (errno == EINTR)
+			continue;
+		if (errno == ENFILE || errno == EMFILE)
+			file_slowaccept = 1;
+		return;
+	}
+	if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
+		file_log(f->file);
+		log_puts(": failed to set non-blocking mode\n");
+		goto bad_close;
+	}
+	if (f->path == NULL) {
+		opt = 1;
+		if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+			&opt, sizeof(int)) < 0) {
+			file_log(f->file);
+			log_puts(": failed to set TCP_NODELAY flag\n");
+			goto bad_close;
+		}
+	}
+	if (sock_new(sock) == NULL)
+		goto bad_close;
+	return;
+bad_close:
+	close(sock);
+}
+
+void
+listen_out(void *arg)
+{
+}
+
+void
+listen_hup(void *arg)
+{
+	struct listen *f = arg;
+
+	listen_close(f);
+}
+@
+
+
+1.11
+log
+@Fix changes that last commit undid by mistake, sorry.
+@
+text
+@d243 1
+a243 2
+		close(sock);
+		return;
+d251 1
+a251 2
+			close(sock);
+			return;
+d254 5
+a258 4
+	if (sock_new(sock) == NULL) {
+		close(sock);
+		return;
+	}
+@
+
+
+1.10
+log
+@Make code fit in 80 columns, remove trailing spaces & tabs.
+@
+text
+@a167 15
+		if (ai->ai_family == AF_INET6) {
+			/*
+			 * make sure IPv6 sockets are restricted to IPv6
+			 * addresses because we already use a IP socket
+			 * for IP addresses
+			 */
+			opt = 1;
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
+				&opt, sizeof(int)) < 0) {
+				log_puts(addr);
+				log_puts(": failed to set IPV6_V6ONLY\n");
+				goto bad_close;
+			}
+		}
+
+@
+
+
+1.9
+log
+@don't call unlink() to delete socket as this would require cpath
+@
+text
+@d133 3
+a135 3
+	
+	/* 
+	 * obtain a list of possible addresses for the host/port 
+d150 1
+a150 1
+	/* 
+d182 1
+a182 1
+			
+@
+
+
+1.8
+log
+@Make listen_new_xxx() routines return NULL on failure and check the
+returned value wheneverer they are called.
+@
+text
+@a71 1
+		unlink(f->path);
+@
+
+
+1.7
+log
+@Don't set (unused) IPV6_V6ONLY option.
+
+suggested by deraadt
+@
+text
+@a26 1
+#include <err.h>
+a30 1
+#include <stdlib.h>
+d71 2
+a72 1
+	if (f->path != NULL)
+d74 1
+d80 1
+a80 1
+void
+d89 3
+a91 2
+		perror("socket");
+		exit(1);
+d94 2
+a95 1
+		perror("unlink");
+d103 2
+a104 1
+		perror("bind");
+d108 2
+a109 1
+		perror("listen");
+a117 4
+	if (f->path == NULL) {
+		perror("strdup");
+		exit(1);
+	}
+d121 1
+a121 1
+	return;
+d124 1
+a124 1
+	exit(1);	
+d127 1
+a127 1
+void
+d146 3
+a148 2
+		fprintf(stderr, "%s: %s\n", addr, gai_strerror(error));
+		exit(1);
+d158 2
+a159 1
+			perror("socket");
+d165 2
+a166 1
+			perror("setsockopt");
+d169 15
+d185 2
+a186 1
+			perror("bind");
+d190 2
+a191 1
+			perror("listen");
+d208 1
+a208 2
+	if (n == 0)
+		exit(1);
+a253 2
+		else if (errno != ECONNABORTED && errno != EWOULDBLOCK)
+			perror("accept");
+d257 2
+a258 1
+		perror("fcntl(sock, O_NONBLOCK)");
+d266 2
+a267 1
+			perror("setsockopt");
+@
+
+
+1.6
+log
+@Don't attempt to remove unix socket as it's owned by root and
+we've already dropped root privileges.
+@
+text
+@a165 14
+		if (ai->ai_family == AF_INET6) {
+			/*
+			 * make sure IPv6 sockets are restricted to IPv6
+			 * addresses because we already use a IP socket
+			 * for IP addresses
+			 */
+			opt = 1;
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
+				&opt, sizeof(int)) < 0) {
+				perror("setsockopt");
+				goto bad_close;
+			}
+		}
+			
+@
+
+
+1.5
+log
+@In case of a bug in sndiod, an attacker (a local user) could run
+arbitrary code as user _sndio, i.e. get a second uid.
+
+Mitigate the risk by implementing initial privilege separation as
+follows. Break sndiod in two processes: a chroot()ed "worker" process
+processing input, and a non-chroot()ed "helper" process opening
+devices and passing descriptors to the worker.
+
+With help from benno, claudio, semarie and gilles.
+
+ok benno, semarie and tb
+@
+text
+@d73 1
+a73 2
+	if (f->path != NULL) {
+		unlink(f->path);
+a74 1
+	}
+@
+
+
+1.4
+log
+@Work on a copy of the slowaccept flag instead of the global one as
+it could change somewhere in the poll() loop.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: listen.c,v 1.3 2015/11/18 08:36:20 ratchov Exp $	*/
+a128 1
+#ifdef USE_TCP
+a206 1
+#endif
+@
+
+
+1.3
+log
+@disable networking (i.e. -L option) until privilege separation is
+implemented
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: listen.c,v 1.2 2013/03/13 08:28:33 ratchov Exp $	*/
+d221 2
+a222 1
+	if (file_slowaccept)
+d232 4
+@
+
+
+1.2
+log
+@don't display warnings if accept() returns ECONNABORTED or
+EWOULDBLOCK, as we do in other daemons
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: listen.c,v 1.1 2012/11/23 07:03:28 ratchov Exp $	*/
+d129 1
+d208 1
+@
+
+
+1.1
+log
+@Remplace aucat server by a new sndiod daemon aimed to be simpler
+smaller and faster than aucat. It's a drop in replacement with the
+following exceptions that don't affect the default setup:
+  - The sample rate and the encoding are a per-device parameters
+    thus -r and -e options must precede the corresponding -f option
+  - MIDI thru boxes are dynamically created and no -M option
+    is required anymore, so -M was removed.
+  - MIDI ports are exposed with a new ``midi/N'' name, rather
+    than abusing MIDI thru boxes.
+with help from armani@@, ok deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d246 1
+a246 1
+		else
+@
+

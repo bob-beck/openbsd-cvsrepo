@@ -1,0 +1,1355 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_5_4:1.6.0.4
+	OPENBSD_5_4_BASE:1.6
+	OPENBSD_5_3:1.6.0.2
+	OPENBSD_5_3_BASE:1.6
+	OPENBSD_5_2:1.5.0.4
+	OPENBSD_5_2_BASE:1.5
+	OPENBSD_5_1_BASE:1.5
+	OPENBSD_5_1:1.5.0.2
+	v7_10_3:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_0:1.4.0.6
+	OPENBSD_5_0_BASE:1.4
+	OPENBSD_4_9:1.4.0.2
+	OPENBSD_4_9_BASE:1.4
+	OPENBSD_4_8:1.4.0.4
+	OPENBSD_4_8_BASE:1.4
+	OPENBSD_4_7:1.2.0.4
+	OPENBSD_4_7_BASE:1.2
+	OPENBSD_4_6:1.2.0.2
+	OPENBSD_4_6_BASE:1.2
+	OPENBSD_4_5:1.1.0.2
+	OPENBSD_4_5_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2013.09.05.14.04.28;	author jsg;	state dead;
+branches;
+next	1.6;
+
+1.6
+date	2012.08.17.13.58.15;	author mpi;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2011.10.23.13.37.39;	author matthieu;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2010.07.24.18.13.33;	author oga;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2010.05.22.20.06.19;	author matthieu;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.05.17.20.26.39;	author matthieu;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.11.02.14.58.16;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.10.23.13.29.38;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@Merge Mesa 9.2.0
+@
+text
+@/**************************************************************************
+ * 
+ * Copyright 2006 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * All Rights Reserved.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ * 
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL TUNGSTEN GRAPHICS AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * 
+ **************************************************************************/
+
+#include "intel_context.h"
+#include "intel_batchbuffer.h"
+#include "intel_buffer_objects.h"
+#include "intel_decode.h"
+#include "intel_reg.h"
+#include "intel_bufmgr.h"
+#include "intel_buffers.h"
+
+struct cached_batch_item {
+   struct cached_batch_item *next;
+   uint16_t header;
+   uint16_t size;
+};
+
+static void clear_cache( struct intel_context *intel )
+{
+   struct cached_batch_item *item = intel->batch.cached_items;
+
+   while (item) {
+      struct cached_batch_item *next = item->next;
+      free(item);
+      item = next;
+   }
+
+   intel->batch.cached_items = NULL;
+}
+
+void
+intel_batchbuffer_init(struct intel_context *intel)
+{
+   intel_batchbuffer_reset(intel);
+
+   if (intel->gen == 6) {
+      /* We can't just use brw_state_batch to get a chunk of space for
+       * the gen6 workaround because it involves actually writing to
+       * the buffer, and the kernel doesn't let us write to the batch.
+       */
+      intel->batch.workaround_bo = drm_intel_bo_alloc(intel->bufmgr,
+						      "gen6 workaround",
+						      4096, 4096);
+   }
+}
+
+void
+intel_batchbuffer_reset(struct intel_context *intel)
+{
+   if (intel->batch.last_bo != NULL) {
+      drm_intel_bo_unreference(intel->batch.last_bo);
+      intel->batch.last_bo = NULL;
+   }
+   intel->batch.last_bo = intel->batch.bo;
+
+   clear_cache(intel);
+
+   intel->batch.bo = drm_intel_bo_alloc(intel->bufmgr, "batchbuffer",
+					intel->maxBatchSize, 4096);
+
+   intel->batch.reserved_space = BATCH_RESERVED;
+   intel->batch.state_batch_offset = intel->batch.bo->size;
+   intel->batch.used = 0;
+}
+
+void
+intel_batchbuffer_free(struct intel_context *intel)
+{
+   drm_intel_bo_unreference(intel->batch.last_bo);
+   drm_intel_bo_unreference(intel->batch.bo);
+   drm_intel_bo_unreference(intel->batch.workaround_bo);
+   clear_cache(intel);
+}
+
+
+/* TODO: Push this whole function into bufmgr.
+ */
+static void
+do_flush_locked(struct intel_context *intel)
+{
+   struct intel_batchbuffer *batch = &intel->batch;
+   int ret = 0;
+
+   if (!intel->intelScreen->no_hw) {
+      int ring;
+
+      if (intel->gen < 6 || !batch->is_blit) {
+	 ring = I915_EXEC_RENDER;
+      } else {
+	 ring = I915_EXEC_BLT;
+      }
+
+      ret = drm_intel_bo_subdata(batch->bo, 0, 4*batch->used, batch->map);
+      if (ret == 0 && batch->state_batch_offset != batch->bo->size) {
+	 ret = drm_intel_bo_subdata(batch->bo,
+				    batch->state_batch_offset,
+				    batch->bo->size - batch->state_batch_offset,
+				    (char *)batch->map + batch->state_batch_offset);
+      }
+
+      if (ret == 0)
+	 ret = drm_intel_bo_mrb_exec(batch->bo, 4*batch->used, NULL, 0, 0, ring);
+   }
+
+   if (unlikely(INTEL_DEBUG & DEBUG_BATCH)) {
+      intel_decode(batch->map, batch->used,
+		   batch->bo->offset,
+		   intel->intelScreen->deviceID, GL_TRUE);
+
+      if (intel->vtbl.debug_batch != NULL)
+	 intel->vtbl.debug_batch(intel);
+   }
+
+   if (ret != 0) {
+      exit(1);
+   }
+   intel->vtbl.new_batch(intel);
+}
+
+void
+_intel_batchbuffer_flush(struct intel_context *intel,
+			 const char *file, int line)
+{
+   if (intel->batch.used == 0)
+      return;
+
+   if (intel->first_post_swapbuffers_batch == NULL) {
+      intel->first_post_swapbuffers_batch = intel->batch.bo;
+      drm_intel_bo_reference(intel->first_post_swapbuffers_batch);
+   }
+
+   if (unlikely(INTEL_DEBUG & DEBUG_BATCH))
+      fprintf(stderr, "%s:%d: Batchbuffer flush with %db used\n", file, line,
+	      4*intel->batch.used);
+
+   intel->batch.reserved_space = 0;
+
+   if (intel->always_flush_cache) {
+      intel_batchbuffer_emit_mi_flush(intel);
+   }
+
+   /* Mark the end of the buffer. */
+   intel_batchbuffer_emit_dword(intel, MI_BATCH_BUFFER_END);
+   if (intel->batch.used & 1) {
+      /* Round batchbuffer usage to 2 DWORDs. */
+      intel_batchbuffer_emit_dword(intel, MI_NOOP);
+   }
+
+   if (intel->vtbl.finish_batch)
+      intel->vtbl.finish_batch(intel);
+
+   intel_upload_finish(intel);
+
+   /* Check that we didn't just wrap our batchbuffer at a bad time. */
+   assert(!intel->no_batch_wrap);
+
+   do_flush_locked(intel);
+
+   if (unlikely(INTEL_DEBUG & DEBUG_SYNC)) {
+      fprintf(stderr, "waiting for idle\n");
+      drm_intel_bo_wait_rendering(intel->batch.bo);
+   }
+
+   /* Reset the buffer:
+    */
+   intel_batchbuffer_reset(intel);
+}
+
+
+/*  This is the only way buffers get added to the validate list.
+ */
+GLboolean
+intel_batchbuffer_emit_reloc(struct intel_context *intel,
+                             drm_intel_bo *buffer,
+                             uint32_t read_domains, uint32_t write_domain,
+			     uint32_t delta)
+{
+   int ret;
+
+   ret = drm_intel_bo_emit_reloc(intel->batch.bo, 4*intel->batch.used,
+				 buffer, delta,
+				 read_domains, write_domain);
+   assert(ret == 0);
+   (void)ret;
+
+   /*
+    * Using the old buffer offset, write in what the right data would be, in case
+    * the buffer doesn't move and we can short-circuit the relocation processing
+    * in the kernel
+    */
+   intel_batchbuffer_emit_dword(intel, buffer->offset + delta);
+
+   return GL_TRUE;
+}
+
+GLboolean
+intel_batchbuffer_emit_reloc_fenced(struct intel_context *intel,
+				    drm_intel_bo *buffer,
+				    uint32_t read_domains,
+				    uint32_t write_domain,
+				    uint32_t delta)
+{
+   int ret;
+
+   ret = drm_intel_bo_emit_reloc_fence(intel->batch.bo, 4*intel->batch.used,
+				       buffer, delta,
+				       read_domains, write_domain);
+   assert(ret == 0);
+   (void)ret;
+
+   /*
+    * Using the old buffer offset, write in what the right data would
+    * be, in case the buffer doesn't move and we can short-circuit the
+    * relocation processing in the kernel
+    */
+   intel_batchbuffer_emit_dword(intel, buffer->offset + delta);
+
+   return GL_TRUE;
+}
+
+void
+intel_batchbuffer_data(struct intel_context *intel,
+                       const void *data, GLuint bytes, bool is_blit)
+{
+   assert((bytes & 3) == 0);
+   intel_batchbuffer_require_space(intel, bytes, is_blit);
+   __memcpy(intel->batch.map + intel->batch.used, data, bytes);
+   intel->batch.used += bytes >> 2;
+}
+
+void
+intel_batchbuffer_cached_advance(struct intel_context *intel)
+{
+   struct cached_batch_item **prev = &intel->batch.cached_items, *item;
+   uint32_t sz = (intel->batch.used - intel->batch.emit) * sizeof(uint32_t);
+   uint32_t *start = intel->batch.map + intel->batch.emit;
+   uint16_t op = *start >> 16;
+
+   while (*prev) {
+      uint32_t *old;
+
+      item = *prev;
+      old = intel->batch.map + item->header;
+      if (op == *old >> 16) {
+	 if (item->size == sz && memcmp(old, start, sz) == 0) {
+	    if (prev != &intel->batch.cached_items) {
+	       *prev = item->next;
+	       item->next = intel->batch.cached_items;
+	       intel->batch.cached_items = item;
+	    }
+	    intel->batch.used = intel->batch.emit;
+	    return;
+	 }
+
+	 goto emit;
+      }
+      prev = &item->next;
+   }
+
+   item = malloc(sizeof(struct cached_batch_item));
+   if (item == NULL)
+      return;
+
+   item->next = intel->batch.cached_items;
+   intel->batch.cached_items = item;
+
+emit:
+   item->size = sz;
+   item->header = intel->batch.emit;
+}
+
+/**
+ * Restriction [DevSNB, DevIVB]:
+ *
+ * Prior to changing Depth/Stencil Buffer state (i.e. any combination of
+ * 3DSTATE_DEPTH_BUFFER, 3DSTATE_CLEAR_PARAMS, 3DSTATE_STENCIL_BUFFER,
+ * 3DSTATE_HIER_DEPTH_BUFFER) SW must first issue a pipelined depth stall
+ * (PIPE_CONTROL with Depth Stall bit set), followed by a pipelined depth
+ * cache flush (PIPE_CONTROL with Depth Flush Bit set), followed by
+ * another pipelined depth stall (PIPE_CONTROL with Depth Stall bit set),
+ * unless SW can otherwise guarantee that the pipeline from WM onwards is
+ * already flushed (e.g., via a preceding MI_FLUSH).
+ */
+void
+intel_emit_depth_stall_flushes(struct intel_context *intel)
+{
+   assert(intel->gen >= 6 && intel->gen <= 7);
+
+   BEGIN_BATCH(4);
+   OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+   OUT_BATCH(PIPE_CONTROL_DEPTH_STALL);
+   OUT_BATCH(0); /* address */
+   OUT_BATCH(0); /* write data */
+   ADVANCE_BATCH()
+
+   BEGIN_BATCH(4);
+   OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+   OUT_BATCH(PIPE_CONTROL_DEPTH_CACHE_FLUSH);
+   OUT_BATCH(0); /* address */
+   OUT_BATCH(0); /* write data */
+   ADVANCE_BATCH();
+
+   BEGIN_BATCH(4);
+   OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+   OUT_BATCH(PIPE_CONTROL_DEPTH_STALL);
+   OUT_BATCH(0); /* address */
+   OUT_BATCH(0); /* write data */
+   ADVANCE_BATCH();
+}
+
+/**
+ * Emits a PIPE_CONTROL with a non-zero post-sync operation, for
+ * implementing two workarounds on gen6.  From section 1.4.7.1
+ * "PIPE_CONTROL" of the Sandy Bridge PRM volume 2 part 1:
+ *
+ * [DevSNB-C+{W/A}] Before any depth stall flush (including those
+ * produced by non-pipelined state commands), software needs to first
+ * send a PIPE_CONTROL with no bits set except Post-Sync Operation !=
+ * 0.
+ *
+ * [Dev-SNB{W/A}]: Before a PIPE_CONTROL with Write Cache Flush Enable
+ * =1, a PIPE_CONTROL with any non-zero post-sync-op is required.
+ *
+ * And the workaround for these two requires this workaround first:
+ *
+ * [Dev-SNB{W/A}]: Pipe-control with CS-stall bit set must be sent
+ * BEFORE the pipe-control with a post-sync op and no write-cache
+ * flushes.
+ *
+ * And this last workaround is tricky because of the requirements on
+ * that bit.  From section 1.4.7.2.3 "Stall" of the Sandy Bridge PRM
+ * volume 2 part 1:
+ *
+ *     "1 of the following must also be set:
+ *      - Render Target Cache Flush Enable ([12] of DW1)
+ *      - Depth Cache Flush Enable ([0] of DW1)
+ *      - Stall at Pixel Scoreboard ([1] of DW1)
+ *      - Depth Stall ([13] of DW1)
+ *      - Post-Sync Operation ([13] of DW1)
+ *      - Notify Enable ([8] of DW1)"
+ *
+ * The cache flushes require the workaround flush that triggered this
+ * one, so we can't use it.  Depth stall would trigger the same.
+ * Post-sync nonzero is what triggered this second workaround, so we
+ * can't use that one either.  Notify enable is IRQs, which aren't
+ * really our business.  That leaves only stall at scoreboard.
+ */
+void
+intel_emit_post_sync_nonzero_flush(struct intel_context *intel)
+{
+   if (!intel->batch.need_workaround_flush)
+      return;
+
+   BEGIN_BATCH(4);
+   OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+   OUT_BATCH(PIPE_CONTROL_CS_STALL |
+	     PIPE_CONTROL_STALL_AT_SCOREBOARD);
+   OUT_BATCH(0); /* address */
+   OUT_BATCH(0); /* write data */
+   ADVANCE_BATCH();
+
+   BEGIN_BATCH(4);
+   OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+   OUT_BATCH(PIPE_CONTROL_WRITE_IMMEDIATE);
+   OUT_RELOC(intel->batch.workaround_bo,
+	     I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION, 0);
+   OUT_BATCH(0); /* write data */
+   ADVANCE_BATCH();
+
+   intel->batch.need_workaround_flush = false;
+}
+
+/* Emit a pipelined flush to either flush render and texture cache for
+ * reading from a FBO-drawn texture, or flush so that frontbuffer
+ * render appears on the screen in DRI1.
+ *
+ * This is also used for the always_flush_cache driconf debug option.
+ */
+void
+intel_batchbuffer_emit_mi_flush(struct intel_context *intel)
+{
+   if (intel->gen >= 6) {
+      if (intel->batch.is_blit) {
+	 BEGIN_BATCH_BLT(4);
+	 OUT_BATCH(MI_FLUSH_DW);
+	 OUT_BATCH(0);
+	 OUT_BATCH(0);
+	 OUT_BATCH(0);
+	 ADVANCE_BATCH();
+      } else {
+	 if (intel->gen == 6) {
+	    /* Hardware workaround: SNB B-Spec says:
+	     *
+	     * [Dev-SNB{W/A}]: Before a PIPE_CONTROL with Write Cache
+	     * Flush Enable =1, a PIPE_CONTROL with any non-zero
+	     * post-sync-op is required.
+	     */
+	    intel_emit_post_sync_nonzero_flush(intel);
+	 }
+
+	 BEGIN_BATCH(4);
+	 OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+	 OUT_BATCH(PIPE_CONTROL_INSTRUCTION_FLUSH |
+		   PIPE_CONTROL_WRITE_FLUSH |
+		   PIPE_CONTROL_DEPTH_CACHE_FLUSH |
+		   PIPE_CONTROL_TC_FLUSH |
+		   PIPE_CONTROL_NO_WRITE);
+	 OUT_BATCH(0); /* write address */
+	 OUT_BATCH(0); /* write data */
+	 ADVANCE_BATCH();
+      }
+   } else if (intel->gen >= 4) {
+      BEGIN_BATCH(4);
+      OUT_BATCH(_3DSTATE_PIPE_CONTROL |
+		PIPE_CONTROL_WRITE_FLUSH |
+		PIPE_CONTROL_NO_WRITE);
+      OUT_BATCH(0); /* write address */
+      OUT_BATCH(0); /* write data */
+      OUT_BATCH(0); /* write data */
+      ADVANCE_BATCH();
+   } else {
+      BEGIN_BATCH(1);
+      OUT_BATCH(MI_FLUSH);
+      ADVANCE_BATCH();
+   }
+}
+@
+
+
+1.6
+log
+@Upate to libGL 7.11.2
+
+Tested by jsg@@, matthieu@@ and ajacoutot@@, ok mattieu@@
+@
+text
+@@
+
+
+1.5
+log
+@Merge Mesa 7.10.3
+@
+text
+@d30 1
+d36 7
+a42 2
+void
+intel_batchbuffer_reset(struct intel_batchbuffer *batch)
+d44 1
+a44 1
+   struct intel_context *intel = batch->intel;
+d46 4
+a49 3
+   if (batch->buf != NULL) {
+      drm_intel_bo_unreference(batch->buf);
+      batch->buf = NULL;
+d52 7
+a58 4
+   batch->buf = drm_intel_bo_alloc(intel->bufmgr, "batchbuffer",
+				   intel->maxBatchSize, 4096);
+   drm_intel_gem_bo_map_gtt(batch->buf);
+   batch->map = batch->buf->virtual;
+d60 9
+a68 5
+   batch->size = intel->maxBatchSize;
+   batch->ptr = batch->map;
+   batch->reserved_space = BATCH_RESERVED;
+   batch->dirty_state = ~0;
+   batch->state_batch_offset = batch->size;
+d71 2
+a72 2
+struct intel_batchbuffer *
+intel_batchbuffer_alloc(struct intel_context *intel)
+d74 7
+a80 1
+   struct intel_batchbuffer *batch = calloc(sizeof(*batch), 1);
+d82 2
+a83 2
+   batch->intel = intel;
+   intel_batchbuffer_reset(batch);
+d85 3
+a87 1
+   return batch;
+d91 1
+a91 1
+intel_batchbuffer_free(struct intel_batchbuffer *batch)
+d93 4
+a96 7
+   if (batch->map) {
+      drm_intel_gem_bo_unmap_gtt(batch->buf);
+      batch->map = NULL;
+   }
+   dri_bo_unreference(batch->buf);
+   batch->buf = NULL;
+   free(batch);
+a99 1
+
+d103 1
+a103 1
+do_flush_locked(struct intel_batchbuffer *batch, GLuint used)
+d105 1
+a105 1
+   struct intel_context *intel = batch->intel;
+a106 5
+   int x_off = 0, y_off = 0;
+
+   drm_intel_gem_bo_unmap_gtt(batch->buf);
+
+   batch->ptr = NULL;
+d111 1
+a111 1
+      if (intel->gen < 6 || !intel->batch->is_blit) {
+d117 10
+a126 2
+      drm_intel_bo_mrb_exec(batch->buf, used, NULL, 0,
+			    (x_off & 0xffff) | (y_off << 16), ring);
+d130 2
+a131 2
+      drm_intel_bo_map(batch->buf, GL_FALSE);
+      intel_decode(batch->buf->virtual, used / 4, batch->buf->offset,
+a132 1
+      drm_intel_bo_unmap(batch->buf);
+d145 2
+a146 2
+_intel_batchbuffer_flush(struct intel_batchbuffer *batch, const char *file,
+			 int line)
+d148 2
+a149 2
+   struct intel_context *intel = batch->intel;
+   GLuint used = batch->ptr - batch->map;
+d152 1
+a152 1
+      intel->first_post_swapbuffers_batch = intel->batch->buf;
+a155 3
+   if (used == 0)
+      return;
+
+d158 1
+a158 1
+	      used);
+d160 1
+a160 1
+   batch->reserved_space = 0;
+d163 1
+a163 2
+      intel_batchbuffer_emit_mi_flush(batch);
+      used = batch->ptr - batch->map;
+d166 5
+a170 6
+   /* Round batchbuffer usage to 2 DWORDs. */
+
+   if ((used & 4) == 0) {
+      *(GLuint *) (batch->ptr) = 0; /* noop */
+      batch->ptr += 4;
+      used = batch->ptr - batch->map;
+a172 17
+   /* Mark the end of the buffer. */
+   *(GLuint *) (batch->ptr) = MI_BATCH_BUFFER_END;
+   batch->ptr += 4;
+   used = batch->ptr - batch->map;
+   assert (used <= batch->buf->size);
+
+   /* Workaround for recursive batchbuffer flushing: If the window is
+    * moved, we can get into a case where we try to flush during a
+    * flush.  What happens is that when we try to grab the lock for
+    * the first flush, we detect that the window moved which then
+    * causes another flush (from the intel_draw_buffer() call in
+    * intelUpdatePageFlipping()).  To work around this we reset the
+    * batchbuffer tail pointer before trying to get the lock.  This
+    * prevent the nested buffer flush, but a better fix would be to
+    * avoid that in the first place. */
+   batch->ptr = batch->map;
+
+d176 2
+d181 1
+a181 1
+   do_flush_locked(batch, used);
+d185 1
+a185 2
+      drm_intel_bo_map(batch->buf, GL_TRUE);
+      drm_intel_bo_unmap(batch->buf);
+d190 1
+a190 1
+   intel_batchbuffer_reset(batch);
+d197 1
+a197 1
+intel_batchbuffer_emit_reloc(struct intel_batchbuffer *batch,
+d204 1
+a204 6
+   assert(delta < buffer->size);
+
+   if (batch->ptr - batch->map > batch->buf->size)
+    printf ("bad relocation ptr %p map %p offset %d size %lu\n",
+	    batch->ptr, batch->map, batch->ptr - batch->map, batch->buf->size);
+   ret = drm_intel_bo_emit_reloc(batch->buf, batch->ptr - batch->map,
+d207 2
+d215 1
+a215 1
+   intel_batchbuffer_emit_dword (batch, buffer->offset + delta);
+d221 1
+a221 1
+intel_batchbuffer_emit_reloc_fenced(struct intel_batchbuffer *batch,
+d223 2
+a224 1
+				    uint32_t read_domains, uint32_t write_domain,
+d229 1
+a229 6
+   assert(delta < buffer->size);
+
+   if (batch->ptr - batch->map > batch->buf->size)
+    printf ("bad relocation ptr %p map %p offset %d size %lu\n",
+	    batch->ptr, batch->map, batch->ptr - batch->map, batch->buf->size);
+   ret = drm_intel_bo_emit_reloc_fence(batch->buf, batch->ptr - batch->map,
+d232 2
+d240 1
+a240 1
+   intel_batchbuffer_emit_dword (batch, buffer->offset + delta);
+d246 1
+a246 1
+intel_batchbuffer_data(struct intel_batchbuffer *batch,
+d250 145
+a394 3
+   intel_batchbuffer_require_space(batch, bytes, is_blit);
+   __memcpy(batch->ptr, data, bytes);
+   batch->ptr += bytes;
+d404 1
+a404 1
+intel_batchbuffer_emit_mi_flush(struct intel_batchbuffer *batch)
+a405 2
+   struct intel_context *intel = batch->intel;
+
+d407 1
+a407 1
+      if (intel->batch->is_blit) {
+d415 9
+a423 8
+	 BEGIN_BATCH(8);
+	 /* XXX workaround: issue any post sync != 0 before write
+	  * cache flush = 1
+	  */
+	 OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+	 OUT_BATCH(PIPE_CONTROL_WRITE_IMMEDIATE);
+	 OUT_BATCH(0); /* write address */
+	 OUT_BATCH(0); /* write data */
+d425 1
+d430 1
+@
+
+
+1.4
+log
+@This is a hack.
+
+Since mesa changed some code, GL applications have been rather nasty to
+the xserver, if they are unconstrained rendering wise they spam too many
+requests at the xserver and make it slow as hell (even if the cpu is
+fairly idle).
+
+There is a throttling mechanism in the xserver (1.8 at least), but that
+only really works if you are doing vblank syncing (which is turned off
+in our intel driver right now for unrelated reasons), and even then an unsynced
+client can cause the same problem.
+
+While a proper fix is being worked on (I am in discussion with X
+developers), comment out two conditionals in the intel mesa driver so
+that even when using dri2 swapbuffers we wait on the swapbuffers before
+last before rendeing more, this prevents almost DoSing the server.
+
+Tested on ironlake, 855 and 965 by me (and my matthieu as well). ok
+matthieu@@
+@
+text
+@d41 1
+a41 1
+      dri_bo_unreference(batch->buf);
+d45 4
+a48 2
+   if (!batch->buffer)
+      batch->buffer = malloc (intel->maxBatchSize);
+a49 8
+   batch->buf = dri_bo_alloc(intel->bufmgr, "batchbuffer",
+			     intel->maxBatchSize, 4096);
+   if (batch->buffer)
+      batch->map = batch->buffer;
+   else {
+      dri_bo_map(batch->buf, GL_TRUE);
+      batch->map = batch->buf->virtual;
+   }
+d52 1
+d54 1
+d71 3
+a73 7
+   if (batch->buffer)
+      free (batch->buffer);
+   else {
+      if (batch->map) {
+	 dri_bo_unmap(batch->buf);
+	 batch->map = NULL;
+      }
+d91 1
+a91 4
+   if (batch->buffer)
+      dri_bo_subdata (batch->buf, 0, used, batch->buffer);
+   else
+      dri_bo_unmap(batch->buf);
+a92 1
+   batch->map = NULL;
+d95 12
+a106 2
+   if (!intel->no_hw)
+      dri_bo_exec(batch->buf, used, NULL, 0, (x_off & 0xffff) | (y_off << 16));
+d108 2
+a109 2
+   if (INTEL_DEBUG & DEBUG_BATCH) {
+      dri_bo_map(batch->buf, GL_FALSE);
+d111 2
+a112 2
+		   intel->intelScreen->deviceID);
+      dri_bo_unmap(batch->buf);
+d131 1
+a131 2
+   if (/* !intel->using_dri2_swapbuffers && */
+       intel->first_post_swapbuffers_batch == NULL) {
+d139 1
+a139 1
+   if (INTEL_DEBUG & DEBUG_BATCH)
+d144 1
+a144 1
+   /* Emit a flush if the bufmgr doesn't do it for us. */
+a180 5
+   batch->reserved_space = BATCH_RESERVED;
+
+   /* TODO: Just pass the relocation list and dma buffer up to the
+    * kernel.
+    */
+d183 1
+a183 1
+   if (INTEL_DEBUG & DEBUG_SYNC) {
+d185 2
+a186 2
+      dri_bo_map(batch->buf, GL_TRUE);
+      dri_bo_unmap(batch->buf);
+d199 1
+a199 1
+                             dri_bo *buffer,
+d210 3
+a212 2
+   ret = dri_bo_emit_reloc(batch->buf, read_domains, write_domain,
+			   delta, batch->ptr - batch->map, buffer);
+d253 1
+a253 1
+                       const void *data, GLuint bytes)
+d256 1
+a256 1
+   intel_batchbuffer_require_space(batch, bytes);
+d272 28
+a299 1
+   if (intel->gen >= 4) {
+a301 1
+		PIPE_CONTROL_INSTRUCTION_FLUSH |
+@
+
+
+1.3
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@d133 1
+a133 1
+   if (!intel->using_dri2_swapbuffers &&
+@
+
+
+1.2
+log
+@Update to Mesa 7.4.2. Tested by oga@@, ckuethe@@ and naddy@@.
+@
+text
+@a34 38
+/* Relocations in kernel space:
+ *    - pass dma buffer seperately
+ *    - memory manager knows how to patch
+ *    - pass list of dependent buffers
+ *    - pass relocation list
+ *
+ * Either:
+ *    - get back an offset for buffer to fire
+ *    - memory manager knows how to fire buffer
+ *
+ * Really want the buffer to be AGP and pinned.
+ *
+ */
+
+/* Cliprect fence: The highest fence protecting a dma buffer
+ * containing explicit cliprect information.  Like the old drawable
+ * lock but irq-driven.  X server must wait for this fence to expire
+ * before changing cliprects [and then doing sw rendering?].  For
+ * other dma buffers, the scheduler will grab current cliprect info
+ * and mix into buffer.  X server must hold the lock while changing
+ * cliprects???  Make per-drawable.  Need cliprects in shared memory
+ * -- beats storing them with every cmd buffer in the queue.
+ *
+ * ==> X server must wait for this fence to expire before touching the
+ * framebuffer with new cliprects.
+ *
+ * ==> Cliprect-dependent buffers associated with a
+ * cliprect-timestamp.  All of the buffers associated with a timestamp
+ * must go to hardware before any buffer with a newer timestamp.
+ *
+ * ==> Dma should be queued per-drawable for correct X/GL
+ * synchronization.  Or can fences be used for this?
+ *
+ * Applies to: Blit operations, metaops, X server operations -- X
+ * server automatically waits on its own dma to complete before
+ * modifying cliprects ???
+ */
+
+d45 1
+a45 1
+   if (!batch->buffer && intel->ttm == GL_TRUE)
+a58 1
+   batch->cliprect_mode = IGNORE_CLIPRECTS;
+d93 1
+a93 2
+do_flush_locked(struct intel_batchbuffer *batch,
+		GLuint used, GLboolean allow_unlock)
+a96 2
+   unsigned int num_cliprects = 0;
+   struct drm_clip_rect *cliprects = NULL;
+d107 2
+a108 25
+
+   if (batch->cliprect_mode == LOOP_CLIPRECTS) {
+      intel_get_cliprects(intel, &cliprects, &num_cliprects, &x_off, &y_off);
+   }
+   /* Dispatch the batchbuffer, if it has some effect (nonzero cliprects).
+    * Can't short-circuit like this once we have hardware contexts, but we
+    * should always be in DRI2 mode by then anyway.
+    */
+   if ((batch->cliprect_mode != LOOP_CLIPRECTS ||
+	num_cliprects != 0) && !intel->no_hw) {
+      dri_bo_exec(batch->buf, used, cliprects, num_cliprects,
+		  (x_off & 0xffff) | (y_off << 16));
+   }
+
+   if (batch->cliprect_mode == LOOP_CLIPRECTS && num_cliprects == 0) {
+      if (allow_unlock) {
+	 /* If we are not doing any actual user-visible rendering,
+	  * do a sched_yield to keep the app from pegging the cpu while
+	  * achieving nothing.
+	  */
+         UNLOCK_HARDWARE(intel);
+         sched_yield();
+         LOCK_HARDWARE(intel);
+      }
+   }
+a120 1
+      UNLOCK_HARDWARE(intel);
+a131 1
+   GLboolean was_locked = intel->locked;
+d133 7
+a139 2
+   if (used == 0) {
+      batch->cliprect_mode = IGNORE_CLIPRECTS;
+a140 1
+   }
+d146 1
+d148 2
+a149 3
+   if (!intel->ttm) {
+      *(GLuint *) (batch->ptr) = intel->vtbl.flush_cmd();
+      batch->ptr += 4;
+d162 1
+a162 1
+   *(GLuint *) (batch->ptr) = MI_BATCH_BUFFER_END; /* noop */
+d165 1
+d181 5
+d189 1
+a189 7
+   if (!was_locked)
+      LOCK_HARDWARE(intel);
+
+   do_flush_locked(batch, used, GL_FALSE);
+
+   if (!was_locked)
+      UNLOCK_HARDWARE(intel);
+d213 2
+d216 2
+a217 2
+    _mesa_printf ("bad relocation ptr %p map %p offset %d size %d\n",
+		  batch->ptr, batch->map, batch->ptr - batch->map, batch->buf->size);
+d231 27
+d260 1
+a260 2
+                       const void *data, GLuint bytes,
+		       enum cliprect_mode cliprect_mode)
+d263 1
+a263 1
+   intel_batchbuffer_require_space(batch, bytes, cliprect_mode);
+d266 28
+@
+
+
+1.1
+log
+@Mesa 7.2, Tested by ckuethe@@, naddy@@, oga@@, and others.
+@
+text
+@d28 1
+a29 1
+#include "intel_ioctl.h"
+d32 2
+d83 3
+d87 7
+a93 4
+			     intel->maxBatchSize, 4096,
+			     DRM_BO_FLAG_MEM_LOCAL | DRM_BO_FLAG_CACHED | DRM_BO_FLAG_CACHED_MAPPED);
+   dri_bo_map(batch->buf, GL_TRUE);
+   batch->map = batch->buf->virtual;
+a97 4
+
+   /* account batchbuffer in aperture */
+   dri_bufmgr_check_aperture_space(batch->buf);
+
+a105 1
+   batch->last_fence = NULL;
+d114 7
+a120 8
+   if (batch->last_fence) {
+      dri_fence_wait(batch->last_fence);
+      dri_fence_unreference(batch->last_fence);
+      batch->last_fence = NULL;
+   }
+   if (batch->map) {
+      dri_bo_unmap(batch->buf);
+      batch->map = NULL;
+d136 9
+a144 5
+   void *start;
+   GLuint count;
+
+   dri_bo_unmap(batch->buf);
+   start = dri_process_relocs(batch->buf, &count);
+d149 7
+a155 3
+   /* Throw away non-effective packets.  Won't work once we have
+    * hardware contexts which would preserve statechanges beyond a
+    * single buffer.
+d157 4
+a160 16
+
+   if (!(intel->numClipRects == 0 &&
+	 batch->cliprect_mode == LOOP_CLIPRECTS)) {
+      if (intel->ttm == GL_TRUE) {
+	 intel_exec_ioctl(batch->intel,
+			  used,
+			  batch->cliprect_mode != LOOP_CLIPRECTS,
+			  allow_unlock,
+			  start, count, &batch->last_fence);
+      } else {
+	 intel_batch_ioctl(batch->intel,
+			   batch->buf->offset,
+			   used,
+			   batch->cliprect_mode != LOOP_CLIPRECTS,
+			   allow_unlock);
+      }
+a161 2
+      
+   dri_post_submit(batch->buf, &batch->last_fence);
+d163 1
+a163 2
+   if (intel->numClipRects == 0 &&
+       batch->cliprect_mode == LOOP_CLIPRECTS) {
+d185 4
+d200 2
+a201 1
+   if (used == 0)
+d203 1
+d208 6
+a213 8
+   /* Add the MI_BATCH_BUFFER_END.  Always add an MI_FLUSH - this is a
+    * performance drain that we would like to avoid.
+    */
+   if (used & 4) {
+      ((int *) batch->ptr)[0] = intel->vtbl.flush_cmd();
+      ((int *) batch->ptr)[1] = 0;
+      ((int *) batch->ptr)[2] = MI_BATCH_BUFFER_END;
+      used += 12;
+d215 7
+a221 4
+   else {
+      ((int *) batch->ptr)[0] = intel->vtbl.flush_cmd();
+      ((int *) batch->ptr)[1] = MI_BATCH_BUFFER_END;
+      used += 8;
+d224 5
+d240 3
+d256 2
+a257 2
+      if (batch->last_fence != NULL)
+	 dri_fence_wait(batch->last_fence);
+a264 8
+void
+intel_batchbuffer_finish(struct intel_batchbuffer *batch)
+{
+   intel_batchbuffer_flush(batch);
+   if (batch->last_fence != NULL)
+      dri_fence_wait(batch->last_fence);
+}
+
+d271 2
+a272 1
+                             GLuint flags, GLuint delta)
+d276 5
+a280 1
+   ret = dri_emit_reloc(batch->buf, flags, delta, batch->ptr - batch->map, buffer);
+@
+
+
+1.1.1.1
+log
+@Import Mesa 7.10.3
+@
+text
+@a27 1
+#include "intel_context.h"
+d29 1
+d32 38
+a69 2
+#include "intel_bufmgr.h"
+#include "intel_buffers.h"
+d77 1
+a77 1
+      drm_intel_bo_unreference(batch->buf);
+d81 4
+a84 3
+   batch->buf = drm_intel_bo_alloc(intel->bufmgr, "batchbuffer",
+				   intel->maxBatchSize, 4096);
+   drm_intel_gem_bo_map_gtt(batch->buf);
+a85 1
+
+a87 1
+   batch->reserved_space = BATCH_RESERVED;
+d89 5
+a93 1
+   batch->state_batch_offset = batch->size;
+d102 1
+d111 5
+d117 1
+a117 1
+      drm_intel_gem_bo_unmap_gtt(batch->buf);
+d130 2
+a131 1
+do_flush_locked(struct intel_batchbuffer *batch, GLuint used)
+d134 2
+a135 2
+   int ret = 0;
+   int x_off = 0, y_off = 0;
+d137 2
+a138 1
+   drm_intel_gem_bo_unmap_gtt(batch->buf);
+d140 1
+d143 4
+a146 2
+   if (!intel->intelScreen->no_hw) {
+      int ring;
+d148 8
+a155 2
+      if (intel->gen < 6 || !intel->batch->is_blit) {
+	 ring = I915_EXEC_RENDER;
+d157 5
+a161 1
+	 ring = I915_EXEC_BLT;
+d163 3
+d167 11
+a177 2
+      drm_intel_bo_mrb_exec(batch->buf, used, NULL, 0,
+			    (x_off & 0xffff) | (y_off << 16), ring);
+d180 2
+a181 2
+   if (unlikely(INTEL_DEBUG & DEBUG_BATCH)) {
+      drm_intel_bo_map(batch->buf, GL_FALSE);
+d183 2
+a184 2
+		   intel->intelScreen->deviceID, GL_TRUE);
+      drm_intel_bo_unmap(batch->buf);
+a189 3
+   if (ret != 0) {
+      exit(1);
+   }
+d199 1
+a199 5
+
+   if (intel->first_post_swapbuffers_batch == NULL) {
+      intel->first_post_swapbuffers_batch = intel->batch->buf;
+      drm_intel_bo_reference(intel->first_post_swapbuffers_batch);
+   }
+d204 1
+a204 1
+   if (unlikely(INTEL_DEBUG & DEBUG_BATCH))
+d207 8
+a214 6
+
+   batch->reserved_space = 0;
+
+   if (intel->always_flush_cache) {
+      intel_batchbuffer_emit_mi_flush(batch);
+      used = batch->ptr - batch->map;
+d216 4
+a219 7
+
+   /* Round batchbuffer usage to 2 DWORDs. */
+
+   if ((used & 4) == 0) {
+      *(GLuint *) (batch->ptr) = 0; /* noop */
+      batch->ptr += 4;
+      used = batch->ptr - batch->map;
+a221 6
+   /* Mark the end of the buffer. */
+   *(GLuint *) (batch->ptr) = MI_BATCH_BUFFER_END;
+   batch->ptr += 4;
+   used = batch->ptr - batch->map;
+   assert (used <= batch->buf->size);
+
+d233 5
+a237 2
+   if (intel->vtbl.finish_batch)
+      intel->vtbl.finish_batch(intel);
+d239 1
+a239 2
+   /* Check that we didn't just wrap our batchbuffer at a bad time. */
+   assert(!intel->no_batch_wrap);
+d241 2
+a242 1
+   do_flush_locked(batch, used);
+d244 1
+a244 1
+   if (unlikely(INTEL_DEBUG & DEBUG_SYNC)) {
+d246 2
+a247 2
+      drm_intel_bo_map(batch->buf, GL_TRUE);
+      drm_intel_bo_unmap(batch->buf);
+d255 8
+d268 2
+a269 3
+                             drm_intel_bo *buffer,
+                             uint32_t read_domains, uint32_t write_domain,
+			     uint32_t delta)
+d273 1
+a273 8
+   assert(delta < buffer->size);
+
+   if (batch->ptr - batch->map > batch->buf->size)
+    printf ("bad relocation ptr %p map %p offset %d size %lu\n",
+	    batch->ptr, batch->map, batch->ptr - batch->map, batch->buf->size);
+   ret = drm_intel_bo_emit_reloc(batch->buf, batch->ptr - batch->map,
+				 buffer, delta,
+				 read_domains, write_domain);
+a284 27
+GLboolean
+intel_batchbuffer_emit_reloc_fenced(struct intel_batchbuffer *batch,
+				    drm_intel_bo *buffer,
+				    uint32_t read_domains, uint32_t write_domain,
+				    uint32_t delta)
+{
+   int ret;
+
+   assert(delta < buffer->size);
+
+   if (batch->ptr - batch->map > batch->buf->size)
+    printf ("bad relocation ptr %p map %p offset %d size %lu\n",
+	    batch->ptr, batch->map, batch->ptr - batch->map, batch->buf->size);
+   ret = drm_intel_bo_emit_reloc_fence(batch->buf, batch->ptr - batch->map,
+				       buffer, delta,
+				       read_domains, write_domain);
+
+   /*
+    * Using the old buffer offset, write in what the right data would
+    * be, in case the buffer doesn't move and we can short-circuit the
+    * relocation processing in the kernel
+    */
+   intel_batchbuffer_emit_dword (batch, buffer->offset + delta);
+
+   return GL_TRUE;
+}
+
+d287 2
+a288 1
+                       const void *data, GLuint bytes, bool is_blit)
+d291 1
+a291 1
+   intel_batchbuffer_require_space(batch, bytes, is_blit);
+a293 54
+}
+
+/* Emit a pipelined flush to either flush render and texture cache for
+ * reading from a FBO-drawn texture, or flush so that frontbuffer
+ * render appears on the screen in DRI1.
+ *
+ * This is also used for the always_flush_cache driconf debug option.
+ */
+void
+intel_batchbuffer_emit_mi_flush(struct intel_batchbuffer *batch)
+{
+   struct intel_context *intel = batch->intel;
+
+   if (intel->gen >= 6) {
+      if (intel->batch->is_blit) {
+	 BEGIN_BATCH_BLT(4);
+	 OUT_BATCH(MI_FLUSH_DW);
+	 OUT_BATCH(0);
+	 OUT_BATCH(0);
+	 OUT_BATCH(0);
+	 ADVANCE_BATCH();
+      } else {
+	 BEGIN_BATCH(8);
+	 /* XXX workaround: issue any post sync != 0 before write
+	  * cache flush = 1
+	  */
+	 OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+	 OUT_BATCH(PIPE_CONTROL_WRITE_IMMEDIATE);
+	 OUT_BATCH(0); /* write address */
+	 OUT_BATCH(0); /* write data */
+
+	 OUT_BATCH(_3DSTATE_PIPE_CONTROL);
+	 OUT_BATCH(PIPE_CONTROL_INSTRUCTION_FLUSH |
+		   PIPE_CONTROL_WRITE_FLUSH |
+		   PIPE_CONTROL_DEPTH_CACHE_FLUSH |
+		   PIPE_CONTROL_NO_WRITE);
+	 OUT_BATCH(0); /* write address */
+	 OUT_BATCH(0); /* write data */
+	 ADVANCE_BATCH();
+      }
+   } else if (intel->gen >= 4) {
+      BEGIN_BATCH(4);
+      OUT_BATCH(_3DSTATE_PIPE_CONTROL |
+		PIPE_CONTROL_WRITE_FLUSH |
+		PIPE_CONTROL_NO_WRITE);
+      OUT_BATCH(0); /* write address */
+      OUT_BATCH(0); /* write data */
+      OUT_BATCH(0); /* write data */
+      ADVANCE_BATCH();
+   } else {
+      BEGIN_BATCH(1);
+      OUT_BATCH(MI_FLUSH);
+      ADVANCE_BATCH();
+   }
+@
+
+

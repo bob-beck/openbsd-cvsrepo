@@ -1,0 +1,507 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_5_6:1.5.0.10
+	OPENBSD_5_6_BASE:1.5
+	OPENBSD_5_5:1.5.0.8
+	OPENBSD_5_5_BASE:1.5
+	OPENBSD_5_4:1.5.0.4
+	OPENBSD_5_4_BASE:1.5
+	OPENBSD_5_3:1.5.0.2
+	OPENBSD_5_3_BASE:1.5
+	OPENBSD_5_2:1.3.0.2
+	OPENBSD_5_2_BASE:1.3
+	OPENBSD_5_1_BASE:1.1
+	OPENBSD_5_1:1.1.0.2;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2014.08.26.19.35.33;	author robert;	state dead;
+branches;
+next	1.5;
+commitid	sO1mMs3aGJWmnMM1;
+
+1.5
+date	2013.01.14.17.08.13;	author robert;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2012.08.21.11.31.52;	author robert;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.05.13.09.14.58;	author robert;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.02.18.11.20.21;	author robert;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.09.22.23.38.25;	author robert;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@remove nginx from the base system in favor of OpenBSD's own httpd(8)
+@
+text
+@
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
+ */
+
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+
+
+#if (NGX_HAVE_ATOMIC_OPS)
+
+
+static void ngx_shmtx_wakeup(ngx_shmtx_t *mtx);
+
+
+ngx_int_t
+ngx_shmtx_create(ngx_shmtx_t *mtx, ngx_shmtx_sh_t *addr, u_char *name)
+{
+    mtx->lock = &addr->lock;
+
+    if (mtx->spin == (ngx_uint_t) -1) {
+        return NGX_OK;
+    }
+
+    mtx->spin = 2048;
+
+#if (NGX_HAVE_POSIX_SEM)
+
+    mtx->wait = &addr->wait;
+
+    if (sem_init(&mtx->sem, 1, 0) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_errno,
+                      "sem_init() failed");
+    } else {
+        mtx->semaphore = 1;
+    }
+
+#endif
+
+    return NGX_OK;
+}
+
+
+void
+ngx_shmtx_destroy(ngx_shmtx_t *mtx)
+{
+#if (NGX_HAVE_POSIX_SEM)
+
+    if (mtx->semaphore) {
+        if (sem_destroy(&mtx->sem) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_errno,
+                          "sem_destroy() failed");
+        }
+    }
+
+#endif
+}
+
+
+ngx_uint_t
+ngx_shmtx_trylock(ngx_shmtx_t *mtx)
+{
+    return (*mtx->lock == 0 && ngx_atomic_cmp_set(mtx->lock, 0, ngx_pid));
+}
+
+
+void
+ngx_shmtx_lock(ngx_shmtx_t *mtx)
+{
+    ngx_uint_t         i, n;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0, "shmtx lock");
+
+    for ( ;; ) {
+
+        if (*mtx->lock == 0 && ngx_atomic_cmp_set(mtx->lock, 0, ngx_pid)) {
+            return;
+        }
+
+        if (ngx_ncpu > 1) {
+
+            for (n = 1; n < mtx->spin; n <<= 1) {
+
+                for (i = 0; i < n; i++) {
+                    ngx_cpu_pause();
+                }
+
+                if (*mtx->lock == 0
+                    && ngx_atomic_cmp_set(mtx->lock, 0, ngx_pid))
+                {
+                    return;
+                }
+            }
+        }
+
+#if (NGX_HAVE_POSIX_SEM)
+
+        if (mtx->semaphore) {
+            (void) ngx_atomic_fetch_add(mtx->wait, 1);
+
+            if (*mtx->lock == 0 && ngx_atomic_cmp_set(mtx->lock, 0, ngx_pid)) {
+                return;
+            }
+
+            ngx_log_debug1(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                           "shmtx wait %uA", *mtx->wait);
+
+            while (sem_wait(&mtx->sem) == -1) {
+                ngx_err_t  err;
+
+                err = ngx_errno;
+
+                if (err != NGX_EINTR) {
+                    ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, err,
+                                  "sem_wait() failed while waiting on shmtx");
+                    break;
+                }
+            }
+
+            ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                           "shmtx awoke");
+
+            continue;
+        }
+
+#endif
+
+        ngx_sched_yield();
+    }
+}
+
+
+void
+ngx_shmtx_unlock(ngx_shmtx_t *mtx)
+{
+    if (mtx->spin != (ngx_uint_t) -1) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0, "shmtx unlock");
+    }
+
+    if (ngx_atomic_cmp_set(mtx->lock, ngx_pid, 0)) {
+        ngx_shmtx_wakeup(mtx);
+    }
+}
+
+
+ngx_uint_t
+ngx_shmtx_force_unlock(ngx_shmtx_t *mtx, ngx_pid_t pid)
+{
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                   "shmtx forced unlock");
+
+    if (ngx_atomic_cmp_set(mtx->lock, pid, 0)) {
+        ngx_shmtx_wakeup(mtx);
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static void
+ngx_shmtx_wakeup(ngx_shmtx_t *mtx)
+{
+#if (NGX_HAVE_POSIX_SEM)
+    ngx_atomic_uint_t  wait;
+
+    if (!mtx->semaphore) {
+        return;
+    }
+
+    for ( ;; ) {
+
+        wait = *mtx->wait;
+
+        if (wait == 0) {
+            return;
+        }
+
+        if (ngx_atomic_cmp_set(mtx->wait, wait, wait - 1)) {
+            break;
+        }
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                   "shmtx wake %uA", wait);
+
+    if (sem_post(&mtx->sem) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_errno,
+                      "sem_post() failed while wake shmtx");
+    }
+
+#endif
+}
+
+
+#else
+
+
+ngx_int_t
+ngx_shmtx_create(ngx_shmtx_t *mtx, ngx_shmtx_sh_t *addr, u_char *name)
+{
+    if (mtx->name) {
+
+        if (ngx_strcmp(name, mtx->name) == 0) {
+            mtx->name = name;
+            return NGX_OK;
+        }
+
+        ngx_shmtx_destroy(mtx);
+    }
+
+    mtx->fd = ngx_open_file(name, NGX_FILE_RDWR, NGX_FILE_CREATE_OR_OPEN,
+                            NGX_FILE_DEFAULT_ACCESS);
+
+    if (mtx->fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_EMERG, ngx_cycle->log, ngx_errno,
+                      ngx_open_file_n " \"%s\" failed", name);
+        return NGX_ERROR;
+    }
+
+    if (ngx_delete_file(name) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_errno,
+                      ngx_delete_file_n " \"%s\" failed", name);
+    }
+
+    mtx->name = name;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_shmtx_destroy(ngx_shmtx_t *mtx)
+{
+    if (ngx_close_file(mtx->fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", mtx->name);
+    }
+}
+
+
+ngx_uint_t
+ngx_shmtx_trylock(ngx_shmtx_t *mtx)
+{
+    ngx_err_t  err;
+
+    err = ngx_trylock_fd(mtx->fd);
+
+    if (err == 0) {
+        return 1;
+    }
+
+    if (err == NGX_EAGAIN) {
+        return 0;
+    }
+
+#if __osf__ /* Tru64 UNIX */
+
+    if (err == NGX_EACCESS) {
+        return 0;
+    }
+
+#endif
+
+    ngx_log_abort(err, ngx_trylock_fd_n " %s failed", mtx->name);
+
+    return 0;
+}
+
+
+void
+ngx_shmtx_lock(ngx_shmtx_t *mtx)
+{
+    ngx_err_t  err;
+
+    err = ngx_lock_fd(mtx->fd);
+
+    if (err == 0) {
+        return;
+    }
+
+    ngx_log_abort(err, ngx_lock_fd_n " %s failed", mtx->name);
+}
+
+
+void
+ngx_shmtx_unlock(ngx_shmtx_t *mtx)
+{
+    ngx_err_t  err;
+
+    err = ngx_unlock_fd(mtx->fd);
+
+    if (err == 0) {
+        return;
+    }
+
+    ngx_log_abort(err, ngx_unlock_fd_n " %s failed", mtx->name);
+}
+
+
+ngx_uint_t
+ngx_shmtx_force_unlock(ngx_shmtx_t *mtx, ngx_pid_t pid)
+{
+    return 0;
+}
+
+#endif
+@
+
+
+1.5
+log
+@update to nginx-1.2.6
+@
+text
+@@
+
+
+1.4
+log
+@update to nginx-1.2.3
+@
+text
+@d120 1
+d122 2
+a123 3
+                ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                               "shmtx awoke");
+            }
+@
+
+
+1.3
+log
+@update to nginx-1.2.0
+@
+text
+@d47 1
+a47 1
+ngx_shmtx_destory(ngx_shmtx_t *mtx)
+d211 1
+a211 1
+        ngx_shmtx_destory(mtx);
+d235 1
+a235 1
+ngx_shmtx_destory(ngx_shmtx_t *mtx)
+@
+
+
+1.2
+log
+@update to 1.0.12
+@
+text
+@d15 3
+d19 1
+a19 1
+ngx_shmtx_create(ngx_shmtx_t *mtx, void *addr, u_char *name)
+d21 1
+a21 1
+    mtx->lock = addr;
+d31 2
+d65 1
+a65 6
+    ngx_atomic_uint_t  val;
+
+    val = *mtx->lock;
+
+    return ((val & 0x80000000) == 0
+            && ngx_atomic_cmp_set(mtx->lock, val, val | 0x80000000));
+a72 1
+    ngx_atomic_uint_t  val;
+d78 1
+a78 5
+        val = *mtx->lock;
+
+        if ((val & 0x80000000) == 0
+            && ngx_atomic_cmp_set(mtx->lock, val, val | 0x80000000))
+        {
+d90 2
+a91 4
+                val = *mtx->lock;
+
+                if ((val & 0x80000000) == 0
+                    && ngx_atomic_cmp_set(mtx->lock, val, val | 0x80000000))
+d101 11
+a111 1
+            val = *mtx->lock;
+d113 6
+a118 16
+            if ((val & 0x80000000)
+                && ngx_atomic_cmp_set(mtx->lock, val, val + 1))
+            {
+                ngx_log_debug1(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                               "shmtx wait %XA", val);
+
+                while (sem_wait(&mtx->sem) == -1) {
+                    ngx_err_t  err;
+
+                    err = ngx_errno;
+
+                    if (err != NGX_EINTR) {
+                        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, err,
+                                   "sem_wait() failed while waiting on shmtx");
+                        break;
+                    }
+a137 2
+    ngx_atomic_uint_t  val, old, wait;
+
+d142 4
+a145 1
+    for ( ;; ) {
+a146 3
+        old = *mtx->lock;
+        wait = old & 0x7fffffff;
+        val = wait ? wait - 1 : 0;
+d148 9
+a156 3
+        if (ngx_atomic_cmp_set(mtx->lock, old, val)) {
+            break;
+        }
+d159 7
+d167 1
+d169 1
+a169 1
+    if (wait == 0 || !mtx->semaphore) {
+d173 13
+d187 1
+a187 1
+                   "shmtx wake %XA", old);
+d202 1
+a202 1
+ngx_shmtx_create(ngx_shmtx_t *mtx, void *addr, u_char *name)
+d300 7
+@
+
+
+1.1
+log
+@thank you CVS for missing the "core" directory
+@
+text
+@d4 1
+@
+

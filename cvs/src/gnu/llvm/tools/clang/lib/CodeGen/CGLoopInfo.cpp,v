@@ -1,0 +1,464 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.46.57;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.46.57;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.55.51;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.11;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===---- CGLoopInfo.cpp - LLVM CodeGen for loop metadata -*- C++ -*-------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+#include "CGLoopInfo.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/Sema/LoopHint.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+using namespace clang::CodeGen;
+using namespace llvm;
+
+static MDNode *createMetadata(LLVMContext &Ctx, const LoopAttributes &Attrs) {
+
+  if (!Attrs.IsParallel && Attrs.VectorizeWidth == 0 &&
+      Attrs.InterleaveCount == 0 && Attrs.UnrollCount == 0 &&
+      Attrs.VectorizeEnable == LoopAttributes::Unspecified &&
+      Attrs.UnrollEnable == LoopAttributes::Unspecified)
+    return nullptr;
+
+  SmallVector<Metadata *, 4> Args;
+  // Reserve operand 0 for loop id self reference.
+  auto TempNode = MDNode::getTemporary(Ctx, None);
+  Args.push_back(TempNode.get());
+
+  // Setting vectorize.width
+  if (Attrs.VectorizeWidth > 0) {
+    Metadata *Vals[] = {MDString::get(Ctx, "llvm.loop.vectorize.width"),
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            Type::getInt32Ty(Ctx), Attrs.VectorizeWidth))};
+    Args.push_back(MDNode::get(Ctx, Vals));
+  }
+
+  // Setting interleave.count
+  if (Attrs.InterleaveCount > 0) {
+    Metadata *Vals[] = {MDString::get(Ctx, "llvm.loop.interleave.count"),
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            Type::getInt32Ty(Ctx), Attrs.InterleaveCount))};
+    Args.push_back(MDNode::get(Ctx, Vals));
+  }
+
+  // Setting interleave.count
+  if (Attrs.UnrollCount > 0) {
+    Metadata *Vals[] = {MDString::get(Ctx, "llvm.loop.unroll.count"),
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            Type::getInt32Ty(Ctx), Attrs.UnrollCount))};
+    Args.push_back(MDNode::get(Ctx, Vals));
+  }
+
+  // Setting vectorize.enable
+  if (Attrs.VectorizeEnable != LoopAttributes::Unspecified) {
+    Metadata *Vals[] = {MDString::get(Ctx, "llvm.loop.vectorize.enable"),
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            Type::getInt1Ty(Ctx), (Attrs.VectorizeEnable ==
+                                                   LoopAttributes::Enable)))};
+    Args.push_back(MDNode::get(Ctx, Vals));
+  }
+
+  // Setting unroll.full or unroll.disable
+  if (Attrs.UnrollEnable != LoopAttributes::Unspecified) {
+    std::string Name;
+    if (Attrs.UnrollEnable == LoopAttributes::Enable)
+      Name = "llvm.loop.unroll.enable";
+    else if (Attrs.UnrollEnable == LoopAttributes::Full)
+      Name = "llvm.loop.unroll.full";
+    else
+      Name = "llvm.loop.unroll.disable";
+    Metadata *Vals[] = {MDString::get(Ctx, Name)};
+    Args.push_back(MDNode::get(Ctx, Vals));
+  }
+
+  // Set the first operand to itself.
+  MDNode *LoopID = MDNode::get(Ctx, Args);
+  LoopID->replaceOperandWith(0, LoopID);
+  return LoopID;
+}
+
+LoopAttributes::LoopAttributes(bool IsParallel)
+    : IsParallel(IsParallel), VectorizeEnable(LoopAttributes::Unspecified),
+      UnrollEnable(LoopAttributes::Unspecified), VectorizeWidth(0),
+      InterleaveCount(0), UnrollCount(0) {}
+
+void LoopAttributes::clear() {
+  IsParallel = false;
+  VectorizeWidth = 0;
+  InterleaveCount = 0;
+  UnrollCount = 0;
+  VectorizeEnable = LoopAttributes::Unspecified;
+  UnrollEnable = LoopAttributes::Unspecified;
+}
+
+LoopInfo::LoopInfo(BasicBlock *Header, const LoopAttributes &Attrs)
+    : LoopID(nullptr), Header(Header), Attrs(Attrs) {
+  LoopID = createMetadata(Header->getContext(), Attrs);
+}
+
+void LoopInfoStack::push(BasicBlock *Header) {
+  Active.push_back(LoopInfo(Header, StagedAttrs));
+  // Clear the attributes so nested loops do not inherit them.
+  StagedAttrs.clear();
+}
+
+void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
+                         ArrayRef<const clang::Attr *> Attrs) {
+
+  // Identify loop hint attributes from Attrs.
+  for (const auto *Attr : Attrs) {
+    const LoopHintAttr *LH = dyn_cast<LoopHintAttr>(Attr);
+
+    // Skip non loop hint attributes
+    if (!LH)
+      continue;
+
+    auto *ValueExpr = LH->getValue();
+    unsigned ValueInt = 1;
+    if (ValueExpr) {
+      llvm::APSInt ValueAPS = ValueExpr->EvaluateKnownConstInt(Ctx);
+      ValueInt = ValueAPS.getSExtValue();
+    }
+
+    LoopHintAttr::OptionType Option = LH->getOption();
+    LoopHintAttr::LoopHintState State = LH->getState();
+    switch (State) {
+    case LoopHintAttr::Disable:
+      switch (Option) {
+      case LoopHintAttr::Vectorize:
+        // Disable vectorization by specifying a width of 1.
+        setVectorizeWidth(1);
+        break;
+      case LoopHintAttr::Interleave:
+        // Disable interleaving by speciyfing a count of 1.
+        setInterleaveCount(1);
+        break;
+      case LoopHintAttr::Unroll:
+        setUnrollState(LoopAttributes::Disable);
+        break;
+      case LoopHintAttr::UnrollCount:
+      case LoopHintAttr::VectorizeWidth:
+      case LoopHintAttr::InterleaveCount:
+        llvm_unreachable("Options cannot be disabled.");
+        break;
+      }
+      break;
+    case LoopHintAttr::Enable:
+      switch (Option) {
+      case LoopHintAttr::Vectorize:
+      case LoopHintAttr::Interleave:
+        setVectorizeEnable(true);
+        break;
+      case LoopHintAttr::Unroll:
+        setUnrollState(LoopAttributes::Enable);
+        break;
+      case LoopHintAttr::UnrollCount:
+      case LoopHintAttr::VectorizeWidth:
+      case LoopHintAttr::InterleaveCount:
+        llvm_unreachable("Options cannot enabled.");
+        break;
+      }
+      break;
+    case LoopHintAttr::AssumeSafety:
+      switch (Option) {
+      case LoopHintAttr::Vectorize:
+      case LoopHintAttr::Interleave:
+        // Apply "llvm.mem.parallel_loop_access" metadata to load/stores.
+        setParallel(true);
+        setVectorizeEnable(true);
+        break;
+      case LoopHintAttr::Unroll:
+      case LoopHintAttr::UnrollCount:
+      case LoopHintAttr::VectorizeWidth:
+      case LoopHintAttr::InterleaveCount:
+        llvm_unreachable("Options cannot be used to assume mem safety.");
+        break;
+      }
+      break;
+    case LoopHintAttr::Full:
+      switch (Option) {
+      case LoopHintAttr::Unroll:
+        setUnrollState(LoopAttributes::Full);
+        break;
+      case LoopHintAttr::Vectorize:
+      case LoopHintAttr::Interleave:
+      case LoopHintAttr::UnrollCount:
+      case LoopHintAttr::VectorizeWidth:
+      case LoopHintAttr::InterleaveCount:
+        llvm_unreachable("Options cannot be used with 'full' hint.");
+        break;
+      }
+      break;
+    case LoopHintAttr::Numeric:
+      switch (Option) {
+      case LoopHintAttr::VectorizeWidth:
+        setVectorizeWidth(ValueInt);
+        break;
+      case LoopHintAttr::InterleaveCount:
+        setInterleaveCount(ValueInt);
+        break;
+      case LoopHintAttr::UnrollCount:
+        setUnrollCount(ValueInt);
+        break;
+      case LoopHintAttr::Unroll:
+      case LoopHintAttr::Vectorize:
+      case LoopHintAttr::Interleave:
+        llvm_unreachable("Options cannot be assigned a value.");
+        break;
+      }
+      break;
+    }
+  }
+
+  /// Stage the attributes.
+  push(Header);
+}
+
+void LoopInfoStack::pop() {
+  assert(!Active.empty() && "No active loops to pop");
+  Active.pop_back();
+}
+
+void LoopInfoStack::InsertHelper(Instruction *I) const {
+  if (!hasInfo())
+    return;
+
+  const LoopInfo &L = getInfo();
+  if (!L.getLoopID())
+    return;
+
+  if (TerminatorInst *TI = dyn_cast<TerminatorInst>(I)) {
+    for (unsigned i = 0, ie = TI->getNumSuccessors(); i < ie; ++i)
+      if (TI->getSuccessor(i) == L.getHeader()) {
+        TI->setMetadata("llvm.loop", L.getLoopID());
+        break;
+      }
+    return;
+  }
+
+  if (L.getAttributes().IsParallel && I->mayReadOrWriteMemory())
+    I->setMetadata("llvm.mem.parallel_loop_access", L.getLoopID());
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d22 1
+a22 2
+static MDNode *createMetadata(LLVMContext &Ctx, const LoopAttributes &Attrs,
+                              llvm::DebugLoc Location) {
+d27 1
+a27 3
+      Attrs.UnrollEnable == LoopAttributes::Unspecified &&
+      Attrs.DistributeEnable == LoopAttributes::Unspecified &&
+      !Location)
+a34 4
+  // If we have a valid debug location for the loop, add it.
+  if (Location)
+    Args.push_back(Location.getAsMDNode());
+
+a80 8
+  if (Attrs.DistributeEnable != LoopAttributes::Unspecified) {
+    Metadata *Vals[] = {MDString::get(Ctx, "llvm.loop.distribute.enable"),
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            Type::getInt1Ty(Ctx), (Attrs.DistributeEnable ==
+                                                   LoopAttributes::Enable)))};
+    Args.push_back(MDNode::get(Ctx, Vals));
+  }
+
+d90 1
+a90 2
+      InterleaveCount(0), UnrollCount(0),
+      DistributeEnable(LoopAttributes::Unspecified) {}
+d101 1
+a101 2
+LoopInfo::LoopInfo(BasicBlock *Header, const LoopAttributes &Attrs,
+                   llvm::DebugLoc Location)
+d103 1
+a103 1
+  LoopID = createMetadata(Header->getContext(), Attrs, Location);
+d106 2
+a107 2
+void LoopInfoStack::push(BasicBlock *Header, llvm::DebugLoc Location) {
+  Active.push_back(LoopInfo(Header, StagedAttrs, Location));
+d113 1
+a113 2
+                         ArrayRef<const clang::Attr *> Attrs,
+                         llvm::DebugLoc Location) {
+a117 2
+    const OpenCLUnrollHintAttr *OpenCLHint =
+        dyn_cast<OpenCLUnrollHintAttr>(Attr);
+d120 1
+a120 1
+    if (!LH && !OpenCLHint) {
+a121 1
+    }
+d123 1
+a123 2
+    LoopHintAttr::OptionType Option = LoopHintAttr::Unroll;
+    LoopHintAttr::LoopHintState State = LoopHintAttr::Disable;
+d125 4
+a128 20
+    // Translate opencl_unroll_hint attribute argument to
+    // equivalent LoopHintAttr enums.
+    // OpenCL v2.0 s6.11.5:  
+    // 0 - full unroll (no argument).
+    // 1 - disable unroll.
+    // other positive integer n - unroll by n.
+    if (OpenCLHint) {
+      ValueInt = OpenCLHint->getUnrollHint();
+      if (ValueInt == 0) {
+        State = LoopHintAttr::Full;
+      } else if (ValueInt != 1) {
+        Option = LoopHintAttr::UnrollCount;
+        State = LoopHintAttr::Numeric;
+      }
+    } else if (LH) {
+      auto *ValueExpr = LH->getValue();
+      if (ValueExpr) {
+        llvm::APSInt ValueAPS = ValueExpr->EvaluateKnownConstInt(Ctx);
+        ValueInt = ValueAPS.getSExtValue();
+      }
+d130 2
+a131 3
+      Option = LH->getOption();
+      State = LH->getState();
+    }
+a145 3
+      case LoopHintAttr::Distribute:
+        setDistributeState(false);
+        break;
+a161 3
+      case LoopHintAttr::Distribute:
+        setDistributeState(true);
+        break;
+a180 1
+      case LoopHintAttr::Distribute:
+a194 1
+      case LoopHintAttr::Distribute:
+a212 1
+      case LoopHintAttr::Distribute:
+d221 1
+a221 1
+  push(Header, Location);
+d240 1
+a240 1
+        TI->setMetadata(llvm::LLVMContext::MD_loop, L.getLoopID());
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d23 1
+a23 2
+                              const llvm::DebugLoc &StartLoc,
+                              const llvm::DebugLoc &EndLoc) {
+d30 1
+a30 1
+      !StartLoc && !EndLoc)
+d38 3
+a40 8
+  // If we have a valid start debug location for the loop, add it.
+  if (StartLoc) {
+    Args.push_back(StartLoc.getAsMDNode());
+
+    // If we also have a valid end debug location for the loop, add it.
+    if (EndLoc)
+      Args.push_back(EndLoc.getAsMDNode());
+  }
+a114 1
+  DistributeEnable = LoopAttributes::Unspecified;
+d118 1
+a118 1
+                   const llvm::DebugLoc &StartLoc, const llvm::DebugLoc &EndLoc)
+d120 1
+a120 1
+  LoopID = createMetadata(Header->getContext(), Attrs, StartLoc, EndLoc);
+d123 2
+a124 3
+void LoopInfoStack::push(BasicBlock *Header, const llvm::DebugLoc &StartLoc,
+                         const llvm::DebugLoc &EndLoc) {
+  Active.push_back(LoopInfo(Header, StagedAttrs, StartLoc, EndLoc));
+d131 1
+a131 2
+                         const llvm::DebugLoc &StartLoc,
+                         const llvm::DebugLoc &EndLoc) {
+d269 1
+a269 1
+  push(Header, StartLoc, EndLoc);
+@
+
+

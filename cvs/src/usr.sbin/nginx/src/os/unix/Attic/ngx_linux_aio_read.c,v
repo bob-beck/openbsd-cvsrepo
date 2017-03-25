@@ -1,0 +1,306 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_6:1.3.0.12
+	OPENBSD_5_6_BASE:1.3
+	OPENBSD_5_5:1.3.0.10
+	OPENBSD_5_5_BASE:1.3
+	OPENBSD_5_4:1.3.0.6
+	OPENBSD_5_4_BASE:1.3
+	OPENBSD_5_3:1.3.0.4
+	OPENBSD_5_3_BASE:1.3
+	OPENBSD_5_2:1.3.0.2
+	OPENBSD_5_2_BASE:1.3
+	NGINX_1_0_14:1.1.1.2
+	NGINX:1.1.1
+	OPENBSD_5_1_BASE:1.2
+	OPENBSD_5_1:1.2.0.2
+	nginx_1_0_6:1.1.1.1
+	nginx:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2014.08.26.19.35.34;	author robert;	state dead;
+branches;
+next	1.3;
+commitid	sO1mMs3aGJWmnMM1;
+
+1.3
+date	2012.02.18.11.20.22;	author robert;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2011.10.03.17.38.55;	author robert;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.09.22.23.32.24;	author robert;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.09.22.23.32.24;	author robert;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2012.03.15.16.48.19;	author sthen;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@remove nginx from the base system in favor of OpenBSD's own httpd(8)
+@
+text
+@
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
+ */
+
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+
+
+extern int            ngx_eventfd;
+extern aio_context_t  ngx_aio_ctx;
+
+
+static void ngx_file_aio_event_handler(ngx_event_t *ev);
+
+
+static int
+io_submit(aio_context_t ctx, long n, struct iocb **paiocb)
+{
+    return syscall(SYS_io_submit, ctx, n, paiocb);
+}
+
+
+ssize_t
+ngx_file_aio_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
+    ngx_pool_t *pool)
+{
+    ngx_err_t         err;
+    struct iocb      *piocb[1];
+    ngx_event_t      *ev;
+    ngx_event_aio_t  *aio;
+
+    if (!ngx_file_aio) {
+        return ngx_read_file(file, buf, size, offset);
+    }
+
+    aio = file->aio;
+
+    if (aio == NULL) {
+        aio = ngx_pcalloc(pool, sizeof(ngx_event_aio_t));
+        if (aio == NULL) {
+            return NGX_ERROR;
+        }
+
+        aio->file = file;
+        aio->fd = file->fd;
+        aio->event.data = aio;
+        aio->event.ready = 1;
+        aio->event.log = file->log;
+        file->aio = aio;
+    }
+
+    ev = &aio->event;
+
+    if (!ev->ready) {
+        ngx_log_error(NGX_LOG_ALERT, file->log, 0,
+                      "second aio post for \"%V\"", &file->name);
+        return NGX_AGAIN;
+    }
+
+    ngx_log_debug4(NGX_LOG_DEBUG_CORE, file->log, 0,
+                   "aio complete:%d @@%O:%z %V",
+                   ev->complete, offset, size, &file->name);
+
+    if (ev->complete) {
+        ev->active = 0;
+        ev->complete = 0;
+
+        if (aio->res >= 0) {
+            ngx_set_errno(0);
+            return aio->res;
+        }
+
+        ngx_set_errno(-aio->res);
+
+        ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
+                      "aio read \"%s\" failed", file->name.data);
+
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&aio->aiocb, sizeof(struct iocb));
+
+    aio->aiocb.aio_data = (uint64_t) (uintptr_t) ev;
+    aio->aiocb.aio_lio_opcode = IOCB_CMD_PREAD;
+    aio->aiocb.aio_fildes = file->fd;
+    aio->aiocb.aio_buf = (uint64_t) (uintptr_t) buf;
+    aio->aiocb.aio_nbytes = size;
+    aio->aiocb.aio_offset = offset;
+    aio->aiocb.aio_flags = IOCB_FLAG_RESFD;
+    aio->aiocb.aio_resfd = ngx_eventfd;
+
+    ev->handler = ngx_file_aio_event_handler;
+
+    piocb[0] = &aio->aiocb;
+
+    if (io_submit(ngx_aio_ctx, 1, piocb) == 1) {
+        ev->active = 1;
+        ev->ready = 0;
+        ev->complete = 0;
+
+        return NGX_AGAIN;
+    }
+
+    err = ngx_errno;
+
+    if (err == NGX_EAGAIN) {
+        return ngx_read_file(file, buf, size, offset);
+    }
+
+    ngx_log_error(NGX_LOG_CRIT, file->log, err,
+                  "io_submit(\"%V\") failed", &file->name);
+
+    if (err == NGX_ENOSYS) {
+        ngx_file_aio = 0;
+        return ngx_read_file(file, buf, size, offset);
+    }
+
+    return NGX_ERROR;
+}
+
+
+static void
+ngx_file_aio_event_handler(ngx_event_t *ev)
+{
+    ngx_event_aio_t  *aio;
+
+    aio = ev->data;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, ev->log, 0,
+                   "aio event handler fd:%d %V", aio->fd, &aio->file->name);
+
+    aio->handler(ev);
+}
+@
+
+
+1.3
+log
+@update to 1.0.12
+@
+text
+@@
+
+
+1.2
+log
+@update to nginx-1.0.8 which includes many bugfixes
+for a complete list please check the CHANGES file
+@
+text
+@d4 1
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d19 1
+a19 1
+static long
+d30 1
+a30 1
+    long              n;
+d77 4
+d99 1
+a99 3
+    n = io_submit(ngx_aio_ctx, 1, piocb);
+
+    if (n == 1) {
+d107 1
+a107 1
+    n = -n;
+d109 1
+a109 1
+    if (n == NGX_EAGAIN) {
+d113 1
+a113 1
+    ngx_log_error(NGX_LOG_CRIT, file->log, n,
+d116 1
+a116 1
+    if (n == NGX_ENOSYS) {
+@
+
+
+1.1.1.1
+log
+@import of nginx 1.0.6 with a bundled libpcre needed for pcre to work
+properly.
+this is not yet linked to the build but we would like to work on it
+in tree to provide an apache replacement for base
+@
+text
+@@
+
+
+1.1.1.2
+log
+@update to nginx 1.0.14
+
+SECURITY fix: contents of previously freed memory might be sent
+to a client if backend returned specially crafted response.
+
+ok robert@@
+@
+text
+@a3 1
+ * Copyright (C) Nginx, Inc.
+d19 1
+a19 1
+static int
+d30 1
+a30 1
+    ngx_err_t         err;
+a76 4
+
+        ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
+                      "aio read \"%s\" failed", file->name.data);
+
+d95 3
+a97 1
+    if (io_submit(ngx_aio_ctx, 1, piocb) == 1) {
+d105 1
+a105 1
+    err = ngx_errno;
+d107 1
+a107 1
+    if (err == NGX_EAGAIN) {
+d111 1
+a111 1
+    ngx_log_error(NGX_LOG_CRIT, file->log, err,
+d114 1
+a114 1
+    if (err == NGX_ENOSYS) {
+@
+

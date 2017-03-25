@@ -1,0 +1,750 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	mesa-13_0_6:1.1.1.2
+	mesa-13_0_5:1.1.1.2
+	mesa-13_0_3:1.1.1.2
+	mesa-13_0_2:1.1.1.2
+	OPENBSD_6_0:1.1.1.2.0.4
+	OPENBSD_6_0_BASE:1.1.1.2
+	mesa-11_2_2:1.1.1.2
+	OPENBSD_5_9:1.1.1.1.0.2
+	OPENBSD_5_9_BASE:1.1.1.1
+	mesa-11_0_9:1.1.1.1
+	mesa-11_0_8:1.1.1.1
+	mesa-11_0_6:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.1
+date	2015.11.22.02.38.17;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.1
+date	2015.11.22.02.38.17;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.2
+date	2016.05.29.10.13.26;	author jsg;	state Exp;
+branches;
+next	;
+commitid	OwGfrJACrYJkCVJ4;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@/*
+ * Copyright (C) 2013 Christoph Bumiller
+ * Copyright (C) 2015 Samuel Pitoiset
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+/**
+ * Performance monitoring counters interface to gallium.
+ */
+
+#include "st_debug.h"
+#include "st_context.h"
+#include "st_cb_bitmap.h"
+#include "st_cb_perfmon.h"
+
+#include "util/bitset.h"
+
+#include "pipe/p_context.h"
+#include "pipe/p_screen.h"
+#include "util/u_memory.h"
+
+/**
+ * Return a PIPE_QUERY_x type >= PIPE_QUERY_DRIVER_SPECIFIC, or -1 if
+ * the driver-specific query doesn't exist.
+ */
+static int
+find_query_type(struct pipe_screen *screen, const char *name)
+{
+   int num_queries;
+   int type = -1;
+   int i;
+
+   num_queries = screen->get_driver_query_info(screen, 0, NULL);
+   if (!num_queries)
+      return type;
+
+   for (i = 0; i < num_queries; i++) {
+      struct pipe_driver_query_info info;
+
+      if (!screen->get_driver_query_info(screen, i, &info))
+         continue;
+
+      if (!strncmp(info.name, name, strlen(name))) {
+         type = info.query_type;
+         break;
+      }
+   }
+   return type;
+}
+
+/**
+ * Return TRUE if the underlying driver expose GPU counters.
+ */
+static bool
+has_gpu_counters(struct pipe_screen *screen)
+{
+   int num_groups, gid;
+
+   num_groups = screen->get_driver_query_group_info(screen, 0, NULL);
+   for (gid = 0; gid < num_groups; gid++) {
+      struct pipe_driver_query_group_info group_info;
+
+      if (!screen->get_driver_query_group_info(screen, gid, &group_info))
+         continue;
+
+      if (group_info.type == PIPE_DRIVER_QUERY_GROUP_TYPE_GPU)
+         return true;
+   }
+   return false;
+}
+
+static bool
+init_perf_monitor(struct gl_context *ctx, struct gl_perf_monitor_object *m)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_screen *screen = st_context(ctx)->pipe->screen;
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+   int gid, cid;
+
+   st_flush_bitmap_cache(st_context(ctx));
+
+   /* Create a query for each active counter. */
+   for (gid = 0; gid < ctx->PerfMonitor.NumGroups; gid++) {
+      const struct gl_perf_monitor_group *g = &ctx->PerfMonitor.Groups[gid];
+
+      if (m->ActiveGroups[gid] > g->MaxActiveCounters) {
+         /* Maximum number of counters reached. Cannot start the session. */
+         if (ST_DEBUG & DEBUG_MESA) {
+            debug_printf("Maximum number of counters reached. "
+                         "Cannot start the session!\n");
+         }
+         return false;
+      }
+
+      for (cid = 0; cid < g->NumCounters; cid++) {
+         const struct gl_perf_monitor_counter *c = &g->Counters[cid];
+         struct st_perf_counter_object *cntr;
+         int query_type;
+
+         if (!BITSET_TEST(m->ActiveCounters[gid], cid))
+            continue;
+
+         query_type = find_query_type(screen, c->Name);
+         assert(query_type != -1);
+
+         cntr = CALLOC_STRUCT(st_perf_counter_object);
+         if (!cntr)
+            return false;
+
+         cntr->query    = pipe->create_query(pipe, query_type, 0);
+         cntr->id       = cid;
+         cntr->group_id = gid;
+
+         list_addtail(&cntr->list, &stm->active_counters);
+      }
+   }
+   return true;
+}
+
+static void
+reset_perf_monitor(struct st_perf_monitor_object *stm,
+                   struct pipe_context *pipe)
+{
+   struct st_perf_counter_object *cntr, *tmp;
+
+   LIST_FOR_EACH_ENTRY_SAFE(cntr, tmp, &stm->active_counters, list) {
+      if (cntr->query)
+         pipe->destroy_query(pipe, cntr->query);
+      list_del(&cntr->list);
+      free(cntr);
+   }
+}
+
+static struct gl_perf_monitor_object *
+st_NewPerfMonitor(struct gl_context *ctx)
+{
+   struct st_perf_monitor_object *stq = ST_CALLOC_STRUCT(st_perf_monitor_object);
+   if (stq) {
+      list_inithead(&stq->active_counters);
+      return &stq->base;
+   }
+   return NULL;
+}
+
+static void
+st_DeletePerfMonitor(struct gl_context *ctx, struct gl_perf_monitor_object *m)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+
+   reset_perf_monitor(stm, pipe);
+   FREE(stm);
+}
+
+static GLboolean
+st_BeginPerfMonitor(struct gl_context *ctx, struct gl_perf_monitor_object *m)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+   struct st_perf_counter_object *cntr;
+
+   if (LIST_IS_EMPTY(&stm->active_counters)) {
+      /* Create a query for each active counter before starting
+       * a new monitoring session. */
+      if (!init_perf_monitor(ctx, m))
+         goto fail;
+   }
+
+   /* Start the query for each active counter. */
+   LIST_FOR_EACH_ENTRY(cntr, &stm->active_counters, list) {
+      if (!pipe->begin_query(pipe, cntr->query))
+          goto fail;
+   }
+   return true;
+
+fail:
+   /* Failed to start the monitoring session. */
+   reset_perf_monitor(stm, pipe);
+   return false;
+}
+
+static void
+st_EndPerfMonitor(struct gl_context *ctx, struct gl_perf_monitor_object *m)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+   struct st_perf_counter_object *cntr;
+
+   /* Stop the query for each active counter. */
+   LIST_FOR_EACH_ENTRY(cntr, &stm->active_counters, list)
+      pipe->end_query(pipe, cntr->query);
+}
+
+static void
+st_ResetPerfMonitor(struct gl_context *ctx, struct gl_perf_monitor_object *m)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+
+   if (!m->Ended)
+      st_EndPerfMonitor(ctx, m);
+
+   reset_perf_monitor(stm, pipe);
+
+   if (m->Active)
+      st_BeginPerfMonitor(ctx, m);
+}
+
+static GLboolean
+st_IsPerfMonitorResultAvailable(struct gl_context *ctx,
+                                struct gl_perf_monitor_object *m)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+   struct st_perf_counter_object *cntr;
+
+   if (LIST_IS_EMPTY(&stm->active_counters))
+      return false;
+
+   /* The result of a monitoring session is only available if the query of
+    * each active counter is idle. */
+   LIST_FOR_EACH_ENTRY(cntr, &stm->active_counters, list) {
+      union pipe_query_result result;
+      if (!pipe->get_query_result(pipe, cntr->query, FALSE, &result)) {
+         /* The query is busy. */
+         return false;
+      }
+   }
+   return true;
+}
+
+static void
+st_GetPerfMonitorResult(struct gl_context *ctx,
+                        struct gl_perf_monitor_object *m,
+                        GLsizei dataSize,
+                        GLuint *data,
+                        GLint *bytesWritten)
+{
+   struct st_perf_monitor_object *stm = st_perf_monitor_object(m);
+   struct pipe_context *pipe = st_context(ctx)->pipe;
+   struct st_perf_counter_object *cntr;
+
+   /* Copy data to the supplied array (data).
+    *
+    * The output data format is: <group ID, counter ID, value> for each
+    * active counter. The API allows counters to appear in any order.
+    */
+   GLsizei offset = 0;
+
+   /* Read query results for each active counter. */
+   LIST_FOR_EACH_ENTRY(cntr, &stm->active_counters, list) {
+      union pipe_query_result result = { 0 };
+      int gid, cid;
+      GLenum type;
+
+      cid  = cntr->id;
+      gid  = cntr->group_id;
+      type = ctx->PerfMonitor.Groups[gid].Counters[cid].Type;
+
+      if (!pipe->get_query_result(pipe, cntr->query, TRUE, &result))
+         continue;
+
+      data[offset++] = gid;
+      data[offset++] = cid;
+      switch (type) {
+      case GL_UNSIGNED_INT64_AMD:
+         *(uint64_t *)&data[offset] = result.u64;
+         offset += sizeof(uint64_t) / sizeof(GLuint);
+         break;
+      case GL_UNSIGNED_INT:
+         *(uint32_t *)&data[offset] = result.u32;
+         offset += sizeof(uint32_t) / sizeof(GLuint);
+         break;
+      case GL_FLOAT:
+      case GL_PERCENTAGE_AMD:
+         *(GLfloat *)&data[offset] = result.f;
+         offset += sizeof(GLfloat) / sizeof(GLuint);
+         break;
+      }
+   }
+
+   if (bytesWritten)
+      *bytesWritten = offset * sizeof(GLuint);
+}
+
+
+bool
+st_init_perfmon(struct st_context *st)
+{
+   struct gl_perf_monitor_state *perfmon = &st->ctx->PerfMonitor;
+   struct pipe_screen *screen = st->pipe->screen;
+   struct gl_perf_monitor_group *groups = NULL;
+   int num_counters, num_groups;
+   int gid, cid;
+
+   if (!screen->get_driver_query_info || !screen->get_driver_query_group_info)
+      return false;
+
+   if (!has_gpu_counters(screen)) {
+      /* According to the spec, GL_AMD_performance_monitor must only
+       * expose GPU counters. */
+      return false;
+   }
+
+   /* Get the number of available queries. */
+   num_counters = screen->get_driver_query_info(screen, 0, NULL);
+   if (!num_counters)
+      return false;
+
+   /* Get the number of available groups. */
+   num_groups = screen->get_driver_query_group_info(screen, 0, NULL);
+   if (num_groups)
+      groups = CALLOC(num_groups, sizeof(*groups));
+   if (!groups)
+      return false;
+
+   for (gid = 0; gid < num_groups; gid++) {
+      struct gl_perf_monitor_group *g = &groups[perfmon->NumGroups];
+      struct pipe_driver_query_group_info group_info;
+      struct gl_perf_monitor_counter *counters = NULL;
+
+      if (!screen->get_driver_query_group_info(screen, gid, &group_info))
+         continue;
+
+      if (group_info.type != PIPE_DRIVER_QUERY_GROUP_TYPE_GPU)
+         continue;
+
+      g->Name = group_info.name;
+      g->MaxActiveCounters = group_info.max_active_queries;
+      g->NumCounters = 0;
+      g->Counters = NULL;
+
+      if (group_info.num_queries)
+         counters = CALLOC(group_info.num_queries, sizeof(*counters));
+      if (!counters)
+         goto fail;
+
+      for (cid = 0; cid < num_counters; cid++) {
+         struct gl_perf_monitor_counter *c = &counters[g->NumCounters];
+         struct pipe_driver_query_info info;
+
+         if (!screen->get_driver_query_info(screen, cid, &info))
+            continue;
+         if (info.group_id != gid)
+            continue;
+
+         c->Name = info.name;
+         switch (info.type) {
+            case PIPE_DRIVER_QUERY_TYPE_UINT64:
+               c->Minimum.u64 = 0;
+               c->Maximum.u64 = info.max_value.u64 ? info.max_value.u64 : -1;
+               c->Type = GL_UNSIGNED_INT64_AMD;
+               break;
+            case PIPE_DRIVER_QUERY_TYPE_UINT:
+               c->Minimum.u32 = 0;
+               c->Maximum.u32 = info.max_value.u32 ? info.max_value.u32 : -1;
+               c->Type = GL_UNSIGNED_INT;
+               break;
+            case PIPE_DRIVER_QUERY_TYPE_FLOAT:
+               c->Minimum.f = 0.0;
+               c->Maximum.f = info.max_value.f ? info.max_value.f : -1;
+               c->Type = GL_FLOAT;
+               break;
+            case PIPE_DRIVER_QUERY_TYPE_PERCENTAGE:
+               c->Minimum.f = 0.0f;
+               c->Maximum.f = 100.0f;
+               c->Type = GL_PERCENTAGE_AMD;
+               break;
+            default:
+               unreachable("Invalid driver query type!");
+         }
+         g->NumCounters++;
+      }
+      g->Counters = counters;
+      perfmon->NumGroups++;
+   }
+   perfmon->Groups = groups;
+
+   return true;
+
+fail:
+   for (gid = 0; gid < num_groups; gid++)
+      FREE((void *)groups[gid].Counters);
+   FREE(groups);
+   return false;
+}
+
+void
+st_destroy_perfmon(struct st_context *st)
+{
+   struct gl_perf_monitor_state *perfmon = &st->ctx->PerfMonitor;
+   int gid;
+
+   for (gid = 0; gid < perfmon->NumGroups; gid++)
+      FREE((void *)perfmon->Groups[gid].Counters);
+   FREE((void *)perfmon->Groups);
+}
+
+void st_init_perfmon_functions(struct dd_function_table *functions)
+{
+   functions->NewPerfMonitor = st_NewPerfMonitor;
+   functions->DeletePerfMonitor = st_DeletePerfMonitor;
+   functions->BeginPerfMonitor = st_BeginPerfMonitor;
+   functions->EndPerfMonitor = st_EndPerfMonitor;
+   functions->ResetPerfMonitor = st_ResetPerfMonitor;
+   functions->IsPerfMonitorResultAvailable = st_IsPerfMonitorResultAvailable;
+   functions->GetPerfMonitorResult = st_GetPerfMonitorResult;
+}
+@
+
+
+1.1.1.1
+log
+@import Mesa 11.0.6
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 11.2.2
+@
+text
+@d39 50
+a91 1
+   struct st_context *st = st_context(ctx);
+d93 2
+a94 5
+   struct pipe_context *pipe = st->pipe;
+   unsigned *batch = NULL;
+   unsigned num_active_counters = 0;
+   unsigned max_batch_counters = 0;
+   unsigned num_batch_counters = 0;
+d97 1
+a97 1
+   st_flush_bitmap_cache(st);
+d99 1
+a99 1
+   /* Determine the number of active counters. */
+a101 1
+      const struct st_perf_monitor_group *stg = &st->perfmon[gid];
+d112 4
+a115 4
+      num_active_counters += m->ActiveGroups[gid];
+      if (stg->has_batch)
+         max_batch_counters += m->ActiveGroups[gid];
+   }
+d117 2
+a118 2
+   if (!num_active_counters)
+      return true;
+d120 2
+a121 16
+   stm->active_counters = CALLOC(num_active_counters,
+                                 sizeof(*stm->active_counters));
+   if (!stm->active_counters)
+      return false;
+
+   if (max_batch_counters) {
+      batch = CALLOC(max_batch_counters, sizeof(*batch));
+      if (!batch)
+         return false;
+   }
+
+   /* Create a query for each active counter. */
+   for (gid = 0; gid < ctx->PerfMonitor.NumGroups; gid++) {
+      const struct gl_perf_monitor_group *g = &ctx->PerfMonitor.Groups[gid];
+      const struct st_perf_monitor_group *stg = &st->perfmon[gid];
+      BITSET_WORD tmp;
+d123 3
+a125 4
+      BITSET_FOREACH_SET(cid, tmp, m->ActiveCounters[gid], g->NumCounters) {
+         const struct st_perf_monitor_counter *stc = &stg->counters[cid];
+         struct st_perf_counter_object *cntr =
+            &stm->active_counters[stm->num_active_counters];
+d127 1
+d130 2
+a131 9
+         if (stc->flags & PIPE_DRIVER_QUERY_FLAG_BATCH) {
+            cntr->batch_index = num_batch_counters;
+            batch[num_batch_counters++] = stc->query_type;
+         } else {
+            cntr->query = pipe->create_query(pipe, stc->query_type, 0);
+            if (!cntr->query)
+               goto fail;
+         }
+         ++stm->num_active_counters;
+a133 11
+
+   /* Create the batch query. */
+   if (num_batch_counters) {
+      stm->batch_query = pipe->create_batch_query(pipe, num_batch_counters,
+                                                  batch);
+      stm->batch_result = CALLOC(num_batch_counters, sizeof(stm->batch_result->batch[0]));
+      if (!stm->batch_query || !stm->batch_result)
+         goto fail;
+   }
+
+   FREE(batch);
+a134 4
+
+fail:
+   FREE(batch);
+   return false;
+d141 1
+a141 1
+   unsigned i;
+d143 5
+a147 12
+   for (i = 0; i < stm->num_active_counters; ++i) {
+      struct pipe_query *query = stm->active_counters[i].query;
+      if (query)
+         pipe->destroy_query(pipe, query);
+   }
+   FREE(stm->active_counters);
+   stm->active_counters = NULL;
+   stm->num_active_counters = 0;
+
+   if (stm->batch_query) {
+      pipe->destroy_query(pipe, stm->batch_query);
+      stm->batch_query = NULL;
+a148 2
+   FREE(stm->batch_result);
+   stm->batch_result = NULL;
+d155 2
+a156 1
+   if (stq)
+d158 1
+d177 1
+a177 1
+   unsigned i;
+d179 1
+a179 1
+   if (!stm->num_active_counters) {
+d187 2
+a188 3
+   for (i = 0; i < stm->num_active_counters; ++i) {
+      struct pipe_query *query = stm->active_counters[i].query;
+      if (query && !pipe->begin_query(pipe, query))
+a190 4
+
+   if (stm->batch_query && !pipe->begin_query(pipe, stm->batch_query))
+      goto fail;
+
+d204 1
+a204 1
+   unsigned i;
+d207 2
+a208 8
+   for (i = 0; i < stm->num_active_counters; ++i) {
+      struct pipe_query *query = stm->active_counters[i].query;
+      if (query)
+         pipe->end_query(pipe, query);
+   }
+
+   if (stm->batch_query)
+      pipe->end_query(pipe, stm->batch_query);
+d232 1
+a232 1
+   unsigned i;
+d234 1
+a234 1
+   if (!stm->num_active_counters)
+d239 1
+a239 2
+   for (i = 0; i < stm->num_active_counters; ++i) {
+      struct pipe_query *query = stm->active_counters[i].query;
+d241 1
+a241 1
+      if (query && !pipe->get_query_result(pipe, query, FALSE, &result)) {
+a245 5
+
+   if (stm->batch_query &&
+       !pipe->get_query_result(pipe, stm->batch_query, FALSE, stm->batch_result))
+      return false;
+
+d258 1
+a258 1
+   unsigned i;
+a265 5
+   bool have_batch_query = false;
+
+   if (stm->batch_query)
+      have_batch_query = pipe->get_query_result(pipe, stm->batch_query, TRUE,
+                                                stm->batch_result);
+d268 1
+a268 2
+   for (i = 0; i < stm->num_active_counters; ++i) {
+      struct st_perf_counter_object *cntr = &stm->active_counters[i];
+d277 2
+a278 8
+      if (cntr->query) {
+         if (!pipe->get_query_result(pipe, cntr->query, TRUE, &result))
+            continue;
+      } else {
+         if (!have_batch_query)
+            continue;
+         result.batch[0] = stm->batch_result->batch[cntr->batch_index];
+      }
+d305 1
+a305 1
+st_have_perfmon(struct st_context *st)
+d307 1
+d309 3
+d316 5
+a320 13
+   return screen->get_driver_query_group_info(screen, 0, NULL) != 0;
+}
+
+static void
+st_InitPerfMonitorGroups(struct gl_context *ctx)
+{
+   struct st_context *st = st_context(ctx);
+   struct gl_perf_monitor_state *perfmon = &st->ctx->PerfMonitor;
+   struct pipe_screen *screen = st->pipe->screen;
+   struct gl_perf_monitor_group *groups = NULL;
+   struct st_perf_monitor_group *stgroups = NULL;
+   int num_counters, num_groups;
+   int gid, cid;
+d324 2
+d329 2
+a330 1
+   groups = CALLOC(num_groups, sizeof(*groups));
+d332 1
+a332 5
+      return;
+
+   stgroups = CALLOC(num_groups, sizeof(*stgroups));
+   if (!stgroups)
+      goto fail_only_groups;
+a335 1
+      struct st_perf_monitor_group *stg = &stgroups[perfmon->NumGroups];
+a337 1
+      struct st_perf_monitor_counter *stcounters = NULL;
+d342 3
+d347 2
+a353 6
+      g->Counters = counters;
+
+      stcounters = CALLOC(group_info.num_queries, sizeof(*stcounters));
+      if (!stcounters)
+         goto fail;
+      stg->counters = stcounters;
+a356 1
+         struct st_perf_monitor_counter *stc = &stcounters[g->NumCounters];
+a366 3
+            case PIPE_DRIVER_QUERY_TYPE_BYTES:
+            case PIPE_DRIVER_QUERY_TYPE_MICROSECONDS:
+            case PIPE_DRIVER_QUERY_TYPE_HZ:
+a388 6
+
+         stc->query_type = info.query_type;
+         stc->flags = info.flags;
+         if (stc->flags & PIPE_DRIVER_QUERY_FLAG_BATCH)
+            stg->has_batch = true;
+
+d391 1
+a394 1
+   st->perfmon = stgroups;
+d396 1
+a396 1
+   return;
+d399 1
+a399 2
+   for (gid = 0; gid < num_groups; gid++) {
+      FREE(stgroups[gid].counters);
+a400 3
+   }
+   FREE(stgroups);
+fail_only_groups:
+d402 1
+d411 1
+a411 2
+   for (gid = 0; gid < perfmon->NumGroups; gid++) {
+      FREE(st->perfmon[gid].counters);
+a412 2
+   }
+   FREE(st->perfmon);
+a417 1
+   functions->InitPerfMonitorGroups = st_InitPerfMonitorGroups;
+@
+

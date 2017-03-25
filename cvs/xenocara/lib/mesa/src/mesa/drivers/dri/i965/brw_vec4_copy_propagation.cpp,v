@@ -1,0 +1,784 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	mesa-13_0_6:1.1.1.3
+	mesa-13_0_5:1.1.1.3
+	mesa-13_0_3:1.1.1.3
+	mesa-13_0_2:1.1.1.3
+	OPENBSD_6_0:1.1.1.2.0.4
+	OPENBSD_6_0_BASE:1.1.1.2
+	mesa-11_2_2:1.1.1.2
+	OPENBSD_5_9:1.1.1.1.0.2
+	OPENBSD_5_9_BASE:1.1.1.1
+	mesa-11_0_9:1.1.1.1
+	mesa-11_0_8:1.1.1.1
+	mesa-11_0_6:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2015.11.22.02.40.01;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.1
+date	2015.11.22.02.40.01;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.2
+date	2016.05.29.10.15.18;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	OwGfrJACrYJkCVJ4;
+
+1.1.1.3
+date	2016.12.11.08.36.42;	author jsg;	state Exp;
+branches;
+next	;
+commitid	uuv5VTS15jglEDZU;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@/*
+ * Copyright © 2011 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+/**
+ * @@file brw_vec4_copy_propagation.cpp
+ *
+ * Implements tracking of values copied between registers, and
+ * optimizations based on that: copy propagation and constant
+ * propagation.
+ */
+
+#include "brw_vec4.h"
+#include "brw_cfg.h"
+extern "C" {
+#include "main/macros.h"
+}
+
+namespace brw {
+
+struct copy_entry {
+   src_reg *value[4];
+   int saturatemask;
+};
+
+static bool
+is_direct_copy(vec4_instruction *inst)
+{
+   return (inst->opcode == BRW_OPCODE_MOV &&
+	   !inst->predicate &&
+	   inst->dst.file == GRF &&
+	   !inst->dst.reladdr &&
+	   !inst->src[0].reladdr &&
+	   (inst->dst.type == inst->src[0].type ||
+            (inst->dst.type == BRW_REGISTER_TYPE_F &&
+             inst->src[0].type == BRW_REGISTER_TYPE_VF)));
+}
+
+static bool
+is_dominated_by_previous_instruction(vec4_instruction *inst)
+{
+   return (inst->opcode != BRW_OPCODE_DO &&
+	   inst->opcode != BRW_OPCODE_WHILE &&
+	   inst->opcode != BRW_OPCODE_ELSE &&
+	   inst->opcode != BRW_OPCODE_ENDIF);
+}
+
+static bool
+is_channel_updated(vec4_instruction *inst, src_reg *values[4], int ch)
+{
+   const src_reg *src = values[ch];
+
+   /* consider GRF only */
+   assert(inst->dst.file == GRF);
+   if (!src || src->file != GRF)
+      return false;
+
+   return (src->in_range(inst->dst, inst->regs_written) &&
+           inst->dst.writemask & (1 << BRW_GET_SWZ(src->swizzle, ch)));
+}
+
+static unsigned
+swizzle_vf_imm(unsigned vf4, unsigned swizzle)
+{
+   union {
+      unsigned vf4;
+      uint8_t vf[4];
+   } v = { vf4 }, ret;
+
+   ret.vf[0] = v.vf[BRW_GET_SWZ(swizzle, 0)];
+   ret.vf[1] = v.vf[BRW_GET_SWZ(swizzle, 1)];
+   ret.vf[2] = v.vf[BRW_GET_SWZ(swizzle, 2)];
+   ret.vf[3] = v.vf[BRW_GET_SWZ(swizzle, 3)];
+
+   return ret.vf4;
+}
+
+static bool
+is_logic_op(enum opcode opcode)
+{
+   return (opcode == BRW_OPCODE_AND ||
+           opcode == BRW_OPCODE_OR  ||
+           opcode == BRW_OPCODE_XOR ||
+           opcode == BRW_OPCODE_NOT);
+}
+
+static bool
+try_constant_propagate(const struct brw_device_info *devinfo,
+                       vec4_instruction *inst,
+                       int arg, struct copy_entry *entry)
+{
+   /* For constant propagation, we only handle the same constant
+    * across all 4 channels.  Some day, we should handle the 8-bit
+    * float vector format, which would let us constant propagate
+    * vectors better.
+    */
+   src_reg value = *entry->value[0];
+   for (int i = 1; i < 4; i++) {
+      if (!value.equals(*entry->value[i]))
+	 return false;
+   }
+
+   if (value.file != IMM)
+      return false;
+
+   if (value.type == BRW_REGISTER_TYPE_VF) {
+      /* The result of bit-casting the component values of a vector float
+       * cannot in general be represented as an immediate.
+       */
+      if (inst->src[arg].type != BRW_REGISTER_TYPE_F)
+         return false;
+   } else {
+      value.type = inst->src[arg].type;
+   }
+
+   if (inst->src[arg].abs) {
+      if ((devinfo->gen >= 8 && is_logic_op(inst->opcode)) ||
+          !brw_abs_immediate(value.type, &value.fixed_hw_reg)) {
+         return false;
+      }
+   }
+
+   if (inst->src[arg].negate) {
+      if ((devinfo->gen >= 8 && is_logic_op(inst->opcode)) ||
+          !brw_negate_immediate(value.type, &value.fixed_hw_reg)) {
+         return false;
+      }
+   }
+
+   if (value.type == BRW_REGISTER_TYPE_VF)
+      value.fixed_hw_reg.dw1.ud = swizzle_vf_imm(value.fixed_hw_reg.dw1.ud,
+                                                 inst->src[arg].swizzle);
+
+   switch (inst->opcode) {
+   case BRW_OPCODE_MOV:
+   case SHADER_OPCODE_BROADCAST:
+      inst->src[arg] = value;
+      return true;
+
+   case SHADER_OPCODE_POW:
+   case SHADER_OPCODE_INT_QUOTIENT:
+   case SHADER_OPCODE_INT_REMAINDER:
+      if (devinfo->gen < 8)
+         break;
+      /* fallthrough */
+   case BRW_OPCODE_DP2:
+   case BRW_OPCODE_DP3:
+   case BRW_OPCODE_DP4:
+   case BRW_OPCODE_DPH:
+   case BRW_OPCODE_BFI1:
+   case BRW_OPCODE_ASR:
+   case BRW_OPCODE_SHL:
+   case BRW_OPCODE_SHR:
+   case BRW_OPCODE_SUBB:
+      if (arg == 1) {
+         inst->src[arg] = value;
+         return true;
+      }
+      break;
+
+   case BRW_OPCODE_MACH:
+   case BRW_OPCODE_MUL:
+   case SHADER_OPCODE_MULH:
+   case BRW_OPCODE_ADD:
+   case BRW_OPCODE_OR:
+   case BRW_OPCODE_AND:
+   case BRW_OPCODE_XOR:
+   case BRW_OPCODE_ADDC:
+      if (arg == 1) {
+	 inst->src[arg] = value;
+	 return true;
+      } else if (arg == 0 && inst->src[1].file != IMM) {
+	 /* Fit this constant in by commuting the operands.  Exception: we
+	  * can't do this for 32-bit integer MUL/MACH because it's asymmetric.
+	  */
+	 if ((inst->opcode == BRW_OPCODE_MUL ||
+              inst->opcode == BRW_OPCODE_MACH) &&
+	     (inst->src[1].type == BRW_REGISTER_TYPE_D ||
+	      inst->src[1].type == BRW_REGISTER_TYPE_UD))
+	    break;
+	 inst->src[0] = inst->src[1];
+	 inst->src[1] = value;
+	 return true;
+      }
+      break;
+
+   case BRW_OPCODE_CMP:
+      if (arg == 1) {
+	 inst->src[arg] = value;
+	 return true;
+      } else if (arg == 0 && inst->src[1].file != IMM) {
+	 enum brw_conditional_mod new_cmod;
+
+	 new_cmod = brw_swap_cmod(inst->conditional_mod);
+	 if (new_cmod != BRW_CONDITIONAL_NONE) {
+	    /* Fit this constant in by swapping the operands and
+	     * flipping the test.
+	     */
+	    inst->src[0] = inst->src[1];
+	    inst->src[1] = value;
+	    inst->conditional_mod = new_cmod;
+	    return true;
+	 }
+      }
+      break;
+
+   case BRW_OPCODE_SEL:
+      if (arg == 1) {
+	 inst->src[arg] = value;
+	 return true;
+      } else if (arg == 0 && inst->src[1].file != IMM) {
+	 inst->src[0] = inst->src[1];
+	 inst->src[1] = value;
+
+	 /* If this was predicated, flipping operands means
+	  * we also need to flip the predicate.
+	  */
+	 if (inst->conditional_mod == BRW_CONDITIONAL_NONE) {
+	    inst->predicate_inverse = !inst->predicate_inverse;
+	 }
+	 return true;
+      }
+      break;
+
+   default:
+      break;
+   }
+
+   return false;
+}
+
+static bool
+try_copy_propagate(const struct brw_device_info *devinfo,
+                   vec4_instruction *inst,
+                   int arg, struct copy_entry *entry)
+{
+   /* For constant propagation, we only handle the same constant
+    * across all 4 channels.  Some day, we should handle the 8-bit
+    * float vector format, which would let us constant propagate
+    * vectors better.
+    */
+   src_reg value = *entry->value[0];
+   for (int i = 1; i < 4; i++) {
+      /* This is equals() except we don't care about the swizzle. */
+      if (value.file != entry->value[i]->file ||
+	  value.reg != entry->value[i]->reg ||
+	  value.reg_offset != entry->value[i]->reg_offset ||
+	  value.type != entry->value[i]->type ||
+	  value.negate != entry->value[i]->negate ||
+	  value.abs != entry->value[i]->abs) {
+	 return false;
+      }
+   }
+
+   /* Compute the swizzle of the original register by swizzling the
+    * component loaded from each value according to the swizzle of
+    * operand we're going to change.
+    */
+   int s[4];
+   for (int i = 0; i < 4; i++) {
+      s[i] = BRW_GET_SWZ(entry->value[i]->swizzle, i);
+   }
+   value.swizzle = brw_compose_swizzle(inst->src[arg].swizzle,
+                                       BRW_SWIZZLE4(s[0], s[1], s[2], s[3]));
+
+   if (value.file != UNIFORM &&
+       value.file != GRF &&
+       value.file != ATTR)
+      return false;
+
+   if (devinfo->gen >= 8 && (value.negate || value.abs) &&
+       is_logic_op(inst->opcode)) {
+      return false;
+   }
+
+   if (inst->src[arg].abs) {
+      value.negate = false;
+      value.abs = true;
+   }
+   if (inst->src[arg].negate)
+      value.negate = !value.negate;
+
+   bool has_source_modifiers = value.negate || value.abs;
+
+   /* gen6 math and gen7+ SENDs from GRFs ignore source modifiers on
+    * instructions.
+    */
+   if ((has_source_modifiers || value.file == UNIFORM ||
+        value.swizzle != BRW_SWIZZLE_XYZW) && !inst->can_do_source_mods(devinfo))
+      return false;
+
+   if (has_source_modifiers && value.type != inst->src[arg].type)
+      return false;
+
+   if (has_source_modifiers &&
+       inst->opcode == SHADER_OPCODE_GEN4_SCRATCH_WRITE)
+      return false;
+
+   if (inst->is_3src() && value.file == UNIFORM)
+      return false;
+
+   if (inst->is_send_from_grf())
+      return false;
+
+   /* we can't generally copy-propagate UD negations becuse we
+    * end up accessing the resulting values as signed integers
+    * instead. See also resolve_ud_negate().
+    */
+   if (value.negate &&
+       value.type == BRW_REGISTER_TYPE_UD)
+      return false;
+
+   /* Don't report progress if this is a noop. */
+   if (value.equals(inst->src[arg]))
+      return false;
+
+   const unsigned dst_saturate_mask = inst->dst.writemask &
+      brw_apply_swizzle_to_mask(inst->src[arg].swizzle, entry->saturatemask);
+
+   if (dst_saturate_mask) {
+      /* We either saturate all or nothing. */
+      if (dst_saturate_mask != inst->dst.writemask)
+         return false;
+
+      /* Limit saturate propagation only to SEL with src1 bounded within 0.0
+       * and 1.0, otherwise skip copy propagate altogether.
+       */
+      switch(inst->opcode) {
+      case BRW_OPCODE_SEL:
+         if (arg != 0 ||
+             inst->src[0].type != BRW_REGISTER_TYPE_F ||
+             inst->src[1].file != IMM ||
+             inst->src[1].type != BRW_REGISTER_TYPE_F ||
+             inst->src[1].fixed_hw_reg.dw1.f < 0.0 ||
+             inst->src[1].fixed_hw_reg.dw1.f > 1.0) {
+            return false;
+         }
+         if (!inst->saturate)
+            inst->saturate = true;
+         break;
+      default:
+         return false;
+      }
+   }
+
+   value.type = inst->src[arg].type;
+   inst->src[arg] = value;
+   return true;
+}
+
+bool
+vec4_visitor::opt_copy_propagation(bool do_constant_prop)
+{
+   bool progress = false;
+   struct copy_entry entries[alloc.total_size];
+
+   memset(&entries, 0, sizeof(entries));
+
+   foreach_block_and_inst(block, vec4_instruction, inst, cfg) {
+      /* This pass only works on basic blocks.  If there's flow
+       * control, throw out all our information and start from
+       * scratch.
+       *
+       * This should really be fixed by using a structure like in
+       * src/glsl/opt_copy_propagation.cpp to track available copies.
+       */
+      if (!is_dominated_by_previous_instruction(inst)) {
+	 memset(&entries, 0, sizeof(entries));
+	 continue;
+      }
+
+      /* For each source arg, see if each component comes from a copy
+       * from the same type file (IMM, GRF, UNIFORM), and try
+       * optimizing out access to the copy result
+       */
+      for (int i = 2; i >= 0; i--) {
+	 /* Copied values end up in GRFs, and we don't track reladdr
+	  * accesses.
+	  */
+	 if (inst->src[i].file != GRF ||
+	     inst->src[i].reladdr)
+	    continue;
+
+         /* We only handle single-register copies. */
+         if (inst->regs_read(i) != 1)
+            continue;
+
+	 int reg = (alloc.offsets[inst->src[i].reg] +
+		    inst->src[i].reg_offset);
+
+	 /* Find the regs that each swizzle component came from.
+	  */
+         struct copy_entry entry;
+         memset(&entry, 0, sizeof(copy_entry));
+	 int c;
+	 for (c = 0; c < 4; c++) {
+            int channel = BRW_GET_SWZ(inst->src[i].swizzle, c);
+            entry.value[c] = entries[reg].value[channel];
+
+	    /* If there's no available copy for this channel, bail.
+	     * We could be more aggressive here -- some channels might
+	     * not get used based on the destination writemask.
+	     */
+	    if (!entry.value[c])
+	       break;
+
+            entry.saturatemask |=
+               (entries[reg].saturatemask & (1 << channel) ? 1 : 0) << c;
+
+	    /* We'll only be able to copy propagate if the sources are
+	     * all from the same file -- there's no ability to swizzle
+	     * 0 or 1 constants in with source registers like in i915.
+	     */
+	    if (c > 0 && entry.value[c - 1]->file != entry.value[c]->file)
+	       break;
+	 }
+
+	 if (c != 4)
+	    continue;
+
+         if (do_constant_prop && try_constant_propagate(devinfo, inst, i, &entry))
+            progress = true;
+
+	 if (try_copy_propagate(devinfo, inst, i, &entry))
+	    progress = true;
+      }
+
+      /* Track available source registers. */
+      if (inst->dst.file == GRF) {
+	 const int reg =
+	    alloc.offsets[inst->dst.reg] + inst->dst.reg_offset;
+
+	 /* Update our destination's current channel values.  For a direct copy,
+	  * the value is the newly propagated source.  Otherwise, we don't know
+	  * the new value, so clear it.
+	  */
+	 bool direct_copy = is_direct_copy(inst);
+         entries[reg].saturatemask &= ~inst->dst.writemask;
+	 for (int i = 0; i < 4; i++) {
+	    if (inst->dst.writemask & (1 << i)) {
+               entries[reg].value[i] = direct_copy ? &inst->src[0] : NULL;
+               entries[reg].saturatemask |=
+                  inst->saturate && direct_copy ? 1 << i : 0;
+            }
+	 }
+
+	 /* Clear the records for any registers whose current value came from
+	  * our destination's updated channels, as the two are no longer equal.
+	  */
+	 if (inst->dst.reladdr)
+	    memset(&entries, 0, sizeof(entries));
+	 else {
+	    for (unsigned i = 0; i < alloc.total_size; i++) {
+	       for (int j = 0; j < 4; j++) {
+		  if (is_channel_updated(inst, entries[i].value, j)) {
+		     entries[i].value[j] = NULL;
+		     entries[i].saturatemask &= ~(1 << j);
+                  }
+	       }
+	    }
+	 }
+      }
+   }
+
+   if (progress)
+      invalidate_live_intervals();
+
+   return progress;
+}
+
+} /* namespace brw */
+@
+
+
+1.1.1.1
+log
+@import Mesa 11.0.6
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 11.2.2
+@
+text
+@d34 3
+a36 1
+#include "brw_eu.h"
+d50 1
+a50 1
+	   inst->dst.file == VGRF &&
+d73 2
+a74 2
+   assert(inst->dst.file == VGRF);
+   if (!src || src->file != VGRF)
+d137 1
+a137 1
+          !brw_abs_immediate(value.type, &value.as_brw_reg())) {
+d144 1
+a144 1
+          !brw_negate_immediate(value.type, &value.as_brw_reg())) {
+d150 2
+a151 1
+      value.ud = swizzle_vf_imm(value.ud, inst->src[arg].swizzle);
+a204 7
+   case GS_OPCODE_SET_WRITE_OFFSET:
+      /* This is just a multiply by a constant with special strides.
+       * The generator will handle immediates in both arguments (generating
+       * a single MOV of the product).  So feel free to propagate in src0.
+       */
+      inst->src[arg] = value;
+      return true;
+d253 2
+a254 2
+                   vec4_instruction *inst, int arg,
+                   struct copy_entry *entry, int attributes_per_reg)
+a255 3
+   /* Build up the value we are propagating as if it were the source of a
+    * single MOV
+    */
+d265 1
+a265 1
+          value.nr != entry->value[i]->nr ||
+d282 2
+a283 1
+   value.swizzle = BRW_SWIZZLE4(s[0], s[1], s[2], s[3]);
+a284 1
+   /* Check that we can propagate that value */
+d286 1
+a286 1
+       value.file != VGRF &&
+d295 7
+d311 1
+a311 3
+   if (has_source_modifiers &&
+       value.type != inst->src[arg].type &&
+       !inst->can_change_types())
+d318 1
+a318 6
+   unsigned composed_swizzle = brw_compose_swizzle(inst->src[arg].swizzle,
+                                                   value.swizzle);
+   if (inst->is_3src() &&
+       (value.file == UNIFORM ||
+        (value.file == ATTR && attributes_per_reg != 1)) &&
+       !brw_is_single_value_swizzle(composed_swizzle))
+d353 2
+a354 2
+             inst->src[1].f < 0.0 ||
+             inst->src[1].f > 1.0) {
+d365 1
+a365 20
+   /* Build the final value */
+   if (inst->src[arg].abs) {
+      value.negate = false;
+      value.abs = true;
+   }
+   if (inst->src[arg].negate)
+      value.negate = !value.negate;
+
+   value.swizzle = composed_swizzle;
+   if (has_source_modifiers &&
+       value.type != inst->src[arg].type) {
+      assert(inst->can_change_types());
+      for (int i = 0; i < 3; i++) {
+         inst->src[i].type = value.type;
+      }
+      inst->dst.type = value.type;
+   } else {
+      value.type = inst->src[arg].type;
+   }
+
+a372 5
+   /* If we are in dual instanced or single mode, then attributes are going
+    * to be interleaved, so one register contains two attribute slots.
+    */
+   const int attributes_per_reg =
+      prog_data->dispatch_mode == DISPATCH_MODE_4X2_DUAL_OBJECT ? 1 : 2;
+d392 1
+a392 1
+       * from the same type file (IMM, VGRF, UNIFORM), and try
+d399 1
+a399 1
+	 if (inst->src[i].file != VGRF ||
+d407 1
+a407 1
+         int reg = (alloc.offsets[inst->src[i].nr] +
+d443 1
+a443 1
+         if (try_copy_propagate(devinfo, inst, i, &entry, attributes_per_reg))
+d448 1
+a448 1
+      if (inst->dst.file == VGRF) {
+d450 1
+a450 1
+            alloc.offsets[inst->dst.nr] + inst->dst.reg_offset;
+@
+
+
+1.1.1.3
+log
+@Import Mesa 13.0.2
+@
+text
+@a48 1
+	   inst->dst.offset % REG_SIZE == 0 &&
+d75 1
+a75 2
+   return regions_overlap(*src, REG_SIZE, inst->dst, inst->size_written) &&
+          (inst->dst.offset != src->offset ||
+d79 16
+a103 44
+/**
+ * Get the origin of a copy as a single register if all components present in
+ * the given readmask originate from the same register and have compatible
+ * regions, otherwise return a BAD_FILE register.
+ */
+static src_reg
+get_copy_value(const copy_entry &entry, unsigned readmask)
+{
+   unsigned swz[4] = {};
+   src_reg value;
+
+   for (unsigned i = 0; i < 4; i++) {
+      if (readmask & (1 << i)) {
+         if (entry.value[i]) {
+            src_reg src = *entry.value[i];
+
+            if (src.file == IMM) {
+               swz[i] = i;
+            } else {
+               swz[i] = BRW_GET_SWZ(src.swizzle, i);
+               /* Overwrite the original swizzle so the src_reg::equals call
+                * below doesn't care about it, the correct swizzle will be
+                * calculated once the swizzles of all components are known.
+                */
+               src.swizzle = BRW_SWIZZLE_XYZW;
+            }
+
+            if (value.file == BAD_FILE) {
+               value = src;
+            } else if (!value.equals(src)) {
+               return src_reg();
+            }
+         } else {
+            return src_reg();
+         }
+      }
+   }
+
+   return swizzle(value,
+                  brw_compose_swizzle(brw_swizzle_for_mask(readmask),
+                                      BRW_SWIZZLE4(swz[0], swz[1],
+                                                   swz[2], swz[3])));
+}
+
+d105 1
+a105 1
+try_constant_propagate(const struct gen_device_info *devinfo,
+d107 1
+a107 1
+                       int arg, const copy_entry *entry)
+a112 2
+    * We could be more aggressive here -- some channels might not get used
+    * based on the destination writemask.
+d114 5
+a118 4
+   src_reg value =
+      get_copy_value(*entry,
+                     brw_apply_inv_swizzle_to_mask(inst->src[arg].swizzle,
+                                                   WRITEMASK_XYZW));
+d147 2
+a148 1
+   value = swizzle(value, inst->src[arg].swizzle);
+d256 1
+a256 1
+try_copy_propagate(const struct gen_device_info *devinfo,
+d258 1
+a258 1
+                   const copy_entry *entry, int attributes_per_reg)
+d263 27
+a289 4
+   src_reg value =
+      get_copy_value(*entry,
+                     brw_apply_inv_swizzle_to_mask(inst->src[arg].swizzle,
+                                                   WRITEMASK_XYZW));
+d322 1
+a322 1
+   if (inst->is_3src(devinfo) &&
+d434 2
+a435 3
+         /* We only handle register-aligned single GRF copies. */
+         if (inst->size_read(i) != REG_SIZE ||
+             inst->src[i].offset % REG_SIZE)
+d438 32
+a469 3
+         const unsigned reg = (alloc.offsets[inst->src[i].nr] +
+                               inst->src[i].offset / REG_SIZE);
+         const copy_entry &entry = entries[reg];
+d473 2
+a474 1
+         else if (try_copy_propagate(devinfo, inst, i, &entry, attributes_per_reg))
+d481 1
+a481 1
+            alloc.offsets[inst->dst.nr] + inst->dst.offset / REG_SIZE;
+@
+
+

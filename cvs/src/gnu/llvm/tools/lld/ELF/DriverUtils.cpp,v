@@ -1,0 +1,628 @@
+head	1.4;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.2
+	LLVM_4_0_0_RC1:1.1.1.2
+	LLVM_3_9_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+expand	@o@;
+
+
+1.4
+date	2017.03.24.03.13.55;	author jsg;	state Exp;
+branches;
+next	1.3;
+commitid	DgUzi2HH13KgRQGm;
+
+1.3
+date	2017.01.31.09.53.07;	author patrick;	state Exp;
+branches;
+next	1.2;
+commitid	gd2jeVetTMV9XxTy;
+
+1.2
+date	2017.01.24.10.17.56;	author kettenis;	state Exp;
+branches;
+next	1.1;
+commitid	npkuQnhpvG8vtKtY;
+
+1.1
+date	2017.01.14.19.55.45;	author patrick;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.1
+date	2017.01.14.19.55.45;	author patrick;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.2
+date	2017.01.24.08.33.12;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.4
+log
+@Add "supported targets" in lld --help output to be compatible with what
+libtool generated configure scripts expect.  Otherwise they might assume
+shared libraries aren't supported.
+
+From lld svn revisions 298568 and 298571.
+Discussed with kettenis@@
+@
+text
+@//===- DriverUtils.cpp ----------------------------------------------------===//
+//
+//                             The LLVM Linker
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file contains utility functions for the driver. Because there
+// are so many small functions, we created this separate file to make
+// Driver.cpp less cluttered.
+//
+//===----------------------------------------------------------------------===//
+
+#include "Driver.h"
+#include "Error.h"
+#include "Memory.h"
+#include "ScriptParser.h"
+#include "lld/Config/Version.h"
+#include "lld/Core/Reproduce.h"
+#include "llvm/ADT/Optional.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Triple.h"
+#include "llvm/Option/Option.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
+
+using namespace llvm;
+using namespace llvm::sys;
+
+using namespace lld;
+using namespace lld::elf;
+
+// Create OptTable
+
+// Create prefix string literals used in Options.td
+#define PREFIX(NAME, VALUE) const char *const NAME[] = VALUE;
+#include "Options.inc"
+#undef PREFIX
+
+// Create table mapping all options defined in Options.td
+static const opt::OptTable::Info OptInfo[] = {
+#define OPTION(X1, X2, ID, KIND, GROUP, ALIAS, X6, X7, X8, X9, X10)            \
+  {X1, X2, X9,          X10,         OPT_##ID, opt::Option::KIND##Class,       \
+   X8, X7, OPT_##GROUP, OPT_##ALIAS, X6},
+#include "Options.inc"
+#undef OPTION
+};
+
+ELFOptTable::ELFOptTable() : OptTable(OptInfo) {}
+
+// Parse -color-diagnostics={auto,always,never} or -no-color-diagnostics.
+static bool getColorDiagnostics(opt::InputArgList &Args) {
+  bool Default = (ErrorOS == &errs() && Process::StandardErrHasColors());
+
+  auto *Arg = Args.getLastArg(OPT_color_diagnostics, OPT_color_diagnostics_eq,
+                              OPT_no_color_diagnostics);
+  if (!Arg)
+    return Default;
+  if (Arg->getOption().getID() == OPT_color_diagnostics)
+    return true;
+  if (Arg->getOption().getID() == OPT_no_color_diagnostics)
+    return false;
+
+  StringRef S = Arg->getValue();
+  if (S == "auto")
+    return Default;
+  if (S == "always")
+    return true;
+  if (S != "never")
+    error("unknown option: -color-diagnostics=" + S);
+  return false;
+}
+
+static cl::TokenizerCallback getQuotingStyle(opt::InputArgList &Args) {
+  if (auto *Arg = Args.getLastArg(OPT_rsp_quoting)) {
+    StringRef S = Arg->getValue();
+    if (S != "windows" && S != "posix")
+      error("invalid response file quoting: " + S);
+    if (S == "windows")
+      return cl::TokenizeWindowsCommandLine;
+    return cl::TokenizeGNUCommandLine;
+  }
+  if (Triple(sys::getProcessTriple()).getOS() == Triple::Win32)
+    return cl::TokenizeWindowsCommandLine;
+  return cl::TokenizeGNUCommandLine;
+}
+
+// Parses a given list of options.
+opt::InputArgList ELFOptTable::parse(ArrayRef<const char *> Argv) {
+  // Make InputArgList from string vectors.
+  unsigned MissingIndex;
+  unsigned MissingCount;
+  SmallVector<const char *, 256> Vec(Argv.data(), Argv.data() + Argv.size());
+
+  // We need to get the quoting style for response files before parsing all
+  // options so we parse here before and ignore all the options but
+  // --rsp-quoting.
+  opt::InputArgList Args = this->ParseArgs(Vec, MissingIndex, MissingCount);
+
+  // Expand response files (arguments in the form of @@<filename>)
+  // and then parse the argument again.
+  cl::ExpandResponseFiles(Saver, getQuotingStyle(Args), Vec);
+  Args = this->ParseArgs(Vec, MissingIndex, MissingCount);
+
+  // Interpret -color-diagnostics early so that error messages
+  // for unknown flags are colored.
+  Config->ColorDiagnostics = getColorDiagnostics(Args);
+  if (MissingCount)
+    error(Twine(Args.getArgString(MissingIndex)) + ": missing argument");
+
+  for (auto *Arg : Args.filtered(OPT_UNKNOWN))
+    error("unknown argument: " + Arg->getSpelling());
+  return Args;
+}
+
+void elf::printHelp(const char *Argv0) {
+  ELFOptTable Table;
+  Table.PrintHelp(outs(), Argv0, "lld", false);
+  outs() << "\n";
+
+  // Scripts generated by Libtool versions up to at least 2.4.6 (the most
+  // recent version as of March 2017) expect /: supported targets:.* elf/
+  // in a message for the -help option. If it doesn't match, the scripts
+  // assume that the linker doesn't support very basic features such as
+  // shared libraries. Therefore, we need to print out at least "elf".
+  // Here, we print out all the targets that we support.
+  outs() << Argv0 << ": supported targets: "
+         << "elf32-i386 elf32-iamcu elf32-littlearm elf32-powerpc "
+         << "elf32-tradbigmips elf32-tradlittlemips elf32-x86-64 "
+         << "elf64-amdgpu elf64-littleaarch64 elf64-powerpc "
+         << "elf64-tradbigmips elf64-tradlittlemips elf64-x86-64\n";
+}
+
+// Reconstructs command line arguments so that so that you can re-run
+// the same command with the same inputs. This is for --reproduce.
+std::string elf::createResponseFile(const opt::InputArgList &Args) {
+  SmallString<0> Data;
+  raw_svector_ostream OS(Data);
+
+  // Copy the command line to the output while rewriting paths.
+  for (auto *Arg : Args) {
+    switch (Arg->getOption().getID()) {
+    case OPT_reproduce:
+      break;
+    case OPT_INPUT:
+      OS << quote(rewritePath(Arg->getValue())) << "\n";
+      break;
+    case OPT_L:
+    case OPT_dynamic_list:
+    case OPT_rpath:
+    case OPT_alias_script_T:
+    case OPT_script:
+    case OPT_version_script:
+      OS << Arg->getSpelling() << " " << quote(rewritePath(Arg->getValue()))
+         << "\n";
+      break;
+    default:
+      OS << toString(Arg) << "\n";
+    }
+  }
+  return Data.str();
+}
+
+// Find a file by concatenating given paths. If a resulting path
+// starts with "=", the character is replaced with a --sysroot value.
+static Optional<std::string> findFile(StringRef Path1, const Twine &Path2) {
+  SmallString<128> S;
+  if (Path1.startswith("="))
+    path::append(S, Config->Sysroot, Path1.substr(1), Path2);
+  else
+    path::append(S, Path1, Path2);
+
+  if (fs::exists(S))
+    return S.str().str();
+  return None;
+}
+
+Optional<std::string> elf::findFromSearchPaths(StringRef Path) {
+  for (StringRef Dir : Config->SearchPaths)
+    if (Optional<std::string> S = findFile(Dir, Path))
+      return S;
+  return None;
+}
+
+// This is for -lfoo. We'll look for libfoo.so or libfoo.a from
+// search paths.
+Optional<std::string> elf::searchLibrary(StringRef Name) {
+  if (Name.startswith(":"))
+    return findFromSearchPaths(Name.substr(1));
+
+  for (StringRef Dir : Config->SearchPaths) {
+    if (!Config->Static) {
+      if (Optional<std::string> S = findFile(Dir, "lib" + Name + ".so"))
+        return S;
+
+      llvm::SmallString<128> Scratch;
+      const StringRef LibName = ("lib" + Name + ".so.").toStringRef(Scratch);
+      int MaxMaj = -1, MaxMin = -1;
+      std::error_code EC;
+      for (fs::directory_iterator LI(Dir, EC), LE;
+	   !EC && LI != LE; LI = LI.increment(EC)) {
+        StringRef FilePath = LI->path();
+	StringRef FileName = path::filename(FilePath);
+	if (!(FileName.startswith(LibName)))
+	  continue;
+	std::pair<StringRef, StringRef> MajMin =
+	  FileName.substr(LibName.size()).split('.');
+	int Maj, Min;
+	if (MajMin.first.getAsInteger(10, Maj) || Maj < 0)
+	  continue;
+	if (MajMin.second.getAsInteger(10, Min) || Min < 0)
+	  continue;
+	if (Maj > MaxMaj)
+	  MaxMaj = Maj, MaxMin = Min;
+	if (MaxMaj == Maj && Min > MaxMin)
+	  MaxMin = Min;
+      }
+      if (MaxMaj >= 0)
+	return findFile(Dir, LibName + Twine(MaxMaj) + "." + Twine(MaxMin));
+    }
+    if (Optional<std::string> S = findFile(Dir, "lib" + Name + ".a"))
+      return S;
+  }
+  return None;
+}
+@
+
+
+1.3
+log
+@Fix creation of the library name, as assigning a string to a StringRef
+seems to cause bad behaviour.  Instead call toStringRef() and use its
+return value.
+
+ok tom@@
+@
+text
+@d123 13
+@
+
+
+1.2
+log
+@Handle the OpenBSD-style major/minor shared library version scheme.
+
+Don't try to upstream this; we are considering moving to a more standard
+way that uses symbolic links to point the linker at the right version of
+shared libraries.
+@
+text
+@d187 2
+a188 1
+      const StringRef LibName = (Twine("lib") + Name + ".so.").str();
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d18 2
+d21 2
+d29 1
+a29 1
+#include "llvm/Support/StringSaver.h"
+d47 2
+a48 4
+  {                                                                            \
+    X1, X2, X9, X10, OPT_##ID, opt::Option::KIND##Class, X8, X7, OPT_##GROUP,  \
+        OPT_##ALIAS, X6                                                        \
+  },
+d55 23
+d104 2
+a105 2
+  // Expand response files. '@@<filename>' is replaced by the file's contents.
+  StringSaver Saver(Alloc);
+d107 1
+d109 3
+a111 2
+  // Parse options and then do error checking.
+  Args = this->ParseArgs(Vec, MissingIndex, MissingCount);
+d113 1
+a113 3
+    error(Twine("missing arg value for \"") + Args.getArgString(MissingIndex) +
+          "\", expected " + Twine(MissingCount) +
+          (MissingCount == 1 ? " argument.\n" : " arguments"));
+a124 109
+std::string elf::getVersionString() {
+  std::string Version = getLLDVersion();
+  std::string Repo = getLLDRepositoryVersion();
+  if (Repo.empty())
+    return "LLD " + Version + "\n";
+  return "LLD " + Version + " " + Repo + "\n";
+}
+
+// Makes a given pathname an absolute path first, and then remove
+// beginning /. For example, "../foo.o" is converted to "home/john/foo.o",
+// assuming that the current directory is "/home/john/bar".
+std::string elf::relativeToRoot(StringRef Path) {
+  SmallString<128> Abs = Path;
+  if (std::error_code EC = fs::make_absolute(Abs))
+    fatal("make_absolute failed: " + EC.message());
+  path::remove_dots(Abs, /*remove_dot_dot=*/true);
+
+  // This is Windows specific. root_name() returns a drive letter
+  // (e.g. "c:") or a UNC name (//net). We want to keep it as part
+  // of the result.
+  SmallString<128> Res;
+  StringRef Root = path::root_name(Abs);
+  if (Root.endswith(":"))
+    Res = Root.drop_back();
+  else if (Root.startswith("//"))
+    Res = Root.substr(2);
+
+  path::append(Res, path::relative_path(Abs));
+  return Res.str();
+}
+
+CpioFile::CpioFile(std::unique_ptr<raw_fd_ostream> OS, StringRef S)
+    : OS(std::move(OS)), Basename(S) {}
+
+CpioFile *CpioFile::create(StringRef OutputPath) {
+  std::string Path = (OutputPath + ".cpio").str();
+  std::error_code EC;
+  auto OS = llvm::make_unique<raw_fd_ostream>(Path, EC, fs::F_None);
+  if (EC) {
+    error(EC, "--reproduce: failed to open " + Path);
+    return nullptr;
+  }
+  return new CpioFile(std::move(OS), path::filename(OutputPath));
+}
+
+static void writeMember(raw_fd_ostream &OS, StringRef Path, StringRef Data) {
+  // The c_dev/c_ino pair should be unique according to the spec,
+  // but no one seems to care.
+  OS << "070707";                        // c_magic
+  OS << "000000";                        // c_dev
+  OS << "000000";                        // c_ino
+  OS << "100664";                        // c_mode: C_ISREG | rw-rw-r--
+  OS << "000000";                        // c_uid
+  OS << "000000";                        // c_gid
+  OS << "000001";                        // c_nlink
+  OS << "000000";                        // c_rdev
+  OS << "00000000000";                   // c_mtime
+  OS << format("%06o", Path.size() + 1); // c_namesize
+  OS << format("%011o", Data.size());    // c_filesize
+  OS << Path << '\0';                    // c_name
+  OS << Data;                            // c_filedata
+}
+
+void CpioFile::append(StringRef Path, StringRef Data) {
+  if (!Seen.insert(Path).second)
+    return;
+
+  // Construct an in-archive filename so that /home/foo/bar is stored
+  // as baz/home/foo/bar where baz is the basename of the output file.
+  // (i.e. in that case we are creating baz.cpio.)
+  SmallString<128> Fullpath;
+  path::append(Fullpath, Basename, Path);
+
+  // Use unix path separators so the cpio can be extracted on both unix and
+  // windows.
+  std::replace(Fullpath.begin(), Fullpath.end(), '\\', '/');
+
+  writeMember(*OS, Fullpath, Data);
+
+  // Print the trailer and seek back.
+  // This way we have a valid archive if we crash.
+  uint64_t Pos = OS->tell();
+  writeMember(*OS, "TRAILER!!!", "");
+  OS->seek(Pos);
+}
+
+// Quote a given string if it contains a space character.
+static std::string quote(StringRef S) {
+  if (S.find(' ') == StringRef::npos)
+    return S;
+  return ("\"" + S + "\"").str();
+}
+
+static std::string rewritePath(StringRef S) {
+  if (fs::exists(S))
+    return relativeToRoot(S);
+  return S;
+}
+
+static std::string stringize(opt::Arg *Arg) {
+  std::string K = Arg->getSpelling();
+  if (Arg->getNumValues() == 0)
+    return K;
+  std::string V = quote(Arg->getValue());
+  if (Arg->getOption().getRenderStyle() == opt::Option::RenderJoinedStyle)
+    return K + V;
+  return K + " " + V;
+}
+
+d145 2
+a146 2
+      OS << Arg->getSpelling() << " "
+         << quote(rewritePath(Arg->getValue())) << "\n";
+d149 1
+a149 1
+      OS << stringize(Arg) << "\n";
+d155 19
+a173 7
+std::string elf::findFromSearchPaths(StringRef Path) {
+  for (StringRef Dir : Config->SearchPaths) {
+    std::string FullPath = buildSysrootedPath(Dir, Path);
+    if (fs::exists(FullPath))
+      return FullPath;
+  }
+  return "";
+d176 6
+a181 5
+// Searches a given library from input search paths, which are filled
+// from -L command line switches. Returns a path to an existent library file.
+std::string elf::searchLibrary(StringRef Path) {
+  if (Path.startswith(":"))
+    return findFromSearchPaths(Path.substr(1));
+d184 1
+a184 2
+      std::string S = buildSysrootedPath(Dir, ("lib" + Path + ".so").str());
+      if (fs::exists(S))
+d186 24
+d211 1
+a211 2
+    std::string S = buildSysrootedPath(Dir, ("lib" + Path + ".a").str());
+    if (fs::exists(S))
+d214 1
+a214 13
+  return "";
+}
+
+// Makes a path by concatenating Dir and File.
+// If Dir starts with '=' the result will be preceded by Sysroot,
+// which can be set with --sysroot command line switch.
+std::string elf::buildSysrootedPath(StringRef Dir, StringRef File) {
+  SmallString<128> Path;
+  if (Dir.startswith("="))
+    path::append(Path, Config->Sysroot, Dir.substr(1), File);
+  else
+    path::append(Path, Dir, File);
+  return Path.str();
+@
+
+
+1.1.1.1
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@a17 2
+#include "Memory.h"
+#include "ScriptParser.h"
+a18 2
+#include "lld/Core/Reproduce.h"
+#include "llvm/ADT/Optional.h"
+d25 1
+a25 1
+#include "llvm/Support/Process.h"
+d43 4
+a46 2
+  {X1, X2, X9,          X10,         OPT_##ID, opt::Option::KIND##Class,       \
+   X8, X7, OPT_##GROUP, OPT_##ALIAS, X6},
+a52 23
+// Parse -color-diagnostics={auto,always,never} or -no-color-diagnostics.
+static bool getColorDiagnostics(opt::InputArgList &Args) {
+  bool Default = (ErrorOS == &errs() && Process::StandardErrHasColors());
+
+  auto *Arg = Args.getLastArg(OPT_color_diagnostics, OPT_color_diagnostics_eq,
+                              OPT_no_color_diagnostics);
+  if (!Arg)
+    return Default;
+  if (Arg->getOption().getID() == OPT_color_diagnostics)
+    return true;
+  if (Arg->getOption().getID() == OPT_no_color_diagnostics)
+    return false;
+
+  StringRef S = Arg->getValue();
+  if (S == "auto")
+    return Default;
+  if (S == "always")
+    return true;
+  if (S != "never")
+    error("unknown option: -color-diagnostics=" + S);
+  return false;
+}
+
+d79 2
+a80 2
+  // Expand response files (arguments in the form of @@<filename>)
+  // and then parse the argument again.
+d82 2
+a84 4
+
+  // Interpret -color-diagnostics early so that error messages
+  // for unknown flags are colored.
+  Config->ColorDiagnostics = getColorDiagnostics(Args);
+d86 3
+a88 1
+    error(Twine(Args.getArgString(MissingIndex)) + ": missing argument");
+d100 109
+d229 2
+a230 2
+      OS << Arg->getSpelling() << " " << quote(rewritePath(Arg->getValue()))
+         << "\n";
+d233 1
+a233 1
+      OS << toString(Arg) << "\n";
+d239 7
+a245 12
+// Find a file by concatenating given paths. If a resulting path
+// starts with "=", the character is replaced with a --sysroot value.
+static Optional<std::string> findFile(StringRef Path1, const Twine &Path2) {
+  SmallString<128> S;
+  if (Path1.startswith("="))
+    path::append(S, Config->Sysroot, Path1.substr(1), Path2);
+  else
+    path::append(S, Path1, Path2);
+
+  if (fs::exists(S))
+    return S.str().str();
+  return None;
+d248 5
+a252 13
+Optional<std::string> elf::findFromSearchPaths(StringRef Path) {
+  for (StringRef Dir : Config->SearchPaths)
+    if (Optional<std::string> S = findFile(Dir, Path))
+      return S;
+  return None;
+}
+
+// This is for -lfoo. We'll look for libfoo.so or libfoo.a from
+// search paths.
+Optional<std::string> elf::searchLibrary(StringRef Name) {
+  if (Name.startswith(":"))
+    return findFromSearchPaths(Name.substr(1));
+
+d254 3
+a256 2
+    if (!Config->Static)
+      if (Optional<std::string> S = findFile(Dir, "lib" + Name + ".so"))
+d258 3
+a260 1
+    if (Optional<std::string> S = findFile(Dir, "lib" + Name + ".a"))
+d263 13
+a275 1
+  return None;
+@
+

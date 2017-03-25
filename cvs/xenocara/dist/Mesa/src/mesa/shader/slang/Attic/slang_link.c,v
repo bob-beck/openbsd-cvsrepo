@@ -1,0 +1,3703 @@
+head	1.5;
+access;
+symbols
+	OPENBSD_5_0:1.4.0.6
+	OPENBSD_5_0_BASE:1.4
+	OPENBSD_4_9:1.4.0.2
+	OPENBSD_4_9_BASE:1.4
+	OPENBSD_4_8:1.4.0.4
+	OPENBSD_4_8_BASE:1.4
+	OPENBSD_4_7:1.3.0.4
+	OPENBSD_4_7_BASE:1.3
+	OPENBSD_4_6:1.3.0.2
+	OPENBSD_4_6_BASE:1.3
+	OPENBSD_4_5:1.2.0.2
+	OPENBSD_4_5_BASE:1.2
+	OPENBSD_4_4:1.1.1.3.0.4
+	OPENBSD_4_4_BASE:1.1.1.3
+	OPENBSD_4_3_BASE:1.1.1.3
+	OPENBSD_4_3:1.1.1.3.0.2
+	v7_0_1:1.1.1.3
+	OPENBSD_4_2:1.1.1.2.0.2
+	OPENBSD_4_2_BASE:1.1.1.2
+	v6_5_2:1.1.1.2
+	v6_5_1:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.5
+date	2011.10.23.13.37.45;	author matthieu;	state dead;
+branches;
+next	1.4;
+
+1.4
+date	2010.05.22.20.06.33;	author matthieu;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2009.05.17.20.26.42;	author matthieu;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2008.11.02.14.58.22;	author matthieu;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2006.11.25.18.51.10;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2006.11.25.18.51.10;	author matthieu;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2007.03.03.11.56.48;	author matthieu;	state Exp;
+branches;
+next	1.1.1.3;
+
+1.1.1.3
+date	2007.11.24.17.31.49;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.5
+log
+@Merge Mesa 7.10.3
+@
+text
+@/*
+ * Mesa 3-D graphics library
+ * Version:  7.3
+ *
+ * Copyright (C) 2008  Brian Paul   All Rights Reserved.
+ * Copyright (C) 2009  VMware, Inc.  All Rights Reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * BRIAN PAUL BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+/**
+ * \file slang_link.c
+ * GLSL linker
+ * \author Brian Paul
+ */
+
+#include "main/imports.h"
+#include "main/context.h"
+#include "main/macros.h"
+#include "shader/program.h"
+#include "shader/prog_instruction.h"
+#include "shader/prog_parameter.h"
+#include "shader/prog_print.h"
+#include "shader/prog_statevars.h"
+#include "shader/prog_uniform.h"
+#include "shader/shader_api.h"
+#include "slang_builtin.h"
+#include "slang_link.h"
+
+
+/** cast wrapper */
+static struct gl_vertex_program *
+vertex_program(struct gl_program *prog)
+{
+   assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
+   return (struct gl_vertex_program *) prog;
+}
+
+
+/** cast wrapper */
+static struct gl_fragment_program *
+fragment_program(struct gl_program *prog)
+{
+   assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+   return (struct gl_fragment_program *) prog;
+}
+
+
+/**
+ * Record a linking error.
+ */
+static void
+link_error(struct gl_shader_program *shProg, const char *msg)
+{
+   if (shProg->InfoLog) {
+      free(shProg->InfoLog);
+   }
+   shProg->InfoLog = _mesa_strdup(msg);
+   shProg->LinkStatus = GL_FALSE;
+}
+
+
+
+/**
+ * Check if the given bit is either set or clear in both bitfields.
+ */
+static GLboolean
+bits_agree(GLbitfield flags1, GLbitfield flags2, GLbitfield bit)
+{
+   return (flags1 & bit) == (flags2 & bit);
+}
+
+
+/**
+ * Linking varying vars involves rearranging varying vars so that the
+ * vertex program's output varyings matches the order of the fragment
+ * program's input varyings.
+ * We'll then rewrite instructions to replace PROGRAM_VARYING with either
+ * PROGRAM_INPUT or PROGRAM_OUTPUT depending on whether it's a vertex or
+ * fragment shader.
+ * This is also where we set program Input/OutputFlags to indicate
+ * which inputs are centroid-sampled, invariant, etc.
+ */
+static GLboolean
+link_varying_vars(GLcontext *ctx,
+                  struct gl_shader_program *shProg, struct gl_program *prog)
+{
+   GLuint *map, i, firstVarying, newFile;
+   GLbitfield *inOutFlags;
+
+   map = (GLuint *) malloc(prog->Varying->NumParameters * sizeof(GLuint));
+   if (!map)
+      return GL_FALSE;
+
+   /* Varying variables are treated like other vertex program outputs
+    * (and like other fragment program inputs).  The position of the
+    * first varying differs for vertex/fragment programs...
+    * Also, replace File=PROGRAM_VARYING with File=PROGRAM_INPUT/OUTPUT.
+    */
+   if (prog->Target == GL_VERTEX_PROGRAM_ARB) {
+      firstVarying = VERT_RESULT_VAR0;
+      newFile = PROGRAM_OUTPUT;
+      inOutFlags = prog->OutputFlags;
+   }
+   else {
+      assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+      firstVarying = FRAG_ATTRIB_VAR0;
+      newFile = PROGRAM_INPUT;
+      inOutFlags = prog->InputFlags;
+   }
+
+   for (i = 0; i < prog->Varying->NumParameters; i++) {
+      /* see if this varying is in the linked varying list */
+      const struct gl_program_parameter *var = prog->Varying->Parameters + i;
+      GLint j = _mesa_lookup_parameter_index(shProg->Varying, -1, var->Name);
+      if (j >= 0) {
+         /* varying is already in list, do some error checking */
+         const struct gl_program_parameter *v =
+            &shProg->Varying->Parameters[j];
+         if (var->Size != v->Size) {
+            link_error(shProg, "mismatched varying variable types");
+            free(map);
+            return GL_FALSE;
+         }
+         if (!bits_agree(var->Flags, v->Flags, PROG_PARAM_BIT_CENTROID)) {
+            char msg[100];
+            _mesa_snprintf(msg, sizeof(msg),
+		     "centroid modifier mismatch for '%s'", var->Name);
+            link_error(shProg, msg);
+            free(map);
+            return GL_FALSE;
+         }
+         if (!bits_agree(var->Flags, v->Flags, PROG_PARAM_BIT_INVARIANT)) {
+            char msg[100];
+            _mesa_snprintf(msg, sizeof(msg),
+		     "invariant modifier mismatch for '%s'", var->Name);
+            link_error(shProg, msg);
+            free(map);
+            return GL_FALSE;
+         }
+      }
+      else {
+         /* not already in linked list */
+         j = _mesa_add_varying(shProg->Varying, var->Name, var->Size,
+                               var->Flags);
+      }
+
+      if (shProg->Varying->NumParameters > ctx->Const.MaxVarying) {
+         link_error(shProg, "Too many varying variables");
+         free(map);
+         return GL_FALSE;
+      }
+
+      /* Map varying[i] to varying[j].
+       * Note: the loop here takes care of arrays or large (sz>4) vars.
+       */
+      {
+         GLint sz = var->Size;
+         while (sz > 0) {
+            inOutFlags[firstVarying + j] = var->Flags;
+            /*printf("Link varying from %d to %d\n", i, j);*/
+            map[i++] = j++;
+            sz -= 4;
+         }
+         i--; /* go back one */
+      }
+   }
+
+
+   /* OK, now scan the program/shader instructions looking for varying vars,
+    * replacing the old index with the new index.
+    */
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      GLuint j;
+
+      if (inst->DstReg.File == PROGRAM_VARYING) {
+         inst->DstReg.File = newFile;
+         inst->DstReg.Index = map[ inst->DstReg.Index ] + firstVarying;
+      }
+
+      for (j = 0; j < 3; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_VARYING) {
+            inst->SrcReg[j].File = newFile;
+            inst->SrcReg[j].Index = map[ inst->SrcReg[j].Index ] + firstVarying;
+         }
+      }
+   }
+
+   free(map);
+
+   /* these will get recomputed before linking is completed */
+   prog->InputsRead = 0x0;
+   prog->OutputsWritten = 0x0;
+
+   return GL_TRUE;
+}
+
+
+/**
+ * Build the shProg->Uniforms list.
+ * This is basically a list/index of all uniforms found in either/both of
+ * the vertex and fragment shaders.
+ *
+ * About uniforms:
+ * Each uniform has two indexes, one that points into the vertex
+ * program's parameter array and another that points into the fragment
+ * program's parameter array.  When the user changes a uniform's value
+ * we have to change the value in the vertex and/or fragment program's
+ * parameter array.
+ *
+ * This function will be called twice to set up the two uniform->parameter
+ * mappings.
+ *
+ * If a uniform is only present in the vertex program OR fragment program
+ * then the fragment/vertex parameter index, respectively, will be -1.
+ */
+static GLboolean
+link_uniform_vars(GLcontext *ctx,
+                  struct gl_shader_program *shProg,
+                  struct gl_program *prog,
+                  GLuint *numSamplers)
+{
+   GLuint samplerMap[200]; /* max number of samplers declared, not used */
+   GLuint i;
+
+   for (i = 0; i < prog->Parameters->NumParameters; i++) {
+      const struct gl_program_parameter *p = prog->Parameters->Parameters + i;
+
+      /*
+       * XXX FIX NEEDED HERE
+       * We should also be adding a uniform if p->Type == PROGRAM_STATE_VAR.
+       * For example, modelview matrix, light pos, etc.
+       * Also, we need to update the state-var name-generator code to
+       * generate GLSL-style names, like "gl_LightSource[0].position".
+       * Furthermore, we'll need to fix the state-var's size/datatype info.
+       */
+
+      if ((p->Type == PROGRAM_UNIFORM || p->Type == PROGRAM_SAMPLER)
+          && p->Used) {
+         /* add this uniform, indexing into the target's Parameters list */
+         struct gl_uniform *uniform =
+            _mesa_append_uniform(shProg->Uniforms, p->Name, prog->Target, i);
+         if (uniform)
+            uniform->Initialized = p->Initialized;
+      }
+
+      /* The samplerMap[] table we build here is used to remap/re-index
+       * sampler references by TEX instructions.
+       */
+      if (p->Type == PROGRAM_SAMPLER && p->Used) {
+         /* Allocate a new sampler index */
+         GLuint oldSampNum = (GLuint) prog->Parameters->ParameterValues[i][0];
+         GLuint newSampNum = *numSamplers;
+         if (newSampNum >= ctx->Const.MaxTextureImageUnits) {
+            char s[100];
+            sprintf(s, "Too many texture samplers (%u, max is %u)",
+		    newSampNum, ctx->Const.MaxTextureImageUnits);
+            link_error(shProg, s);
+            return GL_FALSE;
+         }
+         /* save old->new mapping in the table */
+         if (oldSampNum < Elements(samplerMap))
+            samplerMap[oldSampNum] = newSampNum;
+         /* update parameter's sampler index */
+         prog->Parameters->ParameterValues[i][0] = (GLfloat) newSampNum;
+         (*numSamplers)++;
+      }
+   }
+
+   /* OK, now scan the program/shader instructions looking for texture
+    * instructions using sampler vars.  Replace old sampler indexes with
+    * new ones.
+    */
+   prog->SamplersUsed = 0x0;
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      if (_mesa_is_tex_instruction(inst->Opcode)) {
+         /* here, inst->TexSrcUnit is really the sampler unit */
+         const GLint oldSampNum = inst->TexSrcUnit;
+
+#if 0
+         printf("====== remap sampler from %d to %d\n",
+                inst->TexSrcUnit, samplerMap[ inst->TexSrcUnit ]);
+#endif
+
+         if (oldSampNum < Elements(samplerMap)) {
+            const GLuint newSampNum = samplerMap[oldSampNum];
+            inst->TexSrcUnit = newSampNum;
+            prog->SamplerTargets[newSampNum] = inst->TexSrcTarget;
+            prog->SamplersUsed |= (1 << newSampNum);
+            if (inst->TexShadow) {
+               prog->ShadowSamplers |= (1 << newSampNum);
+            }
+         }
+      }
+   }
+
+   return GL_TRUE;
+}
+
+
+/**
+ * Resolve binding of generic vertex attributes.
+ * For example, if the vertex shader declared "attribute vec4 foobar" we'll
+ * allocate a generic vertex attribute for "foobar" and plug that value into
+ * the vertex program instructions.
+ * But if the user called glBindAttributeLocation(), those bindings will
+ * have priority.
+ */
+static GLboolean
+_slang_resolve_attributes(struct gl_shader_program *shProg,
+                          const struct gl_program *origProg,
+                          struct gl_program *linkedProg)
+{
+   GLint attribMap[MAX_VERTEX_GENERIC_ATTRIBS];
+   GLuint i, j;
+   GLbitfield usedAttributes; /* generics only, not legacy attributes */
+   GLbitfield inputsRead = 0x0;
+
+   assert(origProg != linkedProg);
+   assert(origProg->Target == GL_VERTEX_PROGRAM_ARB);
+   assert(linkedProg->Target == GL_VERTEX_PROGRAM_ARB);
+
+   if (!shProg->Attributes)
+      shProg->Attributes = _mesa_new_parameter_list();
+
+   if (linkedProg->Attributes) {
+      _mesa_free_parameter_list(linkedProg->Attributes);
+   }
+   linkedProg->Attributes = _mesa_new_parameter_list();
+
+
+   /* Build a bitmask indicating which attribute indexes have been
+    * explicitly bound by the user with glBindAttributeLocation().
+    */
+   usedAttributes = 0x0;
+   for (i = 0; i < shProg->Attributes->NumParameters; i++) {
+      GLint attr = shProg->Attributes->Parameters[i].StateIndexes[0];
+      usedAttributes |= (1 << attr);
+   }
+
+   /* If gl_Vertex is used, that actually counts against the limit
+    * on generic vertex attributes.  This avoids the ambiguity of
+    * whether glVertexAttrib4fv(0, v) sets legacy attribute 0 (vert pos)
+    * or generic attribute[0].  If gl_Vertex is used, we want the former.
+    */
+   if (origProg->InputsRead & VERT_BIT_POS) {
+      usedAttributes |= 0x1;
+   }
+
+   /* initialize the generic attribute map entries to -1 */
+   for (i = 0; i < MAX_VERTEX_GENERIC_ATTRIBS; i++) {
+      attribMap[i] = -1;
+   }
+
+   /*
+    * Scan program for generic attribute references
+    */
+   for (i = 0; i < linkedProg->NumInstructions; i++) {
+      struct prog_instruction *inst = linkedProg->Instructions + i;
+      for (j = 0; j < 3; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_INPUT) {
+            inputsRead |= (1 << inst->SrcReg[j].Index);
+         }
+
+         if (inst->SrcReg[j].File == PROGRAM_INPUT &&
+             inst->SrcReg[j].Index >= VERT_ATTRIB_GENERIC0) {
+            /*
+             * OK, we've found a generic vertex attribute reference.
+             */
+            const GLint k = inst->SrcReg[j].Index - VERT_ATTRIB_GENERIC0;
+
+            GLint attr = attribMap[k];
+
+            if (attr < 0) {
+               /* Need to figure out attribute mapping now.
+                */
+               const char *name = origProg->Attributes->Parameters[k].Name;
+               const GLint size = origProg->Attributes->Parameters[k].Size;
+               const GLenum type =origProg->Attributes->Parameters[k].DataType;
+               GLint index;
+
+               /* See if there's a user-defined attribute binding for
+                * this name.
+                */
+               index = _mesa_lookup_parameter_index(shProg->Attributes,
+                                                    -1, name);
+               if (index >= 0) {
+                  /* Found a user-defined binding */
+                  attr = shProg->Attributes->Parameters[index].StateIndexes[0];
+               }
+               else {
+                  /* No user-defined binding, choose our own attribute number.
+                   * Start at 1 since generic attribute 0 always aliases
+                   * glVertex/position.
+                   */
+                  for (attr = 0; attr < MAX_VERTEX_GENERIC_ATTRIBS; attr++) {
+                     if (((1 << attr) & usedAttributes) == 0)
+                        break;
+                  }
+                  if (attr == MAX_VERTEX_GENERIC_ATTRIBS) {
+                     link_error(shProg, "Too many vertex attributes");
+                     return GL_FALSE;
+                  }
+
+                  /* mark this attribute as used */
+                  usedAttributes |= (1 << attr);
+               }
+
+               attribMap[k] = attr;
+
+               /* Save the final name->attrib binding so it can be queried
+                * with glGetAttributeLocation().
+                */
+               _mesa_add_attribute(linkedProg->Attributes, name,
+                                   size, type, attr);
+            }
+
+            assert(attr >= 0);
+
+            /* update the instruction's src reg */
+            inst->SrcReg[j].Index = VERT_ATTRIB_GENERIC0 + attr;
+         }
+      }
+   }
+
+   /* Handle pre-defined attributes here (gl_Vertex, gl_Normal, etc).
+    * When the user queries the active attributes we need to include both
+    * the user-defined attributes and the built-in ones.
+    */
+   for (i = VERT_ATTRIB_POS; i < VERT_ATTRIB_GENERIC0; i++) {
+      if (inputsRead & (1 << i)) {
+         _mesa_add_attribute(linkedProg->Attributes,
+                             _slang_vert_attrib_name(i),
+                             4, /* size in floats */
+                             _slang_vert_attrib_type(i),
+                             -1 /* attrib/input */);
+      }
+   }
+
+   return GL_TRUE;
+}
+
+
+/**
+ * Scan program instructions to update the program's NumTemporaries field.
+ * Note: this implemenation relies on the code generator allocating
+ * temps in increasing order (0, 1, 2, ... ).
+ */
+static void
+_slang_count_temporaries(struct gl_program *prog)
+{
+   GLuint i, j;
+   GLint maxIndex = -1;
+
+   for (i = 0; i < prog->NumInstructions; i++) {
+      const struct prog_instruction *inst = prog->Instructions + i;
+      const GLuint numSrc = _mesa_num_inst_src_regs(inst->Opcode);
+      for (j = 0; j < numSrc; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_TEMPORARY) {
+            if (maxIndex < inst->SrcReg[j].Index)
+               maxIndex = inst->SrcReg[j].Index;
+         }
+         if (inst->DstReg.File == PROGRAM_TEMPORARY) {
+            if (maxIndex < (GLint) inst->DstReg.Index)
+               maxIndex = inst->DstReg.Index;
+         }
+      }
+   }
+
+   prog->NumTemporaries = (GLuint) (maxIndex + 1);
+}
+
+
+/**
+ * Scan program instructions to update the program's InputsRead and
+ * OutputsWritten fields.
+ */
+static void
+_slang_update_inputs_outputs(struct gl_program *prog)
+{
+   GLuint i, j;
+   GLuint maxAddrReg = 0;
+
+   prog->InputsRead = 0x0;
+   prog->OutputsWritten = 0x0;
+
+   for (i = 0; i < prog->NumInstructions; i++) {
+      const struct prog_instruction *inst = prog->Instructions + i;
+      const GLuint numSrc = _mesa_num_inst_src_regs(inst->Opcode);
+      for (j = 0; j < numSrc; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_INPUT) {
+            prog->InputsRead |= 1 << inst->SrcReg[j].Index;
+         }
+         else if (inst->SrcReg[j].File == PROGRAM_ADDRESS) {
+            maxAddrReg = MAX2(maxAddrReg, (GLuint) (inst->SrcReg[j].Index + 1));
+         }
+      }
+
+      if (inst->DstReg.File == PROGRAM_OUTPUT) {
+         prog->OutputsWritten |= BITFIELD64_BIT(inst->DstReg.Index);
+         if (inst->DstReg.RelAddr) {
+            /* If the output attribute is indexed with relative addressing
+             * we know that it must be a varying or texcoord such as
+             * gl_TexCoord[i] = v;  In this case, mark all the texcoords
+             * or varying outputs as being written.  It's not an error if
+             * a vertex shader writes varying vars that aren't used by the
+             * fragment shader.  But it is an error for a fragment shader
+             * to use varyings that are not written by the vertex shader.
+             */
+            if (prog->Target == GL_VERTEX_PROGRAM_ARB) {
+               if (inst->DstReg.Index == VERT_RESULT_TEX0) {
+                  /* mark all texcoord outputs as written */
+                  const GLbitfield64 mask =
+		     BITFIELD64_RANGE(VERT_RESULT_TEX0,
+				      (VERT_RESULT_TEX0
+				       + MAX_TEXTURE_COORD_UNITS - 1));
+                  prog->OutputsWritten |= mask;
+               }
+               else if (inst->DstReg.Index == VERT_RESULT_VAR0) {
+                  /* mark all generic varying outputs as written */
+                  const GLbitfield64 mask =
+		     BITFIELD64_RANGE(VERT_RESULT_VAR0,
+				      (VERT_RESULT_VAR0 + MAX_VARYING - 1));
+                  prog->OutputsWritten |= mask;
+               }
+            }
+         }
+      }
+      else if (inst->DstReg.File == PROGRAM_ADDRESS) {
+         maxAddrReg = MAX2(maxAddrReg, inst->DstReg.Index + 1);
+      }
+   }
+   prog->NumAddressRegs = maxAddrReg;
+}
+
+
+
+/**
+ * Remove extra #version directives from the concatenated source string.
+ * Disable the extra ones by converting first two chars to //, a comment.
+ * This is a bit of hack to work around a preprocessor bug that only
+ * allows one #version directive per source.
+ */
+static void
+remove_extra_version_directives(GLchar *source)
+{
+   GLuint verCount = 0;
+   while (1) {
+      char *ver = strstr(source, "#version");
+      if (ver) {
+         verCount++;
+         if (verCount > 1) {
+            ver[0] = '/';
+            ver[1] = '/';
+         }
+         source += 8;
+      }
+      else {
+         break;
+      }
+   }
+}
+
+
+
+/**
+ * Return a new shader whose source code is the concatenation of
+ * all the shader sources of the given type.
+ */
+static struct gl_shader *
+concat_shaders(struct gl_shader_program *shProg, GLenum shaderType)
+{
+   struct gl_shader *newShader;
+   const struct gl_shader *firstShader = NULL;
+   GLuint *shaderLengths;
+   GLchar *source;
+   GLuint totalLen = 0, len = 0;
+   GLuint i;
+
+   shaderLengths = (GLuint *)malloc(shProg->NumShaders * sizeof(GLuint));
+   if (!shaderLengths) {
+      return NULL;
+   }
+
+   /* compute total size of new shader source code */
+   for (i = 0; i < shProg->NumShaders; i++) {
+      const struct gl_shader *shader = shProg->Shaders[i];
+      if (shader->Type == shaderType) {
+         shaderLengths[i] = strlen(shader->Source);
+         totalLen += shaderLengths[i];
+         if (!firstShader)
+            firstShader = shader;
+      }
+   }
+
+   if (totalLen == 0) {
+      free(shaderLengths);
+      return NULL;
+   }
+
+   source = (GLchar *) malloc(totalLen + 1);
+   if (!source) {
+      free(shaderLengths);
+      return NULL;
+   }
+
+   /* concatenate shaders */
+   for (i = 0; i < shProg->NumShaders; i++) {
+      const struct gl_shader *shader = shProg->Shaders[i];
+      if (shader->Type == shaderType) {
+         memcpy(source + len, shader->Source, shaderLengths[i]);
+         len += shaderLengths[i];
+      }
+   }
+   source[len] = '\0';
+   /*
+   printf("---NEW CONCATENATED SHADER---:\n%s\n------------\n", source);
+   */
+
+   free(shaderLengths);
+
+   remove_extra_version_directives(source);
+
+   newShader = CALLOC_STRUCT(gl_shader);
+   if (!newShader) {
+      free(source);
+      return NULL;
+   }
+
+   newShader->Type = shaderType;
+   newShader->Source = source;
+   newShader->Pragmas = firstShader->Pragmas;
+
+   return newShader;
+}
+
+
+/**
+ * Search the shader program's list of shaders to find the one that
+ * defines main().
+ * This will involve shader concatenation and recompilation if needed.
+ */
+static struct gl_shader *
+get_main_shader(GLcontext *ctx,
+                struct gl_shader_program *shProg, GLenum type)
+{
+   struct gl_shader *shader = NULL;
+   GLuint i;
+
+   /*
+    * Look for a shader that defines main() and has no unresolved references.
+    */
+   for (i = 0; i < shProg->NumShaders; i++) {
+      shader = shProg->Shaders[i];
+      if (shader->Type == type &&
+          shader->Main &&
+          !shader->UnresolvedRefs) {
+         /* All set! */
+         return shader;
+      }
+   }
+
+   /*
+    * There must have been unresolved references during the original
+    * compilation.  Try concatenating all the shaders of the given type
+    * and recompile that.
+    */
+   shader = concat_shaders(shProg, type);
+
+   if (shader) {
+      _slang_compile(ctx, shader);
+
+      /* Finally, check if recompiling failed */
+      if (!shader->CompileStatus ||
+          !shader->Main ||
+          shader->UnresolvedRefs) {
+         link_error(shProg, "Unresolved symbols");
+         _mesa_free_shader(ctx, shader);
+         return NULL;
+      }
+   }
+
+   return shader;
+}
+
+
+/**
+ * Shader linker.  Currently:
+ *
+ * 1. The last attached vertex shader and fragment shader are linked.
+ * 2. Varying vars in the two shaders are combined so their locations
+ *    agree between the vertex and fragment stages.  They're treated as
+ *    vertex program output attribs and as fragment program input attribs.
+ * 3. The vertex and fragment programs are cloned and modified to update
+ *    src/dst register references so they use the new, linked varying
+ *    storage locations.
+ */
+void
+_slang_link(GLcontext *ctx,
+            GLhandleARB programObj,
+            struct gl_shader_program *shProg)
+{
+   const struct gl_vertex_program *vertProg = NULL;
+   const struct gl_fragment_program *fragProg = NULL;
+   GLboolean vertNotify = GL_TRUE, fragNotify = GL_TRUE;
+   GLuint numSamplers = 0;
+   GLuint i;
+
+   _mesa_clear_shader_program_data(ctx, shProg);
+
+   /* Initialize LinkStatus to "success".  Will be cleared if error. */
+   shProg->LinkStatus = GL_TRUE;
+
+   /* check that all programs compiled successfully */
+   for (i = 0; i < shProg->NumShaders; i++) {
+      if (!shProg->Shaders[i]->CompileStatus) {
+         link_error(shProg, "linking with uncompiled shader\n");
+         return;
+      }
+   }
+
+   shProg->Uniforms = _mesa_new_uniform_list();
+   shProg->Varying = _mesa_new_parameter_list();
+
+   /*
+    * Find the vertex and fragment shaders which define main()
+    */
+   {
+      struct gl_shader *vertShader, *fragShader;
+      vertShader = get_main_shader(ctx, shProg, GL_VERTEX_SHADER);
+      fragShader = get_main_shader(ctx, shProg, GL_FRAGMENT_SHADER);
+      if (vertShader)
+         vertProg = vertex_program(vertShader->Program);
+      if (fragShader)
+         fragProg = fragment_program(fragShader->Program);
+      if (!shProg->LinkStatus)
+         return;
+   }
+
+#if FEATURE_es2_glsl
+   /* must have both a vertex and fragment program for ES2 */
+   if (!vertProg) {
+      link_error(shProg, "missing vertex shader\n");
+      return;
+   }
+   if (!fragProg) {
+      link_error(shProg, "missing fragment shader\n");
+      return;
+   }
+#endif
+
+   /*
+    * Make copies of the vertex/fragment programs now since we'll be
+    * changing src/dst registers after merging the uniforms and varying vars.
+    */
+   _mesa_reference_vertprog(ctx, &shProg->VertexProgram, NULL);
+   if (vertProg) {
+      struct gl_vertex_program *linked_vprog =
+         _mesa_clone_vertex_program(ctx, vertProg);
+      shProg->VertexProgram = linked_vprog; /* refcount OK */
+      /* vertex program ID not significant; just set Id for debugging purposes */
+      shProg->VertexProgram->Base.Id = shProg->Name;
+      ASSERT(shProg->VertexProgram->Base.RefCount == 1);
+   }
+
+   _mesa_reference_fragprog(ctx, &shProg->FragmentProgram, NULL);
+   if (fragProg) {
+      struct gl_fragment_program *linked_fprog = 
+         _mesa_clone_fragment_program(ctx, fragProg);
+      shProg->FragmentProgram = linked_fprog; /* refcount OK */
+      /* vertex program ID not significant; just set Id for debugging purposes */
+      shProg->FragmentProgram->Base.Id = shProg->Name;
+      ASSERT(shProg->FragmentProgram->Base.RefCount == 1);
+   }
+
+   /* link varying vars */
+   if (shProg->VertexProgram) {
+      if (!link_varying_vars(ctx, shProg, &shProg->VertexProgram->Base))
+         return;
+   }
+   if (shProg->FragmentProgram) {
+      if (!link_varying_vars(ctx, shProg, &shProg->FragmentProgram->Base))
+         return;
+   }
+
+   /* link uniform vars */
+   if (shProg->VertexProgram) {
+      if (!link_uniform_vars(ctx, shProg, &shProg->VertexProgram->Base,
+                             &numSamplers)) {
+         return;
+      }
+   }
+   if (shProg->FragmentProgram) {
+      if (!link_uniform_vars(ctx, shProg, &shProg->FragmentProgram->Base,
+                             &numSamplers)) {
+         return;
+      }
+   }
+
+   /*_mesa_print_uniforms(shProg->Uniforms);*/
+
+   if (shProg->VertexProgram) {
+      if (!_slang_resolve_attributes(shProg, &vertProg->Base,
+                                     &shProg->VertexProgram->Base)) {
+         return;
+      }
+   }
+
+   if (shProg->VertexProgram) {
+      _slang_update_inputs_outputs(&shProg->VertexProgram->Base);
+      _slang_count_temporaries(&shProg->VertexProgram->Base);
+      if (!(shProg->VertexProgram->Base.OutputsWritten
+	    & BITFIELD64_BIT(VERT_RESULT_HPOS))) {
+         /* the vertex program did not compute a vertex position */
+         link_error(shProg,
+                    "gl_Position was not written by vertex shader\n");
+         return;
+      }
+   }
+   if (shProg->FragmentProgram) {
+      _slang_count_temporaries(&shProg->FragmentProgram->Base);
+      _slang_update_inputs_outputs(&shProg->FragmentProgram->Base);
+   }
+
+   /* Check that all the varying vars needed by the fragment shader are
+    * actually produced by the vertex shader.
+    */
+   if (shProg->FragmentProgram) {
+      const GLbitfield varyingRead
+         = shProg->FragmentProgram->Base.InputsRead >> FRAG_ATTRIB_VAR0;
+      const GLbitfield64 varyingWritten = shProg->VertexProgram ?
+         shProg->VertexProgram->Base.OutputsWritten >> VERT_RESULT_VAR0 : 0x0;
+      if ((varyingRead & varyingWritten) != varyingRead) {
+         link_error(shProg,
+          "Fragment program using varying vars not written by vertex shader\n");
+         return;
+      }         
+   }
+
+   /* check that gl_FragColor and gl_FragData are not both written to */
+   if (shProg->FragmentProgram) {
+      const GLbitfield64 outputsWritten =
+	 shProg->FragmentProgram->Base.OutputsWritten;
+      if ((outputsWritten & BITFIELD64_BIT(FRAG_RESULT_COLOR)) &&
+          (outputsWritten >= BITFIELD64_BIT(FRAG_RESULT_DATA0))) {
+         link_error(shProg, "Fragment program cannot write both gl_FragColor"
+                    " and gl_FragData[].\n");
+         return;
+      }         
+   }
+
+
+   if (fragProg && shProg->FragmentProgram) {
+      /* Compute initial program's TexturesUsed info */
+      _mesa_update_shader_textures_used(&shProg->FragmentProgram->Base);
+
+      /* notify driver that a new fragment program has been compiled/linked */
+      vertNotify = ctx->Driver.ProgramStringNotify(ctx, GL_FRAGMENT_PROGRAM_ARB,
+                                                 &shProg->FragmentProgram->Base);
+      if (ctx->Shader.Flags & GLSL_DUMP) {
+         printf("Mesa pre-link fragment program:\n");
+         _mesa_print_program(&fragProg->Base);
+         _mesa_print_program_parameters(ctx, &fragProg->Base);
+
+         printf("Mesa post-link fragment program:\n");
+         _mesa_print_program(&shProg->FragmentProgram->Base);
+         _mesa_print_program_parameters(ctx, &shProg->FragmentProgram->Base);
+      }
+   }
+
+   if (vertProg && shProg->VertexProgram) {
+      /* Compute initial program's TexturesUsed info */
+      _mesa_update_shader_textures_used(&shProg->VertexProgram->Base);
+
+      /* notify driver that a new vertex program has been compiled/linked */
+      fragNotify = ctx->Driver.ProgramStringNotify(ctx, GL_VERTEX_PROGRAM_ARB,
+                                                   &shProg->VertexProgram->Base);
+      if (ctx->Shader.Flags & GLSL_DUMP) {
+         printf("Mesa pre-link vertex program:\n");
+         _mesa_print_program(&vertProg->Base);
+         _mesa_print_program_parameters(ctx, &vertProg->Base);
+
+         printf("Mesa post-link vertex program:\n");
+         _mesa_print_program(&shProg->VertexProgram->Base);
+         _mesa_print_program_parameters(ctx, &shProg->VertexProgram->Base);
+      }
+   }
+
+   /* Debug: */
+   if (0) {
+      if (shProg->VertexProgram)
+         _mesa_postprocess_program(ctx, &shProg->VertexProgram->Base);
+      if (shProg->FragmentProgram)
+         _mesa_postprocess_program(ctx, &shProg->FragmentProgram->Base);
+   }
+
+   if (ctx->Shader.Flags & GLSL_DUMP) {
+      printf("Varying vars:\n");
+      _mesa_print_parameter_list(shProg->Varying);
+      if (shProg->InfoLog) {
+         printf("Info Log: %s\n", shProg->InfoLog);
+      }
+   }
+
+   if (!vertNotify || !fragNotify) {
+      /* driver rejected one/both of the vertex/fragment programs */
+      if (!shProg->InfoLog) {
+	 link_error(shProg,
+		    "Vertex and/or fragment program rejected by driver\n");
+      }
+   }
+   else {
+      shProg->LinkStatus = (shProg->VertexProgram || shProg->FragmentProgram);
+   }
+}
+
+@
+
+
+1.4
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@@
+
+
+1.3
+log
+@Update to Mesa 7.4.2. Tested by oga@@, ckuethe@@ and naddy@@.
+@
+text
+@a33 1
+#include "main/hash.h"
+d42 1
+d71 1
+a71 1
+      _mesa_free(shProg->InfoLog);
+d100 2
+a101 1
+link_varying_vars(struct gl_shader_program *shProg, struct gl_program *prog)
+d137 1
+d143 1
+a143 1
+                           "centroid modifier mismatch for '%s'", var->Name);
+d145 1
+d151 1
+a151 1
+                           "invariant modifier mismatch for '%s'", var->Name);
+d153 1
+d163 6
+a169 1
+       * Plus, set prog->Input/OutputFlags[] as described above.
+a260 5
+
+	 /* Add the flag indicating that the program is dependent on constant
+	  * state.
+	  */
+	 prog->Parameters->StateFlags |= _NEW_PROGRAM;
+d272 2
+a273 2
+            _mesa_sprintf(s, "Too many texture samplers (%u, max is %u)",
+                          newSampNum, ctx->Const.MaxTextureImageUnits);
+d294 1
+a301 1
+         /* here, texUnit is really samplerUnit */
+d307 3
+d331 1
+a331 1
+   GLint attribMap[MAX_VERTEX_ATTRIBS];
+d334 1
+d368 1
+a368 1
+   for (i = 0; i < MAX_VERTEX_ATTRIBS; i++) {
+d378 4
+d413 1
+a413 1
+                  for (attr = 0; attr < MAX_VERTEX_ATTRIBS; attr++) {
+d417 1
+a417 1
+                  if (attr == MAX_VERTEX_ATTRIBS) {
+d443 14
+a509 14
+            if (prog->Target == GL_FRAGMENT_PROGRAM_ARB &&
+                inst->SrcReg[j].Index == FRAG_ATTRIB_FOGC) {
+               /* The fragment shader FOGC input is used for fog,
+                * front-facing and sprite/point coord.
+                */
+               struct gl_fragment_program *fp = fragment_program(prog);
+               const GLint swz = GET_SWZ(inst->SrcReg[j].Swizzle, 0);
+               if (swz == SWIZZLE_X)
+                  fp->UsesFogFragCoord = GL_TRUE;
+               else if (swz == SWIZZLE_Y)
+                  fp->UsesFrontFacing = GL_TRUE;
+               else if (swz == SWIZZLE_Z || swz == SWIZZLE_W)
+                  fp->UsesPointCoord = GL_TRUE;
+            }
+d517 1
+a517 1
+         prog->OutputsWritten |= 1 << inst->DstReg.Index;
+d530 4
+a533 2
+                  const GLbitfield mask =
+                     ((1 << MAX_TEXTURE_COORD_UNITS) - 1) << VERT_RESULT_TEX0;
+d538 3
+a540 2
+                  const GLbitfield mask =
+                     ((1 << MAX_VARYING) - 1) << VERT_RESULT_VAR0;
+d550 46
+d597 104
+a700 1
+   prog->NumAddressRegs = maxAddrReg;
+d720 3
+a722 2
+   const struct gl_vertex_program *vertProg;
+   const struct gl_fragment_program *fragProg;
+d728 3
+d742 2
+a743 2
+   /**
+    * Find attached vertex, fragment shaders defining main()
+d745 10
+a754 15
+   vertProg = NULL;
+   fragProg = NULL;
+   for (i = 0; i < shProg->NumShaders; i++) {
+      struct gl_shader *shader = shProg->Shaders[i];
+      if (shader->Type == GL_VERTEX_SHADER) {
+         if (shader->Main)
+            vertProg = vertex_program(shader->Program);
+      }
+      else if (shader->Type == GL_FRAGMENT_SHADER) {
+         if (shader->Main)
+            fragProg = fragment_program(shader->Program);
+      }
+      else {
+         _mesa_problem(ctx, "unexpected shader target in slang_link()");
+      }
+d776 1
+a776 1
+         vertex_program(_mesa_clone_program(ctx, &vertProg->Base));
+d778 2
+d786 1
+a786 1
+         fragment_program(_mesa_clone_program(ctx, &fragProg->Base));
+d788 2
+d795 1
+a795 1
+      if (!link_varying_vars(shProg, &shProg->VertexProgram->Base))
+d799 1
+a799 1
+      if (!link_varying_vars(shProg, &shProg->FragmentProgram->Base))
+d829 2
+a830 1
+      if (!(shProg->VertexProgram->Base.OutputsWritten & (1 << VERT_RESULT_HPOS))) {
+d848 1
+a848 1
+      const GLbitfield varyingWritten = shProg->VertexProgram ?
+d859 4
+a862 3
+      GLbitfield outputsWritten = shProg->FragmentProgram->Base.OutputsWritten;
+      if ((outputsWritten & ((1 << FRAG_RESULT_COLR))) &&
+          (outputsWritten >= (1 << FRAG_RESULT_DATA0))) {
+d875 4
+a878 4
+      ctx->Driver.ProgramStringNotify(ctx, GL_FRAGMENT_PROGRAM_ARB,
+                                      &shProg->FragmentProgram->Base);
+      if (MESA_VERBOSE & VERBOSE_GLSL_DUMP) {
+         printf("Mesa original fragment program:\n");
+d893 4
+a896 4
+      ctx->Driver.ProgramStringNotify(ctx, GL_VERTEX_PROGRAM_ARB,
+                                      &shProg->VertexProgram->Base);
+      if (MESA_VERBOSE & VERBOSE_GLSL_DUMP) {
+         printf("Mesa original vertex program:\n");
+d906 9
+a914 1
+   if (MESA_VERBOSE & VERBOSE_GLSL_DUMP) {
+d917 3
+d922 10
+a931 1
+   shProg->LinkStatus = (shProg->VertexProgram || shProg->FragmentProgram);
+@
+
+
+1.2
+log
+@Mesa 7.2, Tested by ckuethe@@, naddy@@, oga@@, and others.
+@
+text
+@d3 1
+a3 1
+ * Version:  7.2
+d6 1
+d46 18
+d80 10
+d93 5
+d103 1
+d109 17
+d131 4
+a134 3
+         /* already in list, check size */
+         if (var->Size != shProg->Varying->Parameters[j].Size) {
+            /* error */
+d138 14
+d155 2
+a156 1
+         j = _mesa_add_varying(shProg->Varying, var->Name, var->Size);
+d159 2
+a160 1
+      /* map varying[i] to varying[j].
+d166 1
+a175 15
+   /* Varying variables are treated like other vertex program outputs
+    * (and like other fragment program inputs).  The position of the
+    * first varying differs for vertex/fragment programs...
+    * Also, replace File=PROGRAM_VARYING with File=PROGRAM_INPUT/OUTPUT.
+    */
+   if (prog->Target == GL_VERTEX_PROGRAM_ARB) {
+      firstVarying = VERT_RESULT_VAR0;
+      newFile = PROGRAM_OUTPUT;
+   }
+   else {
+      assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+      firstVarying = FRAG_ATTRIB_VAR0;
+      newFile = PROGRAM_INPUT;
+   }
+
+d210 13
+d224 3
+a226 2
+static void
+link_uniform_vars(struct gl_shader_program *shProg,
+d230 1
+a230 1
+   GLuint samplerMap[MAX_SAMPLERS];
+d245 12
+a256 3
+      if ((p->Type == PROGRAM_UNIFORM && p->Used) ||
+          p->Type == PROGRAM_SAMPLER) {
+         _mesa_append_uniform(shProg->Uniforms, p->Name, prog->Target, i);
+d259 4
+a262 1
+      if (p->Type == PROGRAM_SAMPLER) {
+a263 1
+         GLuint sampNum = *numSamplers;
+d265 13
+a277 2
+         assert(oldSampNum < MAX_SAMPLERS);
+         samplerMap[oldSampNum] = sampNum;
+d282 3
+a284 3
+
+   /* OK, now scan the program/shader instructions looking for sampler vars,
+    * replacing the old index with the new index.
+d290 3
+a292 1
+         /*
+d294 3
+a296 2
+                inst->Sampler, map[ inst->Sampler ]);
+         */
+d298 6
+a303 3
+         inst->TexSrcUnit = samplerMap[inst->TexSrcUnit];
+         prog->SamplerTargets[inst->TexSrcUnit] = inst->TexSrcTarget;
+         prog->SamplersUsed |= (1 << inst->TexSrcUnit);
+d307 1
+d326 1
+a326 1
+   GLbitfield usedAttributes;
+d350 9
+d401 1
+a401 1
+                  for (attr = 1; attr < MAX_VERTEX_ATTRIBS; attr++) {
+d473 1
+d484 17
+d503 1
+d506 27
+a534 2
+}
+
+d536 1
+a536 15
+/** cast wrapper */
+static struct gl_vertex_program *
+vertex_program(struct gl_program *prog)
+{
+   assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
+   return (struct gl_vertex_program *) prog;
+}
+
+
+/** cast wrapper */
+static struct gl_fragment_program *
+fragment_program(struct gl_program *prog)
+{
+   assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+   return (struct gl_fragment_program *) prog;
+d581 9
+a589 5
+      if (shader->Type == GL_VERTEX_SHADER && shader->Main)
+         vertProg = vertex_program(shader->Program);
+      else if (shader->Type == GL_FRAGMENT_SHADER && shader->Main)
+         fragProg = fragment_program(shader->Program);
+      else
+d591 1
+d637 12
+a648 4
+   if (shProg->VertexProgram)
+      link_uniform_vars(shProg, &shProg->VertexProgram->Base, &numSamplers);
+   if (shProg->FragmentProgram)
+      link_uniform_vars(shProg, &shProg->FragmentProgram->Base, &numSamplers);
+d689 11
+d702 3
+d708 9
+a716 10
+#if 0
+      printf("************** original fragment program\n");
+      _mesa_print_program(&fragProg->Base);
+      _mesa_print_program_parameters(ctx, &fragProg->Base);
+#endif
+#if 0
+      printf("************** linked fragment prog\n");
+      _mesa_print_program(&shProg->FragmentProgram->Base);
+      _mesa_print_program_parameters(ctx, &shProg->FragmentProgram->Base);
+#endif
+d720 3
+d726 14
+a739 10
+#if 0
+      printf("************** original vertex program\n");
+      _mesa_print_program(&vertProg->Base);
+      _mesa_print_program_parameters(ctx, &vertProg->Base);
+#endif
+#if 0
+      printf("************** linked vertex prog\n");
+      _mesa_print_program(&shProg->VertexProgram->Base);
+      _mesa_print_program_parameters(ctx, &shProg->VertexProgram->Base);
+#endif
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d3 1
+a3 1
+ * Version:  6.5
+d5 1
+a5 1
+ * Copyright (C) 2006  Brian Paul   All Rights Reserved.
+d27 2
+a28 2
+ * slang linker
+ * \author Michal Krol
+d31 11
+a41 1
+#include "imports.h"
+a42 1
+#include "slang_analyse.h"
+a43 5
+static GLboolean entry_has_gl_prefix (slang_atom name, slang_atom_pool *atoms)
+{
+	const char *str = slang_atom_pool_id (atoms, name);
+	return str[0] == 'g' && str[1] == 'l' && str[2] == '_';
+}
+d45 2
+a46 2
+/*
+ * slang_active_variables
+d48 2
+a49 2
+
+static GLvoid slang_active_variables_ctr (slang_active_variables *self)
+d51 5
+a55 2
+	self->table = NULL;
+	self->count = 0;
+a57 3
+static GLvoid slang_active_variables_dtr (slang_active_variables *self)
+{
+	GLuint i;
+a58 4
+	for (i = 0; i < self->count; i++)
+		slang_alloc_free (self->table[i].name);
+	slang_alloc_free (self->table);
+}
+d60 4
+a63 67
+static GLboolean add_simple_variable (slang_active_variables *self, slang_export_data_quant *q,
+	const char *name)
+{
+	const GLuint n = self->count;
+
+	self->table = (slang_active_variable *) slang_alloc_realloc (self->table,
+		n * sizeof (slang_active_variable), (n + 1) * sizeof (slang_active_variable));
+	if (self->table == NULL)
+		return GL_FALSE;
+
+	self->table[n].quant = q;
+	self->table[n].name = slang_string_duplicate (name);
+	if (self->table[n].name == NULL)
+		return GL_FALSE;
+	self->count++;
+
+	return GL_TRUE;
+}
+
+static GLboolean add_complex_variable (slang_active_variables *self, slang_export_data_quant *q,
+	char *name, slang_atom_pool *atoms)
+{
+	slang_string_concat (name, slang_atom_pool_id (atoms, q->name));
+	if (slang_export_data_quant_array (q))
+		slang_string_concat (name, "[0]");
+
+	if (slang_export_data_quant_struct (q))
+	{
+		GLuint dot_pos, i;
+		const GLuint fields = slang_export_data_quant_fields (q);
+
+		slang_string_concat (name, ".");
+		dot_pos = slang_string_length (name);
+
+		for (i = 0; i < fields; i++)
+		{
+			if (!add_complex_variable (self, &q->structure[i], name, atoms))
+				return GL_FALSE;
+
+			name[dot_pos] = '\0';
+		}
+
+		return GL_TRUE;
+	}
+
+	return add_simple_variable (self, q, name);
+}
+
+static GLboolean gather_active_variables (slang_active_variables *self,
+	slang_export_data_table *tbl, slang_export_data_access access)
+{
+	GLuint i;
+
+	for (i = 0; i < tbl->count; i++)
+		if (tbl->entries[i].access == access)
+		{
+			char name[1024] = "";
+
+			if (!add_complex_variable (self, &tbl->entries[i].quant, name, tbl->atoms))
+				return GL_FALSE;
+		}
+
+	return GL_TRUE;
+}
+
+/*
+ * slang_attrib_overrides
+d65 2
+a66 2
+
+static GLvoid slang_attrib_overrides_ctr (slang_attrib_overrides *self)
+d68 1
+a68 3
+	self->table = NULL;
+	self->count = 0;
+}
+d70 34
+a103 3
+static GLvoid slang_attrib_overrides_dtr (slang_attrib_overrides *self)
+{
+	GLuint i;
+a104 4
+	for (i = 0; i < self->count; i++)
+		slang_alloc_free (self->table[i].name);
+	slang_alloc_free (self->table);
+}
+d106 14
+a119 4
+GLboolean slang_attrib_overrides_add (slang_attrib_overrides *self, GLuint index, const GLchar *name)
+{
+	const GLuint n = self->count;
+	GLuint i;
+d121 19
+a139 17
+	for (i = 0; i < n; i++)
+		if (slang_string_compare (name, self->table[i].name) == 0)
+		{
+			self->table[i].index = index;
+			return GL_TRUE;
+		}
+
+	self->table = (slang_attrib_override *) slang_alloc_realloc (self->table,
+		n * sizeof (slang_attrib_override), (n + 1) * sizeof (slang_attrib_override));
+	if (self->table == NULL)
+		return GL_FALSE;
+
+	self->table[n].index = index;
+	self->table[n].name = slang_string_duplicate (name);
+	if (self->table[n].name == NULL)
+		return GL_FALSE;
+	self->count++;
+d141 1
+a141 2
+	return GL_TRUE;
+}
+d143 3
+a145 3
+static GLuint lookup_attrib_override (slang_attrib_overrides *self, const GLchar *name)
+{
+	GLuint i;
+d147 1
+a147 4
+	for (i = 0; i < self->count; i++)
+		if (slang_string_compare (name, self->table[i].name) == 0)
+			return self->table[i].index;
+	return MAX_VERTEX_ATTRIBS;
+a149 3
+/*
+ * slang_uniform_bindings
+ */
+d151 39
+a189 5
+static GLvoid slang_uniform_bindings_ctr (slang_uniform_bindings *self)
+{
+	self->table = NULL;
+	self->count = 0;
+}
+a190 3
+static GLvoid slang_uniform_bindings_dtr (slang_uniform_bindings *self)
+{
+	GLuint i;
+d192 17
+a208 31
+	for (i = 0; i < self->count; i++)
+		slang_alloc_free (self->table[i].name);
+	slang_alloc_free (self->table);
+}
+
+static GLboolean add_simple_uniform_binding (slang_uniform_bindings *self,
+	slang_export_data_quant *q, const char *name, GLuint index, GLuint addr)
+{
+	const GLuint n = self->count;
+	GLuint i;
+
+	for (i = 0; i < n; i++)
+		if (slang_string_compare (self->table[i].name, name) == 0)
+		{
+			self->table[i].address[index] = addr;
+			return GL_TRUE;
+		}
+
+	self->table = (slang_uniform_binding *) slang_alloc_realloc (self->table,
+		n * sizeof (slang_uniform_binding), (n + 1) * sizeof (slang_uniform_binding));
+	if (self->table == NULL)
+		return GL_FALSE;
+
+	self->table[n].quant = q;
+	self->table[n].name = slang_string_duplicate (name);
+	if (self->table[n].name == NULL)
+		return GL_FALSE;
+	for (i = 0; i < SLANG_SHADER_MAX; i++)
+		self->table[n].address[i] = ~0;
+	self->table[n].address[index] = addr;
+	self->count++;
+a209 1
+	return GL_TRUE;
+a211 4
+static GLboolean add_complex_uniform_binding (slang_uniform_bindings *self,
+	slang_export_data_quant *q, char *name, slang_atom_pool *atoms, GLuint index, GLuint addr)
+{
+	GLuint count, i;
+d213 7
+a219 61
+	slang_string_concat (name, slang_atom_pool_id (atoms, q->name));
+	count = slang_export_data_quant_elements (q);
+	for (i = 0; i < count; i++)
+	{
+		GLuint bracket_pos;
+
+		bracket_pos = slang_string_length (name);
+		if (slang_export_data_quant_array (q))
+			_mesa_sprintf (name + slang_string_length (name), "[%d]", i);
+
+		if (slang_export_data_quant_struct (q))
+		{
+			GLuint dot_pos, i;
+			const GLuint fields = slang_export_data_quant_fields (q);
+
+			slang_string_concat (name, ".");
+			dot_pos = slang_string_length (name);
+
+			for (i = 0; i < fields; i++)
+			{
+				if (!add_complex_uniform_binding (self, &q->structure[i], name, atoms, index, addr))
+					return GL_FALSE;
+
+				name[dot_pos] = '\0';
+				addr += slang_export_data_quant_size (&q->structure[i]);
+			}
+		}
+		else
+		{
+			if (!add_simple_uniform_binding (self, q, name, index, addr))
+				return GL_FALSE;
+
+			addr += slang_export_data_quant_size (q);
+		}
+
+		name[bracket_pos] = '\0';
+	}
+
+	return GL_TRUE;
+}
+
+static GLboolean gather_uniform_bindings (slang_uniform_bindings *self,
+	slang_export_data_table *tbl, GLuint index)
+{
+	GLuint i;
+
+	for (i = 0; i < tbl->count; i++)
+		if (tbl->entries[i].access == slang_exp_uniform)
+		{
+			char name[1024] = "";
+
+			if (!add_complex_uniform_binding (self, &tbl->entries[i].quant, name, tbl->atoms, index,
+				tbl->entries[i].address))
+				return GL_FALSE;
+		}
+
+	return GL_TRUE;
+}
+
+/*
+ * slang_attrib_bindings
+d221 12
+d234 2
+a235 3
+static GLvoid slang_attrib_bindings_ctr (slang_attrib_bindings *self)
+{
+	GLuint i;
+d237 4
+a240 4
+	self->binding_count = 0;
+	for (i = 0; i < MAX_VERTEX_ATTRIBS; i++)
+		self->slots[i].addr = ~0;
+}
+a241 3
+static GLvoid slang_attrib_bindings_dtr (slang_attrib_bindings *self)
+{
+	GLuint i;
+d243 8
+a250 3
+	for (i = 0; i < self->binding_count; i++)
+		slang_alloc_free (self->bindings[i].name);
+}
+d252 4
+a255 5
+/*
+ * NOTE: If conventional vertex attribute gl_Vertex is used, application cannot use
+ *       vertex attrib index 0 for binding override. Currently this is not checked.
+ *       Although attrib index 0 is not used when not explicitly asked.
+ */
+d257 66
+a322 3
+static GLuint can_allocate_attrib_slots (slang_attrib_bindings *self, GLuint index, GLuint count)
+{
+	GLuint i;
+d324 1
+a324 4
+	for (i = 0; i < count; i++)
+		if (self->slots[index + i].addr != ~0)
+			break;
+	return i;
+a326 3
+static GLuint allocate_attrib_slots (slang_attrib_bindings *self, GLuint count)
+{
+	GLuint i;
+d328 24
+a351 82
+   for (i = 1; i <= MAX_VERTEX_ATTRIBS - count; i++)
+	{
+		GLuint size;
+		
+		size = can_allocate_attrib_slots (self, i, count);
+		if (size == count)
+			return i;
+
+		/* speed-up the search a bit */
+      i += size;
+	}
+	return MAX_VERTEX_ATTRIBS;
+}
+
+static GLboolean
+add_attrib_binding (slang_attrib_bindings *self, slang_export_data_quant *q, const char *name,
+                    GLuint addr, GLuint index_override)
+{
+	const GLuint n = self->binding_count;
+   GLuint slot_span, slot_fill, slot_index;
+	GLuint i;
+
+	assert (slang_export_data_quant_simple (q));
+
+	switch (slang_export_data_quant_type (q))
+	{
+	case GL_FLOAT:
+      slot_span = 1;
+      slot_fill = 1;
+      break;
+	case GL_FLOAT_VEC2:
+      slot_span = 1;
+      slot_fill = 2;
+      break;
+	case GL_FLOAT_VEC3:
+      slot_span = 1;
+      slot_fill = 3;
+      break;
+	case GL_FLOAT_VEC4:
+		slot_span = 1;
+      slot_fill = 4;
+		break;
+	case GL_FLOAT_MAT2:
+		slot_span = 2;
+      slot_fill = 2;
+		break;
+	case GL_FLOAT_MAT3:
+		slot_span = 3;
+      slot_fill = 3;
+		break;
+	case GL_FLOAT_MAT4:
+		slot_span = 4;
+      slot_fill = 4;
+		break;
+	default:
+		assert (0);
+	}
+
+	if (index_override == MAX_VERTEX_ATTRIBS)
+		slot_index = allocate_attrib_slots (self, slot_span);
+	else if (can_allocate_attrib_slots (self, index_override, slot_span) == slot_span)
+		slot_index = index_override;
+	else
+		slot_index = MAX_VERTEX_ATTRIBS;
+			
+	if (slot_index == MAX_VERTEX_ATTRIBS)
+	{
+		/* TODO: info log: error: MAX_VERTEX_ATTRIBS exceeded */
+		return GL_FALSE;
+	}
+
+	self->bindings[n].quant = q;
+	self->bindings[n].name = slang_string_duplicate (name);
+	if (self->bindings[n].name == NULL)
+		return GL_FALSE;
+	self->bindings[n].first_slot_index = slot_index;
+	self->binding_count++;
+
+   for (i = 0; i < slot_span; i++) {
+      slang_attrib_slot *slot = &self->slots[self->bindings[n].first_slot_index + i];
+      slot->addr = addr + i * slot_fill * 4;
+      slot->fill = slot_fill;
+d354 1
+a354 1
+	return GL_TRUE;
+a356 4
+static GLboolean gather_attrib_bindings (slang_attrib_bindings *self, slang_export_data_table *tbl,
+	slang_attrib_overrides *ovr)
+{
+	GLuint i;
+d358 3
+a360 37
+	/* First pass. Gather attribs that have overriden index slots. */
+	for (i = 0; i < tbl->count; i++)
+		if (tbl->entries[i].access == slang_exp_attribute &&
+			!entry_has_gl_prefix (tbl->entries[i].quant.name, tbl->atoms))
+		{
+			slang_export_data_quant *quant = &tbl->entries[i].quant;
+			const GLchar *id = slang_atom_pool_id (tbl->atoms, quant->name);
+			GLuint index = lookup_attrib_override (ovr, id);
+
+			if (index != MAX_VERTEX_ATTRIBS)
+			{
+				if (!add_attrib_binding (self, quant, id, tbl->entries[i].address, index))
+					return GL_FALSE;
+			}
+		}
+
+	/* Second pass. Gather attribs that have *NOT* overriden index slots. */
+	for (i = 0; i < tbl->count; i++)
+		if (tbl->entries[i].access == slang_exp_attribute &&
+			!entry_has_gl_prefix (tbl->entries[i].quant.name, tbl->atoms))
+		{
+			slang_export_data_quant *quant = &tbl->entries[i].quant;
+			const GLchar *id = slang_atom_pool_id (tbl->atoms, quant->name);
+			GLuint index = lookup_attrib_override (ovr, id);
+
+			if (index == MAX_VERTEX_ATTRIBS)
+			{
+				if (!add_attrib_binding (self, quant, id, tbl->entries[i].address, index))
+					return GL_FALSE;
+			}
+		}
+
+	return GL_TRUE;
+}
+
+/*
+ * slang_varying_bindings
+d362 2
+a363 2
+
+static GLvoid slang_varying_bindings_ctr (slang_varying_bindings *self)
+d365 1
+a365 3
+	self->binding_count = 0;
+	self->slot_count = 0;
+}
+d367 15
+a381 6
+static GLvoid slang_varying_bindings_dtr (slang_varying_bindings *self)
+{
+	GLuint i;
+
+	for (i = 0; i < self->binding_count; i++)
+		slang_alloc_free (self->bindings[i].name);
+a383 8
+static GLvoid update_varying_slots (slang_varying_slot *slots, GLuint count, GLboolean is_vert,
+	GLuint addr, GLuint do_offset)
+{
+	GLuint i;
+
+	for (i = 0; i < count; i++)
+		*(is_vert ? &slots[i].vert_addr : &slots[i].frag_addr) = addr + i * 4 * do_offset;
+}
+d385 3
+a387 2
+static GLboolean add_varying_binding (slang_varying_bindings *self,
+	slang_export_data_quant *q, const char *name, GLboolean is_vert, GLuint addr)
+d389 2
+a390 34
+	const GLuint n = self->binding_count;
+	const GLuint slot_span =
+		slang_export_data_quant_components (q) * slang_export_data_quant_elements (q);
+	GLuint i;
+
+	for (i = 0; i < n; i++)
+		if (slang_string_compare (self->bindings[i].name, name) == 0)
+		{
+			/* TODO: data quantities must match, or else link fails */
+			update_varying_slots (&self->slots[self->bindings[i].first_slot_index], slot_span,
+				is_vert, addr, 1);
+			return GL_TRUE;
+		}
+
+	if (self->slot_count + slot_span > MAX_VARYING_FLOATS)
+	{
+		/* TODO: info log: error: MAX_VARYING_FLOATS exceeded */
+		return GL_FALSE;
+	}
+
+	self->bindings[n].quant = q;
+	self->bindings[n].name = slang_string_duplicate (name);
+	if (self->bindings[n].name == NULL)
+		return GL_FALSE;
+	self->bindings[n].first_slot_index = self->slot_count;
+	self->binding_count++;
+
+	update_varying_slots (&self->slots[self->bindings[n].first_slot_index], slot_span, is_vert,
+		addr, 1);
+	update_varying_slots (&self->slots[self->bindings[n].first_slot_index], slot_span, !is_vert,
+		~0, 0);
+	self->slot_count += slot_span;
+
+	return GL_TRUE;
+a392 16
+static GLboolean gather_varying_bindings (slang_varying_bindings *self,
+	slang_export_data_table *tbl, GLboolean is_vert)
+{
+	GLuint i;
+
+	for (i = 0; i < tbl->count; i++)
+		if (tbl->entries[i].access == slang_exp_varying &&
+			!entry_has_gl_prefix (tbl->entries[i].quant.name, tbl->atoms))
+		{
+			if (!add_varying_binding (self, &tbl->entries[i].quant, slang_atom_pool_id (tbl->atoms,
+				tbl->entries[i].quant.name), is_vert, tbl->entries[i].address))
+				return GL_FALSE;
+		}
+
+	return GL_TRUE;
+}
+d394 3
+a396 5
+/*
+ * slang_texture_bindings
+ */
+
+GLvoid slang_texture_usages_ctr (slang_texture_usages *self)
+d398 2
+a399 2
+	self->table = NULL;
+	self->count = 0;
+a401 4
+GLvoid slang_texture_usages_dtr (slang_texture_usages *self)
+{
+	slang_alloc_free (self->table);
+}
+d403 30
+a432 3
+/*
+ * slang_program
+ */
+d434 2
+a435 3
+GLvoid slang_program_ctr (slang_program *self)
+{
+	GLuint i;
+d437 14
+a450 23
+	slang_active_variables_ctr (&self->active_uniforms);
+	slang_active_variables_ctr (&self->active_attribs);
+	slang_attrib_overrides_ctr (&self->attrib_overrides);
+	slang_uniform_bindings_ctr (&self->uniforms);
+	slang_attrib_bindings_ctr (&self->attribs);
+	slang_varying_bindings_ctr (&self->varyings);
+	slang_texture_usages_ctr (&self->texture_usage);
+	for (i = 0; i < SLANG_SHADER_MAX; i++)
+	{
+		GLuint j;
+
+		for (j = 0; j < SLANG_COMMON_FIXED_MAX; j++)
+			self->common_fixed_entries[i][j] = ~0;
+		for (j = 0; j < SLANG_COMMON_CODE_MAX; j++)
+			self->code[i][j] = ~0;
+		self->machines[i] = NULL;
+		self->assemblies[i] = NULL;
+	}
+	for (i = 0; i < SLANG_VERTEX_FIXED_MAX; i++)
+		self->vertex_fixed_entries[i] = ~0;
+	for (i = 0; i < SLANG_FRAGMENT_FIXED_MAX; i++)
+		self->fragment_fixed_entries[i] = ~0;
+}
+d452 11
+a462 10
+GLvoid slang_program_dtr (slang_program *self)
+{
+	slang_active_variables_dtr (&self->active_uniforms);
+	slang_active_variables_dtr (&self->active_attribs);
+	slang_attrib_overrides_dtr (&self->attrib_overrides);
+	slang_uniform_bindings_dtr (&self->uniforms);
+	slang_attrib_bindings_dtr (&self->attribs);
+	slang_varying_bindings_dtr (&self->varyings);
+	slang_texture_usages_dtr (&self->texture_usage);
+}
+d464 11
+a474 3
+GLvoid slang_program_rst (slang_program *self)
+{
+	GLuint i;
+d476 7
+a482 27
+	slang_active_variables_dtr (&self->active_uniforms);
+	slang_active_variables_dtr (&self->active_attribs);
+	slang_uniform_bindings_dtr (&self->uniforms);
+	slang_attrib_bindings_dtr (&self->attribs);
+	slang_varying_bindings_dtr (&self->varyings);
+	slang_texture_usages_dtr (&self->texture_usage);
+
+	slang_active_variables_ctr (&self->active_uniforms);
+	slang_active_variables_ctr (&self->active_attribs);
+	slang_uniform_bindings_ctr (&self->uniforms);
+	slang_attrib_bindings_ctr (&self->attribs);
+	slang_varying_bindings_ctr (&self->varyings);
+	slang_texture_usages_ctr (&self->texture_usage);
+	for (i = 0; i < SLANG_SHADER_MAX; i++)
+	{
+		GLuint j;
+
+		for (j = 0; j < SLANG_COMMON_FIXED_MAX; j++)
+			self->common_fixed_entries[i][j] = ~0;
+		for (j = 0; j < SLANG_COMMON_CODE_MAX; j++)
+			self->code[i][j] = ~0;
+	}
+	for (i = 0; i < SLANG_VERTEX_FIXED_MAX; i++)
+		self->vertex_fixed_entries[i] = ~0;
+	for (i = 0; i < SLANG_FRAGMENT_FIXED_MAX; i++)
+		self->fragment_fixed_entries[i] = ~0;
+}
+d484 9
+a492 3
+/*
+ * _slang_link()
+ */
+d494 14
+a507 4
+static GLuint gd (slang_export_data_table *tbl, const char *name)
+{
+	slang_atom atom;
+	GLuint i;
+d509 14
+a522 9
+	atom = slang_atom_pool_atom (tbl->atoms, name);
+	if (atom == SLANG_ATOM_NULL)
+		return ~0;
+
+	for (i = 0; i < tbl->count; i++)
+		if (atom == tbl->entries[i].quant.name)
+			return tbl->entries[i].address;
+	return ~0;
+}
+d524 14
+a537 48
+static GLvoid resolve_common_fixed (GLuint e[], slang_export_data_table *tbl)
+{
+	e[SLANG_COMMON_FIXED_MODELVIEWMATRIX] = gd (tbl, "gl_ModelViewMatrix");
+	e[SLANG_COMMON_FIXED_PROJECTIONMATRIX] = gd (tbl, "gl_ProjectionMatrix");
+	e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIX] = gd (tbl, "gl_ModelViewProjectionMatrix");
+	e[SLANG_COMMON_FIXED_TEXTUREMATRIX] = gd (tbl, "gl_TextureMatrix");
+	e[SLANG_COMMON_FIXED_NORMALMATRIX] = gd (tbl, "gl_NormalMatrix");
+	e[SLANG_COMMON_FIXED_MODELVIEWMATRIXINVERSE] = gd (tbl, "gl_ModelViewMatrixInverse");
+	e[SLANG_COMMON_FIXED_PROJECTIONMATRIXINVERSE] = gd (tbl, "gl_ProjectionMatrixInverse");
+	e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIXINVERSE] =
+		gd (tbl, "gl_ModelViewProjectionMatrixInverse");
+	e[SLANG_COMMON_FIXED_TEXTUREMATRIXINVERSE] = gd (tbl, "gl_TextureMatrixInverse");
+	e[SLANG_COMMON_FIXED_MODELVIEWMATRIXTRANSPOSE] = gd (tbl, "gl_ModelViewMatrixTranspose");
+	e[SLANG_COMMON_FIXED_PROJECTIONMATRIXTRANSPOSE] = gd (tbl, "gl_ProjectionMatrixTranspose");
+	e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIXTRANSPOSE] =
+		gd (tbl, "gl_ModelViewProjectionMatrixTranspose");
+	e[SLANG_COMMON_FIXED_TEXTUREMATRIXTRANSPOSE] = gd (tbl, "gl_TextureMatrixTranspose");
+	e[SLANG_COMMON_FIXED_MODELVIEWMATRIXINVERSETRANSPOSE] =
+		gd (tbl, "gl_ModelViewMatrixInverseTranspose");
+	e[SLANG_COMMON_FIXED_PROJECTIONMATRIXINVERSETRANSPOSE] =
+		gd (tbl, "gl_ProjectionMatrixInverseTranspose");
+	e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIXINVERSETRANSPOSE] =
+		gd (tbl, "gl_ModelViewProjectionMatrixInverseTranspose");
+	e[SLANG_COMMON_FIXED_TEXTUREMATRIXINVERSETRANSPOSE] =
+		gd (tbl, "gl_TextureMatrixInverseTranspose");
+	e[SLANG_COMMON_FIXED_NORMALSCALE] = gd (tbl, "gl_NormalScale");
+	e[SLANG_COMMON_FIXED_DEPTHRANGE] = gd (tbl, "gl_DepthRange");
+	e[SLANG_COMMON_FIXED_CLIPPLANE] = gd (tbl, "gl_ClipPlane");
+	e[SLANG_COMMON_FIXED_POINT] = gd (tbl, "gl_Point");
+	e[SLANG_COMMON_FIXED_FRONTMATERIAL] = gd (tbl, "gl_FrontMaterial");
+	e[SLANG_COMMON_FIXED_BACKMATERIAL] = gd (tbl, "gl_BackMaterial");
+	e[SLANG_COMMON_FIXED_LIGHTSOURCE] = gd (tbl, "gl_LightSource");
+	e[SLANG_COMMON_FIXED_LIGHTMODEL] = gd (tbl, "gl_LightModel");
+	e[SLANG_COMMON_FIXED_FRONTLIGHTMODELPRODUCT] = gd (tbl, "gl_FrontLightModelProduct");
+	e[SLANG_COMMON_FIXED_BACKLIGHTMODELPRODUCT] = gd (tbl, "gl_BackLightModelProduct");
+	e[SLANG_COMMON_FIXED_FRONTLIGHTPRODUCT] = gd (tbl, "gl_FrontLightProduct");
+	e[SLANG_COMMON_FIXED_BACKLIGHTPRODUCT] = gd (tbl, "gl_BackLightProduct");
+	e[SLANG_COMMON_FIXED_TEXTUREENVCOLOR] = gd (tbl, "gl_TextureEnvColor");
+	e[SLANG_COMMON_FIXED_EYEPLANES] = gd (tbl, "gl_EyePlaneS");
+	e[SLANG_COMMON_FIXED_EYEPLANET] = gd (tbl, "gl_EyePlaneT");
+	e[SLANG_COMMON_FIXED_EYEPLANER] = gd (tbl, "gl_EyePlaneR");
+	e[SLANG_COMMON_FIXED_EYEPLANEQ] = gd (tbl, "gl_EyePlaneQ");
+	e[SLANG_COMMON_FIXED_OBJECTPLANES] = gd (tbl, "gl_ObjectPlaneS");
+	e[SLANG_COMMON_FIXED_OBJECTPLANET] = gd (tbl, "gl_ObjectPlaneT");
+	e[SLANG_COMMON_FIXED_OBJECTPLANER] = gd (tbl, "gl_ObjectPlaneR");
+	e[SLANG_COMMON_FIXED_OBJECTPLANEQ] = gd (tbl, "gl_ObjectPlaneQ");
+	e[SLANG_COMMON_FIXED_FOG] = gd (tbl, "gl_Fog");
+}
+a538 25
+static GLvoid resolve_vertex_fixed (GLuint e[], slang_export_data_table *tbl)
+{
+	e[SLANG_VERTEX_FIXED_POSITION] = gd (tbl, "gl_Position");
+	e[SLANG_VERTEX_FIXED_POINTSIZE] = gd (tbl,  "gl_PointSize");
+	e[SLANG_VERTEX_FIXED_CLIPVERTEX] = gd (tbl, "gl_ClipVertex");
+	e[SLANG_VERTEX_FIXED_COLOR] = gd (tbl, "gl_Color");
+	e[SLANG_VERTEX_FIXED_SECONDARYCOLOR] = gd (tbl, "gl_SecondaryColor");
+	e[SLANG_VERTEX_FIXED_NORMAL] = gd (tbl, "gl_Normal");
+	e[SLANG_VERTEX_FIXED_VERTEX] = gd (tbl, "gl_Vertex");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD0] = gd (tbl, "gl_MultiTexCoord0");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD1] = gd (tbl, "gl_MultiTexCoord1");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD2] = gd (tbl, "gl_MultiTexCoord2");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD3] = gd (tbl, "gl_MultiTexCoord3");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD4] = gd (tbl, "gl_MultiTexCoord4");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD5] = gd (tbl, "gl_MultiTexCoord5");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD6] = gd (tbl, "gl_MultiTexCoord6");
+	e[SLANG_VERTEX_FIXED_MULTITEXCOORD7] = gd (tbl, "gl_MultiTexCoord7");
+	e[SLANG_VERTEX_FIXED_FOGCOORD] = gd (tbl, "gl_FogCoord");
+	e[SLANG_VERTEX_FIXED_FRONTCOLOR] = gd (tbl, "gl_FrontColor");
+	e[SLANG_VERTEX_FIXED_BACKCOLOR] = gd (tbl, "gl_BackColor");
+	e[SLANG_VERTEX_FIXED_FRONTSECONDARYCOLOR] = gd (tbl, "gl_FrontSecondaryColor");
+	e[SLANG_VERTEX_FIXED_BACKSECONDARYCOLOR] = gd (tbl, "gl_BackSecondaryColor");
+	e[SLANG_VERTEX_FIXED_TEXCOORD] = gd (tbl, "gl_TexCoord");
+	e[SLANG_VERTEX_FIXED_FOGFRAGCOORD] = gd (tbl, "gl_FogFragCoord");
+}
+d540 15
+a554 12
+static GLvoid resolve_fragment_fixed (GLuint e[], slang_export_data_table *tbl)
+{
+	e[SLANG_FRAGMENT_FIXED_FRAGCOORD] = gd (tbl, "gl_FragCoord");
+	e[SLANG_FRAGMENT_FIXED_FRONTFACING] = gd (tbl, "gl_FrontFacing");
+	e[SLANG_FRAGMENT_FIXED_FRAGCOLOR] = gd (tbl, "gl_FragColor");
+	e[SLANG_FRAGMENT_FIXED_FRAGDATA] = gd (tbl, "gl_FragData");
+	e[SLANG_FRAGMENT_FIXED_FRAGDEPTH] = gd (tbl, "gl_FragDepth");
+	e[SLANG_FRAGMENT_FIXED_COLOR] = gd (tbl, "gl_Color");
+	e[SLANG_FRAGMENT_FIXED_SECONDARYCOLOR] = gd (tbl, "gl_SecondaryColor");
+	e[SLANG_FRAGMENT_FIXED_TEXCOORD] = gd (tbl, "gl_TexCoord");
+	e[SLANG_FRAGMENT_FIXED_FOGFRAGCOORD] = gd (tbl, "gl_FogFragCoord");
+}
+d556 15
+a570 61
+static GLuint gc (slang_export_code_table *tbl, const char *name)
+{
+	slang_atom atom;
+	GLuint i;
+
+	atom = slang_atom_pool_atom (tbl->atoms, name);
+	if (atom == SLANG_ATOM_NULL)
+		return ~0;
+
+	for (i = 0; i < tbl->count; i++)
+		if (atom == tbl->entries[i].name)
+			return tbl->entries[i].address;
+	return ~0;
+}
+
+static GLvoid resolve_common_code (GLuint code[], slang_export_code_table *tbl)
+{
+	code[SLANG_COMMON_CODE_MAIN] = gc (tbl, "@@main");
+}
+
+GLboolean
+_slang_link (slang_program *prog, slang_code_object **objects, GLuint count)
+{
+	GLuint i;
+
+	for (i = 0; i < count; i++)
+	{
+		GLuint index;
+
+      if (objects[i]->unit.type == slang_unit_fragment_shader) {
+			index = SLANG_SHADER_FRAGMENT;
+         resolve_fragment_fixed (prog->fragment_fixed_entries, &objects[i]->expdata);
+		}
+		else
+		{
+			index = SLANG_SHADER_VERTEX;
+         resolve_vertex_fixed (prog->vertex_fixed_entries, &objects[i]->expdata);
+         if (!gather_attrib_bindings (&prog->attribs, &objects[i]->expdata,
+                                      &prog->attrib_overrides))
+				return GL_FALSE;
+		}
+
+      if (!gather_active_variables (&prog->active_uniforms, &objects[i]->expdata, slang_exp_uniform))
+			return GL_FALSE;
+      if (!gather_active_variables (&prog->active_attribs, &objects[i]->expdata, slang_exp_attribute))
+			return GL_FALSE;
+      if (!gather_uniform_bindings (&prog->uniforms, &objects[i]->expdata, index))
+			return GL_FALSE;
+      if (!gather_varying_bindings (&prog->varyings, &objects[i]->expdata,
+                                    index == SLANG_SHADER_VERTEX))
+			return GL_FALSE;
+      resolve_common_fixed (prog->common_fixed_entries[index], &objects[i]->expdata);
+      resolve_common_code (prog->code[index], &objects[i]->expcode);
+      prog->machines[index] = &objects[i]->machine;
+      prog->assemblies[index] = &objects[i]->assembly;
+	}
+
+	/* TODO: all varyings read by fragment shader must be written by vertex shader */
+
+	if (!_slang_analyse_texture_usage (prog))
+		return GL_FALSE;
+d572 1
+a572 1
+	return GL_TRUE;
+@
+
+
+1.1.1.1
+log
+@Import MesaLibs 6.5.1. (in dist/ since its code is shared between lib 
+and xserver)...
+@
+text
+@@
+
+
+1.1.1.2
+log
+@import MesaLibs version 6.5.2
+@
+text
+@d3 1
+a3 1
+ * Version:  6.6
+d35 1
+a35 9
+#define TABLE_GROW(PTR,TYPE,N) \
+   (PTR = (TYPE *) (slang_alloc_realloc (PTR, N * sizeof (TYPE), (N + 1) * sizeof (TYPE))))
+
+/*
+ * Check if a given name starts with "gl_". Globals with this prefix are
+ * treated differently, as they are built-in variables.
+ */
+static GLboolean
+entry_has_gl_prefix (slang_atom name, slang_atom_pool *atoms)
+d37 2
+a38 4
+   const GLchar *str;
+
+   str = slang_atom_pool_id (atoms, name);
+   return str[0] == 'g' && str[1] == 'l' && str[2] == '_';
+d45 1
+a45 2
+static GLvoid
+slang_active_variables_ctr (slang_active_variables *self)
+d47 2
+a48 2
+   self->table = NULL;
+   self->count = 0;
+d51 1
+a51 2
+static GLvoid
+slang_active_variables_dtr (slang_active_variables *self)
+d53 1
+a53 1
+   GLuint i;
+d55 3
+a57 3
+   for (i = 0; i < self->count; i++)
+      slang_alloc_free (self->table[i].name);
+   slang_alloc_free (self->table);
+d60 4
+a63 5
+/*
+ * Active variable queried by the application cannot be a structure. Queriable globals
+ * (uniforms and attributes) are decomposited into "simple" variables if they are
+ * "complex".
+ */
+d65 4
+a68 5
+static GLboolean
+add_simple_variable (slang_active_variables *self, slang_export_data_quant *q, const GLchar *name)
+{
+   GLuint n;
+   slang_active_variable *var;
+d70 5
+a74 11
+   n = self->count;
+   if (!TABLE_GROW(self->table, slang_active_variable, n))
+      return GL_FALSE;
+
+   /* Initialize the new element. Increment table size only when it is fully initilized. */
+   var = &self->table[n];
+   var->quant = q;
+   var->name = slang_string_duplicate (name);
+   if (var->name == NULL)
+      return GL_FALSE;
+   self->count++;
+d76 1
+a76 1
+   return GL_TRUE;
+d79 2
+a80 3
+static GLboolean
+add_complex_variable (slang_active_variables *self, slang_export_data_quant *q, GLchar *name,
+                      slang_atom_pool *atoms)
+d82 11
+a92 1
+   slang_string_concat (name, slang_atom_pool_id (atoms, q->name));
+d94 4
+a97 17
+   /* If array, add only first element. */
+   if (slang_export_data_quant_array (q))
+      slang_string_concat (name, "[0]");
+
+   if (slang_export_data_quant_struct (q)) {
+      GLuint field_pos, fields, i;
+
+      slang_string_concat (name, ".");
+      field_pos = slang_string_length (name);
+
+      /* Break it down into individual fields. */
+      fields = slang_export_data_quant_fields (q);
+      for (i = 0; i < fields; i++) {
+         if (!add_complex_variable (self, &q->structure[i], name, atoms))
+            return GL_FALSE;
+         name[field_pos] = '\0';
+      }
+d99 5
+a103 2
+      return GL_TRUE;
+   }
+d105 1
+a105 1
+   return add_simple_variable (self, q, name);
+d108 2
+a109 7
+/*
+ * Search a list of global variables with a given access (either attribute or uniform)
+ * and add it to the list of active variables.
+ */
+static GLboolean
+gather_active_variables (slang_active_variables *self, slang_export_data_table *tbl,
+                         slang_export_data_access access)
+d111 6
+a116 1
+   GLuint i;
+d118 3
+a120 8
+   for (i = 0; i < tbl->count; i++) {
+      if (tbl->entries[i].access == access) {
+         GLchar name[1024] = "";
+
+         if (!add_complex_variable (self, &tbl->entries[i].quant, name, tbl->atoms))
+            return GL_FALSE;
+      }
+   }
+d122 1
+a122 1
+   return GL_TRUE;
+d129 1
+a129 2
+static GLvoid
+slang_attrib_overrides_ctr (slang_attrib_overrides *self)
+d131 2
+a132 2
+   self->table = NULL;
+   self->count = 0;
+d135 1
+a135 2
+static GLvoid
+slang_attrib_overrides_dtr (slang_attrib_overrides *self)
+d137 1
+a137 1
+   GLuint i;
+d139 3
+a141 3
+   for (i = 0; i < self->count; i++)
+      slang_alloc_free (self->table[i].name);
+   slang_alloc_free (self->table);
+d144 1
+a144 2
+static slang_attrib_override *
+lookup_attrib_override (slang_attrib_overrides *self, const GLchar *name)
+d146 14
+a159 1
+   GLuint n, i;
+d161 7
+a167 6
+   n = self->count;
+   for (i = 0; i < n; i++) {
+      if (slang_string_compare (name, self->table[i].name) == 0)
+         return &self->table[i];
+   }
+   return NULL;
+d170 1
+a170 2
+GLboolean
+_slang_attrib_overrides_add (slang_attrib_overrides *self, GLuint index, const GLchar *name)
+d172 1
+a172 22
+   slang_attrib_override *ovr;
+   GLuint n;
+
+   /* Attribs can be overriden multiple times. Look-up the table and replace
+    * its index if it is found. */
+   ovr = lookup_attrib_override (self, name);
+   if (ovr != NULL) {
+      ovr->index = index;
+      return GL_TRUE;
+   }
+
+   n = self->count;
+   if (!TABLE_GROW(self->table, slang_attrib_override, n))
+      return GL_FALSE;
+
+   /* Initialize the new element. Increment table size only when it is fully initilized. */
+   ovr = &self->table[n];
+   ovr->index = index;
+   ovr->name = slang_string_duplicate (name);
+   if (ovr->name == NULL)
+      return GL_FALSE;
+   self->count++;
+d174 4
+a177 1
+   return GL_TRUE;
+d184 1
+a184 2
+static GLvoid
+slang_uniform_bindings_ctr (slang_uniform_bindings *self)
+d186 2
+a187 2
+   self->table = NULL;
+   self->count = 0;
+d190 1
+a190 2
+static GLvoid
+slang_uniform_bindings_dtr (slang_uniform_bindings *self)
+d192 1
+a192 1
+   GLuint i;
+d194 3
+a196 3
+   for (i = 0; i < self->count; i++)
+      slang_alloc_free (self->table[i].name);
+   slang_alloc_free (self->table);
+d199 2
+a200 3
+static GLboolean
+add_simple_uniform_binding (slang_uniform_bindings *self, slang_export_data_quant *q,
+                            const GLchar *name, GLuint index, GLuint addr)
+d202 2
+a203 2
+   GLuint n, i;
+   slang_uniform_binding *bind;
+d205 6
+a210 11
+   /* Uniform binding table is shared between vertex and fragment shaders. If the same uniform
+    * is declared both in a vertex and fragment shader, only one uniform entry is maintained.
+    * When add a uniform binding there can be an entry already allocated for it by the other
+    * shader. */
+   n = self->count;
+   for (i = 0; i < n; i++) {
+      if (slang_string_compare (self->table[i].name, name) == 0) {
+         self->table[i].address[index] = addr;
+         return GL_TRUE;
+      }
+   }
+d212 4
+a215 2
+   if (!TABLE_GROW(self->table, slang_uniform_binding, n))
+      return GL_FALSE;
+d217 8
+a224 10
+   /* Initialize the new element. Increment table size only when it is fully initilized. */
+   bind = &self->table[n];
+   bind->quant = q;
+   bind->name = slang_string_duplicate (name);
+   if (bind->name == NULL)
+      return GL_FALSE;
+   for (i = 0; i < SLANG_SHADER_MAX; i++)
+      bind->address[i] = ~0;
+   bind->address[index] = addr;
+   self->count++;
+d226 1
+a226 1
+   return GL_TRUE;
+d229 2
+a230 3
+static GLboolean
+add_complex_uniform_binding (slang_uniform_bindings *self, slang_export_data_quant *q,
+                             GLchar *name, slang_atom_pool *atoms, GLuint index, GLuint addr)
+d232 11
+a242 1
+   GLuint count, i;
+d244 4
+a247 2
+   slang_string_concat (name, slang_atom_pool_id (atoms, q->name));
+   count = slang_export_data_quant_elements (q);
+d249 2
+a250 27
+   /* If array, add binding for every array element. */
+   for (i = 0; i < count; i++) {
+      GLuint bracket_pos;
+
+      bracket_pos = slang_string_length (name);
+      if (slang_export_data_quant_array (q))
+         _mesa_sprintf (&name[slang_string_length (name)], "[%d]", i);
+
+      if (slang_export_data_quant_struct (q)) {
+         GLuint field_pos, fields, i;
+
+         slang_string_concat (name, ".");
+         field_pos = slang_string_length (name);
+
+         /* Break it down into individual fields. */
+         fields = slang_export_data_quant_fields (q);
+         for (i = 0; i < fields; i++) {
+            if (!add_complex_uniform_binding (self, &q->structure[i], name, atoms, index, addr))
+               return GL_FALSE;
+
+            name[field_pos] = '\0';
+            addr += slang_export_data_quant_size (&q->structure[i]);
+         }
+      }
+      else {
+         if (!add_simple_uniform_binding (self, q, name, index, addr))
+            return GL_FALSE;
+d252 4
+a255 2
+         addr += slang_export_data_quant_size (q);
+      }
+d257 14
+a270 2
+      name[bracket_pos] = '\0';
+   }
+d272 1
+a272 1
+   return GL_TRUE;
+d275 2
+a276 2
+static GLboolean
+gather_uniform_bindings (slang_uniform_bindings *self, slang_export_data_table *tbl, GLuint index)
+d278 1
+a278 1
+   GLuint n, i;
+d280 9
+a288 10
+   n = tbl->count;
+   for (i = 0; i < n; i++) {
+      if (tbl->entries[i].access == slang_exp_uniform) {
+         GLchar name[1024] = "";
+
+         if (!add_complex_uniform_binding (self, &tbl->entries[i].quant, name, tbl->atoms, index,
+                                           tbl->entries[i].address))
+            return GL_FALSE;
+      }
+   }
+d290 1
+a290 1
+   return GL_TRUE;
+d297 1
+a297 2
+static GLvoid
+slang_attrib_bindings_ctr (slang_attrib_bindings *self)
+d299 1
+a299 1
+   GLuint i;
+d301 3
+a303 3
+   self->binding_count = 0;
+   for (i = 0; i < MAX_VERTEX_ATTRIBS; i++)
+      self->slots[i].addr = ~0;
+d306 1
+a306 2
+static GLvoid
+slang_attrib_bindings_dtr (slang_attrib_bindings *self)
+d308 1
+a308 1
+   GLuint i;
+d310 2
+a311 2
+   for (i = 0; i < self->binding_count; i++)
+      slang_alloc_free (self->bindings[i].name);
+d317 1
+a317 1
+ *       Anyways, attrib index 0 is not used when not explicitly asked.
+d320 1
+a320 2
+static GLuint
+can_allocate_attrib_slots (slang_attrib_bindings *self, GLuint index, GLuint count)
+d322 1
+a322 1
+   GLuint i;
+d324 4
+a327 5
+   for (i = 0; i < count; i++) {
+      if (self->slots[index + i].addr != ~0)
+         break;
+   }
+   return i;
+d330 1
+a330 2
+static GLuint
+allocate_attrib_slots (slang_attrib_bindings *self, GLuint count)
+d332 1
+a332 1
+   GLuint i;
+d334 7
+a340 4
+   /* Start with attrib index 1. Index 0 will be used when explicitly
+    * asked by application binding. */
+   for (i = 1; i <= MAX_VERTEX_ATTRIBS - count; i++) {
+      GLuint size;
+d342 1
+a342 5
+      size = can_allocate_attrib_slots (self, i, count);
+      if (size == count)
+         return i;
+
+      /* Speed-up the search a bit. */
+d344 2
+a345 3
+   }
+
+   return MAX_VERTEX_ATTRIBS;
+d349 1
+a349 1
+add_attrib_binding (slang_attrib_bindings *self, slang_export_data_quant *q, const GLchar *name,
+d352 9
+a360 7
+   GLuint slot_span, slot_fill, slot_index, i;
+   slang_attrib_binding *bind;
+
+   assert (slang_export_data_quant_simple (q));
+
+   switch (slang_export_data_quant_type (q)) {
+   case GL_FLOAT:
+d364 1
+a364 1
+   case GL_FLOAT_VEC2:
+d368 1
+a368 1
+   case GL_FLOAT_VEC3:
+d372 2
+a373 2
+   case GL_FLOAT_VEC4:
+      slot_span = 1;
+d375 3
+a377 3
+      break;
+   case GL_FLOAT_MAT2:
+      slot_span = 2;
+d379 3
+a381 3
+      break;
+   case GL_FLOAT_MAT3:
+      slot_span = 3;
+d383 3
+a385 3
+      break;
+   case GL_FLOAT_MAT4:
+      slot_span = 4;
+d387 24
+a410 25
+      break;
+   default:
+      assert (0);
+   }
+
+   if (index_override == MAX_VERTEX_ATTRIBS)
+      slot_index = allocate_attrib_slots (self, slot_span);
+   else if (can_allocate_attrib_slots (self, index_override, slot_span) == slot_span)
+      slot_index = index_override;
+   else
+      slot_index = MAX_VERTEX_ATTRIBS;
+
+   if (slot_index == MAX_VERTEX_ATTRIBS) {
+      /* TODO: info log: error: MAX_VERTEX_ATTRIBS exceeded */
+      return GL_FALSE;
+   }
+
+   /* Initialize the new element. Increment table size only when it is fully initilized. */
+   bind = &self->bindings[self->binding_count];
+   bind->quant = q;
+   bind->name = slang_string_duplicate (name);
+   if (bind->name == NULL)
+      return GL_FALSE;
+   bind->first_slot_index = slot_index;
+   self->binding_count++;
+d413 1
+a413 3
+      slang_attrib_slot *slot;
+
+      slot = &self->slots[bind->first_slot_index + i];
+d418 1
+a418 1
+   return GL_TRUE;
+d421 2
+a422 3
+static GLboolean
+gather_attrib_bindings (slang_attrib_bindings *self, slang_export_data_table *tbl,
+                        slang_attrib_overrides *ovr)
+d424 1
+a424 1
+   GLuint i;
+d426 31
+a456 35
+   /* First pass. Gather attribs that have overriden index slots. */
+   for (i = 0; i < tbl->count; i++) {
+      if (tbl->entries[i].access == slang_exp_attribute &&
+          !entry_has_gl_prefix (tbl->entries[i].quant.name, tbl->atoms)) {
+         slang_export_data_quant *quant;
+         const GLchar *id;
+         slang_attrib_override *ao;
+
+         quant = &tbl->entries[i].quant;
+         id = slang_atom_pool_id (tbl->atoms, quant->name);
+         ao = lookup_attrib_override (ovr, id);
+         if (ao != NULL) {
+            if (!add_attrib_binding (self, quant, id, tbl->entries[i].address, ao->index))
+               return GL_FALSE;
+         }
+      }
+   }
+
+   /* Second pass. Gather attribs that have not overriden index slots. */
+   for (i = 0; i < tbl->count; i++) {
+      if (tbl->entries[i].access == slang_exp_attribute &&
+          !entry_has_gl_prefix (tbl->entries[i].quant.name, tbl->atoms)) {
+         slang_export_data_quant *quant;
+         const GLchar *id;
+         slang_attrib_override *ao;
+
+         quant = &tbl->entries[i].quant;
+         id = slang_atom_pool_id (tbl->atoms, quant->name);
+         ao = lookup_attrib_override (ovr, id);
+         if (ao == NULL) {
+            if (!add_attrib_binding (self, quant, id, tbl->entries[i].address, ao->index))
+               return GL_FALSE;
+         }
+      }
+   }
+d458 1
+a458 1
+   return GL_TRUE;
+d465 1
+a465 2
+static GLvoid
+slang_varying_bindings_ctr (slang_varying_bindings *self)
+d467 2
+a468 2
+   self->binding_count = 0;
+   self->slot_count = 0;
+d471 1
+a471 2
+static GLvoid
+slang_varying_bindings_dtr (slang_varying_bindings *self)
+d473 1
+a473 1
+   GLuint i;
+d475 2
+a476 2
+   for (i = 0; i < self->binding_count; i++)
+      slang_alloc_free (self->bindings[i].name);
+d479 2
+a480 3
+static GLvoid
+update_varying_slots (slang_varying_slot *slots, GLuint count, GLboolean is_vert, GLuint addr,
+                      GLuint do_offset)
+d482 1
+a482 1
+   GLuint i;
+d484 2
+a485 6
+   for (i = 0; i < count; i++) {
+      if (is_vert)
+         slots[i].vert_addr = addr + i * 4 * do_offset;
+      else
+         slots[i].frag_addr = addr + i * 4 * do_offset;
+   }
+d488 2
+a489 3
+static GLboolean
+add_varying_binding (slang_varying_bindings *self, slang_export_data_quant *q, const GLchar *name,
+                     GLboolean is_vert, GLuint addr)
+d491 4
+a494 2
+   GLuint n, slot_span, i;
+   slang_varying_binding *bind;
+d496 14
+a509 10
+   n = self->binding_count;
+   slot_span = slang_export_data_quant_components (q) * slang_export_data_quant_elements (q);
+   for (i = 0; i < n; i++) {
+      if (slang_string_compare (self->bindings[i].name, name) == 0) {
+         /* TODO: data quantities must match, or else link fails */
+         update_varying_slots (&self->slots[self->bindings[i].first_slot_index], slot_span,
+                               is_vert, addr, 1);
+         return GL_TRUE;
+      }
+   }
+d511 6
+a516 4
+   if (self->slot_count + slot_span > MAX_VARYING_FLOATS) {
+      /* TODO: info log: error: MAX_VARYING_FLOATS exceeded */
+      return GL_FALSE;
+   }
+d518 5
+a522 12
+   /* Initialize the new element. Increment table size only when it is fully initilized. */
+   bind = &self->bindings[n];
+   bind->quant = q;
+   bind->name = slang_string_duplicate (name);
+   if (bind->name == NULL)
+      return GL_FALSE;
+   bind->first_slot_index = self->slot_count;
+   self->binding_count++;
+
+   update_varying_slots (&self->slots[bind->first_slot_index], slot_span, is_vert, addr, 1);
+   update_varying_slots (&self->slots[bind->first_slot_index], slot_span, !is_vert, ~0, 0);
+   self->slot_count += slot_span;
+d524 1
+a524 1
+   return GL_TRUE;
+d527 2
+a528 3
+static GLboolean
+gather_varying_bindings (slang_varying_bindings *self, slang_export_data_table *tbl,
+                         GLboolean is_vert)
+d530 1
+a530 1
+   GLuint i;
+d532 8
+a539 9
+   for (i = 0; i < tbl->count; i++) {
+      if (tbl->entries[i].access == slang_exp_varying &&
+          !entry_has_gl_prefix (tbl->entries[i].quant.name, tbl->atoms)) {
+         if (!add_varying_binding (self, &tbl->entries[i].quant,
+                                   slang_atom_pool_id (tbl->atoms, tbl->entries[i].quant.name),
+                                   is_vert, tbl->entries[i].address))
+            return GL_FALSE;
+      }
+   }
+d541 1
+a541 1
+   return GL_TRUE;
+d548 1
+a548 2
+GLvoid
+_slang_texture_usages_ctr (slang_texture_usages *self)
+d550 2
+a551 2
+   self->table = NULL;
+   self->count = 0;
+d554 1
+a554 2
+GLvoid
+_slang_texture_usages_dtr (slang_texture_usages *self)
+d556 1
+a556 1
+   slang_alloc_free (self->table);
+d563 1
+a563 2
+GLvoid
+_slang_program_ctr (slang_program *self)
+d565 1
+a565 1
+   GLuint i;
+d567 65
+a631 65
+   slang_active_variables_ctr (&self->active_uniforms);
+   slang_active_variables_ctr (&self->active_attribs);
+   slang_attrib_overrides_ctr (&self->attrib_overrides);
+   slang_uniform_bindings_ctr (&self->uniforms);
+   slang_attrib_bindings_ctr (&self->attribs);
+   slang_varying_bindings_ctr (&self->varyings);
+   _slang_texture_usages_ctr (&self->texture_usage);
+   for (i = 0; i < SLANG_SHADER_MAX; i++) {
+      GLuint j;
+
+      for (j = 0; j < SLANG_COMMON_FIXED_MAX; j++)
+         self->common_fixed_entries[i][j] = ~0;
+      for (j = 0; j < SLANG_COMMON_CODE_MAX; j++)
+         self->code[i][j] = ~0;
+      self->machines[i] = NULL;
+      self->assemblies[i] = NULL;
+   }
+   for (i = 0; i < SLANG_VERTEX_FIXED_MAX; i++)
+      self->vertex_fixed_entries[i] = ~0;
+   for (i = 0; i < SLANG_FRAGMENT_FIXED_MAX; i++)
+      self->fragment_fixed_entries[i] = ~0;
+}
+
+GLvoid
+_slang_program_dtr (slang_program *self)
+{
+   slang_active_variables_dtr (&self->active_uniforms);
+   slang_active_variables_dtr (&self->active_attribs);
+   slang_attrib_overrides_dtr (&self->attrib_overrides);
+   slang_uniform_bindings_dtr (&self->uniforms);
+   slang_attrib_bindings_dtr (&self->attribs);
+   slang_varying_bindings_dtr (&self->varyings);
+   _slang_texture_usages_dtr (&self->texture_usage);
+}
+
+GLvoid
+_slang_program_rst (slang_program *self)
+{
+   GLuint i;
+
+   slang_active_variables_dtr (&self->active_uniforms);
+   slang_active_variables_dtr (&self->active_attribs);
+   slang_uniform_bindings_dtr (&self->uniforms);
+   slang_attrib_bindings_dtr (&self->attribs);
+   slang_varying_bindings_dtr (&self->varyings);
+   _slang_texture_usages_dtr (&self->texture_usage);
+
+   slang_active_variables_ctr (&self->active_uniforms);
+   slang_active_variables_ctr (&self->active_attribs);
+   slang_uniform_bindings_ctr (&self->uniforms);
+   slang_attrib_bindings_ctr (&self->attribs);
+   slang_varying_bindings_ctr (&self->varyings);
+   _slang_texture_usages_ctr (&self->texture_usage);
+   for (i = 0; i < SLANG_SHADER_MAX; i++) {
+      GLuint j;
+
+      for (j = 0; j < SLANG_COMMON_FIXED_MAX; j++)
+         self->common_fixed_entries[i][j] = ~0;
+      for (j = 0; j < SLANG_COMMON_CODE_MAX; j++)
+         self->code[i][j] = ~0;
+   }
+   for (i = 0; i < SLANG_VERTEX_FIXED_MAX; i++)
+      self->vertex_fixed_entries[i] = ~0;
+   for (i = 0; i < SLANG_FRAGMENT_FIXED_MAX; i++)
+      self->fragment_fixed_entries[i] = ~0;
+d638 1
+a638 2
+static GLuint
+gd (slang_export_data_table *tbl, const GLchar *name)
+d640 2
+a641 2
+   slang_atom atom;
+   GLuint i;
+d643 111
+a753 9
+   atom = slang_atom_pool_atom (tbl->atoms, name);
+   if (atom == SLANG_ATOM_NULL)
+      return ~0;
+
+   for (i = 0; i < tbl->count; i++) {
+      if (atom == tbl->entries[i].quant.name)
+         return tbl->entries[i].address;
+   }
+   return ~0;
+d756 1
+a756 2
+static GLvoid
+resolve_common_fixed (GLuint e[], slang_export_data_table *tbl)
+d758 1
+a758 103
+   e[SLANG_COMMON_FIXED_MODELVIEWMATRIX] = gd (tbl, "gl_ModelViewMatrix");
+   e[SLANG_COMMON_FIXED_PROJECTIONMATRIX] = gd (tbl, "gl_ProjectionMatrix");
+   e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIX] = gd (tbl, "gl_ModelViewProjectionMatrix");
+   e[SLANG_COMMON_FIXED_TEXTUREMATRIX] = gd (tbl, "gl_TextureMatrix");
+   e[SLANG_COMMON_FIXED_NORMALMATRIX] = gd (tbl, "gl_NormalMatrix");
+   e[SLANG_COMMON_FIXED_MODELVIEWMATRIXINVERSE] = gd (tbl, "gl_ModelViewMatrixInverse");
+   e[SLANG_COMMON_FIXED_PROJECTIONMATRIXINVERSE] = gd (tbl, "gl_ProjectionMatrixInverse");
+   e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIXINVERSE] = gd (tbl, "gl_ModelViewProjectionMatrixInverse");
+   e[SLANG_COMMON_FIXED_TEXTUREMATRIXINVERSE] = gd (tbl, "gl_TextureMatrixInverse");
+   e[SLANG_COMMON_FIXED_MODELVIEWMATRIXTRANSPOSE] = gd (tbl, "gl_ModelViewMatrixTranspose");
+   e[SLANG_COMMON_FIXED_PROJECTIONMATRIXTRANSPOSE] = gd (tbl, "gl_ProjectionMatrixTranspose");
+   e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIXTRANSPOSE] = gd (tbl, "gl_ModelViewProjectionMatrixTranspose");
+   e[SLANG_COMMON_FIXED_TEXTUREMATRIXTRANSPOSE] = gd (tbl, "gl_TextureMatrixTranspose");
+   e[SLANG_COMMON_FIXED_MODELVIEWMATRIXINVERSETRANSPOSE] = gd (tbl, "gl_ModelViewMatrixInverseTranspose");
+   e[SLANG_COMMON_FIXED_PROJECTIONMATRIXINVERSETRANSPOSE] = gd (tbl, "gl_ProjectionMatrixInverseTranspose");
+   e[SLANG_COMMON_FIXED_MODELVIEWPROJECTIONMATRIXINVERSETRANSPOSE] = gd (tbl, "gl_ModelViewProjectionMatrixInverseTranspose");
+   e[SLANG_COMMON_FIXED_TEXTUREMATRIXINVERSETRANSPOSE] = gd (tbl, "gl_TextureMatrixInverseTranspose");
+   e[SLANG_COMMON_FIXED_NORMALSCALE] = gd (tbl, "gl_NormalScale");
+   e[SLANG_COMMON_FIXED_DEPTHRANGE] = gd (tbl, "gl_DepthRange");
+   e[SLANG_COMMON_FIXED_CLIPPLANE] = gd (tbl, "gl_ClipPlane");
+   e[SLANG_COMMON_FIXED_POINT] = gd (tbl, "gl_Point");
+   e[SLANG_COMMON_FIXED_FRONTMATERIAL] = gd (tbl, "gl_FrontMaterial");
+   e[SLANG_COMMON_FIXED_BACKMATERIAL] = gd (tbl, "gl_BackMaterial");
+   e[SLANG_COMMON_FIXED_LIGHTSOURCE] = gd (tbl, "gl_LightSource");
+   e[SLANG_COMMON_FIXED_LIGHTMODEL] = gd (tbl, "gl_LightModel");
+   e[SLANG_COMMON_FIXED_FRONTLIGHTMODELPRODUCT] = gd (tbl, "gl_FrontLightModelProduct");
+   e[SLANG_COMMON_FIXED_BACKLIGHTMODELPRODUCT] = gd (tbl, "gl_BackLightModelProduct");
+   e[SLANG_COMMON_FIXED_FRONTLIGHTPRODUCT] = gd (tbl, "gl_FrontLightProduct");
+   e[SLANG_COMMON_FIXED_BACKLIGHTPRODUCT] = gd (tbl, "gl_BackLightProduct");
+   e[SLANG_COMMON_FIXED_TEXTUREENVCOLOR] = gd (tbl, "gl_TextureEnvColor");
+   e[SLANG_COMMON_FIXED_EYEPLANES] = gd (tbl, "gl_EyePlaneS");
+   e[SLANG_COMMON_FIXED_EYEPLANET] = gd (tbl, "gl_EyePlaneT");
+   e[SLANG_COMMON_FIXED_EYEPLANER] = gd (tbl, "gl_EyePlaneR");
+   e[SLANG_COMMON_FIXED_EYEPLANEQ] = gd (tbl, "gl_EyePlaneQ");
+   e[SLANG_COMMON_FIXED_OBJECTPLANES] = gd (tbl, "gl_ObjectPlaneS");
+   e[SLANG_COMMON_FIXED_OBJECTPLANET] = gd (tbl, "gl_ObjectPlaneT");
+   e[SLANG_COMMON_FIXED_OBJECTPLANER] = gd (tbl, "gl_ObjectPlaneR");
+   e[SLANG_COMMON_FIXED_OBJECTPLANEQ] = gd (tbl, "gl_ObjectPlaneQ");
+   e[SLANG_COMMON_FIXED_FOG] = gd (tbl, "gl_Fog");
+}
+
+static GLvoid
+resolve_vertex_fixed (GLuint e[], slang_export_data_table *tbl)
+{
+   e[SLANG_VERTEX_FIXED_POSITION] = gd (tbl, "gl_Position");
+   e[SLANG_VERTEX_FIXED_POINTSIZE] = gd (tbl,  "gl_PointSize");
+   e[SLANG_VERTEX_FIXED_CLIPVERTEX] = gd (tbl, "gl_ClipVertex");
+   e[SLANG_VERTEX_FIXED_COLOR] = gd (tbl, "gl_Color");
+   e[SLANG_VERTEX_FIXED_SECONDARYCOLOR] = gd (tbl, "gl_SecondaryColor");
+   e[SLANG_VERTEX_FIXED_NORMAL] = gd (tbl, "gl_Normal");
+   e[SLANG_VERTEX_FIXED_VERTEX] = gd (tbl, "gl_Vertex");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD0] = gd (tbl, "gl_MultiTexCoord0");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD1] = gd (tbl, "gl_MultiTexCoord1");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD2] = gd (tbl, "gl_MultiTexCoord2");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD3] = gd (tbl, "gl_MultiTexCoord3");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD4] = gd (tbl, "gl_MultiTexCoord4");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD5] = gd (tbl, "gl_MultiTexCoord5");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD6] = gd (tbl, "gl_MultiTexCoord6");
+   e[SLANG_VERTEX_FIXED_MULTITEXCOORD7] = gd (tbl, "gl_MultiTexCoord7");
+   e[SLANG_VERTEX_FIXED_FOGCOORD] = gd (tbl, "gl_FogCoord");
+   e[SLANG_VERTEX_FIXED_FRONTCOLOR] = gd (tbl, "gl_FrontColor");
+   e[SLANG_VERTEX_FIXED_BACKCOLOR] = gd (tbl, "gl_BackColor");
+   e[SLANG_VERTEX_FIXED_FRONTSECONDARYCOLOR] = gd (tbl, "gl_FrontSecondaryColor");
+   e[SLANG_VERTEX_FIXED_BACKSECONDARYCOLOR] = gd (tbl, "gl_BackSecondaryColor");
+   e[SLANG_VERTEX_FIXED_TEXCOORD] = gd (tbl, "gl_TexCoord");
+   e[SLANG_VERTEX_FIXED_FOGFRAGCOORD] = gd (tbl, "gl_FogFragCoord");
+}
+
+static GLvoid
+resolve_fragment_fixed (GLuint e[], slang_export_data_table *tbl)
+{
+   e[SLANG_FRAGMENT_FIXED_FRAGCOORD] = gd (tbl, "gl_FragCoord");
+   e[SLANG_FRAGMENT_FIXED_FRONTFACING] = gd (tbl, "gl_FrontFacing");
+   e[SLANG_FRAGMENT_FIXED_FRAGCOLOR] = gd (tbl, "gl_FragColor");
+   e[SLANG_FRAGMENT_FIXED_FRAGDATA] = gd (tbl, "gl_FragData");
+   e[SLANG_FRAGMENT_FIXED_FRAGDEPTH] = gd (tbl, "gl_FragDepth");
+   e[SLANG_FRAGMENT_FIXED_COLOR] = gd (tbl, "gl_Color");
+   e[SLANG_FRAGMENT_FIXED_SECONDARYCOLOR] = gd (tbl, "gl_SecondaryColor");
+   e[SLANG_FRAGMENT_FIXED_TEXCOORD] = gd (tbl, "gl_TexCoord");
+   e[SLANG_FRAGMENT_FIXED_FOGFRAGCOORD] = gd (tbl, "gl_FogFragCoord");
+}
+
+static GLuint
+gc (slang_export_code_table *tbl, const GLchar *name)
+{
+   slang_atom atom;
+   GLuint i;
+
+   atom = slang_atom_pool_atom (tbl->atoms, name);
+   if (atom == SLANG_ATOM_NULL)
+      return ~0;
+
+   for (i = 0; i < tbl->count; i++) {
+      if (atom == tbl->entries[i].name)
+         return tbl->entries[i].address;
+   }
+   return ~0;
+}
+
+static GLvoid
+resolve_common_code (GLuint code[], slang_export_code_table *tbl)
+{
+   code[SLANG_COMMON_CODE_MAIN] = gc (tbl, "@@main");
+d764 1
+a764 1
+   GLuint i;
+d766 3
+a768 2
+   for (i = 0; i < count; i++) {
+      GLuint index;
+d771 1
+a771 1
+         index = SLANG_SHADER_FRAGMENT;
+d773 4
+a776 3
+      }
+      else {
+         index = SLANG_SHADER_VERTEX;
+d780 2
+a781 2
+            return GL_FALSE;
+      }
+d784 1
+a784 1
+         return GL_FALSE;
+d786 1
+a786 1
+         return GL_FALSE;
+d788 1
+a788 1
+         return GL_FALSE;
+d791 1
+a791 1
+         return GL_FALSE;
+d796 1
+a796 1
+   }
+d798 1
+a798 1
+   /* TODO: all varyings read by fragment shader must be written by vertex shader */
+d800 2
+a801 2
+   if (!_slang_analyse_texture_usage (prog))
+      return GL_FALSE;
+d803 1
+a803 1
+   return GL_TRUE;
+@
+
+
+1.1.1.3
+log
+@Mesa 7.0.1
+@
+text
+@d3 1
+a3 1
+ * Version:  6.5.3
+d5 1
+a5 1
+ * Copyright (C) 2007  Brian Paul   All Rights Reserved.
+d27 2
+a28 2
+ * GLSL linker
+ * \author Brian Paul
+a31 9
+#include "context.h"
+#include "hash.h"
+#include "macros.h"
+#include "program.h"
+#include "prog_instruction.h"
+#include "prog_parameter.h"
+#include "prog_print.h"
+#include "prog_statevars.h"
+#include "shader_api.h"
+d33 1
+d35 2
+d38 12
+d51 26
+d79 1
+a79 1
+link_varying_vars(struct gl_shader_program *shProg, struct gl_program *prog)
+d81 6
+a86 2
+   GLuint *map, i, firstVarying, newFile;
+   GLbitfield varsWritten, varsRead;
+d88 5
+a92 2
+   map = (GLuint *) malloc(prog->Varying->NumParameters * sizeof(GLuint));
+   if (!map)
+d94 17
+d112 2
+a113 4
+   for (i = 0; i < prog->Varying->NumParameters; i++) {
+      /* see if this varying is in the linked varying list */
+      const struct gl_program_parameter *var
+         = prog->Varying->Parameters + i;
+d115 4
+a118 5
+      GLint j = _mesa_lookup_parameter_index(shProg->Varying, -1, var->Name);
+      if (j >= 0) {
+         /* already in list, check size */
+         if (var->Size != shProg->Varying->Parameters[j].Size) {
+            /* error */
+d120 1
+a120 5
+         }
+      }
+      else {
+         /* not already in linked list */
+         j = _mesa_add_varying(shProg->Varying, var->Name, var->Size);
+a121 1
+      ASSERT(j >= 0);
+d123 1
+a123 1
+      map[i] = j;
+d126 12
+d139 7
+a145 13
+   /* Varying variables are treated like other vertex program outputs
+    * (and like other fragment program inputs).  The position of the
+    * first varying differs for vertex/fragment programs...
+    * Also, replace File=PROGRAM_VARYING with File=PROGRAM_INPUT/OUTPUT.
+    */
+   if (prog->Target == GL_VERTEX_PROGRAM_ARB) {
+      firstVarying = VERT_RESULT_VAR0;
+      newFile = PROGRAM_OUTPUT;
+   }
+   else {
+      assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+      firstVarying = FRAG_ATTRIB_VAR0;
+      newFile = PROGRAM_INPUT;
+d148 18
+a165 2
+   /* keep track of which varying vars we read and write */
+   varsWritten = varsRead = 0x0;
+d167 4
+a170 6
+   /* OK, now scan the program/shader instructions looking for varying vars,
+    * replacing the old index with the new index.
+    */
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      GLuint j;
+d172 4
+a175 5
+      if (inst->DstReg.File == PROGRAM_VARYING) {
+         inst->DstReg.File = newFile;
+         inst->DstReg.Index = map[ inst->DstReg.Index ] + firstVarying;
+         varsWritten |= (1 << inst->DstReg.Index);
+      }
+d177 4
+a180 7
+      for (j = 0; j < 3; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_VARYING) {
+            inst->SrcReg[j].File = newFile;
+            inst->SrcReg[j].Index = map[ inst->SrcReg[j].Index ] + firstVarying;
+            varsRead |= (1 << inst->SrcReg[j].Index);
+         }
+      }
+d182 8
+d191 6
+a196 8
+   if (prog->Target == GL_VERTEX_PROGRAM_ARB) {
+      prog->OutputsWritten |= varsWritten;
+      /*printf("VERT OUTPUTS: 0x%x \n", varsWritten);*/
+   }
+   else {
+      assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+      prog->InputsRead |= varsRead;
+      /*printf("FRAG INPUTS: 0x%x\n", varsRead);*/
+d199 11
+a209 1
+   free(map);
+d214 3
+d218 2
+a219 2
+static GLboolean
+is_uniform(GLuint file)
+d221 2
+a222 6
+   return (file == PROGRAM_ENV_PARAM ||
+           file == PROGRAM_STATE_VAR ||
+           file == PROGRAM_NAMED_PARAM ||
+           file == PROGRAM_CONSTANT ||
+           file == PROGRAM_SAMPLER ||
+           file == PROGRAM_UNIFORM);
+d225 9
+d236 2
+a237 1
+link_uniform_vars(struct gl_shader_program *shProg, struct gl_program *prog)
+d239 2
+a240 1
+   GLuint *map, i;
+d242 11
+a252 4
+#if 0
+   printf("================ pre link uniforms ===============\n");
+   _mesa_print_parameter_list(shProg->Uniforms);
+#endif
+d254 1
+a254 2
+   map = (GLuint *) malloc(prog->Parameters->NumParameters * sizeof(GLuint));
+   if (!map)
+d257 10
+a266 6
+   for (i = 0; i < prog->Parameters->NumParameters; /* incr below*/) {
+      /* see if this uniform is in the linked uniform list */
+      const struct gl_program_parameter *p = prog->Parameters->Parameters + i;
+      const GLfloat *pVals = prog->Parameters->ParameterValues[i];
+      GLint j;
+      GLint size;
+d268 2
+a269 2
+      /* sanity check */
+      assert(is_uniform(p->Type));
+d271 32
+a302 2
+      if (p->Name) {
+         j = _mesa_lookup_parameter_index(shProg->Uniforms, -1, p->Name);
+d305 4
+a308 9
+         /*GLuint swizzle;*/
+         ASSERT(p->Type == PROGRAM_CONSTANT);
+         if (_mesa_lookup_parameter_constant(shProg->Uniforms, pVals,
+                                             p->Size, &j, NULL)) {
+            assert(j >= 0);
+         }
+         else {
+            j = -1;
+         }
+d311 18
+a328 26
+      if (j >= 0) {
+         /* already in list, check size XXX check this */
+#if 0
+         assert(p->Size == shProg->Uniforms->Parameters[j].Size);
+#endif
+      }
+      else {
+         /* not already in linked list */
+         switch (p->Type) {
+         case PROGRAM_ENV_PARAM:
+            j = _mesa_add_named_parameter(shProg->Uniforms, p->Name, pVals);
+            break;
+         case PROGRAM_CONSTANT:
+            j = _mesa_add_named_constant(shProg->Uniforms, p->Name, pVals, p->Size);
+            break;
+         case PROGRAM_STATE_VAR:
+            j = _mesa_add_state_reference(shProg->Uniforms, p->StateIndexes);
+            break;
+         case PROGRAM_UNIFORM:
+            j = _mesa_add_uniform(shProg->Uniforms, p->Name, p->Size, p->DataType);
+            break;
+         case PROGRAM_SAMPLER:
+            j = _mesa_add_sampler(shProg->Uniforms, p->Name, p->DataType);
+            break;
+         default:
+            _mesa_problem(NULL, "bad parameter type in link_uniform_vars()");
+a329 1
+         }
+d331 1
+d333 31
+a363 1
+      ASSERT(j >= 0);
+d365 4
+a368 7
+      size = p->Size;
+      while (size > 0) {
+         map[i] = j;
+         i++;
+         j++;
+         size -= 4;
+      }
+d370 3
+d374 12
+d387 3
+a389 4
+#if 0
+   printf("================ post link uniforms ===============\n");
+   _mesa_print_parameter_list(shProg->Uniforms);
+#endif
+d391 2
+a392 7
+#if 0
+   {
+      GLuint i;
+      for (i = 0; i < prog->Parameters->NumParameters; i++) {
+         printf("map[%d] = %d\n", i, map[i]);
+      }
+      _mesa_print_parameter_list(shProg->Uniforms);
+a393 1
+#endif
+d395 9
+a403 6
+   /* OK, now scan the program/shader instructions looking for uniform vars,
+    * replacing the old index with the new index.
+    */
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      GLuint j;
+d405 1
+a405 3
+      if (is_uniform(inst->DstReg.File)) {
+         inst->DstReg.Index = map[ inst->DstReg.Index ];
+      }
+d407 39
+a445 5
+      for (j = 0; j < 3; j++) {
+         if (is_uniform(inst->SrcReg[j].File)) {
+            inst->SrcReg[j].Index = map[ inst->SrcReg[j].Index ];
+         }
+      }
+d447 3
+a449 9
+      if (inst->Opcode == OPCODE_TEX ||
+          inst->Opcode == OPCODE_TXB ||
+          inst->Opcode == OPCODE_TXP) {
+         /*
+         printf("====== remap sampler from %d to %d\n",
+                inst->Sampler, map[ inst->Sampler ]);
+         */
+         inst->Sampler = map[ inst->Sampler ];
+      }
+d452 16
+a467 1
+   free(map);
+d472 5
+d478 17
+a494 66
+/**
+ * Resolve binding of generic vertex attributes.
+ * For example, if the vertex shader declared "attribute vec4 foobar" we'll
+ * allocate a generic vertex attribute for "foobar" and plug that value into
+ * the vertex program instructions.
+ */
+static GLboolean
+_slang_resolve_attributes(struct gl_shader_program *shProg,
+                          struct gl_program *prog)
+{
+   GLuint i, j;
+   GLbitfield usedAttributes;
+   GLint size = 4; /* XXX fix */
+
+   assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
+
+   if (!shProg->Attributes)
+      shProg->Attributes = _mesa_new_parameter_list();
+
+   /* Build a bitmask indicating which attribute indexes have been
+    * explicitly bound by the user with glBindAttributeLocation().
+    */
+   usedAttributes = 0x0;
+   for (i = 0; i < shProg->Attributes->NumParameters; i++) {
+      GLint attr = shProg->Attributes->Parameters[i].StateIndexes[0];
+      usedAttributes |= attr;
+   }
+
+   /*
+    * Scan program for generic attribute references
+    */
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      for (j = 0; j < 3; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_INPUT &&
+             inst->SrcReg[j].Index >= VERT_ATTRIB_GENERIC0) {
+            /* this is a generic attrib */
+            const GLint k = inst->SrcReg[j].Index - VERT_ATTRIB_GENERIC0;
+            const char *name = prog->Attributes->Parameters[k].Name;
+            /* See if this attrib name is in the program's attribute list
+             * (i.e. was bound by the user).
+             */
+            GLint index = _mesa_lookup_parameter_index(shProg->Attributes,
+                                                          -1, name);
+            GLint attr;
+            if (index >= 0) {
+               /* found, user must have specified a binding */
+               attr = shProg->Attributes->Parameters[index].StateIndexes[0];
+            }
+            else {
+               /* Not found, choose our own attribute number.
+                * Start at 1 since generic attribute 0 always aliases
+                * glVertex/position.
+                */
+               for (attr = 1; attr < MAX_VERTEX_ATTRIBS; attr++) {
+                  if (((1 << attr) & usedAttributes) == 0) {
+                     usedAttributes |= (1 << attr);
+                     break;
+                  }
+               }
+               if (attr == MAX_VERTEX_ATTRIBS) {
+                  /* too many!  XXX record error log */
+                  return GL_FALSE;
+               }
+               _mesa_add_attribute(shProg->Attributes, name, size, attr);
+            }
+d496 14
+a509 1
+            inst->SrcReg[j].Index = VERT_ATTRIB_GENERIC0 + attr;
+d513 1
+d517 10
+d528 26
+a553 6
+/**
+ * Scan program instructions to update the program's InputsRead and
+ * OutputsWritten fields.
+ */
+static void
+_slang_update_inputs_outputs(struct gl_program *prog)
+d555 2
+a556 1
+   GLuint i, j;
+d558 8
+a565 13
+   prog->InputsRead = 0x0;
+   prog->OutputsWritten = 0x0;
+
+   for (i = 0; i < prog->NumInstructions; i++) {
+      const struct prog_instruction *inst = prog->Instructions + i;
+      const GLuint numSrc = _mesa_num_inst_src_regs(inst->Opcode);
+      for (j = 0; j < numSrc; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_INPUT) {
+            prog->InputsRead |= 1 << inst->SrcReg[j].Index;
+         }
+      }
+      if (inst->DstReg.File == PROGRAM_OUTPUT) {
+         prog->OutputsWritten |= 1 << inst->DstReg.Index;
+d568 20
+d590 5
+d596 7
+a602 22
+/**
+ * Scan a vertex program looking for instances of
+ * (PROGRAM_INPUT, VERT_ATTRIB_GENERIC0 + oldAttrib) and replace with
+ * (PROGRAM_INPUT, VERT_ATTRIB_GENERIC0 + newAttrib).
+ * This is used when the user calls glBindAttribLocation on an already linked
+ * shader program.
+ */
+void
+_slang_remap_attribute(struct gl_program *prog, GLuint oldAttrib, GLuint newAttrib)
+{
+   GLuint i, j;
+
+   assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
+
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      for (j = 0; j < 3; j++) {
+         if (inst->SrcReg[j].File == PROGRAM_INPUT) {
+            if (inst->SrcReg[j].Index == VERT_ATTRIB_GENERIC0 + oldAttrib) {
+               inst->SrcReg[j].Index = VERT_ATTRIB_GENERIC0 + newAttrib;
+            }
+         }
+d606 1
+a606 1
+   _slang_update_inputs_outputs(prog);
+d609 3
+d613 12
+d626 2
+a627 4
+/**
+ * Scan program for texture instructions, lookup sampler/uniform's value
+ * to determine which texture unit to use.
+ * Also, update the program's TexturesUsed[] array.
+d629 3
+a631 3
+void
+_slang_resolve_samplers(struct gl_shader_program *shProg,
+                        struct gl_program *prog)
+d635 9
+a643 2
+   for (i = 0; i < MAX_TEXTURE_IMAGE_UNITS; i++)
+      prog->TexturesUsed[i] = 0;
+d645 12
+a656 8
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      if (inst->Opcode == OPCODE_TEX ||
+          inst->Opcode == OPCODE_TXB ||
+          inst->Opcode == OPCODE_TXP) {
+         GLint sampleUnit = (GLint) shProg->Uniforms->ParameterValues[inst->Sampler][0];
+         assert(sampleUnit < MAX_TEXTURE_IMAGE_UNITS);
+         inst->TexSrcUnit = sampleUnit;
+d658 10
+a667 3
+         prog->TexturesUsed[inst->TexSrcUnit] |= (1 << inst->TexSrcTarget);
+      }
+   }
+d670 20
+d691 14
+d706 2
+a707 3
+/** cast wrapper */
+static struct gl_vertex_program *
+vertex_program(struct gl_program *prog)
+d709 12
+a720 2
+   assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
+   return (struct gl_vertex_program *) prog;
+d723 43
+d767 2
+a768 3
+/** cast wrapper */
+static struct gl_fragment_program *
+fragment_program(struct gl_program *prog)
+d770 22
+a791 2
+   assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB);
+   return (struct gl_fragment_program *) prog;
+d794 13
+d808 2
+a809 5
+/**
+ * Record a linking error.
+ */
+static void
+link_error(struct gl_shader_program *shProg, const char *msg)
+d811 10
+a820 2
+   if (shProg->InfoLog) {
+      _mesa_free(shProg->InfoLog);
+d822 7
+a828 2
+   shProg->InfoLog = _mesa_strdup(msg);
+   shProg->LinkStatus = GL_FALSE;
+d831 4
+d836 14
+d851 13
+a863 40
+/**
+ * Shader linker.  Currently:
+ *
+ * 1. The last attached vertex shader and fragment shader are linked.
+ * 2. Varying vars in the two shaders are combined so their locations
+ *    agree between the vertex and fragment stages.  They're treated as
+ *    vertex program output attribs and as fragment program input attribs.
+ * 3. Uniform vars (including state references, constants, etc) from the
+ *    vertex and fragment shaders are merged into one group.  Recall that
+ *    GLSL uniforms are shared by all linked shaders.
+ * 4. The vertex and fragment programs are cloned and modified to update
+ *    src/dst register references so they use the new, linked uniform/
+ *    varying storage locations.
+ */
+void
+_slang_link(GLcontext *ctx,
+            GLhandleARB programObj,
+            struct gl_shader_program *shProg)
+{
+   const struct gl_vertex_program *vertProg;
+   const struct gl_fragment_program *fragProg;
+   GLuint i;
+
+   _mesa_clear_shader_program_data(ctx, shProg);
+
+   shProg->Uniforms = _mesa_new_parameter_list();
+   shProg->Varying = _mesa_new_parameter_list();
+
+   /**
+    * Find attached vertex shader, fragment shader
+    */
+   vertProg = NULL;
+   fragProg = NULL;
+   for (i = 0; i < shProg->NumShaders; i++) {
+      if (shProg->Shaders[i]->Type == GL_VERTEX_SHADER)
+         vertProg = vertex_program(shProg->Shaders[i]->Programs[0]);
+      else if (shProg->Shaders[i]->Type == GL_FRAGMENT_SHADER)
+         fragProg = fragment_program(shProg->Shaders[i]->Programs[0]);
+      else
+         _mesa_problem(ctx, "unexpected shader target in slang_link()");
+d866 4
+a869 114
+   /*
+    * Make copies of the vertex/fragment programs now since we'll be
+    * changing src/dst registers after merging the uniforms and varying vars.
+    */
+   if (vertProg) {
+      shProg->VertexProgram
+         = vertex_program(_mesa_clone_program(ctx, &vertProg->Base));
+   }
+   else {
+      shProg->VertexProgram = NULL;
+   }
+
+   if (fragProg) {
+      shProg->FragmentProgram
+         = fragment_program(_mesa_clone_program(ctx, &fragProg->Base));
+   }
+   else {
+      shProg->FragmentProgram = NULL;
+   }
+
+   if (shProg->VertexProgram)
+      link_varying_vars(shProg, &shProg->VertexProgram->Base);
+   if (shProg->FragmentProgram)
+      link_varying_vars(shProg, &shProg->FragmentProgram->Base);
+
+   if (shProg->VertexProgram)
+      link_uniform_vars(shProg, &shProg->VertexProgram->Base);
+   if (shProg->FragmentProgram)
+      link_uniform_vars(shProg, &shProg->FragmentProgram->Base);
+
+   /* The vertex and fragment programs share a common set of uniforms now */
+   if (shProg->VertexProgram) {
+      _mesa_free_parameter_list(shProg->VertexProgram->Base.Parameters);
+      shProg->VertexProgram->Base.Parameters = shProg->Uniforms;
+   }
+   if (shProg->FragmentProgram) {
+      _mesa_free_parameter_list(shProg->FragmentProgram->Base.Parameters);
+      shProg->FragmentProgram->Base.Parameters = shProg->Uniforms;
+   }
+
+   if (shProg->VertexProgram) {
+      _slang_resolve_samplers(shProg, &shProg->VertexProgram->Base);
+   }
+   if (shProg->FragmentProgram) {
+      _slang_resolve_samplers(shProg, &shProg->FragmentProgram->Base);
+   }
+
+   if (shProg->VertexProgram) {
+      if (!_slang_resolve_attributes(shProg, &shProg->VertexProgram->Base)) {
+         /*goto cleanup;*/
+         _mesa_problem(ctx, "_slang_resolve_attributes() failed");
+         return;
+      }
+   }
+
+   if (shProg->VertexProgram) {
+      _slang_update_inputs_outputs(&shProg->VertexProgram->Base);
+      if (!(shProg->VertexProgram->Base.OutputsWritten & (1 << VERT_RESULT_HPOS))) {
+         /* the vertex program did not compute a vertex position */
+         link_error(shProg,
+                    "gl_Position was not written by vertex shader\n");
+         return;
+      }
+   }
+   if (shProg->FragmentProgram)
+      _slang_update_inputs_outputs(&shProg->FragmentProgram->Base);
+
+   /* Check that all the varying vars needed by the fragment shader are
+    * actually produced by the vertex shader.
+    */
+   if (shProg->FragmentProgram) {
+      const GLbitfield varyingRead
+         = shProg->FragmentProgram->Base.InputsRead >> FRAG_ATTRIB_VAR0;
+      const GLbitfield varyingWritten = shProg->VertexProgram ?
+         shProg->VertexProgram->Base.OutputsWritten >> VERT_RESULT_VAR0 : 0x0;
+      if ((varyingRead & varyingWritten) != varyingRead) {
+         link_error(shProg,
+          "Fragment program using varying vars not written by vertex shader\n");
+         return;
+      }         
+   }
+
+
+   if (fragProg && shProg->FragmentProgram) {
+      /* notify driver that a new fragment program has been compiled/linked */
+      ctx->Driver.ProgramStringNotify(ctx, GL_FRAGMENT_PROGRAM_ARB,
+                                      &shProg->FragmentProgram->Base);
+#if 0
+      printf("************** original fragment program\n");
+      _mesa_print_program(&fragProg->Base);
+      _mesa_print_program_parameters(ctx, &fragProg->Base);
+#endif
+#if 0
+      printf("************** linked fragment prog\n");
+      _mesa_print_program(&shProg->FragmentProgram->Base);
+      _mesa_print_program_parameters(ctx, &shProg->FragmentProgram->Base);
+#endif
+   }
+
+   if (vertProg && shProg->VertexProgram) {
+      /* notify driver that a new vertex program has been compiled/linked */
+      ctx->Driver.ProgramStringNotify(ctx, GL_VERTEX_PROGRAM_ARB,
+                                      &shProg->VertexProgram->Base);
+#if 0
+      printf("************** original vertex program\n");
+      _mesa_print_program(&vertProg->Base);
+      _mesa_print_program_parameters(ctx, &vertProg->Base);
+#endif
+#if 0
+      printf("************** linked vertex prog\n");
+      _mesa_print_program(&shProg->VertexProgram->Base);
+      _mesa_print_program_parameters(ctx, &shProg->VertexProgram->Base);
+#endif
+   }
+d871 1
+a871 1
+   shProg->LinkStatus = (shProg->VertexProgram || shProg->FragmentProgram);
+@
+
+

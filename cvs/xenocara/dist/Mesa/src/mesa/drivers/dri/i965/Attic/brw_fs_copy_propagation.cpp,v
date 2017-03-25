@@ -1,0 +1,1431 @@
+head	1.2;
+access;
+symbols
+	OPENBSD_5_8:1.1.1.5.0.4
+	OPENBSD_5_8_BASE:1.1.1.5
+	OPENBSD_5_7:1.1.1.5.0.2
+	OPENBSD_5_7_BASE:1.1.1.5
+	v10_2_9:1.1.1.5
+	v10_4_3:1.1.1.4
+	v10_2_7:1.1.1.3
+	OPENBSD_5_6:1.1.1.2.0.2
+	OPENBSD_5_6_BASE:1.1.1.2
+	v10_2_3:1.1.1.2
+	OPENBSD_5_5:1.1.1.1.0.2
+	OPENBSD_5_5_BASE:1.1.1.1
+	v9_2_5:1.1.1.1
+	v9_2_3:1.1.1.1
+	v9_2_2:1.1.1.1
+	v9_2_1:1.1.1.1
+	v9_2_0:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@// @;
+expand	@o@;
+
+
+1.2
+date	2015.12.23.05.17.49;	author jsg;	state dead;
+branches;
+next	1.1;
+commitid	TnlogFl9nOv2eaRf;
+
+1.1
+date	2013.09.05.13.15.33;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2013.09.05.13.15.33;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2014.07.09.20.34.50;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	3JhLfwcuBALP0ZR7;
+
+1.1.1.3
+date	2014.09.07.15.06.06;	author jsg;	state Exp;
+branches;
+next	1.1.1.4;
+commitid	dm8VnQHhowGHmemJ;
+
+1.1.1.4
+date	2015.01.25.14.11.37;	author jsg;	state Exp;
+branches;
+next	1.1.1.5;
+commitid	ce2W5rH5aF7VS9gi;
+
+1.1.1.5
+date	2015.02.20.22.48.43;	author jsg;	state Exp;
+branches;
+next	;
+commitid	F54a1i0WXHMxq7kE;
+
+
+desc
+@@
+
+
+1.2
+log
+@remove the now unused Mesa 10.2.9 code
+@
+text
+@/*
+ * Copyright © 2012 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+/** @@file brw_fs_copy_propagation.cpp
+ *
+ * Support for global copy propagation in two passes: A local pass that does
+ * intra-block copy (and constant) propagation, and a global pass that uses
+ * dataflow analysis on the copies available at the end of each block to re-do
+ * local copy propagation with more copies available.
+ *
+ * See Muchnik's Advanced Compiler Design and Implementation, section
+ * 12.5 (p356).
+ */
+
+#define ACP_HASH_SIZE 16
+
+#include "main/bitset.h"
+#include "brw_fs.h"
+#include "brw_cfg.h"
+
+namespace { /* avoid conflict with opt_copy_propagation_elements */
+struct acp_entry : public exec_node {
+   fs_reg dst;
+   fs_reg src;
+};
+
+struct block_data {
+   /**
+    * Which entries in the fs_copy_prop_dataflow acp table are live at the
+    * start of this block.  This is the useful output of the analysis, since
+    * it lets us plug those into the local copy propagation on the second
+    * pass.
+    */
+   BITSET_WORD *livein;
+
+   /**
+    * Which entries in the fs_copy_prop_dataflow acp table are live at the end
+    * of this block.  This is done in initial setup from the per-block acps
+    * returned by the first local copy prop pass.
+    */
+   BITSET_WORD *liveout;
+
+   /**
+    * Which entries in the fs_copy_prop_dataflow acp table are killed over the
+    * course of this block.
+    */
+   BITSET_WORD *kill;
+};
+
+class fs_copy_prop_dataflow
+{
+public:
+   fs_copy_prop_dataflow(void *mem_ctx, cfg_t *cfg,
+                         exec_list *out_acp[ACP_HASH_SIZE]);
+
+   void setup_kills();
+   void run();
+
+   void *mem_ctx;
+   cfg_t *cfg;
+
+   acp_entry **acp;
+   int num_acp;
+   int bitset_words;
+
+  struct block_data *bd;
+};
+} /* anonymous namespace */
+
+fs_copy_prop_dataflow::fs_copy_prop_dataflow(void *mem_ctx, cfg_t *cfg,
+                                             exec_list *out_acp[ACP_HASH_SIZE])
+   : mem_ctx(mem_ctx), cfg(cfg)
+{
+   bd = rzalloc_array(mem_ctx, struct block_data, cfg->num_blocks);
+
+   num_acp = 0;
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      for (int i = 0; i < ACP_HASH_SIZE; i++) {
+         foreach_list(entry_node, &out_acp[b][i]) {
+            num_acp++;
+         }
+      }
+   }
+
+   acp = rzalloc_array(mem_ctx, struct acp_entry *, num_acp);
+
+   bitset_words = BITSET_WORDS(num_acp);
+
+   int next_acp = 0;
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bd[b].livein = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[b].liveout = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[b].kill = rzalloc_array(bd, BITSET_WORD, bitset_words);
+
+      for (int i = 0; i < ACP_HASH_SIZE; i++) {
+         foreach_list(entry_node, &out_acp[b][i]) {
+            acp_entry *entry = (acp_entry *)entry_node;
+
+            acp[next_acp] = entry;
+            BITSET_SET(bd[b].liveout, next_acp);
+            next_acp++;
+         }
+      }
+   }
+
+   assert(next_acp == num_acp);
+
+   setup_kills();
+   run();
+}
+
+/**
+ * Walk the set of instructions in the block, marking which entries in the acp
+ * are killed by the block.
+ */
+void
+fs_copy_prop_dataflow::setup_kills()
+{
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bblock_t *block = cfg->blocks[b];
+
+      for (fs_inst *inst = (fs_inst *)block->start;
+           inst != block->end->next;
+           inst = (fs_inst *)inst->next) {
+         if (inst->dst.file != GRF)
+            continue;
+
+         for (int i = 0; i < num_acp; i++) {
+            if (inst->overwrites_reg(acp[i]->dst) ||
+                inst->overwrites_reg(acp[i]->src)) {
+               BITSET_SET(bd[b].kill, i);
+            }
+         }
+      }
+   }
+}
+
+/**
+ * Walk the set of instructions in the block, marking which entries in the acp
+ * are killed by the block.
+ */
+void
+fs_copy_prop_dataflow::run()
+{
+   bool cont = true;
+
+   while (cont) {
+      cont = false;
+
+      for (int b = 0; b < cfg->num_blocks; b++) {
+         for (int i = 0; i < bitset_words; i++) {
+            BITSET_WORD new_liveout = (bd[b].livein[i] &
+                                       ~bd[b].kill[i] &
+                                       ~bd[b].liveout[i]);
+            if (new_liveout) {
+               bd[b].liveout[i] |= new_liveout;
+               cont = true;
+            }
+
+            /* Update livein: if it's live at the end of all parents, it's
+             * live at our start.
+             */
+            BITSET_WORD new_livein = ~bd[b].livein[i];
+            foreach_list(block_node, &cfg->blocks[b]->parents) {
+               bblock_link *link = (bblock_link *)block_node;
+               bblock_t *block = link->block;
+               new_livein &= bd[block->block_num].liveout[i];
+               if (!new_livein)
+                  break;
+            }
+            if (new_livein) {
+               bd[b].livein[i] |= new_livein;
+               cont = true;
+            }
+         }
+      }
+   }
+}
+
+bool
+fs_visitor::try_copy_propagate(fs_inst *inst, int arg, acp_entry *entry)
+{
+   if (entry->src.file == IMM)
+      return false;
+
+   if (inst->src[arg].file != entry->dst.file ||
+       inst->src[arg].reg != entry->dst.reg ||
+       inst->src[arg].reg_offset != entry->dst.reg_offset) {
+      return false;
+   }
+
+   /* See resolve_ud_negate() and comment in brw_fs_emit.cpp. */
+   if (inst->conditional_mod &&
+       inst->src[arg].type == BRW_REGISTER_TYPE_UD &&
+       entry->src.negate)
+      return false;
+
+   bool has_source_modifiers = entry->src.abs || entry->src.negate;
+
+   if ((has_source_modifiers || entry->src.file == UNIFORM ||
+        entry->src.smear != -1) && !can_do_source_mods(inst))
+      return false;
+
+   if (has_source_modifiers && entry->dst.type != inst->src[arg].type)
+      return false;
+
+   inst->src[arg].file = entry->src.file;
+   inst->src[arg].reg = entry->src.reg;
+   inst->src[arg].reg_offset = entry->src.reg_offset;
+   if (entry->src.smear != -1)
+      inst->src[arg].smear = entry->src.smear;
+
+   if (!inst->src[arg].abs) {
+      inst->src[arg].abs = entry->src.abs;
+      inst->src[arg].negate ^= entry->src.negate;
+   }
+
+   return true;
+}
+
+
+bool
+fs_visitor::try_constant_propagate(fs_inst *inst, acp_entry *entry)
+{
+   bool progress = false;
+
+   if (entry->src.file != IMM)
+      return false;
+
+   for (int i = 2; i >= 0; i--) {
+      if (inst->src[i].file != entry->dst.file ||
+          inst->src[i].reg != entry->dst.reg ||
+          inst->src[i].reg_offset != entry->dst.reg_offset)
+         continue;
+
+      /* Don't bother with cases that should have been taken care of by the
+       * GLSL compiler's constant folding pass.
+       */
+      if (inst->src[i].negate || inst->src[i].abs)
+         continue;
+
+      switch (inst->opcode) {
+      case BRW_OPCODE_MOV:
+         inst->src[i] = entry->src;
+         progress = true;
+         break;
+
+      case BRW_OPCODE_MACH:
+      case BRW_OPCODE_MUL:
+      case BRW_OPCODE_ADD:
+         if (i == 1) {
+            inst->src[i] = entry->src;
+            progress = true;
+         } else if (i == 0 && inst->src[1].file != IMM) {
+            /* Fit this constant in by commuting the operands.
+             * Exception: we can't do this for 32-bit integer MUL/MACH
+             * because it's asymmetric.
+             */
+            if ((inst->opcode == BRW_OPCODE_MUL ||
+                 inst->opcode == BRW_OPCODE_MACH) &&
+                (inst->src[1].type == BRW_REGISTER_TYPE_D ||
+                 inst->src[1].type == BRW_REGISTER_TYPE_UD))
+               break;
+            inst->src[0] = inst->src[1];
+            inst->src[1] = entry->src;
+            progress = true;
+         }
+         break;
+
+      case BRW_OPCODE_CMP:
+      case BRW_OPCODE_IF:
+         if (i == 1) {
+            inst->src[i] = entry->src;
+            progress = true;
+         } else if (i == 0 && inst->src[1].file != IMM) {
+            uint32_t new_cmod;
+
+            new_cmod = brw_swap_cmod(inst->conditional_mod);
+            if (new_cmod != ~0u) {
+               /* Fit this constant in by swapping the operands and
+                * flipping the test
+                */
+               inst->src[0] = inst->src[1];
+               inst->src[1] = entry->src;
+               inst->conditional_mod = new_cmod;
+               progress = true;
+            }
+         }
+         break;
+
+      case BRW_OPCODE_SEL:
+         if (i == 1) {
+            inst->src[i] = entry->src;
+            progress = true;
+         } else if (i == 0 && inst->src[1].file != IMM) {
+            inst->src[0] = inst->src[1];
+            inst->src[1] = entry->src;
+
+            /* If this was predicated, flipping operands means
+             * we also need to flip the predicate.
+             */
+            if (inst->conditional_mod == BRW_CONDITIONAL_NONE) {
+               inst->predicate_inverse =
+                  !inst->predicate_inverse;
+            }
+            progress = true;
+         }
+         break;
+
+      case SHADER_OPCODE_RCP:
+         /* The hardware doesn't do math on immediate values
+          * (because why are you doing that, seriously?), but
+          * the correct answer is to just constant fold it
+          * anyway.
+          */
+         assert(i == 0);
+         if (inst->src[0].imm.f != 0.0f) {
+            inst->opcode = BRW_OPCODE_MOV;
+            inst->src[0] = entry->src;
+            inst->src[0].imm.f = 1.0f / inst->src[0].imm.f;
+            progress = true;
+         }
+         break;
+
+      case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD:
+         inst->src[i] = entry->src;
+         progress = true;
+         break;
+
+      default:
+         break;
+      }
+   }
+
+   return progress;
+}
+/* Walks a basic block and does copy propagation on it using the acp
+ * list.
+ */
+bool
+fs_visitor::opt_copy_propagate_local(void *mem_ctx, bblock_t *block,
+                                     exec_list *acp)
+{
+   bool progress = false;
+
+   for (fs_inst *inst = (fs_inst *)block->start;
+	inst != block->end->next;
+	inst = (fs_inst *)inst->next) {
+
+      /* Try propagating into this instruction. */
+      for (int i = 0; i < 3; i++) {
+         if (inst->src[i].file != GRF)
+            continue;
+
+         foreach_list(entry_node, &acp[inst->src[i].reg % ACP_HASH_SIZE]) {
+            acp_entry *entry = (acp_entry *)entry_node;
+
+            if (try_constant_propagate(inst, entry))
+               progress = true;
+
+            if (try_copy_propagate(inst, i, entry))
+               progress = true;
+         }
+      }
+
+      /* kill the destination from the ACP */
+      if (inst->dst.file == GRF) {
+	 foreach_list_safe(entry_node, &acp[inst->dst.reg % ACP_HASH_SIZE]) {
+	    acp_entry *entry = (acp_entry *)entry_node;
+
+	    if (inst->overwrites_reg(entry->dst)) {
+	       entry->remove();
+	    }
+	 }
+
+         /* Oops, we only have the chaining hash based on the destination, not
+          * the source, so walk across the entire table.
+          */
+         for (int i = 0; i < ACP_HASH_SIZE; i++) {
+            foreach_list_safe(entry_node, &acp[i]) {
+               acp_entry *entry = (acp_entry *)entry_node;
+               if (inst->overwrites_reg(entry->src))
+                  entry->remove();
+            }
+	 }
+      }
+
+      /* If this instruction's source could potentially be folded into the
+       * operand of another instruction, add it to the ACP.
+       */
+      if (inst->opcode == BRW_OPCODE_MOV &&
+	  inst->dst.file == GRF &&
+	  ((inst->src[0].file == GRF &&
+	    (inst->src[0].reg != inst->dst.reg ||
+	     inst->src[0].reg_offset != inst->dst.reg_offset)) ||
+           inst->src[0].file == UNIFORM ||
+           inst->src[0].file == IMM) &&
+	  inst->src[0].type == inst->dst.type &&
+	  !inst->saturate &&
+	  !inst->is_partial_write()) {
+	 acp_entry *entry = ralloc(mem_ctx, acp_entry);
+	 entry->dst = inst->dst;
+	 entry->src = inst->src[0];
+	 acp[entry->dst.reg % ACP_HASH_SIZE].push_tail(entry);
+      }
+   }
+
+   return progress;
+}
+
+bool
+fs_visitor::opt_copy_propagate()
+{
+   bool progress = false;
+   void *mem_ctx = ralloc_context(this->mem_ctx);
+   cfg_t cfg(this);
+   exec_list *out_acp[cfg.num_blocks];
+   for (int i = 0; i < cfg.num_blocks; i++)
+      out_acp[i] = new exec_list [ACP_HASH_SIZE];
+
+   /* First, walk through each block doing local copy propagation and getting
+    * the set of copies available at the end of the block.
+    */
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+
+      progress = opt_copy_propagate_local(mem_ctx, block,
+                                          out_acp[b]) || progress;
+   }
+
+   /* Do dataflow analysis for those available copies. */
+   fs_copy_prop_dataflow dataflow(mem_ctx, &cfg, out_acp);
+
+   /* Next, re-run local copy propagation, this time with the set of copies
+    * provided by the dataflow analysis available at the start of a block.
+    */
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+      exec_list in_acp[ACP_HASH_SIZE];
+
+      for (int i = 0; i < dataflow.num_acp; i++) {
+         if (BITSET_TEST(dataflow.bd[b].livein, i)) {
+            struct acp_entry *entry = dataflow.acp[i];
+            in_acp[entry->dst.reg % ACP_HASH_SIZE].push_tail(entry);
+         }
+      }
+
+      progress = opt_copy_propagate_local(mem_ctx, block, in_acp) || progress;
+   }
+
+   for (int i = 0; i < cfg.num_blocks; i++)
+      delete [] out_acp[i];
+   ralloc_free(mem_ctx);
+
+   if (progress)
+      live_intervals_valid = false;
+
+   return progress;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Import Mesa 9.2.0
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 10.2.3
+@
+text
+@d31 1
+a31 1
+ * See Muchnick's Advanced Compiler Design and Implementation, section
+a63 7
+    * Which entries in the fs_copy_prop_dataflow acp table are generated by
+    * instructions in this block which reach the end of the block without
+    * being killed.
+    */
+   BITSET_WORD *copy;
+
+   /**
+d76 1
+a76 1
+   void setup_initial_values();
+a78 2
+   void dump_block_data() const;
+
+a112 1
+      bd[b].copy = rzalloc_array(bd, BITSET_WORD, bitset_words);
+d120 1
+a120 7
+
+            /* opt_copy_propagate_local populates out_acp with copies created
+             * in a block which are still live at the end of the block.  This
+             * is exactly what we want in the COPY set.
+             */
+            BITSET_SET(bd[b].copy, next_acp);
+
+d128 1
+a128 1
+   setup_initial_values();
+d133 2
+a134 2
+ * Set up initial values for each of the data flow sets, prior to running
+ * the fixed-point algorithm.
+d137 1
+a137 1
+fs_copy_prop_dataflow::setup_initial_values()
+a138 1
+   /* Initialize the COPY and KILL sets. */
+a147 1
+         /* Mark ACP entries which are killed by this instruction. */
+a155 20
+
+   /* Populate the initial values for the livein and liveout sets.  For the
+    * block at the start of the program, livein = 0 and liveout = copy.
+    * For the others, set liveout to 0 (the empty set) and livein to ~0
+    * (the universal set).
+    */
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bblock_t *block = cfg->blocks[b];
+      if (block->parents.is_empty()) {
+         for (int i = 0; i < bitset_words; i++) {
+            bd[b].livein[i] = 0u;
+            bd[b].liveout[i] = bd[b].copy[i];
+         }
+      } else {
+         for (int i = 0; i < bitset_words; i++) {
+            bd[b].liveout[i] = 0u;
+            bd[b].livein[i] = ~0u;
+         }
+      }
+   }
+d165 1
+a165 1
+   bool progress;
+d167 2
+a168 2
+   do {
+      progress = false;
+a169 1
+      /* Update liveout for all blocks. */
+a170 3
+         if (cfg->blocks[b]->parents.is_empty())
+            continue;
+
+d172 7
+a178 1
+            const BITSET_WORD old_liveout = bd[b].liveout[i];
+d180 4
+a183 19
+            bd[b].liveout[i] =
+               bd[b].copy[i] | (bd[b].livein[i] & ~bd[b].kill[i]);
+
+            if (old_liveout != bd[b].liveout[i])
+               progress = true;
+         }
+      }
+
+      /* Update livein for all blocks.  If a copy is live out of all parent
+       * blocks, it's live coming in to this block.
+       */
+      for (int b = 0; b < cfg->num_blocks; b++) {
+         if (cfg->blocks[b]->parents.is_empty())
+            continue;
+
+         for (int i = 0; i < bitset_words; i++) {
+            const BITSET_WORD old_livein = bd[b].livein[i];
+
+            bd[b].livein[i] = ~0u;
+d187 7
+a193 1
+               bd[b].livein[i] &= bd[block->block_num].liveout[i];
+a194 3
+
+            if (old_livein != bd[b].livein[i])
+               progress = true;
+a196 28
+   } while (progress);
+}
+
+void
+fs_copy_prop_dataflow::dump_block_data() const
+{
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bblock_t *block = cfg->blocks[b];
+      fprintf(stderr, "Block %d [%d, %d] (parents ", block->block_num,
+             block->start_ip, block->end_ip);
+      foreach_list(block_node, &block->parents) {
+         bblock_t *parent = ((bblock_link *) block_node)->block;
+         fprintf(stderr, "%d ", parent->block_num);
+      }
+      fprintf(stderr, "):\n");
+      fprintf(stderr, "       livein = 0x");
+      for (int i = 0; i < bitset_words; i++)
+         fprintf(stderr, "%08x", bd[b].livein[i]);
+      fprintf(stderr, ", liveout = 0x");
+      for (int i = 0; i < bitset_words; i++)
+         fprintf(stderr, "%08x", bd[b].liveout[i]);
+      fprintf(stderr, ",\n       copy   = 0x");
+      for (int i = 0; i < bitset_words; i++)
+         fprintf(stderr, "%08x", bd[b].copy[i]);
+      fprintf(stderr, ", kill    = 0x");
+      for (int i = 0; i < bitset_words; i++)
+         fprintf(stderr, "%08x", bd[b].kill[i]);
+      fprintf(stderr, "\n");
+a205 5
+   /* Bail if inst is reading more than entry is writing. */
+   if ((inst->regs_read(this, arg) * inst->src[arg].stride *
+        type_sz(inst->src[arg].type)) > type_sz(entry->dst.type))
+      return false;
+
+d208 1
+a208 2
+       inst->src[arg].reg_offset != entry->dst.reg_offset ||
+       inst->src[arg].subreg_offset != entry->dst.subreg_offset) {
+d221 1
+a221 26
+        !entry->src.is_contiguous()) &&
+       !can_do_source_mods(inst))
+      return false;
+
+   /* Bail if the result of composing both strides would exceed the
+    * hardware limit.
+    */
+   if (entry->src.stride * inst->src[arg].stride > 4)
+      return false;
+
+   /* Bail if the result of composing both strides cannot be expressed
+    * as another stride. This avoids, for example, trying to transform
+    * this:
+    *
+    *     MOV (8) rX<1>UD rY<0;1,0>UD
+    *     FOO (8) ...     rX<8;8,1>UW
+    *
+    * into this:
+    *
+    *     FOO (8) ...     rY<0;1,0>UW
+    *
+    * Which would have different semantics.
+    */
+   if (entry->src.stride != 1 &&
+       (inst->src[arg].stride *
+        type_sz(inst->src[arg].type)) % type_sz(entry->src.type) != 0)
+d230 2
+a231 2
+   inst->src[arg].subreg_offset = entry->src.subreg_offset;
+   inst->src[arg].stride *= entry->src.stride;
+d253 1
+a253 4
+          inst->src[i].reg_offset != entry->dst.reg_offset ||
+          inst->src[i].subreg_offset != entry->dst.subreg_offset ||
+          inst->src[i].type != entry->dst.type ||
+          inst->src[i].stride > 1)
+a267 11
+      case BRW_OPCODE_BFI1:
+      case BRW_OPCODE_ASR:
+      case BRW_OPCODE_SHL:
+      case BRW_OPCODE_SHR:
+      case BRW_OPCODE_SUBB:
+         if (i == 1) {
+            inst->src[i] = entry->src;
+            progress = true;
+         }
+         break;
+
+a270 4
+      case BRW_OPCODE_OR:
+      case BRW_OPCODE_AND:
+      case BRW_OPCODE_XOR:
+      case BRW_OPCODE_ADDC:
+d361 1
+a361 1
+fs_visitor::opt_copy_propagate_local(void *copy_prop_ctx, bblock_t *block,
+d421 1
+a421 1
+	 acp_entry *entry = ralloc(copy_prop_ctx, acp_entry);
+d435 2
+a436 2
+   void *copy_prop_ctx = ralloc_context(NULL);
+   cfg_t cfg(&instructions);
+d447 1
+a447 1
+      progress = opt_copy_propagate_local(copy_prop_ctx, block,
+d452 1
+a452 1
+   fs_copy_prop_dataflow dataflow(copy_prop_ctx, &cfg, out_acp);
+d468 1
+a468 1
+      progress = opt_copy_propagate_local(copy_prop_ctx, block, in_acp) || progress;
+d473 1
+a473 1
+   ralloc_free(copy_prop_ctx);
+d476 1
+a476 1
+      invalidate_live_intervals();
+@
+
+
+1.1.1.3
+log
+@Import Mesa 10.2.7
+@
+text
+@a275 9
+static bool
+is_logic_op(enum opcode opcode)
+{
+   return (opcode == BRW_OPCODE_AND ||
+           opcode == BRW_OPCODE_OR  ||
+           opcode == BRW_OPCODE_XOR ||
+           opcode == BRW_OPCODE_NOT);
+}
+
+a333 5
+   if (brw->gen >= 8 && (entry->src.negate || entry->src.abs) &&
+       is_logic_op(inst->opcode)) {
+      return false;
+   }
+
+d349 2
+a350 3
+static bool
+try_constant_propagate(struct brw_context *brw, fs_inst *inst,
+                       acp_entry *entry)
+a377 6
+      case SHADER_OPCODE_POW:
+      case SHADER_OPCODE_INT_QUOTIENT:
+      case SHADER_OPCODE_INT_REMAINDER:
+         if (brw->gen < 8)
+            break;
+         /* fallthrough */
+a481 16
+
+static bool
+can_propagate_from(fs_inst *inst)
+{
+   return (inst->opcode == BRW_OPCODE_MOV &&
+           inst->dst.file == GRF &&
+           ((inst->src[0].file == GRF &&
+             (inst->src[0].reg != inst->dst.reg ||
+              inst->src[0].reg_offset != inst->dst.reg_offset)) ||
+            inst->src[0].file == UNIFORM ||
+            inst->src[0].file == IMM) &&
+           inst->src[0].type == inst->dst.type &&
+           !inst->saturate &&
+           !inst->is_partial_write());
+}
+
+d503 1
+a503 1
+            if (try_constant_propagate(brw, inst, entry))
+d536 10
+a545 1
+      if (can_propagate_from(inst)) {
+@
+
+
+1.1.1.4
+log
+@Import Mesa 10.4.3
+@
+text
+@a44 3
+   uint8_t regs_written;
+   enum opcode opcode;
+   bool saturate;
+d106 1
+a106 1
+   foreach_block (block, cfg) {
+d108 3
+a110 1
+         num_acp += out_acp[block->num][i].length();
+d119 5
+a123 5
+   foreach_block (block, cfg) {
+      bd[block->num].livein = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[block->num].liveout = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[block->num].copy = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[block->num].kill = rzalloc_array(bd, BITSET_WORD, bitset_words);
+d126 3
+a128 1
+         foreach_in_list(acp_entry, entry, &out_acp[block->num][i]) {
+d135 1
+a135 1
+            BITSET_SET(bd[block->num].copy, next_acp);
+d156 6
+a161 2
+   foreach_block (block, cfg) {
+      foreach_inst_in_block(fs_inst, inst, block) {
+d169 1
+a169 1
+               BITSET_SET(bd[block->num].kill, i);
+d180 2
+a181 1
+   foreach_block (block, cfg) {
+d184 2
+a185 2
+            bd[block->num].livein[i] = 0u;
+            bd[block->num].liveout[i] = bd[block->num].copy[i];
+d189 2
+a190 2
+            bd[block->num].liveout[i] = 0u;
+            bd[block->num].livein[i] = ~0u;
+d209 2
+a210 2
+      foreach_block (block, cfg) {
+         if (block->parents.is_empty())
+d214 1
+a214 1
+            const BITSET_WORD old_liveout = bd[block->num].liveout[i];
+d216 2
+a217 3
+            bd[block->num].liveout[i] =
+               bd[block->num].copy[i] | (bd[block->num].livein[i] &
+                                         ~bd[block->num].kill[i]);
+d219 1
+a219 1
+            if (old_liveout != bd[block->num].liveout[i])
+d227 2
+a228 2
+      foreach_block (block, cfg) {
+         if (block->parents.is_empty())
+d232 1
+a232 1
+            const BITSET_WORD old_livein = bd[block->num].livein[i];
+d234 5
+a238 4
+            bd[block->num].livein[i] = ~0u;
+            foreach_list_typed(bblock_link, parent_link, link, &block->parents) {
+               bblock_t *parent = parent_link->block;
+               bd[block->num].livein[i] &= bd[parent->num].liveout[i];
+d241 1
+a241 1
+            if (old_livein != bd[block->num].livein[i])
+d251 3
+a253 2
+   foreach_block (block, cfg) {
+      fprintf(stderr, "Block %d [%d, %d] (parents ", block->num,
+d255 3
+a257 3
+      foreach_list_typed(bblock_link, link, link, &block->parents) {
+         bblock_t *parent = link->block;
+         fprintf(stderr, "%d ", parent->num);
+d262 1
+a262 1
+         fprintf(stderr, "%08x", bd[block->num].livein[i]);
+d265 1
+a265 1
+         fprintf(stderr, "%08x", bd[block->num].liveout[i]);
+d268 1
+a268 1
+         fprintf(stderr, "%08x", bd[block->num].copy[i]);
+d271 1
+a271 1
+         fprintf(stderr, "%08x", bd[block->num].kill[i]);
+a287 3
+   if (inst->src[arg].file != GRF)
+      return false;
+
+a289 1
+   assert(entry->src.file == GRF || entry->src.file == UNIFORM);
+d291 3
+a293 2
+   if (entry->opcode == SHADER_OPCODE_LOAD_PAYLOAD &&
+       inst->opcode == SHADER_OPCODE_LOAD_PAYLOAD)
+d296 4
+a299 11
+   assert(entry->dst.file == GRF);
+   if (inst->src[arg].reg != entry->dst.reg)
+      return false;
+
+   /* Bail if inst is reading a range that isn't contained in the range
+    * that entry is writing.
+    */
+   if (inst->src[arg].reg_offset < entry->dst.reg_offset ||
+       (inst->src[arg].reg_offset * 32 + inst->src[arg].subreg_offset +
+        inst->regs_read(this, arg) * inst->src[arg].stride * 32) >
+       (entry->dst.reg_offset + entry->regs_written) * 32)
+d301 1
+d313 1
+a313 5
+       !inst->can_do_source_mods(brw))
+      return false;
+
+   if (has_source_modifiers &&
+       inst->opcode == SHADER_OPCODE_GEN4_SCRATCH_WRITE)
+a347 14
+   if (entry->saturate) {
+      switch(inst->opcode) {
+      case BRW_OPCODE_SEL:
+         if (inst->src[1].file != IMM ||
+             inst->src[1].fixed_hw_reg.dw1.f < 0.0 ||
+             inst->src[1].fixed_hw_reg.dw1.f > 1.0) {
+            return false;
+         }
+         break;
+      default:
+         return false;
+      }
+   }
+
+d350 2
+a352 40
+   inst->saturate = inst->saturate || entry->saturate;
+
+   switch (entry->src.file) {
+   case UNIFORM:
+      assert(entry->src.width == 1);
+   case BAD_FILE:
+   case HW_REG:
+      inst->src[arg].width = entry->src.width;
+      inst->src[arg].reg_offset = entry->src.reg_offset;
+      inst->src[arg].subreg_offset = entry->src.subreg_offset;
+      break;
+   case GRF:
+      {
+         assert(entry->src.width % inst->src[arg].width == 0);
+         /* In this case, we'll just leave the width alone.  The source
+          * register could have different widths depending on how it is
+          * being used.  For instance, if only half of the register was
+          * used then we want to preserve that and continue to only use
+          * half.
+          *
+          * Also, we have to deal with mapping parts of vgrfs to other
+          * parts of vgrfs so we have to do some reg_offset magic.
+          */
+
+         /* Compute the offset of inst->src[arg] relative to inst->dst */
+         assert(entry->dst.subreg_offset == 0);
+         int rel_offset = inst->src[arg].reg_offset - entry->dst.reg_offset;
+         int rel_suboffset = inst->src[arg].subreg_offset;
+
+         /* Compute the final register offset (in bytes) */
+         int offset = entry->src.reg_offset * 32 + entry->src.subreg_offset;
+         offset += rel_offset * 32 + rel_suboffset;
+         inst->src[arg].reg_offset = offset / 32;
+         inst->src[arg].subreg_offset = offset % 32;
+      }
+      break;
+   default:
+      unreachable("Invalid register file");
+      break;
+   }
+d363 3
+a365 2
+bool
+fs_visitor::try_constant_propagate(fs_inst *inst, acp_entry *entry)
+d372 7
+a378 16
+   for (int i = inst->sources - 1; i >= 0; i--) {
+      if (inst->src[i].file != GRF)
+         continue;
+
+      assert(entry->dst.file == GRF);
+      if (inst->src[i].reg != entry->dst.reg ||
+          inst->src[i].type != entry->dst.type)
+         continue;
+
+      /* Bail if inst is reading a range that isn't contained in the range
+       * that entry is writing.
+       */
+      if (inst->src[i].reg_offset < entry->dst.reg_offset ||
+          (inst->src[i].reg_offset * 32 + inst->src[i].subreg_offset +
+           inst->regs_read(this, i) * inst->src[i].stride * 32) >
+          (entry->dst.reg_offset + entry->regs_written) * 32)
+a386 3
+      fs_reg val = entry->src;
+      val.effective_width = inst->src[i].effective_width;
+
+d389 1
+a389 2
+      case SHADER_OPCODE_LOAD_PAYLOAD:
+         inst->src[i] = val;
+d405 1
+a405 1
+            inst->src[i] = val;
+d418 1
+a418 1
+            inst->src[i] = val;
+d431 1
+a431 1
+            inst->src[1] = val;
+d439 1
+a439 1
+            inst->src[i] = val;
+d442 1
+a442 1
+            enum brw_conditional_mod new_cmod;
+d445 1
+a445 1
+            if (new_cmod != BRW_CONDITIONAL_NONE) {
+d450 1
+a450 1
+               inst->src[1] = val;
+d459 1
+a459 1
+            inst->src[i] = val;
+d463 1
+a463 1
+            inst->src[1] = val;
+d483 1
+a483 1
+         if (inst->src[0].fixed_hw_reg.dw1.f != 0.0f) {
+d485 2
+a486 2
+            inst->src[0] = val;
+            inst->src[0].fixed_hw_reg.dw1.f = 1.0f / inst->src[0].fixed_hw_reg.dw1.f;
+d492 1
+a492 1
+         inst->src[i] = val;
+d515 1
+d528 4
+a531 1
+   foreach_inst_in_block(fs_inst, inst, block) {
+d533 1
+a533 1
+      for (int i = 0; i < inst->sources; i++) {
+d537 4
+a540 2
+         foreach_in_list(acp_entry, entry, &acp[inst->src[i].reg % ACP_HASH_SIZE]) {
+            if (try_constant_propagate(inst, entry))
+d550 3
+a552 1
+	 foreach_in_list_safe(acp_entry, entry, &acp[inst->dst.reg % ACP_HASH_SIZE]) {
+d562 2
+a563 1
+            foreach_in_list_safe(acp_entry, entry, &acp[i]) {
+a576 3
+         entry->regs_written = inst->regs_written;
+         entry->opcode = inst->opcode;
+         entry->saturate = inst->saturate;
+a577 22
+      } else if (inst->opcode == SHADER_OPCODE_LOAD_PAYLOAD &&
+                 inst->dst.file == GRF) {
+         int offset = 0;
+         for (int i = 0; i < inst->sources; i++) {
+            int regs_written = ((inst->src[i].effective_width *
+                                 type_sz(inst->src[i].type)) + 31) / 32;
+            if (inst->src[i].file == GRF) {
+               acp_entry *entry = ralloc(copy_prop_ctx, acp_entry);
+               entry->dst = inst->dst;
+               entry->dst.reg_offset = offset;
+               entry->dst.width = inst->src[i].effective_width;
+               entry->src = inst->src[i];
+               entry->regs_written = regs_written;
+               entry->opcode = inst->opcode;
+               if (!entry->dst.equals(inst->src[i])) {
+                  acp[entry->dst.reg % ACP_HASH_SIZE].push_tail(entry);
+               } else {
+                  ralloc_free(entry);
+               }
+            }
+            offset += regs_written;
+         }
+d589 3
+a591 3
+   exec_list *out_acp[cfg->num_blocks];
+
+   for (int i = 0; i < cfg->num_blocks; i++)
+d597 3
+a599 1
+   foreach_block (block, cfg) {
+d601 1
+a601 1
+                                          out_acp[block->num]) || progress;
+d605 1
+a605 1
+   fs_copy_prop_dataflow dataflow(copy_prop_ctx, cfg, out_acp);
+d610 2
+a611 1
+   foreach_block (block, cfg) {
+d615 1
+a615 1
+         if (BITSET_TEST(dataflow.bd[block->num].livein, i)) {
+d624 1
+a624 1
+   for (int i = 0; i < cfg->num_blocks; i++)
+@
+
+
+1.1.1.5
+log
+@Import Mesa 10.2.9
+@
+text
+@d45 3
+d109 1
+a109 1
+   for (int b = 0; b < cfg->num_blocks; b++) {
+d111 1
+a111 3
+         foreach_list(entry_node, &out_acp[b][i]) {
+            num_acp++;
+         }
+d120 5
+a124 5
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bd[b].livein = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[b].liveout = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[b].copy = rzalloc_array(bd, BITSET_WORD, bitset_words);
+      bd[b].kill = rzalloc_array(bd, BITSET_WORD, bitset_words);
+d127 1
+a127 3
+         foreach_list(entry_node, &out_acp[b][i]) {
+            acp_entry *entry = (acp_entry *)entry_node;
+
+d134 1
+a134 1
+            BITSET_SET(bd[b].copy, next_acp);
+d155 2
+a156 6
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bblock_t *block = cfg->blocks[b];
+
+      for (fs_inst *inst = (fs_inst *)block->start;
+           inst != block->end->next;
+           inst = (fs_inst *)inst->next) {
+d164 1
+a164 1
+               BITSET_SET(bd[b].kill, i);
+d175 1
+a175 2
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bblock_t *block = cfg->blocks[b];
+d178 2
+a179 2
+            bd[b].livein[i] = 0u;
+            bd[b].liveout[i] = bd[b].copy[i];
+d183 2
+a184 2
+            bd[b].liveout[i] = 0u;
+            bd[b].livein[i] = ~0u;
+d203 2
+a204 2
+      for (int b = 0; b < cfg->num_blocks; b++) {
+         if (cfg->blocks[b]->parents.is_empty())
+d208 1
+a208 1
+            const BITSET_WORD old_liveout = bd[b].liveout[i];
+d210 3
+a212 2
+            bd[b].liveout[i] =
+               bd[b].copy[i] | (bd[b].livein[i] & ~bd[b].kill[i]);
+d214 1
+a214 1
+            if (old_liveout != bd[b].liveout[i])
+d222 2
+a223 2
+      for (int b = 0; b < cfg->num_blocks; b++) {
+         if (cfg->blocks[b]->parents.is_empty())
+d227 1
+a227 1
+            const BITSET_WORD old_livein = bd[b].livein[i];
+d229 4
+a232 5
+            bd[b].livein[i] = ~0u;
+            foreach_list(block_node, &cfg->blocks[b]->parents) {
+               bblock_link *link = (bblock_link *)block_node;
+               bblock_t *block = link->block;
+               bd[b].livein[i] &= bd[block->block_num].liveout[i];
+d235 1
+a235 1
+            if (old_livein != bd[b].livein[i])
+d245 2
+a246 3
+   for (int b = 0; b < cfg->num_blocks; b++) {
+      bblock_t *block = cfg->blocks[b];
+      fprintf(stderr, "Block %d [%d, %d] (parents ", block->block_num,
+d248 3
+a250 3
+      foreach_list(block_node, &block->parents) {
+         bblock_t *parent = ((bblock_link *) block_node)->block;
+         fprintf(stderr, "%d ", parent->block_num);
+d255 1
+a255 1
+         fprintf(stderr, "%08x", bd[b].livein[i]);
+d258 1
+a258 1
+         fprintf(stderr, "%08x", bd[b].liveout[i]);
+d261 1
+a261 1
+         fprintf(stderr, "%08x", bd[b].copy[i]);
+d264 1
+a264 1
+         fprintf(stderr, "%08x", bd[b].kill[i]);
+d281 3
+d286 1
+d288 2
+a289 3
+   /* Bail if inst is reading more than entry is writing. */
+   if ((inst->regs_read(this, arg) * inst->src[arg].stride *
+        type_sz(inst->src[arg].type)) > type_sz(entry->dst.type))
+d292 11
+a302 4
+   if (inst->src[arg].file != entry->dst.file ||
+       inst->src[arg].reg != entry->dst.reg ||
+       inst->src[arg].reg_offset != entry->dst.reg_offset ||
+       inst->src[arg].subreg_offset != entry->dst.subreg_offset) {
+a303 1
+   }
+d315 5
+a319 1
+       !can_do_source_mods(inst))
+d354 14
+a369 2
+   inst->src[arg].reg_offset = entry->src.reg_offset;
+   inst->src[arg].subreg_offset = entry->src.subreg_offset;
+d371 40
+d421 2
+a422 3
+static bool
+try_constant_propagate(struct brw_context *brw, fs_inst *inst,
+                       acp_entry *entry)
+d429 16
+a444 7
+   for (int i = 2; i >= 0; i--) {
+      if (inst->src[i].file != entry->dst.file ||
+          inst->src[i].reg != entry->dst.reg ||
+          inst->src[i].reg_offset != entry->dst.reg_offset ||
+          inst->src[i].subreg_offset != entry->dst.subreg_offset ||
+          inst->src[i].type != entry->dst.type ||
+          inst->src[i].stride > 1)
+d453 3
+d458 2
+a459 1
+         inst->src[i] = entry->src;
+d475 1
+a475 1
+            inst->src[i] = entry->src;
+d488 1
+a488 1
+            inst->src[i] = entry->src;
+d501 1
+a501 1
+            inst->src[1] = entry->src;
+d509 1
+a509 1
+            inst->src[i] = entry->src;
+d512 1
+a512 1
+            uint32_t new_cmod;
+d515 1
+a515 1
+            if (new_cmod != ~0u) {
+d520 1
+a520 1
+               inst->src[1] = entry->src;
+d529 1
+a529 1
+            inst->src[i] = entry->src;
+d533 1
+a533 1
+            inst->src[1] = entry->src;
+d553 1
+a553 1
+         if (inst->src[0].imm.f != 0.0f) {
+d555 2
+a556 2
+            inst->src[0] = entry->src;
+            inst->src[0].imm.f = 1.0f / inst->src[0].imm.f;
+d562 1
+a562 1
+         inst->src[i] = entry->src;
+a584 1
+           !inst->saturate &&
+d597 1
+a597 4
+   for (fs_inst *inst = (fs_inst *)block->start;
+	inst != block->end->next;
+	inst = (fs_inst *)inst->next) {
+
+d599 1
+a599 1
+      for (int i = 0; i < 3; i++) {
+d603 2
+a604 4
+         foreach_list(entry_node, &acp[inst->src[i].reg % ACP_HASH_SIZE]) {
+            acp_entry *entry = (acp_entry *)entry_node;
+
+            if (try_constant_propagate(brw, inst, entry))
+d614 1
+a614 3
+	 foreach_list_safe(entry_node, &acp[inst->dst.reg % ACP_HASH_SIZE]) {
+	    acp_entry *entry = (acp_entry *)entry_node;
+
+d624 1
+a624 2
+            foreach_list_safe(entry_node, &acp[i]) {
+               acp_entry *entry = (acp_entry *)entry_node;
+d638 3
+d642 22
+d675 3
+a677 3
+   cfg_t cfg(&instructions);
+   exec_list *out_acp[cfg.num_blocks];
+   for (int i = 0; i < cfg.num_blocks; i++)
+d683 1
+a683 3
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+
+d685 1
+a685 1
+                                          out_acp[b]) || progress;
+d689 1
+a689 1
+   fs_copy_prop_dataflow dataflow(copy_prop_ctx, &cfg, out_acp);
+d694 1
+a694 2
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+d698 1
+a698 1
+         if (BITSET_TEST(dataflow.bd[b].livein, i)) {
+d707 1
+a707 1
+   for (int i = 0; i < cfg.num_blocks; i++)
+@
+
+

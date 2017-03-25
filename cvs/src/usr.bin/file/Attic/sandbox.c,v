@@ -1,0 +1,384 @@
+head	1.10;
+access;
+symbols
+	OPENBSD_5_8:1.8.0.4
+	OPENBSD_5_8_BASE:1.8;
+locks; strict;
+comment	@ * @;
+
+
+1.10
+date	2015.10.04.07.25.59;	author nicm;	state dead;
+branches;
+next	1.9;
+commitid	dqw6dqZelGQB4GLZ;
+
+1.9
+date	2015.08.23.18.31.41;	author guenther;	state Exp;
+branches;
+next	1.8;
+commitid	yVC4oHqqefLmwhhh;
+
+1.8
+date	2015.06.04.22.56.33;	author nicm;	state Exp;
+branches;
+next	1.7;
+commitid	XPuKygNYLgzcaAFQ;
+
+1.7
+date	2015.05.29.15.58.34;	author nicm;	state Exp;
+branches;
+next	1.6;
+commitid	147ZWb5defUBrhjw;
+
+1.6
+date	2015.05.29.12.38.28;	author nicm;	state Exp;
+branches;
+next	1.5;
+commitid	qbP4C9K0PEqogWVB;
+
+1.5
+date	2015.05.18.11.57.52;	author deraadt;	state Exp;
+branches;
+next	1.4;
+commitid	wlfdU7BegzaUAZIo;
+
+1.4
+date	2015.04.30.14.30.53;	author nicm;	state Exp;
+branches;
+next	1.3;
+commitid	Z11WykHEblOt85K3;
+
+1.3
+date	2015.04.30.14.16.49;	author nicm;	state Exp;
+branches;
+next	1.2;
+commitid	I316KEVQ4xJ9iaRl;
+
+1.2
+date	2015.04.29.06.37.14;	author deraadt;	state Exp;
+branches;
+next	1.1;
+commitid	ybXgKI62QoVjABGp;
+
+1.1
+date	2015.04.27.13.52.17;	author nicm;	state Exp;
+branches;
+next	;
+commitid	hZDBTMiQdWyr3asB;
+
+
+desc
+@@
+
+
+1.10
+log
+@Add tame(2) to file(1) and drop the old systrace(4) sandbox. tame(2) is
+only applied to the child process, which requires the parent to not pass
+directory file descriptors (tame("cmsg") does not allow it). Because
+file(1) is already privsep, the permissions in the child can be quickly
+restricted: first to "stdio cmsg getpw proc" then after the privdrop to
+"stdio cmsg".
+@
+text
+@/* $OpenBSD: sandbox.c,v 1.9 2015/08/23 18:31:41 guenther Exp $ */
+
+/*
+ * Copyright (c) 2015 Nicholas Marriott <nicm@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
+ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+
+#include <dev/systrace.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pwd.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include "file.h"
+#include "magic.h"
+#include "xmalloc.h"
+
+static const struct
+{
+	int syscallnum;
+	int action;
+} allowed_syscalls[] = {
+	{ SYS_open, SYSTR_POLICY_NEVER }, /* for strerror */
+
+	{ SYS_close, SYSTR_POLICY_PERMIT },
+	{ SYS_exit, SYSTR_POLICY_PERMIT },
+	{ SYS_fcntl, SYSTR_POLICY_PERMIT },
+	{ SYS_fstat, SYSTR_POLICY_PERMIT },
+	{ SYS_getdtablecount, SYSTR_POLICY_PERMIT },
+	{ SYS_getentropy, SYSTR_POLICY_PERMIT },
+	{ SYS_getpid, SYSTR_POLICY_PERMIT },
+	{ SYS_getrlimit, SYSTR_POLICY_PERMIT },
+	{ SYS_issetugid, SYSTR_POLICY_PERMIT },
+	{ SYS_kbind, SYSTR_POLICY_PERMIT },
+	{ SYS_madvise, SYSTR_POLICY_PERMIT },
+	{ SYS_mmap, SYSTR_POLICY_PERMIT },
+	{ SYS_mprotect, SYSTR_POLICY_PERMIT },
+	{ SYS_mquery, SYSTR_POLICY_PERMIT },
+	{ SYS_munmap, SYSTR_POLICY_PERMIT },
+	{ SYS_read, SYSTR_POLICY_PERMIT },
+	{ SYS_recvmsg, SYSTR_POLICY_PERMIT },
+	{ SYS_sendmsg, SYSTR_POLICY_PERMIT },
+	{ SYS_sigprocmask, SYSTR_POLICY_PERMIT },
+	{ SYS_write, SYSTR_POLICY_PERMIT },
+
+	{ -1, -1 }
+};
+
+static int
+sandbox_find(int syscallnum)
+{
+	int	i;
+
+	for (i = 0; allowed_syscalls[i].syscallnum != -1; i++) {
+		if (allowed_syscalls[i].syscallnum == syscallnum)
+			return (allowed_syscalls[i].action);
+	}
+	return (SYSTR_POLICY_KILL);
+}
+
+static int
+sandbox_child(const char *user)
+{
+	struct passwd	*pw;
+
+	if (geteuid() == 0) {
+		pw = getpwnam(user);
+		if (pw == NULL)
+			errx(1, "unknown user %s", user);
+		if (setgroups(1, &pw->pw_gid) != 0)
+			err(1, "setgroups");
+		if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) != 0)
+			err(1, "setresgid");
+		if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) != 0)
+			err(1, "setresuid");
+	}
+
+	if (kill(getpid(), SIGSTOP) != 0)
+		err(1, "kill(SIGSTOP)");
+	return (0);
+}
+
+int
+sandbox_fork(const char *user)
+{
+	pid_t			 pid;
+	int			 status, devfd, fd, i;
+	struct systrace_policy	 policy;
+
+	switch (pid = fork()) {
+	case -1:
+		err(1, "fork");
+	case 0:
+		return (sandbox_child(user));
+	}
+
+	/*
+	 * Wait for the child to stop itself with SIGSTOP before assigning the
+	 * policy, before that it might still be calling syscalls the policy
+	 * would block.
+	 */
+	do {
+		pid = waitpid(pid, &status, WUNTRACED);
+	} while (pid == -1 && errno == EINTR);
+	if (!WIFSTOPPED(status))
+		errx(1, "child not stopped");
+
+	devfd = open("/dev/systrace", O_RDONLY);
+	if (devfd == -1)
+		err(1, "open(\"/dev/systrace\")");
+	if (ioctl(devfd, STRIOCCLONE, &fd) == -1)
+		err(1, "ioctl(STRIOCCLONE)");
+	close(devfd);
+
+	if (ioctl(fd, STRIOCATTACH, &pid) == -1)
+		goto out;
+
+	memset(&policy, 0, sizeof policy);
+	policy.strp_op = SYSTR_POLICY_NEW;
+	policy.strp_maxents = SYS_MAXSYSCALL;
+	if (ioctl(fd, STRIOCPOLICY, &policy) == -1)
+		err(1, "ioctl(STRIOCPOLICY/NEW)");
+	policy.strp_op = SYSTR_POLICY_ASSIGN;
+	policy.strp_pid = pid;
+	if (ioctl(fd, STRIOCPOLICY, &policy) == -1)
+		err(1, "ioctl(STRIOCPOLICY/ASSIGN)");
+
+	for (i = 0; i < SYS_MAXSYSCALL; i++) {
+		policy.strp_op = SYSTR_POLICY_MODIFY;
+		policy.strp_code = i;
+		policy.strp_policy = sandbox_find(i);
+		if (ioctl(fd, STRIOCPOLICY, &policy) == -1)
+			err(1, "ioctl(STRIOCPOLICY/MODIFY)");
+	}
+
+out:
+	if (kill(pid, SIGCONT) != 0)
+		err(1, "kill(SIGCONT)");
+	return (pid);
+}
+@
+
+
+1.9
+log
+@Need to permit kbind in this sandbox too
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.8 2015/06/04 22:56:33 nicm Exp $ */
+@
+
+
+1.8
+log
+@systrace(4) STRIOCATTACH can only fail for file(1) if it is already
+systraced. If so, silently ignore the error and do not attempt to apply
+our own systrace policy. From Patrick Keshishian.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.7 2015/05/29 15:58:34 nicm Exp $ */
+d52 1
+@
+
+
+1.7
+log
+@millert points out I can just call tzset() early to avoid having to
+permit access() in the child.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.6 2015/05/29 12:38:28 nicm Exp $ */
+d133 1
+a133 1
+		err(1, "ioctl(STRIOCATTACH)");
+d153 1
+@
+
+
+1.6
+log
+@file(1) needs access(/etc/localtime) for localtime().
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.5 2015/05/18 11:57:52 deraadt Exp $ */
+a42 1
+	{ SYS_access, SYSTR_POLICY_PERMIT },
+@
+
+
+1.5
+log
+@No longer need tricks with setvbuf().  Instead, we just give permission
+to call fstat() and fcntl().
+ok nicm
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.4 2015/04/30 14:30:53 nicm Exp $ */
+d43 1
+@
+
+
+1.4
+log
+@Add a comment about waitpid, suggested by espie@@.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.3 2015/04/30 14:16:49 nicm Exp $ */
+d45 2
+a81 7
+
+	/*
+	 * If we don't set stream buffering explicitly, stdio calls isatty()
+	 * which means ioctl() - too nasty to let through the systrace policy.
+	 */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
+@
+
+
+1.3
+log
+@Tweak comment so it doesn't imply line buffering is needed (any will do
+so long as it is explicit), and set stderr to NBF not LBF. Pointed out
+by espie@@.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.2 2015/04/29 06:37:14 deraadt Exp $ */
+d119 5
+@
+
+
+1.2
+log
+@the non braced do while made my teeth hurt
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: sandbox.c,v 1.1 2015/04/27 13:52:17 nicm Exp $ */
+d82 2
+a83 3
+	 * If we don't set streams to line buffered explicitly, stdio uses
+	 * isatty() which means ioctl() - too nasty to let through the systrace
+	 * policy.
+d86 1
+a86 1
+	setvbuf(stderr, NULL, _IOLBF, 0);
+@
+
+
+1.1
+log
+@Use a systrace(4) sandbox with a short whitelist of allowed syscalls for
+the file(1) child process. Based on similar code in ssh sandbox-systrace.c.
+Idea and help from deraadt@@.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: file.c,v 1.33 2015/04/26 19:53:50 nicm Exp $ */
+d120 1
+a120 1
+	do
+d122 1
+a122 1
+	while (pid == -1 && errno == EINTR);
+@
+

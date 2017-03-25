@@ -1,0 +1,610 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_2_4:1.7.0.2
+	OPENBSD_2_4_BASE:1.7
+	OPENBSD_2_3:1.5.0.2
+	OPENBSD_2_3_BASE:1.5
+	OPENBSD_2_2:1.4.0.2
+	OPENBSD_2_2_BASE:1.4
+	photurisd100:1.1.1.1
+	photuris:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	98.11.14.23.37.09;	author deraadt;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	98.06.30.16.58.44;	author provos;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	98.05.18.21.25.25;	author provos;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	98.03.04.11.43.21;	author provos;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	97.09.02.17.26.37;	author provos;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	97.07.23.12.28.49;	author provos;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	97.07.19.12.07.47;	author provos;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.07.18.22.48.50;	author provos;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.07.18.22.48.50;	author provos;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@move ipsec tools into .
+@
+text
+@/*
+ * Copyright 1997,1998 Niels Provos <provos@@physnet.uni-hamburg.de>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *      This product includes software developed by Niels Provos.
+ * 4. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+/*
+ * handle_identity_response:
+ * receive a IDENTITY_RESPONSE packet; return -1 on failure, 0 on success
+ *
+ */
+
+#ifndef lint
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.7 1998/06/30 16:58:44 provos Exp $";
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include "config.h"
+#include "photuris.h"
+#include "packets.h"
+#include "state.h"
+#include "cookie.h"
+#include "buffer.h"
+#include "packet.h"
+#include "schedule.h"
+#include "encrypt.h"
+#include "identity.h"
+#include "attributes.h"
+#include "secrets.h"
+#include "scheme.h"
+#include "errlog.h"
+#include "spi.h"
+#ifdef IPSEC
+#include "kernel.h"
+#endif
+#ifdef DEBUG
+#include "packet.h"
+#endif
+
+int
+handle_identity_response(u_char *packet, int size, char *address,
+			 char *local_address)
+{
+        struct packet_sub parts[] = {
+	     { "IDChoice", FLD_ATTRIB, FMD_ATT_ONE, 0, },
+	     { "Identity", FLD_VARPRE, 0, 0, },
+	     { "Verification", FLD_VARPRE, 0, 0, },
+	     { "Attributes", FLD_ATTRIB, FMD_ATT_FILL, 0, },
+	     { NULL }
+	};
+
+        struct packet id_msg = {
+	     "Identity Response",
+	     IDENTITY_MESSAGE_MIN, 0, parts
+	};
+
+	struct identity_message *header;
+	struct stateob *st;
+	struct spiob *spi;
+	u_int8_t *attributes;
+	u_int16_t i, attribsize, tmp;
+	u_int8_t signature[22];  /* XXX - constant */
+
+	if (size < IDENTITY_MESSAGE_MIN)
+	     return -1;	/* packet too small  */
+
+	header = (struct identity_message *) packet;
+
+	st = state_find_cookies(address, header->icookie, header->rcookie);
+	if (st == NULL)
+	     return -1;     /* Silently discard */
+
+	if (st->phase != IDENTITY_REQUEST)
+	     return 0;      /* We don't want this packet */
+
+	/* Decrypt message */
+	tmp = size - IDENTITY_MESSAGE_MIN;
+	if (packet_decrypt(st, IDENTITY_MESSAGE_CHOICE(header), &tmp) == -1) {
+	     log_error(0, "packet_decrypt() in handle_identity_response()");
+	     goto verification_failed;
+	}
+
+#ifdef DEBUG2
+	printf("Identity Response (after decryption):\n");
+	packet_dump((u_int8_t *)header, size, 0);
+#endif
+	/* Verify message structure */
+	if (packet_check(packet, size - packet[size-1], &id_msg) == -1) {
+	     log_error(0, "bad packet structure in handle_identity_response()");
+	     return -1;
+	}
+
+	i = get_identity_verification_size(st, IDENTITY_MESSAGE_CHOICE(header));
+	if (!i || i != parts[2].size || i >sizeof(signature)) {
+	     log_error(0, "verification size mismatch in handle_identity_response()");
+	     goto verification_failed;
+	}
+	bcopy(parts[2].where, signature, parts[2].size);
+	
+	attributes = parts[3].where;
+	attribsize = parts[3].size;
+
+	if (!isattribsubset(st->oSPIoattrib,st->oSPIoattribsize,
+			    attributes, attribsize)) {
+	     log_error(0, "attributes are not a subset in handle_identity_response()");
+	     return 0;
+	}
+
+
+	/* Fill the state object */
+	if((st->uSPIidentver = calloc(i, sizeof(u_int8_t))) == NULL) { 
+	     log_error(1, "calloc() in handle_identity_response()"); 
+	     goto verification_failed;
+	}
+	bcopy(signature, st->uSPIidentver, i);
+	st->uSPIidentversize = i;
+
+	if((st->uSPIidentchoice = calloc(parts[0].size, sizeof(u_int8_t))) == NULL) {
+	     log_error(1, "calloc() in handle_identity_response()");
+	     goto verification_failed;
+	}
+	bcopy(parts[0].where, st->uSPIidentchoice, parts[0].size);
+	st->uSPIidentchoicesize = parts[0].size;
+
+	if((st->uSPIident = calloc(parts[1].size, sizeof(u_int8_t))) == NULL) {
+	     log_error(1, "calloc() in handle_identity_response()"); 
+	     goto verification_failed;
+	}
+	bcopy(parts[1].where, st->uSPIident, parts[1].size);
+	
+	if((st->uSPIattrib = calloc(attribsize, sizeof(u_int8_t))) == NULL) {
+	     log_error(1, "calloc() in handle_identity_response()");
+	     goto verification_failed;
+	}
+	bcopy(attributes, st->uSPIattrib, attribsize);
+	st->uSPIattribsize = attribsize;
+
+	if (get_secrets(st, ID_REMOTE) == -1) {
+	     log_error(0, "get_secrets() in in handle_identity_response()");
+	     goto verification_failed;
+	}
+
+	if (!verify_identity_verification(st, signature, packet, size)) {
+	     /* 
+	      * Clean up everything used from this packet 
+	      */
+	     free(st->uSPIidentchoice);
+	     st->uSPIidentchoice = NULL; st->uSPIidentchoicesize = 0;
+	     free(st->uSPIidentver);
+	     st->uSPIidentver = NULL; st->uSPIidentversize = 0;
+	     free(st->uSPIattrib);
+	     st->uSPIattrib = NULL; st->uSPIattribsize = 0;
+	     free(st->uSPIident);
+	     st->uSPIident = NULL;
+
+	     /* Clean up secrets */
+	     free(st->uSPIsecret);
+	     st->uSPIsecret = NULL; st->uSPIsecretsize = 0;
+	verification_failed:
+	     log_error(0, "verification failed in handle_identity_response()");
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+	     return 0;
+	}
+
+	bcopy(header->SPI, st->uSPI, SPI_SIZE);
+	st->ulifetime = (header->lifetime[0] << 16) + 
+	     (header->lifetime[1] << 8) + header->lifetime[2];
+
+	st->lifetime = st->exchange_lifetime + time(NULL) + random() % 20;
+	st->retries = 0;
+	st->phase = SPI_UPDATE;
+
+	schedule_remove(TIMEOUT, st->icookie);
+
+	/* We don't need the packet buffer anylonger */
+	if (st->packet != NULL) {
+	     free(st->packet);
+	     st->packet = NULL;
+	     st->packetlen = 0;
+	}
+		  
+	/* At this point we do not need the exchange values any longer */
+	free(st->texchange); st->texchange = NULL;
+	free(st->exchangevalue); st->exchangevalue = NULL;
+
+	if (st->oSPI[0] || st->oSPI[1] || st->oSPI[2] || st->oSPI[3]) {
+	     /* Insert Owner SPI */
+	     if ((spi = spi_new(st->address, st->oSPI)) == NULL) {
+		  log_error(0, "spi_new() in handle_identity_response()");
+		  return -1;
+	     }
+	     if ((spi->local_address = strdup(local_address)) == NULL) {
+		  log_error(1, "strdup() in handle_identity_response()");
+		  return -1;
+	     }
+	     bcopy(st->icookie, spi->icookie, COOKIE_SIZE);
+	     spi->flags |= SPI_OWNER;
+	     spi->attribsize = st->oSPIattribsize;
+	     spi->attributes = calloc(spi->attribsize, sizeof(u_int8_t));
+	     if (spi->attributes == NULL) {
+		  log_error(0, "calloc() in handle_identity_response()");
+		  spi_value_reset(spi);
+		  return -1;
+	     }
+	     bcopy(st->oSPIattrib, spi->attributes, spi->attribsize);
+	     spi->lifetime = time(NULL) + st->olifetime;
+
+	     /* Cludge for getting the right verification field */
+	     state_save_verification(st, st->oSPIidentver, st->oSPIidentversize);
+	     /* Make session keys for Owner */
+	     make_session_keys(st, spi);
+
+	     spi_insert(spi);
+#ifdef IPSEC
+	     kernel_insert_spi(st, spi);
+#endif
+	     schedule_insert(UPDATE, st->olifetime/2, spi->SPI, SPI_SIZE);
+	}
+	if (st->uSPI[0] || st->uSPI[1] || st->uSPI[2] || st->uSPI[3]) {
+	     /* Insert User SPI */
+	     if ((spi = spi_new(st->address, st->uSPI)) == NULL) {
+		  log_error(0, "spi_new() in handle_identity_response()");
+		  return -1;
+	     }
+	     if ((spi->local_address = strdup(local_address)) == NULL) {
+		  log_error(1, "strdup() in handle_identity_response()");
+		  return -1;
+	     }
+	     spi->flags |= st->flags & IPSEC_NOTIFY ? SPI_NOTIFY : 0;
+	     bcopy(st->icookie, spi->icookie, COOKIE_SIZE);
+	     spi->attribsize = st->uSPIattribsize;
+	     spi->attributes = calloc(spi->attribsize, sizeof(u_int8_t));
+	     if (spi->attributes == NULL) {
+		  log_error(1, "calloc() in handle_identity_response()");
+		  spi_value_reset(spi);
+		  return -1;
+	     }
+	     bcopy(st->uSPIattrib, spi->attributes, spi->attribsize);
+	     spi->lifetime = time(NULL) + st->ulifetime;
+
+	     /* Cludge for getting the right verification field */
+	     state_save_verification(st, st->uSPIidentver, st->uSPIidentversize);
+	     /* Session keys for User */
+	     make_session_keys(st, spi);
+
+	     spi_set_tunnel(st, spi);
+
+	     spi_insert(spi);
+#ifdef IPSEC
+	     kernel_insert_spi(st, spi);
+#endif
+	}
+	return 0;
+}
+@
+
+
+1.7
+log
+@- support HMAC flag which if present in the attribute list toggles to
+HMAC authentication transforms and otherwise to simple keyed authentication.
+Note, HMAC is necessary if new esp is to use integrity checking, i.e.
+authentication of the payload.
+- Also fix bug, where SPIs were reserved for more than one protocol when
+only one protocol, e.g. ESP or AH, could be agreed upon.
+- Also make kernel.c a bit less complex, I hope.
+- return notifies to kernel on failure only when kernel started the keying.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.6 1998/05/18 21:25:25 provos Exp $";
+@
+
+
+1.6
+log
+@support kernel notifies for setsockopt/getsockopt interface and fix various
+small bugs.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.5 1998/03/04 11:43:21 provos Exp $";
+d110 1
+a110 1
+#ifdef DEBUG
+@
+
+
+1.5
+log
+@compliance with draft-simpson-photuris-18.txt, better packet structure
+checking, better support for new esp and ah, documentation ...
+@
+text
+@d2 1
+a2 1
+ * Copyright 1997 Niels Provos <provos@@physnet.uni-hamburg.de>
+d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.4 1997/09/02 17:26:37 provos Exp $";
+d246 1
+a246 1
+	     kernel_insert_spi(spi);
+d260 1
+d281 1
+a281 1
+	     kernel_insert_spi(spi);
+@
+
+
+1.4
+log
+@including changes between drafts-14-16.
+update cookie and counters correctly after receiving a resource limit
+message.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.3 1997/07/23 12:28:49 provos Exp $";
+d63 3
+d71 13
+d87 2
+a88 2
+	u_int8_t *p, *attributes;
+	u_int16_t i, asize, attribsize, tmp;
+d110 13
+a122 2
+	/* Verify message */
+	if (!(i = get_identity_verification_size(st, IDENTITY_MESSAGE_CHOICE(header))))
+d124 2
+d127 2
+a128 21
+	asize = IDENTITY_MESSAGE_MIN;
+
+	p = IDENTITY_MESSAGE_CHOICE(header);
+	asize += p[1] + 2;
+	p += p[1] + 2;
+	asize += varpre2octets(p);
+	p += varpre2octets(p);
+
+	attributes = p + i;
+	asize += i;                            /* Verification size */
+	asize += packet[size-1];               /* Padding size */
+	attribsize = 0;
+	while(asize + attribsize < size)
+	     attribsize += attributes[attribsize+1] + 2;
+
+	asize += attribsize;
+
+	if (asize != size) {
+	     log_error(0, "wrong packet size in handle_identity_response()");
+	     return 0;
+	}
+d136 4
+a139 2
+	if (i > sizeof(signature)) {
+	     log_error(0, "verification too long in handle_identity_response()");
+d142 2
+d145 6
+a150 2
+	bcopy(p, signature, i);
+	bzero(p, i);
+d152 3
+a154 27
+	/* Fill the state object */
+	if (st->uSPIidentver == NULL) {
+	     if((st->uSPIidentver = calloc(i, sizeof(u_int8_t))) == NULL) { 
+		  log_error(1, "calloc() in handle_identity_response()"); 
+		  goto verification_failed;
+	     }
+	     bcopy(signature, st->uSPIidentver, i);
+	     st->uSPIidentversize = i;
+	}
+
+	p = IDENTITY_MESSAGE_CHOICE(header);
+	if (st->uSPIidentchoice == NULL) {
+	     if((st->uSPIidentchoice = calloc(p[1]+2, sizeof(u_int8_t))) == NULL) {
+		  log_error(1, "calloc() in handle_identity_response()");
+		  goto verification_failed;
+	     }
+	     bcopy(p, st->uSPIidentchoice, p[1]+2);
+	     st->uSPIidentchoicesize = p[1]+2;
+	}
+
+	p += p[1] + 2;
+	if (st->uSPIident == NULL) {
+	     if((st->uSPIident = calloc(varpre2octets(p), sizeof(u_int8_t))) == NULL) {
+		  log_error(1, "calloc() in handle_identity_response()"); 
+		  goto verification_failed;
+	     }
+	     bcopy(p, st->uSPIident, varpre2octets(p));
+d156 1
+d158 3
+a160 7
+	if (st->uSPIattrib == NULL) {
+	     if((st->uSPIattrib = calloc(attribsize, sizeof(u_int8_t))) == NULL) {
+		  log_error(1, "calloc() in handle_identity_response()");
+		  goto verification_failed;
+	     }
+	     bcopy(attributes, st->uSPIattrib, attribsize);
+	     st->uSPIattribsize = attribsize;
+d162 2
+@
+
+
+1.3
+log
+@tunnel,lifetimes,hostname via startkey/startup
+errors to stderr before daemon, to syslog afterwards
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.2 1997/07/19 12:07:47 provos Exp $";
+d55 1
+d220 3
+d246 2
+d278 2
+@
+
+
+1.2
+log
+@minor cleanup.
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.1.1.1 1997/07/18 22:48:50 provos Exp $";
+d206 1
+a206 1
+	st->lifetime = exchange_lifetime + time(NULL) + random() % 20;
+d231 1
+a231 1
+	     spi->owner = 1;
+d274 2
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d37 1
+a37 1
+static char rcsid[] = "$Id: handle_identity_response.c,v 1.3 1997/06/12 17:09:20 provos Exp provos $";
+d90 1
+a90 6
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+	     return -1;
+d94 2
+a95 9
+	if (!(i = get_identity_verification_size(st, IDENTITY_MESSAGE_CHOICE(header)))) {
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+
+	     return -1;
+	}
+d116 7
+a122 1
+	     return -1;
+d127 1
+a127 6
+	     packet_size = PACKET_BUFFER_SIZE;
+	     photuris_error_message(st, packet_buffer, &packet_size,
+				    header->icookie, header->rcookie,
+				    0, VERIFICATION_FAILURE);
+	     send_packet();
+	     return -1;
+d137 1
+a137 1
+		  return -1; 
+d147 1
+a147 1
+		  return -1;
+d157 1
+a157 1
+		  return -1; 
+d165 1
+a165 1
+		  return -1;
+d173 1
+a173 1
+	     return -1;
+d192 1
+a192 1
+
+@
+
+
+1.1.1.1
+log
+@initial import of the photuris keymanagement daemon
+@
+text
+@@
+

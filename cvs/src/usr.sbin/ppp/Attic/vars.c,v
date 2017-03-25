@@ -1,0 +1,468 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_2_3:1.7.0.2
+	OPENBSD_2_3_BASE:1.7
+	PPP1_5:1.1.1.1
+	BRIAN:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	98.08.31.00.21.53;	author brian;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	98.01.21.02.13.43;	author brian;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	98.01.20.22.46.32;	author brian;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	98.01.10.01.55.17;	author brian;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	97.12.29.22.23.08;	author brian;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	97.12.21.03.15.56;	author brian;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	97.12.06.12.09.04;	author brian;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.11.23.20.27.36;	author brian;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.11.23.20.27.36;	author brian;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@Upgrade ppp to version 2.0
+
+This adds a number of features including:
+o Multilink
+o Callback (including CBCP)
+o DNS negotiation (client & server)
+o Easy to configure masquerading/packet aliasing
+o Any number of diagnostic socket connections (limits DOS attacks)
+o Sticky routes (ppp updates the routing table when the IP number is changed)
+
+See the file README.changes for things that effect current
+configurations.
+@
+text
+@/*
+ *		PPP configuration variables
+ *
+ *	    Written by Toshiharu OHNO (tony-o@@iij.ad.jp)
+ *
+ *   Copyright (C) 1993, Internet Initiative Japan, Inc. All rights reserverd.
+ *
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the Internet Initiative Japan, Inc.  The name of the
+ * IIJ may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * $Id: vars.c,v 1.7 1998/01/21 02:13:43 brian Exp $
+ *
+ */
+#include <sys/param.h>
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include "command.h"
+#include "mbuf.h"
+#include "log.h"
+#include "defs.h"
+#include "timer.h"
+#include "fsm.h"
+#include "hdlc.h"
+#include "termios.h"
+#include "loadalias.h"
+#include "vars.h"
+#include "auth.h"
+
+char VarVersion[] = "PPP Version 1.65";
+char VarLocalVersion[] = "$Date: 1998/01/21 02:13:43 $";
+int Utmp = 0;
+int ipKeepAlive = 0;
+int reconnectState = RECON_UNKNOWN;
+int reconnectCount = 0;
+
+/*
+ * Order of conf option is important. See vars.h.
+ */
+struct confdesc pppConfs[] = {
+  {"acfcomp", CONF_ENABLE, CONF_ACCEPT},
+  {"chap", CONF_DISABLE, CONF_ACCEPT},
+  {"deflate", CONF_ENABLE, CONF_ACCEPT},
+  {"lqr", CONF_DISABLE, CONF_ACCEPT},
+  {"pap", CONF_DISABLE, CONF_ACCEPT},
+  {"pppd-deflate", CONF_DISABLE, CONF_DENY},
+  {"pred1", CONF_ENABLE, CONF_ACCEPT},
+  {"protocomp", CONF_ENABLE, CONF_ACCEPT},
+  {"vjcomp", CONF_ENABLE, CONF_ACCEPT},
+  {"msext", CONF_DISABLE, CONF_NONE},
+  {"passwdauth", CONF_DISABLE, CONF_NONE},
+  {"proxy", CONF_DISABLE, CONF_NONE},
+  {"throughput", CONF_DISABLE, CONF_NONE},
+  {"utmp", CONF_ENABLE, CONF_NONE},
+  {NULL},
+};
+
+struct pppvars pppVars = {
+  DEF_MRU, DEF_MTU, 0, MODEM_SPEED, CS8, MODEM_CTSRTS, 180, 30, 3,
+  RECONNECT_TIMER, RECONNECT_TRIES, REDIAL_PERIOD,
+  NEXT_REDIAL_PERIOD, 1, 1, MODEM_DEV, "", BASE_MODEM_DEV,
+  1, LOCAL_NO_AUTH, 0
+};
+
+int
+DisplayCommand(struct cmdargs const *arg)
+{
+  struct confdesc *vp;
+
+  if (!VarTerm)
+    return 1;
+
+  fprintf(VarTerm, "Current configuration option settings..\n\n");
+  fprintf(VarTerm, "Name\t\tMy Side\t\tHis Side\n");
+  fprintf(VarTerm, "----------------------------------------\n");
+  for (vp = pppConfs; vp->name; vp++)
+    fprintf(VarTerm, "%-10s\t%s\t\t%s\n", vp->name,
+	    (vp->myside == CONF_ENABLE) ? "enable" :
+             (vp->myside == CONF_DISABLE ? "disable" : "N/A"),
+	    (vp->hisside == CONF_ACCEPT) ? "accept" :
+             (vp->hisside == CONF_DENY ? "deny" : "N/A"));
+
+  return 0;
+}
+
+static int
+ConfigCommand(struct cmdargs const *arg, int mine, int val)
+{
+  struct confdesc *vp;
+  int err;
+  int narg = 0;
+
+  if (arg->argc < 1)
+    return -1;
+
+  err = 0;
+  do {
+    for (vp = pppConfs; vp->name; vp++)
+      if (strcasecmp(vp->name, arg->argv[narg]) == 0) {
+	if (mine) {
+          if (vp->myside == CONF_NONE) {
+            LogPrintf(LogWARN, "Config: %s cannot be enabled or disabled\n",
+                      vp->name);
+            err++;
+          } else
+	    vp->myside = val;
+	} else {
+          if (vp->hisside == CONF_NONE) {
+            LogPrintf(LogWARN, "Config: %s cannot be accepted or denied\n",
+                      vp->name);
+            err++;
+          } else
+	    vp->hisside = val;
+        }
+	break;
+      }
+    if (!vp->name) {
+      LogPrintf(LogWARN, "Config: %s: No such key word\n", arg->argv[narg]);
+      err++;
+    }
+  } while (++narg < arg->argc);
+
+  return err;
+}
+
+int
+EnableCommand(struct cmdargs const *arg)
+{
+  return ConfigCommand(arg, 1, CONF_ENABLE);
+}
+
+int
+DisableCommand(struct cmdargs const *arg)
+{
+  return ConfigCommand(arg, 1, CONF_DISABLE);
+}
+
+int
+AcceptCommand(struct cmdargs const *arg)
+{
+  return ConfigCommand(arg, 0, CONF_ACCEPT);
+}
+
+int
+DenyCommand(struct cmdargs const *arg)
+{
+  return ConfigCommand(arg, 0, CONF_DENY);
+}
+
+int
+LocalAuthCommand(struct cmdargs const *arg)
+{
+  const char *pass;
+  if (arg->argc == 0)
+    pass = "";
+  else if (arg->argc > 1)
+    return -1;
+  else
+    pass = *arg->argv;
+
+  if (VarHaveLocalAuthKey)
+    VarLocalAuth = strcmp(VarLocalAuthKey, pass) ? LOCAL_NO_AUTH : LOCAL_AUTH;
+  else
+    switch (LocalAuthValidate(SECRETFILE, VarShortHost, pass)) {
+    case INVALID:
+      VarLocalAuth = LOCAL_NO_AUTH;
+      break;
+    case VALID:
+      VarLocalAuth = LOCAL_AUTH;
+      break;
+    case NOT_FOUND:
+      VarLocalAuth = LOCAL_AUTH;
+      LogPrintf(LogWARN, "WARNING: No Entry for this system\n");
+      break;
+    default:
+      VarLocalAuth = LOCAL_NO_AUTH;
+      LogPrintf(LogERROR, "LocalAuthCommand: Ooops?\n");
+      return 1;
+    }
+  return 0;
+}
+@
+
+
+1.7
+log
+@Remove unused #includes.
+Make various bits static.
+Remove unused variables.
+Submitted by: eivind
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.6 1998/01/20 22:46:32 brian Exp $
+d42 1
+a42 1
+char VarLocalVersion[] = "$Date: 1998/01/20 22:46:32 $";
+@
+
+
+1.6
+log
+@Allow an optional delay when specifying "set openmode active".
+The delay defaults to 1 sec (as it always has) unless we've done
+a ~p in interactive mode or we've actually detected a HDLC frame.
+This is now cleanly implemented (via async timers) so that it is
+possible for LCP to come up despite the delay if an LCP REQ is
+received.
+
+This will hopefully solve situations with slow servers or slirp
+scenarios (where ECHO is left on the port for a second or so before
+the peer enters packet mode).
+
+Also, ~p in interactive mode no longer changes the value of the default
+openmode delay and -dedicated mode enters packet mode in the right state
+according to the value of openmode.
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.5 1998/01/10 01:55:17 brian Exp $
+d42 1
+a42 1
+char VarLocalVersion[] = "$Date: 1998/01/10 01:55:17 $";
+a43 2
+int ipInOctets = 0;
+int ipOutOctets = 0;
+a44 1
+int ipConnectSecs = 0;
+@
+
+
+1.5
+log
+@Implement Reset{Req,Ack} properly, as per rfc 1962.
+(I completely mis-read the rfc last time 'round!)
+
+This means:
+  o Better CCP/WARN Reset diagnostics.
+  o After we've sent a REQ and before we've received an ACK, we drop
+    incoming compressed data and send another REQ.
+  o Before sending an ACK, re-sequence all pending PRI_NORMAL data in
+    the modem queue so that pending packets won't get to the peer
+    *after* the ResetAck.
+  o Send ACKs with the `identifier' from the REQ frame.
+  o After we've received a correct ACK, duplicate ACKs are ok (and will
+    reset our history).
+  o Incorrect ACKs (not matching the last REQ) are moaned about and dropped.
+
+Also,
+
+  o Calculate the correct FCS after compressing a packet.  DEFLATE
+    *may* produce an mbuf with more than a single link in the chain,
+    but HdlcOutput didn't know how to calculate the FCS :-(
+  o Make `struct fsm'::reqid a u_char, not an int.
+    This fix will prevent us from sending id `255' 2,000,000,000 times
+    before wrapping to `0' for another 2,000,000,000 sends :-/
+  o Bump the version number a little (it should already have been at 1.6).
+
+The end result:  DEFLATE now works over an unreliable link layer.
+                 I can txfr a 1.5Mb kernel over a (rather bad) null-modem
+                 cable at an average of 21679 bytes per second using rcp.
+Repeat after me: Don't test compression using a loopback ppp/tcp setup as
+                 we never lose packets and therefore never have to reset!
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.4 1997/12/29 22:23:08 brian Exp $
+d42 1
+a42 1
+char VarLocalVersion[] = "$Date: 1997/12/29 22:23:08 $";
+d76 1
+a76 1
+  OPEN_ACTIVE, LOCAL_NO_AUTH, 0
+@
+
+
+1.4
+log
+@Show how much time is left before timing out in the
+`show timeout' output.
+Remove ipIdleSecs variable - it's not used.
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.3 1997/12/21 03:15:56 brian Exp $
+d41 2
+a42 2
+char VarVersion[] = "PPP Version 1.5";
+char VarLocalVersion[] = "$Date: 1997/12/21 03:15:56 $";
+@
+
+
+1.3
+log
+@Allow multiple (comma seperated) devices on the "set device" line.
+Submitted by: Derek Inksetter <derek@@saidev.com>
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.2 1997/12/06 12:09:04 brian Exp $
+d42 1
+a42 1
+char VarLocalVersion[] = "$Date: 1997/12/06 12:09:04 $";
+a47 1
+int ipIdleSecs = 0;
+@
+
+
+1.2
+log
+@Add DEFLATE capabilities (rfc1979).
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.1.1.1 1997/11/23 20:27:36 brian Exp $
+d42 1
+a42 1
+char VarLocalVersion[] = "$Date: 1997/11/23 20:27:36 $";
+d76 1
+a76 1
+  NEXT_REDIAL_PERIOD, 1, 1, MODEM_DEV, BASE_MODEM_DEV,
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d20 1
+a20 1
+ * $Id: vars.c,v 1.37 1997/11/22 13:47:02 brian Exp $
+d42 1
+a42 1
+char VarLocalVersion[] = "$Date: 1997/11/22 13:47:02 $";
+d56 3
+a58 1
+  {"vjcomp", CONF_ENABLE, CONF_ACCEPT},
+a59 1
+  {"chap", CONF_DISABLE, CONF_ACCEPT},
+d61 2
+a62 1
+  {"acfcomp", CONF_ENABLE, CONF_ACCEPT},
+d64 1
+a64 2
+  {"pred1", CONF_ENABLE, CONF_ACCEPT},
+  {"proxy", CONF_DISABLE, CONF_NONE},
+d67 2
+a69 1
+  {"throughput", CONF_DISABLE, CONF_NONE},
+@
+
+
+1.1.1.1
+log
+@Import version 1.5 of ppp.
+
+<sales>
+This is a user-level ppp implementation that uses the
+tun driver.  It was originally created by a Japanese
+ISP.  It's now piled with features.  Check the man pages
+for details.
+</sales>
+
+The sources are identical to the ones in FreeBSD, except
+for the Makefile.
+
+IP aliasing (NAT) is disabled, and can be enabled by simply
+doing a ``make install'' of libalias, then rebuilding
+ppp.  I'll create libalias as a port soon.
+@
+text
+@@

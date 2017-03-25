@@ -1,0 +1,361 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	mesa-13_0_6:1.1.1.3
+	mesa-13_0_5:1.1.1.3
+	mesa-13_0_3:1.1.1.3
+	mesa-13_0_2:1.1.1.3
+	OPENBSD_6_0:1.1.1.2.0.4
+	OPENBSD_6_0_BASE:1.1.1.2
+	mesa-11_2_2:1.1.1.2
+	OPENBSD_5_9:1.1.1.1.0.2
+	OPENBSD_5_9_BASE:1.1.1.1
+	mesa-11_0_9:1.1.1.1
+	mesa-11_0_8:1.1.1.1
+	mesa-11_0_6:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.1
+date	2015.11.22.02.44.24;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.1
+date	2015.11.22.02.44.24;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	bJUptkbooQfJPk5r;
+
+1.1.1.2
+date	2016.05.29.10.19.59;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	OwGfrJACrYJkCVJ4;
+
+1.1.1.3
+date	2016.12.11.08.27.39;	author jsg;	state Exp;
+branches;
+next	;
+commitid	uuv5VTS15jglEDZU;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@/*
+ * Copyright © 2014 Broadcom
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+/**
+ * @@file vc4_opt_algebraic.c
+ *
+ * This is the optimization pass for miscellaneous changes to instructions
+ * where we can simplify the operation by some knowledge about the specific
+ * operations.
+ *
+ * Mostly this will be a matter of turning things into MOVs so that they can
+ * later be copy-propagated out.
+ */
+
+#include "vc4_qir.h"
+#include "util/hash_table.h"
+#include "util/u_math.h"
+
+static inline uint32_t
+index_hash(const void *key)
+{
+        return (uintptr_t)key;
+}
+
+static inline bool
+index_compare(const void *a, const void *b)
+{
+        return a == b;
+}
+
+static void
+add_uniform(struct hash_table *ht, struct qreg reg)
+{
+        struct hash_entry *entry;
+        void *key = (void *)(uintptr_t)(reg.index + 1);
+
+        entry = _mesa_hash_table_search(ht, key);
+        if (entry) {
+                entry->data++;
+        } else {
+                _mesa_hash_table_insert(ht, key, (void *)(uintptr_t)1);
+        }
+}
+
+static void
+remove_uniform(struct hash_table *ht, struct qreg reg)
+{
+        struct hash_entry *entry;
+        void *key = (void *)(uintptr_t)(reg.index + 1);
+
+        entry = _mesa_hash_table_search(ht, key);
+        assert(entry);
+        entry->data--;
+        if (entry->data == NULL)
+                _mesa_hash_table_remove(ht, entry);
+}
+
+static bool
+is_lowerable_uniform(struct qinst *inst, int i)
+{
+        if (inst->src[i].file != QFILE_UNIF)
+                return false;
+        if (qir_is_tex(inst))
+                return i != 1;
+        return true;
+}
+
+void
+qir_lower_uniforms(struct vc4_compile *c)
+{
+        struct hash_table *ht =
+                _mesa_hash_table_create(c, index_hash, index_compare);
+
+        /* Walk the instruction list, finding which instructions have more
+         * than one uniform referenced, and add those uniform values to the
+         * ht.
+         */
+        list_for_each_entry(struct qinst, inst, &c->instructions, link) {
+                uint32_t nsrc = qir_get_op_nsrc(inst->op);
+
+                uint32_t count = 0;
+                for (int i = 0; i < nsrc; i++) {
+                        if (inst->src[i].file == QFILE_UNIF)
+                                count++;
+                }
+
+                if (count <= 1)
+                        continue;
+
+                for (int i = 0; i < nsrc; i++) {
+                        if (is_lowerable_uniform(inst, i))
+                                add_uniform(ht, inst->src[i]);
+                }
+        }
+
+        while (ht->entries) {
+                /* Find the most commonly used uniform in instructions that
+                 * need a uniform lowered.
+                 */
+                uint32_t max_count = 0;
+                uint32_t max_index = 0;
+                struct hash_entry *entry;
+                hash_table_foreach(ht, entry) {
+                        uint32_t count = (uintptr_t)entry->data;
+                        uint32_t index = (uintptr_t)entry->key - 1;
+                        if (count > max_count) {
+                                max_count = count;
+                                max_index = index;
+                        }
+                }
+
+                /* Now, find the instructions using this uniform and make them
+                 * reference a temp instead.
+                 */
+                struct qreg temp = qir_get_temp(c);
+                struct qreg unif = { QFILE_UNIF, max_index };
+                struct qinst *mov = qir_inst(QOP_MOV, temp, unif, c->undef);
+                list_add(&mov->link, &c->instructions);
+                c->defs[temp.index] = mov;
+                list_for_each_entry(struct qinst, inst, &c->instructions, link) {
+                        uint32_t nsrc = qir_get_op_nsrc(inst->op);
+
+                        uint32_t count = 0;
+                        for (int i = 0; i < nsrc; i++) {
+                                if (inst->src[i].file == QFILE_UNIF)
+                                        count++;
+                        }
+
+                        if (count <= 1)
+                                continue;
+
+                        for (int i = 0; i < nsrc; i++) {
+                                if (is_lowerable_uniform(inst, i) &&
+                                    inst->src[i].index == max_index) {
+                                        inst->src[i] = temp;
+                                        remove_uniform(ht, unif);
+                                        count--;
+                                }
+                        }
+
+                        /* If the instruction doesn't need lowering any more,
+                         * then drop it from the list.
+                         */
+                        if (count <= 1) {
+                                for (int i = 0; i < nsrc; i++) {
+                                        if (is_lowerable_uniform(inst, i))
+                                                remove_uniform(ht, inst->src[i]);
+                                }
+                        }
+                }
+        }
+
+        _mesa_hash_table_destroy(ht, NULL);
+}
+@
+
+
+1.1.1.1
+log
+@import Mesa 11.0.6
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 11.2.2
+@
+text
+@d25 1
+a25 1
+ * @@file vc4_qir_lower_uniforms.c
+d27 6
+a32 2
+ * This is the pre-code-generation pass for fixing up instructions that try to
+ * read from multiple uniform values.
+a87 27
+/* Returns the number of different uniform values referenced by the
+ * instruction.
+ */
+static uint32_t
+qir_get_instruction_uniform_count(struct qinst *inst)
+{
+        uint32_t count = 0;
+
+        for (int i = 0; i < qir_get_op_nsrc(inst->op); i++) {
+                if (inst->src[i].file != QFILE_UNIF)
+                        continue;
+
+                bool is_duplicate = false;
+                for (int j = 0; j < i; j++) {
+                        if (inst->src[j].file == QFILE_UNIF &&
+                            inst->src[j].index == inst->src[i].index) {
+                                is_duplicate = true;
+                                break;
+                        }
+                }
+                if (!is_duplicate)
+                        count++;
+        }
+
+        return count;
+}
+
+d101 7
+a107 1
+                if (qir_get_instruction_uniform_count(inst) <= 1)
+d143 5
+a147 1
+                        uint32_t count = qir_get_instruction_uniform_count(inst);
+a151 1
+                        bool removed = false;
+d157 1
+a157 1
+                                        removed = true;
+a159 2
+                        if (removed)
+                                count--;
+@
+
+
+1.1.1.3
+log
+@Import Mesa 13.0.2
+@
+text
+@d121 1
+a121 1
+        qir_for_each_inst_inorder(inst, c) {
+a148 2
+                struct qreg unif = qir_reg(QFILE_UNIF, max_index);
+
+d152 20
+a171 23
+                qir_for_each_block(block, c) {
+                        struct qinst *mov = NULL;
+
+                        qir_for_each_inst(inst, block) {
+                                uint32_t nsrc = qir_get_op_nsrc(inst->op);
+
+                                uint32_t count = qir_get_instruction_uniform_count(inst);
+
+                                if (count <= 1)
+                                        continue;
+
+                                /* If the block doesn't have a load of hte
+                                 * uniform yet, add it.  We could potentially
+                                 * do better and CSE MOVs from multiple blocks
+                                 * into dominating blocks, except that may
+                                 * cause troubles for register allocation.
+                                 */
+                                if (!mov) {
+                                        mov = qir_inst(QOP_MOV, qir_get_temp(c),
+                                                       unif, c->undef);
+                                        list_add(&mov->link,
+                                                 &block->instructions);
+                                        c->defs[mov->dst.index] = mov;
+d173 3
+d177 4
+a180 1
+                                bool removed = false;
+d182 2
+a183 18
+                                        if (is_lowerable_uniform(inst, i) &&
+                                            inst->src[i].index == max_index) {
+                                                inst->src[i] = mov->dst;
+                                                remove_uniform(ht, unif);
+                                                removed = true;
+                                        }
+                                }
+                                if (removed)
+                                        count--;
+
+                                /* If the instruction doesn't need lowering any more,
+                                 * then drop it from the list.
+                                 */
+                                if (count <= 1) {
+                                        for (int i = 0; i < nsrc; i++) {
+                                                if (is_lowerable_uniform(inst, i))
+                                                        remove_uniform(ht, inst->src[i]);
+                                        }
+@
+
+

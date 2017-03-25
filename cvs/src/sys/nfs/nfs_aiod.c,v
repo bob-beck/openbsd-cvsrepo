@@ -1,0 +1,471 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_6_0:1.7.0.4
+	OPENBSD_6_0_BASE:1.7
+	OPENBSD_5_9:1.7.0.2
+	OPENBSD_5_9_BASE:1.7
+	OPENBSD_5_8:1.6.0.8
+	OPENBSD_5_8_BASE:1.6
+	OPENBSD_5_7:1.6.0.2
+	OPENBSD_5_7_BASE:1.6
+	OPENBSD_5_6:1.6.0.4
+	OPENBSD_5_6_BASE:1.6
+	OPENBSD_5_5:1.5.0.4
+	OPENBSD_5_5_BASE:1.5
+	OPENBSD_5_4:1.4.0.16
+	OPENBSD_5_4_BASE:1.4
+	OPENBSD_5_3:1.4.0.14
+	OPENBSD_5_3_BASE:1.4
+	OPENBSD_5_2:1.4.0.12
+	OPENBSD_5_2_BASE:1.4
+	OPENBSD_5_1_BASE:1.4
+	OPENBSD_5_1:1.4.0.10
+	OPENBSD_5_0:1.4.0.8
+	OPENBSD_5_0_BASE:1.4
+	OPENBSD_4_9:1.4.0.6
+	OPENBSD_4_9_BASE:1.4
+	OPENBSD_4_8:1.4.0.4
+	OPENBSD_4_8_BASE:1.4
+	OPENBSD_4_7:1.4.0.2
+	OPENBSD_4_7_BASE:1.4;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2015.08.28.00.03.54;	author deraadt;	state Exp;
+branches;
+next	1.6;
+commitid	NdgfPIGUgJxQPnT7;
+
+1.6
+date	2014.07.12.18.43.52;	author tedu;	state Exp;
+branches;
+next	1.5;
+commitid	FE3DG5cICjyI4jWx;
+
+1.5
+date	2013.11.03.13.50.24;	author miod;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2009.08.27.23.39.46;	author thib;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2009.08.27.23.26.56;	author thib;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.08.26.12.08.10;	author thib;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.08.20.15.04.24;	author thib;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@fairly simple sizes for free(); ok tedu
+@
+text
+@/*	$OpenBSD: nfs_aiod.c,v 1.6 2014/07/12 18:43:52 tedu Exp $	*/
+/*
+ * Copyright (c) 1989, 1993
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * This code is derived from software contributed to Berkeley by
+ * Rick Macklem at The University of Guelph.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/proc.h>
+#include <sys/malloc.h>
+#include <sys/mount.h>
+#include <sys/vnode.h>
+#include <sys/kthread.h>
+#include <sys/rwlock.h>
+#include <sys/signalvar.h>
+#include <sys/queue.h>
+#include <sys/mutex.h>
+
+#include <nfs/rpcv2.h>
+#include <nfs/nfsproto.h>
+#include <nfs/nfs.h>
+#include <nfs/nfsnode.h>
+#include <nfs/nfs_var.h>
+#include <nfs/nfsmount.h>
+
+/* The nfs_aiodl_mtx mutex protects the two lists. */
+struct mutex		nfs_aiodl_mtx;
+struct nfs_aiodhead	nfs_aiods_all;
+struct nfs_aiodhead	nfs_aiods_idle;
+
+/* Current number of "running" aiods. Defaults to NFS_DEFASYNCDAEMON (4). */
+int			nfs_numaiods = -1;
+
+/* Maximum # of buf to queue on an aiod. */
+int			nfs_aiodbufqmax;
+
+/*
+ * Asynchronous I/O threads for client nfs.
+ * They do read-ahead and write-behind operations on the block I/O cache.
+ * Never returns unless it fails or gets killed.
+ */
+void
+nfs_aiod(void *arg)
+{
+	struct nfs_aiod	*aiod;
+	struct nfsmount	*nmp;
+	struct buf	*bp;
+
+	aiod = malloc(sizeof(*aiod), M_TEMP, M_WAITOK|M_ZERO);
+	mtx_enter(&nfs_aiodl_mtx);
+	LIST_INSERT_HEAD(&nfs_aiods_all, aiod, nad_all);
+	LIST_INSERT_HEAD(&nfs_aiods_idle, aiod, nad_idle);
+	mtx_leave(&nfs_aiodl_mtx);
+	nfs_numaiods++;
+
+	/*
+	 * Enforce an upper limit on how many bufs we'll queue up for
+	 * a given aiod. This is arbitrarily chosen to be a quarter of
+	 * the number of bufs in the system, divided evenly between
+	 * the running aiods.
+	 *
+	 * Since the number of bufs in the system is dynamic, and the
+	 * aiods are usually started up very early (during boot), the
+	 * number of buffers available is pretty low, so the limit we
+	 * enforce is way to low: So, always allow a minimum of 64 bufs.
+	 * XXX: Footshooting.
+	 */
+	nfs_aiodbufqmax = max((bcstats.numbufs / 4) / nfs_numaiods, 64);
+
+
+loop:	/* Loop around until SIGKILL */
+	if (aiod->nad_flags & NFSAIOD_WAKEUP) {
+		mtx_enter(&nfs_aiodl_mtx);
+		LIST_INSERT_HEAD(&nfs_aiods_idle, aiod, nad_idle);
+		mtx_leave(&nfs_aiodl_mtx);
+		aiod->nad_flags &= ~NFSAIOD_WAKEUP;
+	}
+
+	while (1) {
+		nmp = aiod->nad_mnt;
+		if (nmp) {
+			aiod->nad_mnt = NULL;
+			break;
+		}
+
+		while (!(aiod->nad_flags & NFSAIOD_WAKEUP))
+			tsleep(aiod, PWAIT, "aiodidle", 0);
+
+		/*
+		 * Wakeup for this aiod happens in one of the following
+		 * situations:
+		 * - The thread is being asked to exit by nfs_set_naiod(), or
+		 * - nfs_asyncio() has found work for this thread on a mount.
+		 *
+		 * In the former case, check to see if nfs_asyncio() has just
+		 * found some work for this thread, and if so, ignore it until
+		 * later.
+		 */
+		if (aiod->nad_flags & NFSAIOD_EXIT) {
+			if (aiod->nad_mnt == NULL)
+				goto out1;
+			else
+				break;
+		}
+	}
+
+	while ((bp = TAILQ_FIRST(&nmp->nm_bufq)) != NULL) {
+		/* Take one off the front of the list */
+		TAILQ_REMOVE(&nmp->nm_bufq, bp, b_freelist);
+		nmp->nm_bufqlen--;
+		nfs_doio(bp, NULL);
+	}
+
+	KASSERT(nmp->nm_naiods > 0);
+	nmp->nm_naiods--;
+	if (aiod->nad_flags & NFSAIOD_EXIT)
+		goto out1;
+
+	goto loop;
+
+out1:
+	free(aiod, M_TEMP, sizeof(*aiod));
+	nfs_numaiods--;
+	KASSERT(nfs_numaiods >= 0);
+	/* Rejust the limit of bufs to queue. See comment above. */
+	if (nfs_numaiods > 0)
+		nfs_aiodbufqmax = max((bcstats.numbufs / 4) / nfs_numaiods, 64);
+	else
+		nfs_aiodbufqmax = 0;
+	kthread_exit(0);
+}
+
+int
+nfs_set_naiod(int howmany)
+{
+	struct nfs_aiod	*aiod;
+	int		 want, error;
+
+	KASSERT(howmany >= 0);
+
+	error = 0;
+
+	if (nfs_numaiods == -1)
+		nfs_numaiods = 0;
+
+	want = howmany - nfs_numaiods;
+
+	if (want > 0) {
+		/* Add more. */	
+		want = min(want, NFS_MAXASYNCDAEMON);
+		while (want > 0) {
+			error = kthread_create(nfs_aiod, NULL, NULL, "nfsaio");
+			if (error)
+				return (error);
+			want--;
+		}
+	} else if (want < 0) {
+		/* Get rid of some. */
+		want = -want;
+		want = min(want, nfs_numaiods);
+
+		/* Favour idle aiod's. */
+		mtx_enter(&nfs_aiodl_mtx);
+		while (!LIST_EMPTY(&nfs_aiods_idle) && want > 0) {
+			aiod = LIST_FIRST(&nfs_aiods_idle);
+			LIST_REMOVE(aiod, nad_idle);
+			LIST_REMOVE(aiod, nad_all);	/* Yuck. */
+			aiod->nad_flags |= NFSAIOD_QUIT;
+			wakeup_one(aiod);
+			want--;
+		}
+
+		while (!LIST_EMPTY(&nfs_aiods_all) && want > 0) {
+			aiod = LIST_FIRST(&nfs_aiods_all);
+			LIST_REMOVE(aiod, nad_all);
+			aiod->nad_flags |= NFSAIOD_QUIT;
+			wakeup_one(aiod);
+			want--;
+		}
+		mtx_leave(&nfs_aiodl_mtx);
+	}
+	/* ignore the want == nfs_numaiods case, since it means no work */
+
+	return (error);
+}
+@
+
+
+1.6
+log
+@add a size argument to free. will be used soon, but for now default to 0.
+after discussions with beck deraadt kettenis.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: nfs_aiod.c,v 1.5 2013/11/03 13:50:24 miod Exp $	*/
+d150 1
+a150 1
+	free(aiod, M_TEMP, 0);
+@
+
+
+1.5
+log
+@Fix bogus kthread_create() usage leading to wrong struct proc * pointer
+usage in the nfs kthreads. Spotted by fgsch@@, similar diff by guenther@@,
+ok guenther@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: nfs_aiod.c,v 1.4 2009/08/27 23:39:46 thib Exp $	*/
+d150 1
+a150 1
+	free(aiod, M_TEMP);
+@
+
+
+1.4
+log
+@Garbage collect two variables that where set but unused.
+Tiny spacing nit.
+Fix a typo, pointed out by miod@@.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: nfs_aiod.c,v 1.3 2009/08/27 23:26:56 thib Exp $	*/
+a74 1
+	struct proc	*p;
+a76 2
+	p = (struct proc *)arg;
+
+a164 1
+	struct proc	*p;
+d180 1
+a180 1
+			error = kthread_create(nfs_aiod, p, &p, "nfsaio");
+@
+
+
+1.3
+log
+@introduce a flag member to struct nfs_aiod, and use flags instead of the exit
+and worked members. nad_worked becomes NFSAIOD_WAKEUP, which is set after if
+an aiod was removed from the idle list and woken up by nfs_asyncio().
+
+don't rely on tsleep wchans being unique, that is keep going back to sleep if
+woken up unless the NFSAIOD_WAKEUP flag is set.
+
+fix a divide by zero crash if nfs.vfs.iothreads is set to 0, as that can happen
+when we recalculate the maximum buf's to queue up for each aiod.
+
+in nfs_asyncio() set the nad_mnt to NULL before returning the aiod back to the
+idle list in the case where we have already queued up to many bufs, otherwise
+we trip an assertion.
+
+minimize the time we are holding the nfs_aiodl_mtx to only when we are inserting
+or removing from the lists, with the exception of nfs_set_naiod() as it would
+make the loops more complicated and its uncommon in any case.
+
+tested by myself and deraadt@@
+"fine with me" deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: nfs_aiod.c,v 1.2 2009/08/26 12:08:10 thib Exp $	*/
+a76 1
+	int		 error;
+a78 1
+	error = 0;
+a102 1
+	
+d161 1
+a161 1
+	kthread_exit(error);
+d169 1
+a169 1
+	int		 want, error, dolock;
+a173 1
+	dolock = 1;
+@
+
+
+1.2
+log
+@make sure that an aiod has been removed from the nfs_aiods_idle list
+before inserting it back into the list.
+
+crashes debugged with help from deraadt@@ who also tested this fix.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d105 3
+a107 2
+	mtx_enter(&nfs_aiodl_mtx);
+	if (aiod->nad_worked) {
+d109 2
+a110 1
+		aiod->nad_worked = 0;
+a111 1
+	mtx_leave(&nfs_aiodl_mtx);
+d120 2
+a121 3
+		error = tsleep(aiod, PWAIT, "nioidle", 0);
+		if (error)
+			goto out;
+d133 1
+a133 1
+		if (aiod->nad_exiting) {
+d150 1
+a150 1
+	if (aiod->nad_exiting)
+a154 4
+out:
+	mtx_enter(&nfs_aiodl_mtx);
+	LIST_REMOVE(aiod, nad_idle);
+	mtx_leave(&nfs_aiodl_mtx);
+d158 1
+d160 4
+a163 1
+	nfs_aiodbufqmax = max((bcstats.numbufs / 4) / nfs_numaiods, 64);
+d204 2
+a205 2
+			aiod->nad_exiting = 1;
+			wakeup(aiod);
+d212 2
+a213 2
+			aiod->nad_exiting = 1;
+			wakeup(aiod);
+@
+
+
+1.1
+log
+@Rework the way we do async I/O in nfs. Introduce separate buf queues for
+each mount, and when work is "found", peg an aiod to that mount todo the
+I/O. Make nfs_asyncio() a bit smarter when deciding when to do asyncio
+and when to force it sync, this is done by keeping the aiod's one two lists,
+an "idle" and an "all" list, so asyncio is only done when there are aiods
+hanging around todo it for us or are already pegged to the mount.
+
+Idea liked by at least beck@@ (and I think art@@).
+Extensive testing done by myself and jasper and a few others on various
+arch's.
+
+Ideas/Code from Net/Free.
+
+OK blambert@@.
+@
+text
+@d85 1
+d106 4
+a109 1
+	LIST_INSERT_HEAD(&nfs_aiods_idle, aiod, nad_idle);
+@
+

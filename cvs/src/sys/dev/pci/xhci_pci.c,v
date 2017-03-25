@@ -1,0 +1,543 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_6_0:1.8.0.4
+	OPENBSD_6_0_BASE:1.8
+	OPENBSD_5_9:1.7.0.2
+	OPENBSD_5_9_BASE:1.7
+	OPENBSD_5_8:1.6.0.4
+	OPENBSD_5_8_BASE:1.6
+	OPENBSD_5_7:1.5.0.4
+	OPENBSD_5_7_BASE:1.5
+	OPENBSD_5_6:1.4.0.4
+	OPENBSD_5_6_BASE:1.4;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2016.06.01.06.19.59;	author mpi;	state Exp;
+branches;
+next	1.7;
+commitid	PBtRMDtR8QQXPa9N;
+
+1.7
+date	2015.11.02.14.53.10;	author mpi;	state Exp;
+branches;
+next	1.6;
+commitid	y9v7kujtiGDwaQG2;
+
+1.6
+date	2015.06.22.08.43.27;	author mpi;	state Exp;
+branches;
+next	1.5;
+commitid	aHYZWLcQlPLUjEaj;
+
+1.5
+date	2014.10.30.18.25.08;	author mpi;	state Exp;
+branches;
+next	1.4;
+commitid	YqEjpcfinbNspaim;
+
+1.4
+date	2014.07.12.17.38.51;	author yuo;	state Exp;
+branches;
+next	1.3;
+commitid	x2X3TVI2QKLRYvys;
+
+1.3
+date	2014.04.07.23.32.41;	author brad;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2014.03.25.17.23.40;	author mpi;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2014.03.08.14.34.12;	author mpi;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@Fix the loop iterating on extended capabilities.  It turns out that we
+never did the handoff between the BIOS and the OS correctly.
+
+Should make xhci(4) usable on machines with xHCI BIOS support like most
+of the recent DELL.
+
+Tested by Hrvoje Popovski and David Hill.
+
+ok kettenis@@, mikeb@@
+@
+text
+@/*	$OpenBSD: xhci_pci.c,v 1.7 2015/11/02 14:53:10 mpi Exp $ */
+
+/*
+ * Copyright (c) 2001, 2002 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Lennart Augustsson (lennart@@augustsson.net).
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/rwlock.h>
+#include <sys/device.h>
+#include <sys/timeout.h>
+#include <sys/queue.h>
+
+#include <machine/bus.h>
+
+#include <dev/pci/pcidevs.h>
+#include <dev/pci/pcivar.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+#include <dev/usb/usb_mem.h>
+
+#include <dev/usb/xhcireg.h>
+#include <dev/usb/xhcivar.h>
+
+#ifdef XHCI_DEBUG
+#define DPRINTF(x)	if (xhcidebug) printf x
+extern int xhcidebug;
+#else
+#define DPRINTF(x)
+#endif
+
+struct xhci_pci_softc {
+	struct xhci_softc	sc;
+	pci_chipset_tag_t	sc_pc;
+	pcitag_t		sc_tag;
+	pcireg_t		sc_id;
+	void 			*sc_ih;		/* interrupt vectoring */
+};
+
+int	xhci_pci_match(struct device *, void *, void *);
+void	xhci_pci_attach(struct device *, struct device *, void *);
+int	xhci_pci_detach(struct device *, int);
+int	xhci_pci_activate(struct device *, int);
+void	xhci_pci_takecontroller(struct xhci_pci_softc *, int);
+
+struct cfattach xhci_pci_ca = {
+	sizeof(struct xhci_pci_softc), xhci_pci_match, xhci_pci_attach,
+	xhci_pci_detach, xhci_pci_activate
+};
+
+int
+xhci_pci_match(struct device *parent, void *match, void *aux)
+{
+	struct pci_attach_args *pa = (struct pci_attach_args *) aux;
+
+	if (PCI_CLASS(pa->pa_class) == PCI_CLASS_SERIALBUS &&
+	    PCI_SUBCLASS(pa->pa_class) == PCI_SUBCLASS_SERIALBUS_USB &&
+	    PCI_INTERFACE(pa->pa_class) == PCI_INTERFACE_XHCI)
+		return (1);
+
+	return (0);
+}
+
+static int
+xhci_pci_port_route(struct xhci_pci_softc *psc)
+{
+	pcireg_t val;
+
+	/*
+	 * Check USB3 Port Routing Mask register that indicates the ports
+	 * can be changed from OS, and turn on by USB3 Port SS Enable register.
+	 */
+	val = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_XHCI_INTEL_USB3PRM);
+	DPRINTF(("%s: USB3PRM / USB3.0 configurable ports: 0x%08x\n",
+	    psc->sc.sc_bus.bdev.dv_xname, val));
+
+	pci_conf_write(psc->sc_pc, psc->sc_tag, PCI_XHCI_INTEL_USB3_PSSEN, val);
+	val = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_XHCI_INTEL_USB3_PSSEN);
+	DPRINTF(("%s: USB3_PSSEN / Enabled USB3.0 ports under xHCI: 0x%08x\n",
+	    psc->sc.sc_bus.bdev.dv_xname, val));
+
+	/*
+	 * Check USB2 Port Routing Mask register that indicates the USB2.0
+	 * ports to be controlled by xHCI HC, and switch them to xHCI HC.
+	 */
+	val = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_XHCI_INTEL_XUSB2PRM);
+	DPRINTF(("%s: XUSB2PRM / USB2.0 ports can switch from EHCI to xHCI:"
+	    "0x%08x\n", psc->sc.sc_bus.bdev.dv_xname, val));
+
+	pci_conf_write(psc->sc_pc, psc->sc_tag, PCI_XHCI_INTEL_XUSB2PR, val);
+	val = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_XHCI_INTEL_XUSB2PR);
+	DPRINTF(("%s: XUSB2PR / USB2.0 ports under xHCI: 0x%08x\n",
+	    psc->sc.sc_bus.bdev.dv_xname, val));
+
+	return (0);
+}
+
+
+void
+xhci_pci_attach(struct device *parent, struct device *self, void *aux)
+{
+	struct xhci_pci_softc *psc = (struct xhci_pci_softc *)self;
+	struct pci_attach_args *pa = (struct pci_attach_args *)aux;
+	const char *intrstr;
+	const char *vendor;
+	pci_intr_handle_t ih;
+	pcireg_t reg;
+	int error;
+
+	reg = pci_mapreg_type(pa->pa_pc, pa->pa_tag, PCI_CBMEM);
+	if (pci_mapreg_map(pa, PCI_CBMEM, reg, 0, &psc->sc.iot, &psc->sc.ioh,
+	    NULL, &psc->sc.sc_size, 0)) {
+		printf(": can't map mem space\n");
+		return;
+	}
+
+	psc->sc_pc = pa->pa_pc;
+	psc->sc_tag = pa->pa_tag;
+	psc->sc_id = pa->pa_id;
+	psc->sc.sc_bus.dmatag = pa->pa_dmat;
+
+	/* Handle quirks */
+	switch (PCI_VENDOR(pa->pa_id)) {
+	case PCI_VENDOR_FRESCO:
+		/* FL1000 / FL1400 claim MSI support but do not support MSI */
+                if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_FRESCO_FL1000 ||
+                    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_FRESCO_FL1400)
+			pa->pa_flags &= ~PCI_FLAGS_MSI_ENABLED;
+		break;
+	}
+
+	/* Map and establish the interrupt. */
+	if (pci_intr_map_msi(pa, &ih) != 0 && pci_intr_map(pa, &ih) != 0) {
+		printf(": couldn't map interrupt\n");
+		goto unmap_ret;
+	}
+	intrstr = pci_intr_string(pa->pa_pc, ih);
+
+	psc->sc_ih = pci_intr_establish(pa->pa_pc, ih, IPL_USB | IPL_MPSAFE,
+	    xhci_intr, psc, psc->sc.sc_bus.bdev.dv_xname);
+	if (psc->sc_ih == NULL) {
+		printf(": couldn't establish interrupt");
+		if (intrstr != NULL)
+			printf(" at %s", intrstr);
+		printf("\n");
+		goto unmap_ret;
+	}
+	printf(": %s\n", intrstr);
+
+	/* Figure out vendor for root hub descriptor. */
+	vendor = pci_findvendor(pa->pa_id);
+	psc->sc.sc_id_vendor = PCI_VENDOR(pa->pa_id);
+	if (vendor)
+		strlcpy(psc->sc.sc_vendor, vendor, sizeof(psc->sc.sc_vendor));
+	else
+		snprintf(psc->sc.sc_vendor, sizeof(psc->sc.sc_vendor),
+		    "vendor 0x%04x", PCI_VENDOR(pa->pa_id));
+
+	xhci_pci_takecontroller(psc, 0);
+
+	if ((error = xhci_init(&psc->sc)) != 0) {
+		printf("%s: init failed, error=%d\n",
+		    psc->sc.sc_bus.bdev.dv_xname, error);
+		goto disestablish_ret;
+	}
+
+	if (PCI_VENDOR(psc->sc_id) == PCI_VENDOR_INTEL)
+		xhci_pci_port_route(psc);
+
+	/* Attach usb device. */
+	config_found(self, &psc->sc.sc_bus, usbctlprint);
+
+	/* Now that the stack is ready, config' the HC and enable interrupts. */
+	xhci_config(&psc->sc);
+
+	return;
+
+disestablish_ret:
+	pci_intr_disestablish(psc->sc_pc, psc->sc_ih);
+unmap_ret:
+	bus_space_unmap(psc->sc.iot, psc->sc.ioh, psc->sc.sc_size);
+}
+
+int
+xhci_pci_detach(struct device *self, int flags)
+{
+	struct xhci_pci_softc *psc = (struct xhci_pci_softc *)self;
+	int rv;
+
+	rv = xhci_detach(self, flags);
+	if (rv)
+		return (rv);
+	if (psc->sc_ih != NULL) {
+		pci_intr_disestablish(psc->sc_pc, psc->sc_ih);
+		psc->sc_ih = NULL;
+	}
+	if (psc->sc.sc_size) {
+		bus_space_unmap(psc->sc.iot, psc->sc.ioh, psc->sc.sc_size);
+		psc->sc.sc_size = 0;
+	}
+	return (0);
+}
+
+int
+xhci_pci_activate(struct device *self, int act)
+{
+	struct xhci_pci_softc *psc = (struct xhci_pci_softc *)self;
+
+	switch (act) {
+	case DVACT_RESUME:
+		if (PCI_VENDOR(psc->sc_id) == PCI_VENDOR_INTEL)
+			xhci_pci_port_route(psc);
+		break;
+	default:
+		break;
+	}
+
+	return (xhci_activate(self, act));
+}
+
+
+void
+xhci_pci_takecontroller(struct xhci_pci_softc *psc, int silent)
+{
+	uint32_t cparams, xecp, eec;
+	uint8_t bios_sem;
+	int i;
+
+	cparams = XREAD4(&psc->sc, XHCI_HCCPARAMS);
+	eec = -1;
+
+	/* Synchronise with the BIOS if it owns the controller. */
+	for (xecp = XHCI_HCC_XECP(cparams) << 2;
+	    xecp != 0 && XHCI_XECP_NEXT(eec);
+	    xecp += XHCI_XECP_NEXT(eec) << 2) {
+		eec = XREAD4(&psc->sc, xecp);
+		if (XHCI_XECP_ID(eec) != XHCI_ID_USB_LEGACY)
+			continue;
+		bios_sem = XREAD1(&psc->sc, xecp + XHCI_XECP_BIOS_SEM);
+		if (bios_sem) {
+			XWRITE1(&psc->sc, xecp + XHCI_XECP_OS_SEM, 1);
+			DPRINTF(("%s: waiting for BIOS to give up control\n",
+			    psc->sc.sc_bus.bdev.dv_xname));
+			for (i = 0; i < 5000; i++) {
+				bios_sem = XREAD1(&psc->sc, xecp +
+				    XHCI_XECP_BIOS_SEM);
+				if (bios_sem == 0)
+					break;
+				DELAY(1000);
+			}
+			if (silent == 0 && bios_sem)
+				printf("%s: timed out waiting for BIOS\n",
+				    psc->sc.sc_bus.bdev.dv_xname);
+		}
+	}
+}
+@
+
+
+1.7
+log
+@Mark xhci_intr() as IPL_MPSAFE since it only schedules a soft-interrupt.
+
+ok visa@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xhci_pci.c,v 1.6 2015/06/22 08:43:27 mpi Exp $ */
+d261 3
+a263 2
+	for (xecp = XHCI_HCC_XECP(cparams) << 2; xecp != 0;
+	    xecp = XHCI_XECP_NEXT(eec) << 2) {
+@
+
+
+1.6
+log
+@Apparently some BIOSes not supporting xHCI natively switch USB ports
+back to EHCI at suspend.  So route the ports back to xHCI at resume.
+
+Problem reported by Adam Wolk, thanks!
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xhci_pci.c,v 1.5 2014/10/30 18:25:08 mpi Exp $ */
+d167 1
+a167 1
+	psc->sc_ih = pci_intr_establish(pa->pa_pc, ih, IPL_USB,
+@
+
+
+1.5
+log
+@Do not enable interrupts before attaching usb(4), fix a panic when an
+Express Card is plugged with USB devices on it.
+
+While here do not print an unitialized error value if xhci_init() fails,
+from Patrick Wildt.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xhci_pci.c,v 1.4 2014/07/12 17:38:51 yuo Exp $ */
+d64 1
+d71 1
+d76 1
+a76 1
+	xhci_pci_detach, xhci_activate
+d97 1
+a97 1
+	/* 
+d100 1
+a100 1
+	 */ 
+d111 1
+a111 1
+	 * Check USB2 Port Routing Mask register that indicates the USB2.0 
+d147 1
+d195 2
+a196 10
+	switch (PCI_VENDOR(pa->pa_id)) {
+	case PCI_VENDOR_INTEL:
+		switch (PCI_PRODUCT(pa->pa_id)) {
+		case PCI_PRODUCT_INTEL_8SERIES_XHCI:
+		case PCI_PRODUCT_INTEL_8SERIES_LP_XHCI:
+		case PCI_PRODUCT_INTEL_7SERIES_XHCI:
+			xhci_pci_port_route(psc);
+			break;
+		}
+	}
+d231 18
+@
+
+
+1.4
+log
+@To enable Intel XHCI host controller, re-route all of usb port to xhci
+instead of connected to ehci.
+
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xhci_pci.c,v 1.3 2014/04/07 23:32:41 brad Exp $ */
+d186 1
+a186 1
+	if (xhci_init(&psc->sc)) {
+d205 3
+@
+
+
+1.3
+log
+@Add MSI support for xhci(4). Also add a quirk for some of the Fresco
+Logic controllers, taken from the Linux kernel.
+
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xhci_pci.c,v 1.2 2014/03/25 17:23:40 mpi Exp $ */
+d90 35
+d190 11
+@
+
+
+1.2
+log
+@Upon resume do a full reset of the HC, including the command and event
+rings, and rewrite all the addresses in the registers.
+
+While here don't keep a copy of our usb(4) child device, autoconf(9)
+knows how to reach our children.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xhci_pci.c,v 1.1 2014/03/08 14:34:12 mpi Exp $ */
+d112 10
+d123 1
+a123 1
+	if (pci_intr_map(pa, &ih) != 0) {
+@
+
+
+1.1
+log
+@Dumb xhci(4) implementation.
+
+This driver does not handle isochronous endpoint (yet) and has no logical
+TD representation.  Each transfer is linked to the raw TRB of its related
+endpoint.
+
+Most of the transfer error completion codes are not handled, even with all
+the cheese provided by miod@@ I couldn't find a proper way to reset an
+endpoint asynchronously when a device babbles.  Or maybe it was the wine?
+Anyway this will come soon.
+
+In general the endpoint configuration and reset code is really crude and
+requires some love, but our stack should be fixed to properly open only
+once the default pipe of every new USB device first.
+
+This means this driver wont work as it is, our stack needs other changes
+first.
+
+Suspend/resume works but ports are not suspended for the moment.
+
+But even with these problems, interrupt devices: ukbd(4), ums(4) and
+sensors like ugold(4) work properly and USB 3.0 umass(4) devices give
+me a reasonnable read/write speed.
+
+Timeouts to cancel USB transfers are not enabled *on purpose*, to be able
+to track down potential timing issues.
+
+I'm committing now so that others can help fixing my bugs (8
+
+All this work has been done on an ExpressCard with a NEC xHCI 0.96, other
+implementations/versions might trigger more bugs :)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$ */
+d148 1
+a148 1
+	psc->sc.sc_child = config_found(self, &psc->sc.sc_bus, usbctlprint);
+d164 1
+a164 1
+	rv = xhci_detach(&psc->sc, flags);
+@
+

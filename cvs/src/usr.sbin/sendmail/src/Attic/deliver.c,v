@@ -1,0 +1,8116 @@
+head	1.13;
+access;
+symbols
+	OPENBSD_2_6:1.12.0.4
+	OPENBSD_2_6_BASE:1.12
+	OPENBSD_2_5:1.12.0.2
+	OPENBSD_2_5_BASE:1.12
+	OPENBSD_2_4:1.10.0.2
+	OPENBSD_2_4_BASE:1.10
+	sendmail_8_9_1:1.1.1.2
+	UCB:1.1.1
+	OPENBSD_2_3:1.8.0.2
+	OPENBSD_2_3_BASE:1.8
+	OPENBSD_2_2:1.7.0.2
+	OPENBSD_2_2_BASE:1.7
+	OPENBSD_2_1:1.5.0.2
+	OPENBSD_2_1_BASE:1.5
+	OPENBSD_2_0:1.3.0.2
+	OPENBSD_2_0_BASE:1.3
+	netbsd_1_1:1.1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.13
+date	2000.04.18.04.57.19;	author millert;	state dead;
+branches;
+next	1.12;
+
+1.12
+date	99.02.05.05.59.26;	author millert;	state Exp;
+branches;
+next	1.11;
+
+1.11
+date	99.01.01.20.33.43;	author millert;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	98.08.14.00.55.54;	author millert;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	98.07.12.19.44.34;	author millert;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	97.11.09.04.05.38;	author gene;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	97.08.04.02.17.50;	author downsj;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	97.07.15.07.24.03;	author downsj;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	97.01.22.01.07.08;	author downsj;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	96.12.14.21.17.14;	author downsj;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	96.09.19.06.44.55;	author fn;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	96.01.29.01.43.45;	author dm;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	95.10.18.08.48.17;	author deraadt;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	95.10.18.08.48.17;	author deraadt;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	98.07.12.17.10.02;	author millert;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.13
+log
+@remove sendmail 8.9.3
+@
+text
+@/*
+ * Copyright (c) 1998 Sendmail, Inc.  All rights reserved.
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman.  All rights reserved.
+ * Copyright (c) 1988, 1993
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * By using this file, you agree to the terms and conditions set
+ * forth in the LICENSE file which can be found at the top level of
+ * the sendmail distribution.
+ *
+ */
+
+#ifndef lint
+static char sccsid[] = "@@(#)deliver.c	8.367 (Berkeley) 1/18/1999";
+#endif /* not lint */
+
+#include "sendmail.h"
+#include <errno.h>
+#include <grp.h>
+#if NAMED_BIND
+#include <resolv.h>
+#endif
+
+#if HASSETUSERCONTEXT
+# include <login_cap.h>
+#endif
+
+#if SMTP
+extern char	SmtpError[];
+#endif
+
+/*
+**  SENDALL -- actually send all the messages.
+**
+**	Parameters:
+**		e -- the envelope to send.
+**		mode -- the delivery mode to use.  If SM_DEFAULT, use
+**			the current e->e_sendmode.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		Scans the send lists and sends everything it finds.
+**		Delivers any appropriate error messages.
+**		If we are running in a non-interactive mode, takes the
+**			appropriate action.
+*/
+
+void
+sendall(e, mode)
+	ENVELOPE *e;
+	int mode;
+{
+	register ADDRESS *q;
+	char *owner;
+	int otherowners;
+	register ENVELOPE *ee;
+	ENVELOPE *splitenv = NULL;
+	int oldverbose = Verbose;
+	bool somedeliveries = FALSE, expensive = FALSE;
+	pid_t pid;
+	void sendenvelope __P((ENVELOPE *, int));
+
+	/*
+	**  If this message is to be discarded, don't bother sending
+	**  the message at all.
+	*/
+
+	if (bitset(EF_DISCARD, e->e_flags))
+	{
+		if (tTd(13, 1))
+			printf("sendall: discarding id %s\n", e->e_id);
+		e->e_flags |= EF_CLRQUEUE;
+		if (LogLevel > 4)
+			sm_syslog(LOG_INFO, e->e_id, "discarded");
+		markstats(e, NULL, TRUE);
+		return;
+	}
+
+	/*
+	**  If we have had global, fatal errors, don't bother sending
+	**  the message at all if we are in SMTP mode.  Local errors
+	**  (e.g., a single address failing) will still cause the other
+	**  addresses to be sent.
+	*/
+
+	if (bitset(EF_FATALERRS, e->e_flags) &&
+	    (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+	{
+		e->e_flags |= EF_CLRQUEUE;
+		return;
+	}
+
+	/* determine actual delivery mode */
+	if (mode == SM_DEFAULT)
+	{
+		mode = e->e_sendmode;
+		if (mode != SM_VERIFY && mode != SM_DEFER &&
+		    shouldqueue(e->e_msgpriority, e->e_ctime))
+			mode = SM_QUEUE;
+	}
+
+	if (tTd(13, 1))
+	{
+		extern void printenvflags __P((ENVELOPE *));
+
+		printf("\n===== SENDALL: mode %c, id %s, e_from ",
+			mode, e->e_id);
+		printaddr(&e->e_from, FALSE);
+		printf("\te_flags = ");
+		printenvflags(e);
+		printf("sendqueue:\n");
+		printaddr(e->e_sendqueue, TRUE);
+	}
+
+	/*
+	**  Do any preprocessing necessary for the mode we are running.
+	**	Check to make sure the hop count is reasonable.
+	**	Delete sends to the sender in mailing lists.
+	*/
+
+	CurEnv = e;
+	if (tTd(62, 1))
+		checkfds(NULL);
+
+	if (e->e_hopcount > MaxHopCount)
+	{
+		errno = 0;
+#if QUEUE
+		queueup(e, mode == SM_QUEUE || mode == SM_DEFER);
+#endif
+		e->e_flags |= EF_FATALERRS|EF_PM_NOTIFY|EF_CLRQUEUE;
+		syserr("554 Too many hops %d (%d max): from %s via %s, to %s",
+			e->e_hopcount, MaxHopCount, e->e_from.q_paddr,
+			RealHostName == NULL ? "localhost" : RealHostName,
+			e->e_sendqueue->q_paddr);
+		e->e_sendqueue->q_status = "5.4.6";
+		return;
+	}
+
+	/*
+	**  Do sender deletion.
+	**
+	**	If the sender has the QQUEUEUP flag set, skip this.
+	**	This can happen if the name server is hosed when you
+	**	are trying to send mail.  The result is that the sender
+	**	is instantiated in the queue as a recipient.
+	*/
+
+	if (!bitset(EF_METOO, e->e_flags) &&
+	    !bitset(QQUEUEUP, e->e_from.q_flags))
+	{
+		if (tTd(13, 5))
+		{
+			printf("sendall: QDONTSEND ");
+			printaddr(&e->e_from, FALSE);
+		}
+		e->e_from.q_flags |= QDONTSEND;
+		(void) recipient(&e->e_from, &e->e_sendqueue, 0, e);
+	}
+
+	/*
+	**  Handle alias owners.
+	**
+	**	We scan up the q_alias chain looking for owners.
+	**	We discard owners that are the same as the return path.
+	*/
+
+	for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+	{
+		register struct address *a;
+
+		for (a = q; a != NULL && a->q_owner == NULL; a = a->q_alias)
+			continue;
+		if (a != NULL)
+			q->q_owner = a->q_owner;
+
+		if (q->q_owner != NULL &&
+		    !bitset(QDONTSEND, q->q_flags) &&
+		    strcmp(q->q_owner, e->e_from.q_paddr) == 0)
+			q->q_owner = NULL;
+	}
+
+	if (tTd(13, 25))
+	{
+		printf("\nAfter first owner pass, sendq =\n");
+		printaddr(e->e_sendqueue, TRUE);
+	}
+
+	owner = "";
+	otherowners = 1;
+	while (owner != NULL && otherowners > 0)
+	{
+		if (tTd(13, 28))
+			printf("owner = \"%s\", otherowners = %d\n",
+				owner, otherowners);
+		owner = NULL;
+		otherowners = bitset(EF_SENDRECEIPT, e->e_flags) ? 1 : 0;
+
+		for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+		{
+			if (tTd(13, 30))
+			{
+				printf("Checking ");
+				printaddr(q, FALSE);
+			}
+			if (bitset(QDONTSEND, q->q_flags))
+			{
+				if (tTd(13, 30))
+					printf("    ... QDONTSEND\n");
+				continue;
+			}
+			if (tTd(13, 29) && !tTd(13, 30))
+			{
+				printf("Checking ");
+				printaddr(q, FALSE);
+			}
+
+			if (q->q_owner != NULL)
+			{
+				if (owner == NULL)
+				{
+					if (tTd(13, 40))
+						printf("    ... First owner = \"%s\"\n",
+							q->q_owner);
+					owner = q->q_owner;
+				}
+				else if (owner != q->q_owner)
+				{
+					if (strcmp(owner, q->q_owner) == 0)
+					{
+						if (tTd(13, 40))
+							printf("    ... Same owner = \"%s\"\n",
+								owner);
+
+						/* make future comparisons cheap */
+						q->q_owner = owner;
+					}
+					else
+					{
+						if (tTd(13, 40))
+							printf("    ... Another owner \"%s\"\n",
+								q->q_owner);
+						otherowners++;
+					}
+					owner = q->q_owner;
+				}
+				else if (tTd(13, 40))
+					printf("    ... Same owner = \"%s\"\n",
+						owner);
+			}
+			else
+			{
+				if (tTd(13, 40))
+					printf("    ... Null owner\n");
+				otherowners++;
+			}
+
+			/*
+			**  If this mailer is expensive, and if we don't
+			**  want to make connections now, just mark these
+			**  addresses and return.  This is useful if we
+			**  want to batch connections to reduce load.  This
+			**  will cause the messages to be queued up, and a
+			**  daemon will come along to send the messages later.
+			*/
+
+			if (bitset(QBADADDR|QQUEUEUP, q->q_flags))
+			{
+				if (tTd(13, 30))
+					printf("    ... QBADADDR|QQUEUEUP\n");
+				continue;
+			}
+			if (NoConnect && !Verbose &&
+			    bitnset(M_EXPENSIVE, q->q_mailer->m_flags))
+			{
+				if (tTd(13, 30))
+					printf("    ... expensive\n");
+				q->q_flags |= QQUEUEUP;
+				expensive = TRUE;
+			}
+			else
+			{
+				if (tTd(13, 30))
+					printf("    ... deliverable\n");
+				somedeliveries = TRUE;
+			}
+		}
+
+		if (owner != NULL && otherowners > 0)
+		{
+			extern HDR *copyheader __P((HDR *));
+			extern ADDRESS *copyqueue __P((ADDRESS *));
+			extern void dup_queue_file __P((ENVELOPE *, ENVELOPE *, int));
+
+			/*
+			**  Split this envelope into two.
+			*/
+
+			ee = (ENVELOPE *) xalloc(sizeof(ENVELOPE));
+			*ee = *e;
+			ee->e_id = NULL;
+			(void) queuename(ee, '\0');
+
+			if (tTd(13, 1))
+				printf("sendall: split %s into %s, owner = \"%s\", otherowners = %d\n",
+					e->e_id, ee->e_id, owner, otherowners);
+
+			ee->e_header = copyheader(e->e_header);
+			ee->e_sendqueue = copyqueue(e->e_sendqueue);
+			ee->e_errorqueue = copyqueue(e->e_errorqueue);
+			ee->e_flags = e->e_flags & ~(EF_INQUEUE|EF_CLRQUEUE|EF_FATALERRS|EF_SENDRECEIPT|EF_RET_PARAM);
+			ee->e_flags |= EF_NORECEIPT;
+			setsender(owner, ee, NULL, '\0', TRUE);
+			if (tTd(13, 5))
+			{
+				printf("sendall(split): QDONTSEND ");
+				printaddr(&ee->e_from, FALSE);
+			}
+			ee->e_from.q_flags |= QDONTSEND;
+			ee->e_dfp = NULL;
+			ee->e_xfp = NULL;
+			ee->e_errormode = EM_MAIL;
+			ee->e_sibling = splitenv;
+			splitenv = ee;
+
+			for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+			{
+				if (q->q_owner == owner)
+				{
+					q->q_flags |= QDONTSEND;
+					q->q_flags &= ~(QQUEUEUP|QBADADDR);
+					if (tTd(13, 6))
+						printf("\t... stripping %s from original envelope\n",
+							q->q_paddr);
+				}
+			}
+			for (q = ee->e_sendqueue; q != NULL; q = q->q_next)
+			{
+				if (q->q_owner != owner)
+				{
+					q->q_flags |= QDONTSEND;
+					q->q_flags &= ~(QQUEUEUP|QBADADDR);
+					if (tTd(13, 6))
+						printf("\t... dropping %s from cloned envelope\n",
+							q->q_paddr);
+				}
+				else
+				{
+					/* clear DSN parameters */
+					q->q_flags &= ~(QHASNOTIFY|Q_PINGFLAGS);
+					q->q_flags |= DefaultNotify & ~QPINGONSUCCESS;
+					if (tTd(13, 6))
+						printf("\t... moving %s to cloned envelope\n",
+							q->q_paddr);
+				}
+			}
+
+			if (mode != SM_VERIFY && bitset(EF_HAS_DF, e->e_flags))
+				dup_queue_file(e, ee, 'd');
+			openxscript(ee);
+			if (mode != SM_VERIFY && LogLevel > 4)
+				sm_syslog(LOG_INFO, ee->e_id,
+					"clone %s, owner=%s",
+					e->e_id, owner);
+		}
+	}
+
+	if (owner != NULL)
+	{
+		setsender(owner, e, NULL, '\0', TRUE);
+		if (tTd(13, 5))
+		{
+			printf("sendall(owner): QDONTSEND ");
+			printaddr(&e->e_from, FALSE);
+		}
+		e->e_from.q_flags |= QDONTSEND;
+		e->e_errormode = EM_MAIL;
+		e->e_flags |= EF_NORECEIPT;
+		e->e_flags &= ~EF_FATALERRS;
+	}
+
+	/* if nothing to be delivered, just queue up everything */
+	if (!somedeliveries && mode != SM_QUEUE && mode != SM_DEFER &&
+	    mode != SM_VERIFY)
+	{
+		if (tTd(13, 29))
+			printf("No deliveries: auto-queuing\n");
+		mode = SM_QUEUE;
+
+		/* treat this as a delivery in terms of counting tries */
+		e->e_dtime = curtime();
+		if (!expensive)
+			e->e_ntries++;
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			ee->e_dtime = curtime();
+			if (!expensive)
+				ee->e_ntries++;
+		}
+	}
+
+# if QUEUE
+	if ((mode == SM_QUEUE || mode == SM_DEFER || mode == SM_FORK ||
+	     (mode != SM_VERIFY && SuperSafe)) &&
+	    (!bitset(EF_INQUEUE, e->e_flags) || splitenv != NULL))
+	{
+		/* be sure everything is instantiated in the queue */
+		queueup(e, mode == SM_QUEUE || mode == SM_DEFER);
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+			queueup(ee, mode == SM_QUEUE || mode == SM_DEFER);
+	}
+#endif /* QUEUE */
+
+	if (tTd(62, 10))
+		checkfds("after envelope splitting");
+
+	/*
+	**  If we belong in background, fork now.
+	*/
+
+	if (tTd(13, 20))
+	{
+		printf("sendall: final mode = %c\n", mode);
+		if (tTd(13, 21))
+		{
+			printf("\n================ Final Send Queue(s) =====================\n");
+			printf("\n  *** Envelope %s, e_from=%s ***\n",
+				e->e_id, e->e_from.q_paddr);
+			printaddr(e->e_sendqueue, TRUE);
+			for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+			{
+				printf("\n  *** Envelope %s, e_from=%s ***\n",
+					ee->e_id, ee->e_from.q_paddr);
+				printaddr(ee->e_sendqueue, TRUE);
+			}
+			printf("==========================================================\n\n");
+		}
+	}
+	switch (mode)
+	{
+	  case SM_VERIFY:
+		Verbose = 2;
+		break;
+
+	  case SM_QUEUE:
+	  case SM_DEFER:
+# if HASFLOCK
+  queueonly:
+# endif
+		if (e->e_nrcpts > 0)
+			e->e_flags |= EF_INQUEUE;
+		dropenvelope(e, splitenv != NULL);
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			if (ee->e_nrcpts > 0)
+				ee->e_flags |= EF_INQUEUE;
+			dropenvelope(ee, FALSE);
+		}
+		return;
+
+	  case SM_FORK:
+		if (e->e_xfp != NULL)
+			(void) fflush(e->e_xfp);
+
+# if !HASFLOCK
+		/*
+		**  Since fcntl locking has the interesting semantic that
+		**  the lock is owned by a process, not by an open file
+		**  descriptor, we have to flush this to the queue, and
+		**  then restart from scratch in the child.
+		*/
+
+		{
+			/* save id for future use */
+			char *qid = e->e_id;
+
+			/* now drop the envelope in the parent */
+			e->e_flags |= EF_INQUEUE;
+			dropenvelope(e, splitenv != NULL);
+
+			/* arrange to reacquire lock after fork */
+			e->e_id = qid;
+		}
+
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			/* save id for future use */
+			char *qid = ee->e_id;
+
+			/* drop envelope in parent */
+			ee->e_flags |= EF_INQUEUE;
+			dropenvelope(ee, FALSE);
+
+			/* and save qid for reacquisition */
+			ee->e_id = qid;
+		}
+
+# endif /* !HASFLOCK */
+
+		pid = fork();
+		if (pid < 0)
+		{
+# if HASFLOCK
+			goto queueonly;
+# else
+			e->e_id = NULL;
+			for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+				ee->e_id = NULL;
+			return;
+# endif /* HASFLOCK */
+		}
+		else if (pid > 0)
+		{
+# if HASFLOCK
+			/* be sure we leave the temp files to our child */
+			/* close any random open files in the envelope */
+			closexscript(e);
+			if (e->e_dfp != NULL)
+				(void) xfclose(e->e_dfp, "sendenvelope dfp", e->e_id);
+			e->e_dfp = NULL;
+			e->e_flags &= ~EF_HAS_DF;
+
+			/* can't call unlockqueue to avoid unlink of xfp */
+			if (e->e_lockfp != NULL)
+				(void) xfclose(e->e_lockfp, "sendenvelope lockfp", e->e_id);
+			e->e_lockfp = NULL;
+# endif
+
+			/* make sure the parent doesn't own the envelope */
+			e->e_id = NULL;
+
+			/* catch intermediate zombie */
+			(void) waitfor(pid);
+			return;
+		}
+
+		/* double fork to avoid zombies */
+		pid = fork();
+		if (pid > 0)
+			exit(EX_OK);
+
+		/* be sure we are immune from the terminal */
+		disconnect(2, e);
+
+		/* prevent parent from waiting if there was an error */
+		if (pid < 0)
+		{
+# if HASFLOCK
+			e->e_flags |= EF_INQUEUE;
+# else
+			e->e_id = NULL;
+# endif /* HASFLOCK */
+			finis(TRUE, ExitStat);
+		}
+
+		/* be sure to give error messages in child */
+		QuickAbort = FALSE;
+
+		/*
+		**  Close any cached connections.
+		**
+		**	We don't send the QUIT protocol because the parent
+		**	still knows about the connection.
+		**
+		**	This should only happen when delivering an error
+		**	message.
+		*/
+
+		mci_flush(FALSE, NULL);
+
+		/*
+		**  Since the delivery may happen in a child and the parent
+		**  does not wait, the parent may close the maps thereby
+		**  removing any shared memory used by the map.  Therefore,
+		**  open a copy of the maps for the delivery process.
+		*/
+
+		initmaps(FALSE, e);
+
+# if HASFLOCK
+		break;
+# else
+
+		/*
+		**  Now reacquire and run the various queue files.
+		*/
+
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			ENVELOPE *sibling = ee->e_sibling;
+
+			(void) dowork(ee->e_id, FALSE, FALSE, ee);
+			ee->e_sibling = sibling;
+		}
+		(void) dowork(e->e_id, FALSE, FALSE, e);
+		finis(TRUE, ExitStat);
+# endif /* !HASFLOCK */
+	}
+
+	sendenvelope(e, mode);
+	dropenvelope(e, TRUE);
+	for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+	{
+		CurEnv = ee;
+		if (mode != SM_VERIFY)
+			openxscript(ee);
+		sendenvelope(ee, mode);
+		dropenvelope(ee, TRUE);
+	}
+	CurEnv = e;
+
+	Verbose = oldverbose;
+	if (mode == SM_FORK)
+		finis(TRUE, ExitStat);
+}
+
+void
+sendenvelope(e, mode)
+	register ENVELOPE *e;
+	int mode;
+{
+	register ADDRESS *q;
+	bool didany;
+
+	if (tTd(13, 10))
+		printf("sendenvelope(%s) e_flags=0x%lx\n",
+			e->e_id == NULL ? "[NOQUEUE]" : e->e_id,
+			e->e_flags);
+	if (LogLevel > 80)
+		sm_syslog(LOG_DEBUG, e->e_id,
+			"sendenvelope, flags=0x%x",
+			e->e_flags);
+
+	/*
+	**  If we have had global, fatal errors, don't bother sending
+	**  the message at all if we are in SMTP mode.  Local errors
+	**  (e.g., a single address failing) will still cause the other
+	**  addresses to be sent.
+	*/
+
+	if (bitset(EF_FATALERRS, e->e_flags) &&
+	    (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+	{
+		e->e_flags |= EF_CLRQUEUE;
+		return;
+	}
+
+	/*
+	**  Run through the list and send everything.
+	**
+	**	Set EF_GLOBALERRS so that error messages during delivery
+	**	result in returned mail.
+	*/
+
+	e->e_nsent = 0;
+	e->e_flags |= EF_GLOBALERRS;
+	define(macid("{envid}", NULL), e->e_envid, e);
+	define(macid("{bodytype}", NULL), e->e_bodytype, e);
+	didany = FALSE;
+
+	/* now run through the queue */
+	for (q = e->e_sendqueue; q != NULL; q = q->q_next)
+	{
+#if XDEBUG
+		char wbuf[MAXNAME + 20];
+
+		(void) snprintf(wbuf, sizeof wbuf, "sendall(%.*s)",
+			MAXNAME, q->q_paddr);
+		checkfd012(wbuf);
+#endif
+		if (mode == SM_VERIFY)
+		{
+			e->e_to = q->q_paddr;
+			if (!bitset(QDONTSEND|QBADADDR, q->q_flags))
+			{
+				if (q->q_host != NULL && q->q_host[0] != '\0')
+					message("deliverable: mailer %s, host %s, user %s",
+						q->q_mailer->m_name,
+						q->q_host,
+						q->q_user);
+				else
+					message("deliverable: mailer %s, user %s",
+						q->q_mailer->m_name,
+						q->q_user);
+			}
+		}
+		else if (!bitset(QDONTSEND|QBADADDR, q->q_flags))
+		{
+			extern int deliver __P((ENVELOPE *, ADDRESS *));
+
+# if QUEUE
+			/*
+			**  Checkpoint the send list every few addresses
+			*/
+
+			if (e->e_nsent >= CheckpointInterval)
+			{
+				queueup(e, FALSE);
+				e->e_nsent = 0;
+			}
+# endif /* QUEUE */
+			(void) deliver(e, q);
+			didany = TRUE;
+		}
+	}
+	if (didany)
+	{
+		e->e_dtime = curtime();
+		e->e_ntries++;
+	}
+
+#if XDEBUG
+	checkfd012("end of sendenvelope");
+#endif
+}
+/*
+**  DUP_QUEUE_FILE -- duplicate a queue file into a split queue
+**
+**	Parameters:
+**		e -- the existing envelope
+**		ee -- the new envelope
+**		type -- the queue file type (e.g., 'd')
+**
+**	Returns:
+**		none
+*/
+
+void
+dup_queue_file(e, ee, type)
+	struct envelope *e, *ee;
+	int type;
+{
+	char f1buf[MAXQFNAME], f2buf[MAXQFNAME];
+
+	ee->e_dfp = NULL;
+	ee->e_xfp = NULL;
+	snprintf(f1buf, sizeof f1buf, "%s", queuename(e, type));
+	snprintf(f2buf, sizeof f2buf, "%s", queuename(ee, type));
+	if (link(f1buf, f2buf) < 0)
+	{
+		int saverrno = errno;
+
+		syserr("sendall: link(%s, %s)", f1buf, f2buf);
+		if (saverrno == EEXIST)
+		{
+			if (unlink(f2buf) < 0)
+			{
+				syserr("!sendall: unlink(%s): permanent",
+					f2buf);
+				/*NOTREACHED*/
+			}
+			if (link(f1buf, f2buf) < 0)
+			{
+				syserr("!sendall: link(%s, %s): permanent",
+					f1buf, f2buf);
+				/*NOTREACHED*/
+			}
+		}
+	}
+}
+/*
+**  DOFORK -- do a fork, retrying a couple of times on failure.
+**
+**	This MUST be a macro, since after a vfork we are running
+**	two processes on the same stack!!!
+**
+**	Parameters:
+**		none.
+**
+**	Returns:
+**		From a macro???  You've got to be kidding!
+**
+**	Side Effects:
+**		Modifies the ==> LOCAL <== variable 'pid', leaving:
+**			pid of child in parent, zero in child.
+**			-1 on unrecoverable error.
+**
+**	Notes:
+**		I'm awfully sorry this looks so awful.  That's
+**		vfork for you.....
+*/
+
+# define NFORKTRIES	5
+
+# ifndef FORK
+# define FORK	fork
+# endif
+
+# define DOFORK(fORKfN) \
+{\
+	register int i;\
+\
+	for (i = NFORKTRIES; --i >= 0; )\
+	{\
+		pid = fORKfN();\
+		if (pid >= 0)\
+			break;\
+		if (i > 0)\
+			sleep((unsigned) NFORKTRIES - i);\
+	}\
+}
+/*
+**  DOFORK -- simple fork interface to DOFORK.
+**
+**	Parameters:
+**		none.
+**
+**	Returns:
+**		pid of child in parent.
+**		zero in child.
+**		-1 on error.
+**
+**	Side Effects:
+**		returns twice, once in parent and once in child.
+*/
+
+int
+dofork()
+{
+	register pid_t pid = -1;
+
+	DOFORK(fork);
+	return (pid);
+}
+/*
+**  DELIVER -- Deliver a message to a list of addresses.
+**
+**	This routine delivers to everyone on the same host as the
+**	user on the head of the list.  It is clever about mailers
+**	that don't handle multiple users.  It is NOT guaranteed
+**	that it will deliver to all these addresses however -- so
+**	deliver should be called once for each address on the
+**	list.
+**
+**	Parameters:
+**		e -- the envelope to deliver.
+**		firstto -- head of the address list to deliver to.
+**
+**	Returns:
+**		zero -- successfully delivered.
+**		else -- some failure, see ExitStat for more info.
+**
+**	Side Effects:
+**		The standard input is passed off to someone.
+*/
+
+#ifndef NO_UID
+# define NO_UID		-1
+#endif
+#ifndef NO_GID
+# define NO_GID		-1
+#endif
+
+int
+deliver(e, firstto)
+	register ENVELOPE *e;
+	ADDRESS *firstto;
+{
+	char *host;			/* host being sent to */
+	char *user;			/* user being sent to */
+	char **pvp;
+	register char **mvp;
+	register char *p;
+	register MAILER *m;		/* mailer for this recipient */
+	ADDRESS *volatile ctladdr;
+	ADDRESS *volatile contextaddr = NULL;
+	register MCI *volatile mci;
+	register ADDRESS *to = firstto;
+	volatile bool clever = FALSE;	/* running user smtp to this mailer */
+	ADDRESS *volatile tochain = NULL; /* users chain in this mailer call */
+	int rcode;			/* response code */
+	int lmtp_rcode = EX_OK;
+	char *firstsig;			/* signature of firstto */
+	pid_t pid = -1;
+	char *volatile curhost;
+	register u_short port = 0;
+	time_t xstart;
+	bool suidwarn;
+	bool anyok;			/* at least one address was OK */
+	bool goodmxfound = FALSE;	/* at least one MX was OK */
+	int mpvect[2];
+	int rpvect[2];
+	char *pv[MAXPV+1];
+	char tobuf[TOBUFSIZE];		/* text line of to people */
+	char buf[MAXNAME + 1];
+	char rpathbuf[MAXNAME + 1];	/* translated return path */
+	extern int checkcompat __P((ADDRESS *, ENVELOPE *));
+	extern void markfailure __P((ENVELOPE *, ADDRESS *, MCI *, int));
+
+	errno = 0;
+	if (bitset(QDONTSEND|QBADADDR|QQUEUEUP, to->q_flags))
+		return (0);
+
+	suidwarn = geteuid() == 0;
+
+#if NAMED_BIND
+	/* unless interactive, try twice, over a minute */
+	if (OpMode == MD_DAEMON || OpMode == MD_SMTP)
+	{
+		_res.retrans = 30;
+		_res.retry = 2;
+	}
+#endif
+
+	m = to->q_mailer;
+	host = to->q_host;
+	CurEnv = e;			/* just in case */
+	e->e_statmsg = NULL;
+#if SMTP
+	SmtpError[0] = '\0';
+#endif
+	xstart = curtime();
+
+	if (tTd(10, 1))
+		printf("\n--deliver, id=%s, mailer=%s, host=`%s', first user=`%s'\n",
+			e->e_id, m->m_name, host, to->q_user);
+	if (tTd(10, 100))
+		printopenfds(FALSE);
+
+	/*
+	**  Clear $&{client_*} macros if this is a bounce message to
+	**  prevent rejection by check_compat ruleset.
+	*/
+	
+	if (bitset(EF_RESPONSE, e->e_flags))
+	{
+		define(macid("{client_name}", NULL), "", e);
+		define(macid("{client_addr}", NULL), "", e);
+		define(macid("{client_port}", NULL), "", e);
+	}
+	
+	/*
+	**  Do initial argv setup.
+	**	Insert the mailer name.  Notice that $x expansion is
+	**	NOT done on the mailer name.  Then, if the mailer has
+	**	a picky -f flag, we insert it as appropriate.  This
+	**	code does not check for 'pv' overflow; this places a
+	**	manifest lower limit of 4 for MAXPV.
+	**		The from address rewrite is expected to make
+	**		the address relative to the other end.
+	*/
+
+	/* rewrite from address, using rewriting rules */
+	rcode = EX_OK;
+	if (bitnset(M_UDBENVELOPE, e->e_from.q_mailer->m_flags))
+		p = e->e_sender;
+	else
+		p = e->e_from.q_paddr;
+	p = remotename(p, m, RF_SENDERADDR|RF_CANONICAL, &rcode, e);
+	if (strlen(p) >= (SIZE_T) sizeof rpathbuf)
+	{
+		p = shortenstring(p, MAXSHORTSTR);
+		syserr("remotename: huge return %s", p);
+	}
+	snprintf(rpathbuf, sizeof rpathbuf, "%s", p);
+	define('g', rpathbuf, e);		/* translated return path */
+	define('h', host, e);			/* to host */
+	Errors = 0;
+	pvp = pv;
+	*pvp++ = m->m_argv[0];
+
+	/* insert -f or -r flag as appropriate */
+	if (FromFlag && (bitnset(M_FOPT, m->m_flags) || bitnset(M_ROPT, m->m_flags)))
+	{
+		if (bitnset(M_FOPT, m->m_flags))
+			*pvp++ = "-f";
+		else
+			*pvp++ = "-r";
+		*pvp++ = newstr(rpathbuf);
+	}
+
+	/*
+	**  Append the other fixed parts of the argv.  These run
+	**  up to the first entry containing "$u".  There can only
+	**  be one of these, and there are only a few more slots
+	**  in the pv after it.
+	*/
+
+	for (mvp = m->m_argv; (p = *++mvp) != NULL; )
+	{
+		/* can't use strchr here because of sign extension problems */
+		while (*p != '\0')
+		{
+			if ((*p++ & 0377) == MACROEXPAND)
+			{
+				if (*p == 'u')
+					break;
+			}
+		}
+
+		if (*p != '\0')
+			break;
+
+		/* this entry is safe -- go ahead and process it */
+		expand(*mvp, buf, sizeof buf, e);
+		*pvp++ = newstr(buf);
+		if (pvp >= &pv[MAXPV - 3])
+		{
+			syserr("554 Too many parameters to %s before $u", pv[0]);
+			return (-1);
+		}
+	}
+
+	/*
+	**  If we have no substitution for the user name in the argument
+	**  list, we know that we must supply the names otherwise -- and
+	**  SMTP is the answer!!
+	*/
+
+	if (*mvp == NULL)
+	{
+		/* running SMTP */
+# if SMTP
+		clever = TRUE;
+		*pvp = NULL;
+# else /* SMTP */
+		/* oops!  we don't implement SMTP */
+		syserr("554 SMTP style mailer not implemented");
+		return (EX_SOFTWARE);
+# endif /* SMTP */
+	}
+
+	/*
+	**  At this point *mvp points to the argument with $u.  We
+	**  run through our address list and append all the addresses
+	**  we can.  If we run out of space, do not fret!  We can
+	**  always send another copy later.
+	*/
+
+	tobuf[0] = '\0';
+	e->e_to = tobuf;
+	ctladdr = NULL;
+	firstsig = hostsignature(firstto->q_mailer, firstto->q_host, e);
+	for (; to != NULL; to = to->q_next)
+	{
+		/* avoid sending multiple recipients to dumb mailers */
+		if (tobuf[0] != '\0' && !bitnset(M_MUSER, m->m_flags))
+			break;
+
+		/* if already sent or not for this host, don't send */
+		if (bitset(QDONTSEND|QBADADDR|QQUEUEUP, to->q_flags) ||
+		    to->q_mailer != firstto->q_mailer ||
+		    strcmp(hostsignature(to->q_mailer, to->q_host, e), firstsig) != 0)
+			continue;
+
+		/* avoid overflowing tobuf */
+		if (sizeof tobuf < (strlen(to->q_paddr) + strlen(tobuf) + 2))
+			break;
+
+		if (tTd(10, 1))
+		{
+			printf("\nsend to ");
+			printaddr(to, FALSE);
+		}
+
+		/* compute effective uid/gid when sending */
+		if (bitnset(M_RUNASRCPT, to->q_mailer->m_flags))
+			contextaddr = ctladdr = getctladdr(to);
+
+		if (tTd(10, 2))
+		{
+			printf("ctladdr=");
+			printaddr(ctladdr, FALSE);
+		}
+
+		user = to->q_user;
+		e->e_to = to->q_paddr;
+		if (tTd(10, 5))
+		{
+			printf("deliver: QDONTSEND ");
+			printaddr(to, FALSE);
+		}
+		to->q_flags |= QDONTSEND;
+
+		/*
+		**  Check to see that these people are allowed to
+		**  talk to each other.
+		*/
+
+		if (m->m_maxsize != 0 && e->e_msgsize > m->m_maxsize)
+		{
+			e->e_flags |= EF_NO_BODY_RETN;
+			if (bitnset(M_LOCALMAILER, to->q_mailer->m_flags))
+				to->q_status = "5.2.3";
+			else
+				to->q_status = "5.3.4";
+			usrerr("552 Message is too large; %ld bytes max", m->m_maxsize);
+			markfailure(e, to, NULL, EX_UNAVAILABLE);
+			giveresponse(EX_UNAVAILABLE, m, NULL, ctladdr, xstart, e);
+			continue;
+		}
+#if NAMED_BIND
+		h_errno = 0;
+#endif
+
+		/* do config file checking of compatibility */
+		rcode = rscheck("check_compat",
+				e->e_from.q_paddr, to->q_paddr, e);
+		if (rcode == EX_OK)
+		{
+			/* do in-code checking if not discarding */
+			if (!bitset(EF_DISCARD, e->e_flags))
+				rcode = checkcompat(to, e);
+		}
+		if (rcode != EX_OK)
+		{
+			markfailure(e, to, NULL, rcode);
+			giveresponse(rcode, m, NULL, ctladdr, xstart, e);
+			continue;
+		}
+		if (bitset(EF_DISCARD, e->e_flags))
+		{
+			if (tTd(10, 5))
+			{
+				printf("deliver: discarding recipient ");
+				printaddr(to, FALSE);
+			}
+
+			/*
+			**  Remove discard bit to prevent discard of
+			**  future recipients
+			*/
+			e->e_flags &= ~EF_DISCARD;
+
+			continue;
+		}
+
+		/*
+		**  Strip quote bits from names if the mailer is dumb
+		**	about them.
+		*/
+
+		if (bitnset(M_STRIPQ, m->m_flags))
+		{
+			stripquotes(user);
+			stripquotes(host);
+		}
+
+		/* hack attack -- delivermail compatibility */
+		if (m == ProgMailer && *user == '|')
+			user++;
+
+		/*
+		**  If an error message has already been given, don't
+		**	bother to send to this address.
+		**
+		**	>>>>>>>>>> This clause assumes that the local mailer
+		**	>> NOTE >> cannot do any further aliasing; that
+		**	>>>>>>>>>> function is subsumed by sendmail.
+		*/
+
+		if (bitset(QBADADDR|QQUEUEUP, to->q_flags))
+			continue;
+
+		/*
+		**  See if this user name is "special".
+		**	If the user name has a slash in it, assume that this
+		**	is a file -- send it off without further ado.  Note
+		**	that this type of addresses is not processed along
+		**	with the others, so we fudge on the To person.
+		*/
+
+		if (strcmp(m->m_mailer, "[FILE]") == 0)
+		{
+			define('u', user, e);	/* to user */
+			p = to->q_home;
+			if (p == NULL && ctladdr != NULL)
+				p = ctladdr->q_home;
+			define('z', p, e);	/* user's home */
+			expand(m->m_argv[1], buf, sizeof buf, e);
+			if (strlen(buf) > 0)
+				rcode = mailfile(buf, m, ctladdr, SFF_CREAT, e);
+			else
+			{
+				syserr("empty filename specification for mailer %s",
+				       m->m_name);
+				rcode = EX_CONFIG;
+			}
+			giveresponse(rcode, m, NULL, ctladdr, xstart, e);
+			markfailure(e, to, NULL, rcode);
+			e->e_nsent++;
+			if (rcode == EX_OK)
+			{
+				to->q_flags |= QSENT;
+				if (bitnset(M_LOCALMAILER, m->m_flags) &&
+				    bitset(QPINGONSUCCESS, to->q_flags))
+				{
+					to->q_flags |= QDELIVERED;
+					to->q_status = "2.1.5";
+					fprintf(e->e_xfp, "%s... Successfully delivered\n",
+						to->q_paddr);
+				}
+			}
+			to->q_statdate = curtime();
+			markstats(e, to, FALSE);
+			continue;
+		}
+
+		/*
+		**  Address is verified -- add this user to mailer
+		**  argv, and add it to the print list of recipients.
+		*/
+
+		/* link together the chain of recipients */
+		to->q_tchain = tochain;
+		tochain = to;
+
+		/* create list of users for error messages */
+		(void) strcat(tobuf, ",");
+		(void) strcat(tobuf, to->q_paddr);
+		define('u', user, e);		/* to user */
+		p = to->q_home;
+		if (p == NULL && ctladdr != NULL)
+			p = ctladdr->q_home;
+		define('z', p, e);	/* user's home */
+
+		/*
+		**  Expand out this user into argument list.
+		*/
+
+		if (!clever)
+		{
+			expand(*mvp, buf, sizeof buf, e);
+			*pvp++ = newstr(buf);
+			if (pvp >= &pv[MAXPV - 2])
+			{
+				/* allow some space for trailing parms */
+				break;
+			}
+		}
+	}
+
+	/* see if any addresses still exist */
+	if (tobuf[0] == '\0')
+	{
+		define('g', (char *) NULL, e);
+		return (0);
+	}
+
+	/* print out messages as full list */
+	e->e_to = tobuf + 1;
+
+	/*
+	**  Fill out any parameters after the $u parameter.
+	*/
+
+	while (!clever && *++mvp != NULL)
+	{
+		expand(*mvp, buf, sizeof buf, e);
+		*pvp++ = newstr(buf);
+		if (pvp >= &pv[MAXPV])
+			syserr("554 deliver: pv overflow after $u for %s", pv[0]);
+	}
+	*pvp++ = NULL;
+
+	/*
+	**  Call the mailer.
+	**	The argument vector gets built, pipes
+	**	are created as necessary, and we fork & exec as
+	**	appropriate.
+	**	If we are running SMTP, we just need to clean up.
+	*/
+
+	/*XXX this seems a bit wierd */
+	if (ctladdr == NULL && m != ProgMailer && m != FileMailer &&
+	    bitset(QGOODUID, e->e_from.q_flags))
+		ctladdr = &e->e_from;
+
+#if NAMED_BIND
+	if (ConfigLevel < 2)
+		_res.options &= ~(RES_DEFNAMES | RES_DNSRCH);	/* XXX */
+#endif
+
+	if (tTd(11, 1))
+	{
+		printf("openmailer:");
+		printav(pv);
+	}
+	errno = 0;
+#if NAMED_BIND
+	h_errno = 0;
+#endif
+
+	CurHostName = NULL;
+
+	/*
+	**  Deal with the special case of mail handled through an IPC
+	**  connection.
+	**	In this case we don't actually fork.  We must be
+	**	running SMTP for this to work.  We will return a
+	**	zero pid to indicate that we are running IPC.
+	**  We also handle a debug version that just talks to stdin/out.
+	*/
+
+	curhost = NULL;
+	SmtpPhase = NULL;
+	mci = NULL;
+
+#if XDEBUG
+	{
+		char wbuf[MAXLINE];
+
+		/* make absolutely certain 0, 1, and 2 are in use */
+		snprintf(wbuf, sizeof wbuf, "%s... openmailer(%s)",
+			shortenstring(e->e_to, MAXSHORTSTR), m->m_name);
+		checkfd012(wbuf);
+	}
+#endif
+
+	/* check for 8-bit available */
+	if (bitset(EF_HAS8BIT, e->e_flags) &&
+	    bitnset(M_7BITS, m->m_flags) &&
+	    (bitset(EF_DONT_MIME, e->e_flags) ||
+	     !(bitset(MM_MIME8BIT, MimeMode) ||
+	       (bitset(EF_IS_MIME, e->e_flags) &&
+	        bitset(MM_CVTMIME, MimeMode)))))
+	{
+		usrerr("554 Cannot send 8-bit data to 7-bit destination");
+		rcode = EX_DATAERR;
+		e->e_status = "5.6.3";
+		goto give_up;
+	}
+
+	if (tTd(62, 8))
+		checkfds("before delivery");
+
+	/* check for Local Person Communication -- not for mortals!!! */
+	if (strcmp(m->m_mailer, "[LPC]") == 0)
+	{
+		mci = (MCI *) xalloc(sizeof *mci);
+		bzero((char *) mci, sizeof *mci);
+		mci->mci_in = stdin;
+		mci->mci_out = stdout;
+		mci->mci_state = clever ? MCIS_OPENING : MCIS_OPEN;
+		mci->mci_mailer = m;
+	}
+	else if (strcmp(m->m_mailer, "[IPC]") == 0 ||
+		 strcmp(m->m_mailer, "[TCP]") == 0)
+	{
+#if DAEMON
+		register int i;
+
+		if (pv[0] == NULL || pv[1] == NULL || pv[1][0] == '\0')
+		{
+			syserr("null host name for %s mailer", m->m_mailer);
+			rcode = EX_CONFIG;
+			goto give_up;
+		}
+
+		CurHostName = pv[1];
+		curhost = hostsignature(m, pv[1], e);
+
+		if (curhost == NULL || curhost[0] == '\0')
+		{
+			syserr("null host signature for %s", pv[1]);
+			rcode = EX_CONFIG;
+			goto give_up;
+		}
+
+		if (!clever)
+		{
+			syserr("554 non-clever IPC");
+			rcode = EX_CONFIG;
+			goto give_up;
+		}
+		if (pv[2] != NULL)
+		{
+			port = htons(atoi(pv[2]));
+			if (port == 0)
+			{
+				struct servent *sp = getservbyname(pv[2], "tcp");
+
+				if (sp == NULL)
+					syserr("Service %s unknown", pv[2]);
+				else
+					port = sp->s_port;
+			}
+		}
+tryhost:
+		while (*curhost != '\0')
+		{
+			static char hostbuf[MAXNAME + 1];
+			extern int makeconnection __P((char *, u_short, MCI *, ENVELOPE *));
+
+			/* pull the next host from the signature */
+			p = strchr(curhost, ':');
+			if (p == NULL)
+				p = (char *) &curhost[strlen(curhost)];
+			if (p == curhost)
+			{
+				syserr("deliver: null host name in signature");
+				curhost++;
+				continue;
+			}
+			i = p - curhost;
+			if (i >= sizeof hostbuf)
+				i = sizeof hostbuf - 1;
+			strncpy(hostbuf, curhost, i);
+			hostbuf[i] = '\0';
+			if (*p != '\0')
+				p++;
+			curhost = p;
+
+			/* see if we already know that this host is fried */
+			CurHostName = hostbuf;
+			mci = mci_get(hostbuf, m);
+			if (mci->mci_state != MCIS_CLOSED)
+			{
+				if (tTd(11, 1))
+				{
+					printf("openmailer: ");
+					mci_dump(mci, FALSE);
+				}
+				CurHostName = mci->mci_host;
+				message("Using cached %sSMTP connection to %s via %s...",
+					bitset(MCIF_ESMTP, mci->mci_flags) ? "E" : "",
+					hostbuf, m->m_name);
+				break;
+			}
+			mci->mci_mailer = m;
+			if (mci->mci_exitstat != EX_OK)
+			{
+				if (mci->mci_exitstat == EX_TEMPFAIL)
+					goodmxfound = TRUE;
+				continue;
+			}
+
+			if (mci_lock_host(mci) != EX_OK)
+			{
+				mci_setstat(mci, EX_TEMPFAIL, "4.4.5", NULL);
+				goodmxfound = TRUE;
+				continue;
+			}
+
+			/* try the connection */
+			sm_setproctitle(TRUE, "%s %s: %s", e->e_id, hostbuf, "user open");
+			if (port == 0)
+				message("Connecting to %s via %s...",
+					hostbuf, m->m_name);
+			else
+				message("Connecting to %s port %d via %s...",
+					hostbuf, ntohs(port), m->m_name);
+			i = makeconnection(hostbuf, port, mci, e);
+			mci->mci_lastuse = curtime();
+			mci->mci_exitstat = i;
+			mci->mci_errno = errno;
+#if NAMED_BIND
+			mci->mci_herrno = h_errno;
+#endif
+			if (i == EX_OK)
+			{
+				goodmxfound = TRUE;
+				mci->mci_state = MCIS_OPENING;
+				mci_cache(mci);
+				if (TrafficLogFile != NULL)
+					fprintf(TrafficLogFile, "%05d === CONNECT %s\n",
+						(int) getpid(), hostbuf);
+				break;
+			}
+			else
+			{
+			    	if (tTd(11, 1))
+					printf("openmailer: makeconnection => stat=%d, errno=%d\n",
+						i, errno);
+				if (i == EX_TEMPFAIL)
+					goodmxfound = TRUE;
+				mci_unlock_host(mci);
+			}
+
+			/* enter status of this host */
+			setstat(i);
+
+			/* should print some message here for -v mode */
+		}
+		if (mci == NULL)
+		{
+			syserr("deliver: no host name");
+			rcode = EX_SOFTWARE;
+			goto give_up;
+		}
+		mci->mci_pid = 0;
+#else /* no DAEMON */
+		syserr("554 openmailer: no IPC");
+		if (tTd(11, 1))
+			printf("openmailer: NULL\n");
+		rcode = EX_UNAVAILABLE;
+		goto give_up;
+#endif /* DAEMON */
+	}
+	else
+	{
+		/* flush any expired connections */
+		(void) mci_scan(NULL);
+		mci = NULL;
+
+#if SMTP
+		if (bitnset(M_LMTP, m->m_flags))
+		{
+			/* try to get a cached connection */
+			mci = mci_get(m->m_name, m);
+			if (mci->mci_host == NULL)
+				mci->mci_host = m->m_name;
+			CurHostName = mci->mci_host;
+			if (mci->mci_state != MCIS_CLOSED)
+			{
+				message("Using cached LMTP connection for %s...",
+					m->m_name);
+				goto do_transfer;
+			}
+		}
+#endif
+
+		/* announce the connection to verbose listeners */
+		if (host == NULL || host[0] == '\0')
+			message("Connecting to %s...", m->m_name);
+		else
+			message("Connecting to %s via %s...", host, m->m_name);
+		if (TrafficLogFile != NULL)
+		{
+			char **av;
+
+			fprintf(TrafficLogFile, "%05d === EXEC", (int) getpid());
+			for (av = pv; *av != NULL; av++)
+				fprintf(TrafficLogFile, " %s", *av);
+			fprintf(TrafficLogFile, "\n");
+		}
+
+#if XDEBUG
+		checkfd012("before creating mail pipe");
+#endif
+
+		/* create a pipe to shove the mail through */
+		if (pipe(mpvect) < 0)
+		{
+			syserr("%s... openmailer(%s): pipe (to mailer)",
+				shortenstring(e->e_to, MAXSHORTSTR), m->m_name);
+			if (tTd(11, 1))
+				printf("openmailer: NULL\n");
+			rcode = EX_OSERR;
+			goto give_up;
+		}
+
+#if XDEBUG
+		/* make sure we didn't get one of the standard I/O files */
+		if (mpvect[0] < 3 || mpvect[1] < 3)
+		{
+			syserr("%s... openmailer(%s): bogus mpvect %d %d",
+				shortenstring(e->e_to, MAXSHORTSTR), m->m_name,
+				mpvect[0], mpvect[1]);
+			printopenfds(TRUE);
+			if (tTd(11, 1))
+				printf("openmailer: NULL\n");
+			rcode = EX_OSERR;
+			goto give_up;
+		}
+
+		/* make sure system call isn't dead meat */
+		checkfdopen(mpvect[0], "mpvect[0]");
+		checkfdopen(mpvect[1], "mpvect[1]");
+		if (mpvect[0] == mpvect[1] ||
+		    (e->e_lockfp != NULL &&
+		     (mpvect[0] == fileno(e->e_lockfp) ||
+		      mpvect[1] == fileno(e->e_lockfp))))
+		{
+			if (e->e_lockfp == NULL)
+				syserr("%s... openmailer(%s): overlapping mpvect %d %d",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name, mpvect[0], mpvect[1]);
+			else
+				syserr("%s... openmailer(%s): overlapping mpvect %d %d, lockfp = %d",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name, mpvect[0], mpvect[1],
+					fileno(e->e_lockfp));
+		}
+#endif
+
+		/* if this mailer speaks smtp, create a return pipe */
+#if SMTP
+		if (clever)
+		{
+			if (pipe(rpvect) < 0)
+			{
+				syserr("%s... openmailer(%s): pipe (from mailer)",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name);
+				(void) close(mpvect[0]);
+				(void) close(mpvect[1]);
+				if (tTd(11, 1))
+					printf("openmailer: NULL\n");
+				rcode = EX_OSERR;
+				goto give_up;
+			}
+# if XDEBUG
+			checkfdopen(rpvect[0], "rpvect[0]");
+			checkfdopen(rpvect[1], "rpvect[1]");
+# endif
+		}
+#endif
+
+		/*
+		**  Actually fork the mailer process.
+		**	DOFORK is clever about retrying.
+		**
+		**	Dispose of SIGCHLD signal catchers that may be laying
+		**	around so that endmail will get it.
+		*/
+
+		if (e->e_xfp != NULL)
+			(void) fflush(e->e_xfp);		/* for debugging */
+		(void) fflush(stdout);
+		(void) setsignal(SIGCHLD, SIG_DFL);
+		DOFORK(FORK);
+		/* pid is set by DOFORK */
+		if (pid < 0)
+		{
+			/* failure */
+			syserr("%s... openmailer(%s): cannot fork",
+				shortenstring(e->e_to, MAXSHORTSTR), m->m_name);
+			(void) close(mpvect[0]);
+			(void) close(mpvect[1]);
+#if SMTP
+			if (clever)
+			{
+				(void) close(rpvect[0]);
+				(void) close(rpvect[1]);
+			}
+#endif
+			if (tTd(11, 1))
+				printf("openmailer: NULL\n");
+			rcode = EX_OSERR;
+			goto give_up;
+		}
+		else if (pid == 0)
+		{
+			int i;
+			int saveerrno;
+			int new_euid = NO_UID;
+			int new_ruid = NO_UID;
+			int new_gid = NO_GID;
+			struct stat stb;
+			extern int DtableSize;
+
+			if (e->e_lockfp != NULL)
+				(void) close(fileno(e->e_lockfp));
+
+			/* child -- set up input & exec mailer */
+			(void) setsignal(SIGINT, SIG_IGN);
+			(void) setsignal(SIGHUP, SIG_IGN);
+			(void) setsignal(SIGTERM, SIG_DFL);
+
+			if (m != FileMailer || stat(tochain->q_user, &stb) < 0)
+				stb.st_mode = 0;
+
+#if HASSETUSERCONTEXT
+			/*
+			**  Set user resources.
+			*/
+
+			if (contextaddr != NULL)
+			{
+				struct passwd *pwd;
+
+				if (contextaddr->q_ruser != NULL)
+					pwd = sm_getpwnam(contextaddr->q_ruser);
+				else
+					pwd = sm_getpwnam(contextaddr->q_user);
+				if (pwd != NULL)
+					(void) setusercontext(NULL,
+						pwd, pwd->pw_uid,
+						LOGIN_SETRESOURCES|LOGIN_SETPRIORITY);
+			}
+#endif
+
+			/* tweak niceness */
+			if (m->m_nice != 0)
+				nice(m->m_nice);
+
+			/* reset group id */
+			if (bitnset(M_SPECIFIC_UID, m->m_flags))
+				new_gid = m->m_gid;
+			else if (bitset(S_ISGID, stb.st_mode))
+				new_gid = stb.st_gid;
+			else if (ctladdr != NULL && ctladdr->q_gid != 0)
+			{
+				if (!DontInitGroups)
+				{
+					char *u = ctladdr->q_ruser;
+
+					if (u == NULL)
+						u = ctladdr->q_user;
+
+					if (initgroups(u, ctladdr->q_gid) == -1 && suidwarn)
+						syserr("openmailer: initgroups(%s, %d) failed",
+							u, ctladdr->q_gid);
+				}
+				else
+				{
+					GIDSET_T gidset[1];
+
+					gidset[0] = ctladdr->q_gid;
+					if (setgroups(1, gidset) == -1 && suidwarn)
+						syserr("openmailer: setgroups() failed");
+				}
+				new_gid = ctladdr->q_gid;
+			}
+			else
+			{
+				if (!DontInitGroups)
+				{
+					if (initgroups(DefUser, DefGid) == -1 && suidwarn)
+						syserr("openmailer: initgroups(%s, %d) failed",
+							DefUser, DefGid);
+				}
+				else
+				{
+					GIDSET_T gidset[1];
+
+					gidset[0] = DefGid;
+					if (setgroups(1, gidset) == -1 && suidwarn)
+						syserr("openmailer: setgroups() failed");
+				}
+				if (m->m_gid == 0)
+					new_gid = DefGid;
+				else
+					new_gid = m->m_gid;
+			}
+			if (new_gid != NO_GID && setgid(new_gid) < 0 && suidwarn)
+				syserr("openmailer: setgid(%ld) failed",
+					(long) new_gid);
+
+			/* reset user id */
+			endpwent();
+			if (bitnset(M_SPECIFIC_UID, m->m_flags))
+				new_euid = m->m_uid;
+			else if (bitset(S_ISUID, stb.st_mode))
+				new_ruid = stb.st_uid;
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+				new_ruid = ctladdr->q_uid;
+			else if (m->m_uid != 0)
+				new_ruid = m->m_uid;
+			else
+				new_ruid = DefUid;
+			if (new_euid != NO_UID)
+			{
+				vendor_set_uid(new_euid);
+#if USESETEUID
+				if (seteuid(new_euid) < 0 && suidwarn)
+					syserr("openmailer: seteuid(%ld) failed",
+						(long) new_euid);
+#else
+# if HASSETREUID
+				if (setreuid(new_ruid, new_euid) < 0 && suidwarn)
+					syserr("openmailer: setreuid(%ld, %ld) failed",
+						(long) new_ruid, (long) new_euid);
+# else
+				if (new_euid != geteuid() && setuid(new_euid) < 0 && suidwarn)
+					syserr("openmailer: setuid(%ld) failed",
+						(long) new_euid);
+# endif
+#endif
+			}
+			else if (new_ruid != NO_UID)
+			{
+				vendor_set_uid(new_ruid);
+				if (setuid(new_ruid) < 0 && suidwarn)
+					syserr("openmailer: setuid(%ld) failed",
+						(long) new_ruid);
+			}
+
+			if (tTd(11, 2))
+				printf("openmailer: running as r/euid=%d/%d\n",
+					(int) getuid(), (int) geteuid());
+
+			/* move into some "safe" directory */
+			if (m->m_execdir != NULL)
+			{
+				char *q;
+				char buf[MAXLINE + 1];
+
+				for (p = m->m_execdir; p != NULL; p = q)
+				{
+					q = strchr(p, ':');
+					if (q != NULL)
+						*q = '\0';
+					expand(p, buf, sizeof buf, e);
+					if (q != NULL)
+						*q++ = ':';
+					if (tTd(11, 20))
+						printf("openmailer: trydir %s\n",
+							buf);
+					if (buf[0] != '\0' && chdir(buf) >= 0)
+						break;
+				}
+			}
+
+			/* arrange to filter std & diag output of command */
+#if SMTP
+			if (clever)
+			{
+				(void) close(rpvect[0]);
+				if (dup2(rpvect[1], STDOUT_FILENO) < 0)
+				{
+					syserr("%s... openmailer(%s): cannot dup pipe %d for stdout",
+						shortenstring(e->e_to, MAXSHORTSTR),
+						m->m_name, rpvect[1]);
+					_exit(EX_OSERR);
+				}
+				(void) close(rpvect[1]);
+			}
+			else
+			{
+				/* put mailer output in transcript */
+				if (dup2(fileno(e->e_xfp), STDOUT_FILENO) < 0)
+				{
+					syserr("%s... openmailer(%s): cannot dup xscript %d for stdout",
+						shortenstring(e->e_to, MAXSHORTSTR),
+						m->m_name, fileno(e->e_xfp));
+					_exit(EX_OSERR);
+				}
+			}
+#endif
+			if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0)
+			{
+				syserr("%s... openmailer(%s): cannot dup stdout for stderr",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name);
+				_exit(EX_OSERR);
+			}
+
+			/* arrange to get standard input */
+			(void) close(mpvect[1]);
+			if (dup2(mpvect[0], STDIN_FILENO) < 0)
+			{
+				syserr("%s... openmailer(%s): cannot dup pipe %d for stdin",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name, mpvect[0]);
+				_exit(EX_OSERR);
+			}
+			(void) close(mpvect[0]);
+
+			/* arrange for all the files to be closed */
+			for (i = 3; i < DtableSize; i++)
+			{
+				register int j;
+
+				if ((j = fcntl(i, F_GETFD, 0)) != -1)
+					(void) fcntl(i, F_SETFD, j | 1);
+			}
+
+			/* run disconnected from terminal */
+			(void) setsid();
+
+			/* try to execute the mailer */
+			execve(m->m_mailer, (ARGV_T) pv, (ARGV_T) UserEnviron);
+			saveerrno = errno;
+			syserr("Cannot exec %s", m->m_mailer);
+			if (bitnset(M_LOCALMAILER, m->m_flags) ||
+			    transienterror(saveerrno))
+				_exit(EX_OSERR);
+			_exit(EX_UNAVAILABLE);
+		}
+
+		/*
+		**  Set up return value.
+		*/
+
+		if (mci == NULL)
+		{
+			mci = (MCI *) xalloc(sizeof *mci);
+			bzero((char *) mci, sizeof *mci);
+		}
+		mci->mci_mailer = m;
+		if (clever)
+		{
+			mci->mci_state = MCIS_OPENING;
+			mci_cache(mci);
+		}
+		else
+		{
+			mci->mci_state = MCIS_OPEN;
+		}
+		mci->mci_pid = pid;
+		(void) close(mpvect[0]);
+		mci->mci_out = fdopen(mpvect[1], "w");
+		if (mci->mci_out == NULL)
+		{
+			syserr("deliver: cannot create mailer output channel, fd=%d",
+				mpvect[1]);
+			(void) close(mpvect[1]);
+#if SMTP
+			if (clever)
+			{
+				(void) close(rpvect[0]);
+				(void) close(rpvect[1]);
+			}
+#endif
+			rcode = EX_OSERR;
+			goto give_up;
+		}
+#if SMTP
+		if (clever)
+		{
+			(void) close(rpvect[1]);
+			mci->mci_in = fdopen(rpvect[0], "r");
+			if (mci->mci_in == NULL)
+			{
+				syserr("deliver: cannot create mailer input channel, fd=%d",
+					mpvect[1]);
+				(void) close(rpvect[0]);
+				fclose(mci->mci_out);
+				mci->mci_out = NULL;
+				rcode = EX_OSERR;
+				goto give_up;
+			}
+		}
+		else
+#endif
+		{
+			mci->mci_flags |= MCIF_TEMP;
+			mci->mci_in = NULL;
+		}
+	}
+
+	/*
+	**  If we are in SMTP opening state, send initial protocol.
+	*/
+
+	if (bitnset(M_7BITS, m->m_flags) &&
+	    (!clever || mci->mci_state == MCIS_OPENING))
+		mci->mci_flags |= MCIF_7BIT;
+#if SMTP
+	if (clever && mci->mci_state != MCIS_CLOSED)
+	{
+		extern void smtpinit __P((MAILER *, MCI *, ENVELOPE *));
+
+		smtpinit(m, mci, e);
+	}
+#endif
+
+do_transfer:
+	/* clear out per-message flags from connection structure */
+	mci->mci_flags &= ~(MCIF_CVT7TO8|MCIF_CVT8TO7);
+
+	if (bitset(EF_HAS8BIT, e->e_flags) &&
+	    !bitset(EF_DONT_MIME, e->e_flags) &&
+	    bitnset(M_7BITS, m->m_flags))
+		mci->mci_flags |= MCIF_CVT8TO7;
+
+#if MIME7TO8
+	if (bitnset(M_MAKE8BIT, m->m_flags) &&
+	    !bitset(MCIF_7BIT, mci->mci_flags) &&
+	    (p = hvalue("Content-Transfer-Encoding", e->e_header)) != NULL &&
+	     (strcasecmp(p, "quoted-printable") == 0 ||
+	      strcasecmp(p, "base64") == 0) &&
+	    (p = hvalue("Content-Type", e->e_header)) != NULL)
+	{
+		/* may want to convert 7 -> 8 */
+		/* XXX should really parse it here -- and use a class XXX */
+		if (strncasecmp(p, "text/plain", 10) == 0 &&
+		    (p[10] == '\0' || p[10] == ' ' || p[10] == ';'))
+			mci->mci_flags |= MCIF_CVT7TO8;
+	}
+#endif
+
+	if (tTd(11, 1))
+	{
+		printf("openmailer: ");
+		mci_dump(mci, FALSE);
+	}
+
+	if (mci->mci_state != MCIS_OPEN)
+	{
+		/* couldn't open the mailer */
+		rcode = mci->mci_exitstat;
+		errno = mci->mci_errno;
+#if NAMED_BIND
+		h_errno = mci->mci_herrno;
+#endif
+		if (rcode == EX_OK)
+		{
+			/* shouldn't happen */
+			syserr("554 deliver: mci=%lx rcode=%d errno=%d state=%d sig=%s",
+				(long) mci, rcode, errno, mci->mci_state,
+				firstsig);
+			mci_dump_all(TRUE);
+			rcode = EX_SOFTWARE;
+		}
+#if DAEMON
+		else if (curhost != NULL && *curhost != '\0')
+		{
+			/* try next MX site */
+			goto tryhost;
+		}
+#endif
+	}
+	else if (!clever)
+	{
+		/*
+		**  Format and send message.
+		*/
+
+		mci->mci_contentlen = 0;
+		putfromline(mci, e);
+		(*e->e_puthdr)(mci, e->e_header, e, M87F_OUTER);
+		(*e->e_putbody)(mci, e, NULL);
+
+		/* get the exit status */
+		rcode = endmailer(mci, e, pv);
+	}
+	else
+#if SMTP
+	{
+		extern int smtpmailfrom __P((MAILER *, MCI *, ENVELOPE *));
+		extern int smtprcpt __P((ADDRESS *, MAILER *, MCI *, ENVELOPE *));
+		extern int smtpdata __P((MAILER *, MCI *, ENVELOPE *));
+
+		/*
+		**  Send the MAIL FROM: protocol
+		*/
+
+		rcode = smtpmailfrom(m, mci, e);
+		if (rcode == EX_OK)
+		{
+			register char *t = tobuf;
+			register int i;
+
+			/* send the recipient list */
+			tobuf[0] = '\0';
+			for (to = tochain; to != NULL; to = to->q_tchain)
+			{
+				e->e_to = to->q_paddr;
+				if (strlen(to->q_paddr) + (t - tobuf) + 2 > sizeof tobuf)
+				{
+					/* not enough room */
+					continue;
+				}
+				else if ((i = smtprcpt(to, m, mci, e)) != EX_OK)
+				{
+					markfailure(e, to, mci, i);
+					giveresponse(i, m, mci, ctladdr, xstart, e);
+				}
+				else
+				{
+					*t++ = ',';
+					for (p = to->q_paddr; *p; *t++ = *p++)
+						continue;
+					*t = '\0';
+				}
+			}
+
+			/* now send the data */
+			if (tobuf[0] == '\0')
+			{
+				rcode = EX_OK;
+				e->e_to = NULL;
+				if (bitset(MCIF_CACHED, mci->mci_flags))
+					smtprset(m, mci, e);
+			}
+			else
+			{
+				e->e_to = tobuf + 1;
+				rcode = smtpdata(m, mci, e);
+			}
+		}
+# if DAEMON
+		if (rcode == EX_TEMPFAIL && curhost != NULL && *curhost != '\0')
+		{
+			/* try next MX site */
+			goto tryhost;
+		}
+# endif
+	}
+#else /* not SMTP */
+	{
+		syserr("554 deliver: need SMTP compiled to use clever mailer");
+		rcode = EX_CONFIG;
+		goto give_up;
+	}
+#endif /* SMTP */
+#if NAMED_BIND
+	if (ConfigLevel < 2)
+		_res.options |= RES_DEFNAMES | RES_DNSRCH;	/* XXX */
+#endif
+
+	if (tTd(62, 1))
+		checkfds("after delivery");
+
+	/*
+	**  Do final status disposal.
+	**	We check for something in tobuf for the SMTP case.
+	**	If we got a temporary failure, arrange to queue the
+	**		addressees.
+	*/
+
+  give_up:
+#if SMTP
+	if (bitnset(M_LMTP, m->m_flags))
+	{
+		lmtp_rcode = rcode;
+		tobuf[0] = '\0';
+		anyok = FALSE;
+	}
+	else
+#endif
+		anyok = rcode == EX_OK;
+
+	for (to = tochain; to != NULL; to = to->q_tchain)
+	{
+		/* see if address already marked */
+		if (bitset(QBADADDR|QQUEUEUP, to->q_flags))
+			continue;
+
+#if SMTP
+		/* if running LMTP, get the status for each address */
+		if (bitnset(M_LMTP, m->m_flags))
+		{
+			extern int smtpgetstat __P((MAILER *, MCI *, ENVELOPE *));
+
+			if (lmtp_rcode == EX_OK)
+				rcode = smtpgetstat(m, mci, e);
+			if (rcode == EX_OK)
+			{
+				if (strlen(to->q_paddr) + strlen(tobuf) + 2 > sizeof tobuf)
+				{
+					syserr("LMTP tobuf overflow");
+				}
+				else
+				{
+					strcat(tobuf, ",");
+					strcat(tobuf, to->q_paddr);
+				}
+				anyok = TRUE;
+			}
+			else
+			{
+				e->e_to = to->q_paddr;
+				markfailure(e, to, mci, rcode);
+				giveresponse(rcode, m, mci, ctladdr, xstart, e);
+				e->e_to = tobuf + 1;
+				continue;
+			}
+		}
+		else
+#endif
+		{
+			/* mark bad addresses */
+			if (rcode != EX_OK)
+			{
+				if (goodmxfound && rcode == EX_NOHOST)
+					rcode = EX_TEMPFAIL;
+				markfailure(e, to, mci, rcode);
+				continue;
+			}
+		}
+
+		/* successful delivery */
+		to->q_flags |= QSENT;
+		to->q_statdate = curtime();
+		e->e_nsent++;
+		if (bitnset(M_LOCALMAILER, m->m_flags) &&
+		    bitset(QPINGONSUCCESS, to->q_flags))
+		{
+			to->q_flags |= QDELIVERED;
+			to->q_status = "2.1.5";
+			fprintf(e->e_xfp, "%s... Successfully delivered\n",
+				to->q_paddr);
+		}
+		else if (bitset(QPINGONSUCCESS, to->q_flags) &&
+			 bitset(QPRIMARY, to->q_flags) &&
+			 !bitset(MCIF_DSN, mci->mci_flags))
+		{
+			to->q_flags |= QRELAYED;
+			fprintf(e->e_xfp, "%s... relayed; expect no further notifications\n",
+				to->q_paddr);
+		}
+	}
+
+#if SMTP
+	if (bitnset(M_LMTP, m->m_flags))
+	{
+		/*
+		**  Global information applies to the last recipient only;
+		**  clear it out to avoid bogus errors.
+		*/
+
+		rcode = EX_OK;
+		e->e_statmsg = NULL;
+
+		/* reset the mci state for the next transaction */
+		if (mci != NULL && mci->mci_state == MCIS_ACTIVE)
+			mci->mci_state = MCIS_OPEN;
+	}
+#endif
+
+	if (tobuf[0] != '\0')
+		giveresponse(rcode, m, mci, ctladdr, xstart, e);
+	if (anyok)
+		markstats(e, tochain, FALSE);
+	mci_store_persistent(mci);
+
+#if SMTP
+	/* now close the connection */
+	if (clever && mci != NULL && mci->mci_state != MCIS_CLOSED &&
+	    !bitset(MCIF_CACHED, mci->mci_flags))
+		smtpquit(m, mci, e);
+#endif
+
+	/*
+	**  Restore state and return.
+	*/
+
+#if XDEBUG
+	{
+		char wbuf[MAXLINE];
+
+		/* make absolutely certain 0, 1, and 2 are in use */
+		snprintf(wbuf, sizeof wbuf, "%s... end of deliver(%s)",
+			e->e_to == NULL ? "NO-TO-LIST"
+					: shortenstring(e->e_to, MAXSHORTSTR),
+			m->m_name);
+		checkfd012(wbuf);
+	}
+#endif
+
+	errno = 0;
+	define('g', (char *) NULL, e);
+	return (rcode);
+}
+/*
+**  MARKFAILURE -- mark a failure on a specific address.
+**
+**	Parameters:
+**		e -- the envelope we are sending.
+**		q -- the address to mark.
+**		mci -- mailer connection information.
+**		rcode -- the code signifying the particular failure.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		marks the address (and possibly the envelope) with the
+**			failure so that an error will be returned or
+**			the message will be queued, as appropriate.
+*/
+
+void
+markfailure(e, q, mci, rcode)
+	register ENVELOPE *e;
+	register ADDRESS *q;
+	register MCI *mci;
+	int rcode;
+{
+	char *stat = NULL;
+
+	switch (rcode)
+	{
+	  case EX_OK:
+		break;
+
+	  case EX_TEMPFAIL:
+	  case EX_IOERR:
+	  case EX_OSERR:
+		q->q_flags |= QQUEUEUP;
+		q->q_flags &= ~QDONTSEND;
+		break;
+
+	  default:
+		q->q_flags |= QBADADDR;
+		break;
+	}
+
+	/* find most specific error code possible */
+	if (mci != NULL && mci->mci_status != NULL)
+	{
+		q->q_status = mci->mci_status;
+		if (mci->mci_rstatus != NULL)
+			q->q_rstatus = newstr(mci->mci_rstatus);
+		else
+			q->q_rstatus = NULL;
+	}
+	else if (e->e_status != NULL)
+	{
+		q->q_status = e->e_status;
+		q->q_rstatus = NULL;
+	}
+	else
+	{
+		switch (rcode)
+		{
+		  case EX_USAGE:
+			stat = "5.5.4";
+			break;
+
+		  case EX_DATAERR:
+			stat = "5.5.2";
+			break;
+
+		  case EX_NOUSER:
+			stat = "5.1.1";
+			break;
+
+		  case EX_NOHOST:
+			stat = "5.1.2";
+			break;
+
+		  case EX_NOINPUT:
+		  case EX_CANTCREAT:
+		  case EX_NOPERM:
+			stat = "5.3.0";
+			break;
+
+		  case EX_UNAVAILABLE:
+		  case EX_SOFTWARE:
+		  case EX_OSFILE:
+		  case EX_PROTOCOL:
+		  case EX_CONFIG:
+			stat = "5.5.0";
+			break;
+
+		  case EX_OSERR:
+		  case EX_IOERR:
+			stat = "4.5.0";
+			break;
+
+		  case EX_TEMPFAIL:
+			stat = "4.2.0";
+			break;
+		}
+		if (stat != NULL)
+			q->q_status = stat;
+	}
+
+	q->q_statdate = curtime();
+	if (CurHostName != NULL && CurHostName[0] != '\0')
+		q->q_statmta = newstr(CurHostName);
+	if (rcode != EX_OK && q->q_rstatus == NULL &&
+	    q->q_mailer != NULL && q->q_mailer->m_diagtype != NULL &&
+	    strcasecmp(q->q_mailer->m_diagtype, "UNIX") == 0)
+	{
+		char buf[30];
+
+		(void) snprintf(buf, sizeof buf, "%d", rcode);
+		q->q_rstatus = newstr(buf);
+	}
+}
+/*
+**  ENDMAILER -- Wait for mailer to terminate.
+**
+**	We should never get fatal errors (e.g., segmentation
+**	violation), so we report those specially.  For other
+**	errors, we choose a status message (into statmsg),
+**	and if it represents an error, we print it.
+**
+**	Parameters:
+**		pid -- pid of mailer.
+**		e -- the current envelope.
+**		pv -- the parameter vector that invoked the mailer
+**			(for error messages).
+**
+**	Returns:
+**		exit code of mailer.
+**
+**	Side Effects:
+**		none.
+*/
+
+int
+endmailer(mci, e, pv)
+	register MCI *mci;
+	register ENVELOPE *e;
+	char **pv;
+{
+	int st;
+
+	mci_unlock_host(mci);
+
+	/* close any connections */
+	if (mci->mci_in != NULL)
+		(void) xfclose(mci->mci_in, mci->mci_mailer->m_name, "mci_in");
+	if (mci->mci_out != NULL)
+		(void) xfclose(mci->mci_out, mci->mci_mailer->m_name, "mci_out");
+	mci->mci_in = mci->mci_out = NULL;
+	mci->mci_state = MCIS_CLOSED;
+
+	/* in the IPC case there is nothing to wait for */
+	if (mci->mci_pid == 0)
+		return (EX_OK);
+
+#if _FFR_TIMEOUT_WAIT
+	put a timeout around the wait
+#endif
+
+	/* wait for the mailer process to die and collect status */
+	st = waitfor(mci->mci_pid);
+	if (st == -1)
+	{
+		syserr("endmailer %s: wait", mci->mci_mailer->m_name);
+		return (EX_SOFTWARE);
+	}
+
+	if (WIFEXITED(st))
+	{
+		/* normal death -- return status */
+		return (WEXITSTATUS(st));
+	}
+
+	/* it died a horrid death */
+	syserr("451 mailer %s died with signal %o",
+		mci->mci_mailer->m_name, st);
+
+	/* log the arguments */
+	if (pv != NULL && e->e_xfp != NULL)
+	{
+		register char **av;
+
+		fprintf(e->e_xfp, "Arguments:");
+		for (av = pv; *av != NULL; av++)
+			fprintf(e->e_xfp, " %s", *av);
+		fprintf(e->e_xfp, "\n");
+	}
+
+	ExitStat = EX_TEMPFAIL;
+	return (EX_TEMPFAIL);
+}
+/*
+**  GIVERESPONSE -- Interpret an error response from a mailer
+**
+**	Parameters:
+**		stat -- the status code from the mailer (high byte
+**			only; core dumps must have been taken care of
+**			already).
+**		m -- the mailer info for this mailer.
+**		mci -- the mailer connection info -- can be NULL if the
+**			response is given before the connection is made.
+**		ctladdr -- the controlling address for the recipient
+**			address(es).
+**		xstart -- the transaction start time, for computing
+**			transaction delays.
+**		e -- the current envelope.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		Errors may be incremented.
+**		ExitStat may be set.
+*/
+
+void
+giveresponse(stat, m, mci, ctladdr, xstart, e)
+	int stat;
+	register MAILER *m;
+	register MCI *mci;
+	ADDRESS *ctladdr;
+	time_t xstart;
+	ENVELOPE *e;
+{
+	register const char *statmsg;
+	extern char *SysExMsg[];
+	register int i;
+	extern int N_SysEx;
+	char buf[MAXLINE];
+
+	if (e == NULL)
+		syserr("giveresponse: null envelope");
+
+	/*
+	**  Compute status message from code.
+	*/
+
+	i = stat - EX__BASE;
+	if (stat == 0)
+	{
+		statmsg = "250 Sent";
+		if (e->e_statmsg != NULL)
+		{
+			(void) snprintf(buf, sizeof buf, "%s (%s)",
+				statmsg, shortenstring(e->e_statmsg, 403));
+			statmsg = buf;
+		}
+	}
+	else if (i < 0 || i >= N_SysEx)
+	{
+		(void) snprintf(buf, sizeof buf, "554 unknown mailer error %d",
+			stat);
+		stat = EX_UNAVAILABLE;
+		statmsg = buf;
+	}
+	else if (stat == EX_TEMPFAIL)
+	{
+		char *bp = buf;
+
+		snprintf(bp, SPACELEFT(buf, bp), "%s", SysExMsg[i] + 1);
+		bp += strlen(bp);
+#if NAMED_BIND
+		if (h_errno == TRY_AGAIN)
+			statmsg = errstring(h_errno+E_DNSBASE);
+		else
+#endif
+		{
+			if (errno != 0)
+				statmsg = errstring(errno);
+			else
+			{
+#if SMTP
+				statmsg = SmtpError;
+#else /* SMTP */
+				statmsg = NULL;
+#endif /* SMTP */
+			}
+		}
+		if (statmsg != NULL && statmsg[0] != '\0')
+			snprintf(bp, SPACELEFT(buf, bp), ": %s", statmsg);
+		statmsg = buf;
+	}
+#if NAMED_BIND
+	else if (stat == EX_NOHOST && h_errno != 0)
+	{
+		statmsg = errstring(h_errno + E_DNSBASE);
+		(void) snprintf(buf, sizeof buf, "%s (%s)",
+			SysExMsg[i] + 1, statmsg);
+		statmsg = buf;
+	}
+#endif
+	else
+	{
+		statmsg = SysExMsg[i];
+		if (*statmsg++ == ':' && errno != 0)
+		{
+			(void) snprintf(buf, sizeof buf, "%s: %s",
+				statmsg, errstring(errno));
+			statmsg = buf;
+		}
+	}
+
+	/*
+	**  Print the message as appropriate
+	*/
+
+	if (stat == EX_OK || stat == EX_TEMPFAIL)
+	{
+		extern char MsgBuf[];
+
+		message("%s", &statmsg[4]);
+		if (stat == EX_TEMPFAIL && e->e_xfp != NULL)
+			fprintf(e->e_xfp, "%s\n", &MsgBuf[4]);
+	}
+	else
+	{
+		char mbuf[8];
+
+		Errors++;
+		snprintf(mbuf, sizeof mbuf, "%.3s %%s", statmsg);
+		usrerr(mbuf, &statmsg[4]);
+	}
+
+	/*
+	**  Final cleanup.
+	**	Log a record of the transaction.  Compute the new
+	**	ExitStat -- if we already had an error, stick with
+	**	that.
+	*/
+
+	if (OpMode != MD_VERIFY && !bitset(EF_VRFYONLY, e->e_flags) &&
+	    LogLevel > ((stat == EX_TEMPFAIL) ? 8 : (stat == EX_OK) ? 7 : 6))
+		logdelivery(m, mci, &statmsg[4], ctladdr, xstart, e);
+
+	if (tTd(11, 2))
+		printf("giveresponse: stat=%d, e->e_message=%s\n",
+			stat, e->e_message == NULL ? "<NULL>" : e->e_message);
+
+	if (stat != EX_TEMPFAIL)
+		setstat(stat);
+	if (stat != EX_OK && (stat != EX_TEMPFAIL || e->e_message == NULL))
+	{
+		if (e->e_message != NULL)
+			free(e->e_message);
+		e->e_message = newstr(&statmsg[4]);
+	}
+	errno = 0;
+#if NAMED_BIND
+	h_errno = 0;
+#endif
+}
+/*
+**  LOGDELIVERY -- log the delivery in the system log
+**
+**	Care is taken to avoid logging lines that are too long, because
+**	some versions of syslog have an unfortunate proclivity for core
+**	dumping.  This is a hack, to be sure, that is at best empirical.
+**
+**	Parameters:
+**		m -- the mailer info.  Can be NULL for initial queue.
+**		mci -- the mailer connection info -- can be NULL if the
+**			log is occuring when no connection is active.
+**		stat -- the message to print for the status.
+**		ctladdr -- the controlling address for the to list.
+**		xstart -- the transaction start time, used for
+**			computing transaction delay.
+**		e -- the current envelope.
+**
+**	Returns:
+**		none
+**
+**	Side Effects:
+**		none
+*/
+
+void
+logdelivery(m, mci, stat, ctladdr, xstart, e)
+	MAILER *m;
+	register MCI *mci;
+	const char *stat;
+	ADDRESS *ctladdr;
+	time_t xstart;
+	register ENVELOPE *e;
+{
+	register char *bp;
+	register char *p;
+	int l;
+	char buf[1024];
+
+#  if (SYSLOG_BUFSIZE) >= 256
+	/* ctladdr: max 106 bytes */
+	bp = buf;
+	if (ctladdr != NULL)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", ctladdr=%s",
+			shortenstring(ctladdr->q_paddr, 83));
+		bp += strlen(bp);
+		if (bitset(QGOODUID, ctladdr->q_flags))
+		{
+			(void) snprintf(bp, SPACELEFT(buf, bp), " (%d/%d)",
+					ctladdr->q_uid, ctladdr->q_gid);
+			bp += strlen(bp);
+		}
+	}
+
+	/* delay & xdelay: max 41 bytes */
+	snprintf(bp, SPACELEFT(buf, bp), ", delay=%s",
+		pintvl(curtime() - e->e_ctime, TRUE));
+	bp += strlen(bp);
+
+	if (xstart != (time_t) 0)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", xdelay=%s",
+			pintvl(curtime() - xstart, TRUE));
+		bp += strlen(bp);
+	}
+
+	/* mailer: assume about 19 bytes (max 10 byte mailer name) */
+	if (m != NULL)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", mailer=%s", m->m_name);
+		bp += strlen(bp);
+	}
+
+	/* relay: max 66 bytes for IPv4 addresses */
+	if (mci != NULL && mci->mci_host != NULL)
+	{
+# if DAEMON
+		extern SOCKADDR CurHostAddr;
+# endif
+
+		snprintf(bp, SPACELEFT(buf, bp), ", relay=%s",
+			shortenstring(mci->mci_host, 40));
+		bp += strlen(bp);
+
+# if DAEMON
+		if (CurHostAddr.sa.sa_family != 0)
+		{
+			snprintf(bp, SPACELEFT(buf, bp), " [%s]",
+				anynet_ntoa(&CurHostAddr));
+		}
+# endif
+	}
+	else if (strcmp(stat, "queued") != 0)
+	{
+		p = macvalue('h', e);
+		if (p != NULL && p[0] != '\0')
+		{
+			snprintf(bp, SPACELEFT(buf, bp), ", relay=%s",
+				shortenstring(p, 40));
+		}
+	}
+	bp += strlen(bp);
+
+#define STATLEN		(((SYSLOG_BUFSIZE) - 100) / 4)
+#if (STATLEN) < 63
+# undef STATLEN
+# define STATLEN	63
+#endif
+#if (STATLEN) > 203
+# undef STATLEN
+# define STATLEN	203
+#endif
+
+	/* stat: max 210 bytes */
+	if ((bp - buf) > (sizeof buf - ((STATLEN) + 20)))
+	{
+		/* desperation move -- truncate data */
+		bp = buf + sizeof buf - ((STATLEN) + 17);
+		strcpy(bp, "...");
+		bp += 3;
+	}
+
+	(void) strcpy(bp, ", stat=");
+	bp += strlen(bp);
+
+	(void) strcpy(bp, shortenstring(stat, (STATLEN)));
+
+	/* id, to: max 13 + TOBUFSIZE bytes */
+	l = SYSLOG_BUFSIZE - 100 - strlen(buf);
+	p = e->e_to;
+	while (strlen(p) >= (SIZE_T) l)
+	{
+		register char *q = strchr(p + l, ',');
+
+		if (q == NULL)
+			break;
+		sm_syslog(LOG_INFO, e->e_id,
+			"to=%.*s [more]%s",
+			++q - p, p, buf);
+		p = q;
+	}
+	sm_syslog(LOG_INFO, e->e_id, "to=%s%s", p, buf);
+
+#  else		/* we have a very short log buffer size */
+
+	l = SYSLOG_BUFSIZE - 85;
+	p = e->e_to;
+	while (strlen(p) >= (SIZE_T) l)
+	{
+		register char *q = strchr(p + l, ',');
+
+		if (q == NULL)
+			break;
+		sm_syslog(LOG_INFO, e->e_id,
+			"to=%.*s [more]",
+			++q - p, p);
+		p = q;
+	}
+	sm_syslog(LOG_INFO, e->e_id, "to=%s", p);
+
+	if (ctladdr != NULL)
+	{
+		bp = buf;
+		snprintf(bp, SPACELEFT(buf, bp), "ctladdr=%s",
+			shortenstring(ctladdr->q_paddr, 83));
+		bp += strlen(bp);
+		if (bitset(QGOODUID, ctladdr->q_flags))
+		{
+			(void) snprintf(bp, SPACELEFT(buf, bp), " (%d/%d)",
+					ctladdr->q_uid, ctladdr->q_gid);
+			bp += strlen(bp);
+		}
+		sm_syslog(LOG_INFO, e->e_id, "%s", buf);
+	}
+	bp = buf;
+	snprintf(bp, SPACELEFT(buf, bp), "delay=%s",
+		pintvl(curtime() - e->e_ctime, TRUE));
+	bp += strlen(bp);
+	if (xstart != (time_t) 0)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", xdelay=%s",
+			pintvl(curtime() - xstart, TRUE));
+		bp += strlen(bp);
+	}
+
+	if (m != NULL)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", mailer=%s", m->m_name);
+		bp += strlen(bp);
+	}
+	sm_syslog(LOG_INFO, e->e_id, "%.1000s", buf);
+
+	buf[0] = '\0';
+	bp = buf;
+	if (mci != NULL && mci->mci_host != NULL)
+	{
+# if DAEMON
+		extern SOCKADDR CurHostAddr;
+# endif
+
+		snprintf(bp, SPACELEFT(buf, bp), "relay=%.100s", mci->mci_host);
+		bp += strlen(bp);
+
+# if DAEMON
+		if (CurHostAddr.sa.sa_family != 0)
+			snprintf(bp, SPACELEFT(buf, bp), " [%.100s]",
+				anynet_ntoa(&CurHostAddr));
+# endif
+	}
+	else if (strcmp(stat, "queued") != 0)
+	{
+		p = macvalue('h', e);
+		if (p != NULL && p[0] != '\0')
+			snprintf(buf, sizeof buf, "relay=%.100s", p);
+	}
+	if (buf[0] != '\0')
+		sm_syslog(LOG_INFO, e->e_id, "%.1000s", buf);
+
+	sm_syslog(LOG_INFO, e->e_id, "stat=%s", shortenstring(stat, 63));
+#  endif /* short log buffer */
+}
+/*
+**  PUTFROMLINE -- output a UNIX-style from line (or whatever)
+**
+**	This can be made an arbitrary message separator by changing $l
+**
+**	One of the ugliest hacks seen by human eyes is contained herein:
+**	UUCP wants those stupid "remote from <host>" lines.  Why oh why
+**	does a well-meaning programmer such as myself have to deal with
+**	this kind of antique garbage????
+**
+**	Parameters:
+**		mci -- the connection information.
+**		e -- the envelope.
+**
+**	Returns:
+**		none
+**
+**	Side Effects:
+**		outputs some text to fp.
+*/
+
+void
+putfromline(mci, e)
+	register MCI *mci;
+	ENVELOPE *e;
+{
+	char *template = UnixFromLine;
+	char buf[MAXLINE];
+	char xbuf[MAXLINE];
+
+	if (bitnset(M_NHDR, mci->mci_mailer->m_flags))
+		return;
+
+	mci->mci_flags |= MCIF_INHEADER;
+
+	if (bitnset(M_UGLYUUCP, mci->mci_mailer->m_flags))
+	{
+		char *bang;
+
+		expand("\201g", buf, sizeof buf, e);
+		bang = strchr(buf, '!');
+		if (bang == NULL)
+		{
+			char *at;
+			char hname[MAXNAME];
+
+		    	/*
+			**  If we can construct a UUCP path, do so
+			*/
+
+			at = strrchr(buf, '@@');
+			if (at == NULL)
+			{
+				expand( "\201k", hname, sizeof hname, e);
+				at = hname;
+			}
+			else
+				*at++ = '\0';
+			(void) snprintf(xbuf, sizeof xbuf,
+				"From %.800s  \201d remote from %.100s\n",
+				buf, at);
+		}
+		else
+		{
+			*bang++ = '\0';
+			(void) snprintf(xbuf, sizeof xbuf,
+				"From %.800s  \201d remote from %.100s\n",
+				bang, buf);
+			template = xbuf;
+		}
+	}
+	expand(template, buf, sizeof buf, e);
+	putxline(buf, strlen(buf), mci, PXLF_HEADER);
+}
+/*
+**  PUTBODY -- put the body of a message.
+**
+**	Parameters:
+**		mci -- the connection information.
+**		e -- the envelope to put out.
+**		separator -- if non-NULL, a message separator that must
+**			not be permitted in the resulting message.
+**
+**	Returns:
+**		none.
+**
+**	Side Effects:
+**		The message is written onto fp.
+*/
+
+/* values for output state variable */
+#define OS_HEAD		0	/* at beginning of line */
+#define OS_CR		1	/* read a carriage return */
+#define OS_INLINE	2	/* putting rest of line */
+
+void
+putbody(mci, e, separator)
+	register MCI *mci;
+	register ENVELOPE *e;
+	char *separator;
+{
+	char buf[MAXLINE];
+	char *boundaries[MAXMIMENESTING + 1];
+
+	/*
+	**  Output the body of the message
+	*/
+
+	if (e->e_dfp == NULL && bitset(EF_HAS_DF, e->e_flags))
+	{
+		char *df = queuename(e, 'd');
+
+		e->e_dfp = fopen(df, "r");
+		if (e->e_dfp == NULL)
+			syserr("putbody: Cannot open %s for %s from %s",
+				df, e->e_to, e->e_from.q_paddr);
+	}
+	if (e->e_dfp == NULL)
+	{
+		if (bitset(MCIF_INHEADER, mci->mci_flags))
+		{
+			putline("", mci);
+			mci->mci_flags &= ~MCIF_INHEADER;
+		}
+		putline("<<< No Message Collected >>>", mci);
+		goto endofmessage;
+	}
+	if (e->e_dfino == (ino_t) 0)
+	{
+		struct stat stbuf;
+
+		if (fstat(fileno(e->e_dfp), &stbuf) < 0)
+			e->e_dfino = -1;
+		else
+		{
+			e->e_dfdev = stbuf.st_dev;
+			e->e_dfino = stbuf.st_ino;
+		}
+	}
+	rewind(e->e_dfp);
+
+#if MIME8TO7
+	if (bitset(MCIF_CVT8TO7, mci->mci_flags))
+	{
+		/*
+		**  Do 8 to 7 bit MIME conversion.
+		*/
+
+		/* make sure it looks like a MIME message */
+		if (hvalue("MIME-Version", e->e_header) == NULL)
+			putline("MIME-Version: 1.0", mci);
+
+		if (hvalue("Content-Type", e->e_header) == NULL)
+		{
+			snprintf(buf, sizeof buf,
+				"Content-Type: text/plain; charset=%s",
+				defcharset(e));
+			putline(buf, mci);
+		}
+
+		/* now do the hard work */
+		boundaries[0] = NULL;
+		mci->mci_flags |= MCIF_INHEADER;
+		mime8to7(mci, e->e_header, e, boundaries, M87F_OUTER);
+	}
+# if MIME7TO8
+	else if (bitset(MCIF_CVT7TO8, mci->mci_flags))
+	{
+		mime7to8(mci, e->e_header, e);
+	}
+# endif
+	else if (MaxMimeHeaderLength > 0 || MaxMimeFieldLength > 0)
+	{
+		/* Use mime8to7 to check multipart for MIME header overflows */
+		boundaries[0] = NULL;
+		mci->mci_flags |= MCIF_INHEADER;
+		mime8to7(mci, e->e_header, e, boundaries, M87F_OUTER|M87F_NO8TO7);
+	}
+	else
+#endif
+	{
+		int ostate;
+		register char *bp;
+		register char *pbp;
+		register int c;
+		register char *xp;
+		int padc;
+		char *buflim;
+		int pos = 0;
+		size_t eol_len;
+		char peekbuf[10];
+
+		if (bitset(MCIF_INHEADER, mci->mci_flags))
+		{
+			putline("", mci);
+			mci->mci_flags &= ~MCIF_INHEADER;
+		}
+
+		/* determine end of buffer; allow for short mailer lines */
+		buflim = &buf[sizeof buf - 1];
+		if (mci->mci_mailer->m_linelimit > 0 &&
+		    mci->mci_mailer->m_linelimit < sizeof buf - 1)
+			buflim = &buf[mci->mci_mailer->m_linelimit - 1];
+		eol_len = strlen(mci->mci_mailer->m_eol);
+
+		/* copy temp file to output with mapping */
+		ostate = OS_HEAD;
+		bp = buf;
+		pbp = peekbuf;
+		while (!ferror(mci->mci_out))
+		{
+			if (pbp > peekbuf)
+				c = *--pbp;
+			else if ((c = getc(e->e_dfp)) == EOF)
+				break;
+			if (bitset(MCIF_7BIT, mci->mci_flags))
+				c &= 0x7f;
+			switch (ostate)
+			{
+			  case OS_HEAD:
+#if _FFR_NONULLS
+				if (c == '\0' &&
+				    bitnset(M_NONULLS, mci->mci_mailer->m_flags))
+					break;
+#endif
+				if (c != '\r' && c != '\n' && bp < buflim)
+				{
+					*bp++ = c;
+					break;
+				}
+
+				/* check beginning of line for special cases */
+				*bp = '\0';
+				pos = 0;
+				padc = EOF;
+				if (buf[0] == 'F' &&
+				    bitnset(M_ESCFROM, mci->mci_mailer->m_flags) &&
+				    strncmp(buf, "From ", 5) == 0)
+				{
+					padc = '>';
+				}
+				if (buf[0] == '-' && buf[1] == '-' &&
+				    separator != NULL)
+				{
+					/* possible separator */
+					int sl = strlen(separator);
+
+					if (strncmp(&buf[2], separator, sl) == 0)
+						padc = ' ';
+				}
+				if (buf[0] == '.' &&
+				    bitnset(M_XDOT, mci->mci_mailer->m_flags))
+				{
+					padc = '.';
+				}
+
+				/* now copy out saved line */
+				if (TrafficLogFile != NULL)
+				{
+					fprintf(TrafficLogFile, "%05d >>> ",
+						(int) getpid());
+					if (padc != EOF)
+						putc(padc, TrafficLogFile);
+					for (xp = buf; xp < bp; xp++)
+						putc(*xp, TrafficLogFile);
+					if (c == '\n')
+						fputs(mci->mci_mailer->m_eol,
+						      TrafficLogFile);
+				}
+				if (padc != EOF)
+				{
+					putc(padc, mci->mci_out);
+					mci->mci_contentlen++;
+					pos++;
+				}
+				for (xp = buf; xp < bp; xp++)
+				{
+					putc(*xp, mci->mci_out);
+					mci->mci_contentlen++;
+				}
+				if (c == '\n')
+				{
+					fputs(mci->mci_mailer->m_eol,
+					      mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					pos = 0;
+				}
+				else
+				{
+					pos += bp - buf;
+					if (c != '\r')
+						*pbp++ = c;
+				}
+				bp = buf;
+
+				/* determine next state */
+				if (c == '\n')
+					ostate = OS_HEAD;
+				else if (c == '\r')
+					ostate = OS_CR;
+				else
+					ostate = OS_INLINE;
+				continue;
+
+			  case OS_CR:
+				if (c == '\n')
+				{
+					/* got CRLF */
+					fputs(mci->mci_mailer->m_eol, mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					if (TrafficLogFile != NULL)
+					{
+						fputs(mci->mci_mailer->m_eol,
+						      TrafficLogFile);
+					}
+					ostate = OS_HEAD;
+					continue;
+				}
+
+				/* had a naked carriage return */
+				*pbp++ = c;
+				c = '\r';
+				ostate = OS_INLINE;
+				goto putch;
+
+			  case OS_INLINE:
+				if (c == '\r')
+				{
+					ostate = OS_CR;
+					continue;
+				}
+#if _FFR_NONULLS
+				if (c == '\0' &&
+				    bitnset(M_NONULLS, mci->mci_mailer->m_flags))
+					break;
+#endif
+putch:
+				if (mci->mci_mailer->m_linelimit > 0 &&
+				    pos > mci->mci_mailer->m_linelimit &&
+				    c != '\n')
+				{
+					putc('!', mci->mci_out);
+					mci->mci_contentlen++;
+					fputs(mci->mci_mailer->m_eol, mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					if (TrafficLogFile != NULL)
+					{
+						fprintf(TrafficLogFile, "!%s",
+							mci->mci_mailer->m_eol);
+					}
+					ostate = OS_HEAD;
+					*pbp++ = c;
+					continue;
+				}
+				if (c == '\n')
+				{
+					if (TrafficLogFile != NULL)
+						fputs(mci->mci_mailer->m_eol,
+						      TrafficLogFile);
+					fputs(mci->mci_mailer->m_eol, mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					pos = 0;
+					ostate = OS_HEAD;
+				}
+				else
+				{
+					if (TrafficLogFile != NULL)
+						putc(c, TrafficLogFile);
+					putc(c, mci->mci_out);
+					mci->mci_contentlen++;
+					pos++;
+					ostate = OS_INLINE;
+				}
+				break;
+			}
+		}
+
+		/* make sure we are at the beginning of a line */
+		if (bp > buf)
+		{
+			if (TrafficLogFile != NULL)
+			{
+				for (xp = buf; xp < bp; xp++)
+					putc(*xp, TrafficLogFile);
+			}
+			for (xp = buf; xp < bp; xp++)
+			{
+				putc(*xp, mci->mci_out);
+				mci->mci_contentlen++;
+			}
+			pos += bp - buf;
+		}
+		if (pos > 0)
+		{
+			if (TrafficLogFile != NULL)
+				fputs(mci->mci_mailer->m_eol, TrafficLogFile);
+			fputs(mci->mci_mailer->m_eol, mci->mci_out);
+			mci->mci_contentlen += eol_len;
+		}
+	}
+
+	if (ferror(e->e_dfp))
+	{
+		syserr("putbody: df%s: read error", e->e_id);
+		ExitStat = EX_IOERR;
+	}
+
+endofmessage:
+	/* some mailers want extra blank line at end of message */
+	if (bitnset(M_BLANKEND, mci->mci_mailer->m_flags) &&
+	    buf[0] != '\0' && buf[0] != '\n')
+		putline("", mci);
+
+	(void) fflush(mci->mci_out);
+	if (ferror(mci->mci_out) && errno != EPIPE)
+	{
+		syserr("putbody: write error");
+		ExitStat = EX_IOERR;
+	}
+	errno = 0;
+}
+/*
+**  MAILFILE -- Send a message to a file.
+**
+**	If the file has the setuid/setgid bits set, but NO execute
+**	bits, sendmail will try to become the owner of that file
+**	rather than the real user.  Obviously, this only works if
+**	sendmail runs as root.
+**
+**	This could be done as a subordinate mailer, except that it
+**	is used implicitly to save messages in ~/dead.letter.  We
+**	view this as being sufficiently important as to include it
+**	here.  For example, if the system is dying, we shouldn't have
+**	to create another process plus some pipes to save the message.
+**
+**	Parameters:
+**		filename -- the name of the file to send to.
+**		mailer -- mailer definition for recipient -- if NULL,
+**			use FileMailer.
+**		ctladdr -- the controlling address header -- includes
+**			the userid/groupid to be when sending.
+**		sfflags -- flags for opening.
+**		e -- the current envelope.
+**
+**	Returns:
+**		The exit code associated with the operation.
+**
+**	Side Effects:
+**		none.
+*/
+
+static jmp_buf	CtxMailfileTimeout;
+static void	mailfiletimeout __P((void));
+
+int
+mailfile(filename, mailer, ctladdr, sfflags, e)
+	char *volatile filename;
+	MAILER *volatile mailer;
+	ADDRESS *ctladdr;
+	volatile int sfflags;
+	register ENVELOPE *e;
+{
+	register FILE *f;
+	register pid_t pid = -1;
+	volatile int mode = ST_MODE_NOFILE;
+	bool suidwarn = geteuid() == 0;
+	char *p;
+	EVENT *ev;
+
+	if (tTd(11, 1))
+	{
+		printf("mailfile %s\n  ctladdr=", filename);
+		printaddr(ctladdr, FALSE);
+	}
+
+	if (mailer == NULL)
+		mailer = FileMailer;
+
+	if (e->e_xfp != NULL)
+		fflush(e->e_xfp);
+
+	/*
+	**  Special case /dev/null.  This allows us to restrict file
+	**  delivery to regular files only.
+	*/
+
+	if (strcmp(filename, "/dev/null") == 0)
+		return EX_OK;
+
+	/* check for 8-bit available */
+	if (bitset(EF_HAS8BIT, e->e_flags) &&
+	    bitnset(M_7BITS, mailer->m_flags) &&
+	    (bitset(EF_DONT_MIME, e->e_flags) ||
+	     !(bitset(MM_MIME8BIT, MimeMode) ||
+	       (bitset(EF_IS_MIME, e->e_flags) &&
+		bitset(MM_CVTMIME, MimeMode)))))
+	{
+		usrerr("554 Cannot send 8-bit data to 7-bit destination");
+		e->e_status = "5.6.3";
+		return(EX_DATAERR);
+	}
+
+	/*
+	**  Fork so we can change permissions here.
+	**	Note that we MUST use fork, not vfork, because of
+	**	the complications of calling subroutines, etc.
+	*/
+
+	DOFORK(fork);
+
+	if (pid < 0)
+		return (EX_OSERR);
+	else if (pid == 0)
+	{
+		/* child -- actually write to file */
+		struct stat stb;
+		MCI mcibuf;
+		int err;
+		volatile int oflags = O_WRONLY|O_APPEND;
+
+		if (e->e_lockfp != NULL)
+			(void) close(fileno(e->e_lockfp));
+
+		(void) setsignal(SIGINT, SIG_DFL);
+		(void) setsignal(SIGHUP, SIG_DFL);
+		(void) setsignal(SIGTERM, SIG_DFL);
+		(void) umask(OldUmask);
+		e->e_to = filename;
+		ExitStat = EX_OK;
+
+		if (setjmp(CtxMailfileTimeout) != 0)
+		{
+			exit(EX_TEMPFAIL);
+		}
+
+		if (TimeOuts.to_fileopen > 0)
+			ev = setevent(TimeOuts.to_fileopen, mailfiletimeout, 0);
+		else
+			ev = NULL;
+
+#ifdef HASLSTAT
+		if (bitset(DBS_FILEDELIVERYTOSYMLINK, DontBlameSendmail))
+			err = stat(filename, &stb);
+		else
+			err = lstat(filename, &stb);
+		if (err < 0)
+#else
+		if (stat(filename, &stb) < 0)
+#endif
+		{
+			stb.st_mode = ST_MODE_NOFILE;
+			mode = FileMode;
+			oflags |= O_CREAT|O_EXCL;
+		}
+		else if (bitset(S_IXUSR|S_IXGRP|S_IXOTH, stb.st_mode) ||
+			 (!bitset(DBS_FILEDELIVERYTOHARDLINK, DontBlameSendmail) &&
+			  stb.st_nlink != 1) ||
+			 (SafeFileEnv != NULL && !S_ISREG(stb.st_mode)))
+			exit(EX_CANTCREAT);
+		if (mode == ST_MODE_NOFILE)
+			mode = stb.st_mode;
+
+		/* limit the errors to those actually caused in the child */
+		errno = 0;
+		ExitStat = EX_OK;
+
+		if (ctladdr != NULL || bitset(SFF_RUNASREALUID, sfflags))
+		{
+			/* ignore setuid and setgid bits */
+			mode &= ~(S_ISGID|S_ISUID);
+		}
+
+		/* we have to open the dfile BEFORE setuid */
+		if (e->e_dfp == NULL && bitset(EF_HAS_DF, e->e_flags))
+		{
+			char *df = queuename(e, 'd');
+
+			e->e_dfp = fopen(df, "r");
+			if (e->e_dfp == NULL)
+			{
+				syserr("mailfile: Cannot open %s for %s from %s",
+					df, e->e_to, e->e_from.q_paddr);
+			}
+		}
+
+		/* select a new user to run as */
+		if (!bitset(SFF_RUNASREALUID, sfflags))
+		{
+			if (bitnset(M_SPECIFIC_UID, mailer->m_flags))
+			{
+				RealUserName = NULL;
+				RealUid = mailer->m_uid;
+			}
+			else if (bitset(S_ISUID, mode))
+			{
+				RealUserName = NULL;
+				RealUid = stb.st_uid;
+			}
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+			{
+				if (ctladdr->q_ruser != NULL)
+					RealUserName = ctladdr->q_ruser;
+				else
+					RealUserName = ctladdr->q_user;
+				RealUid = ctladdr->q_uid;
+			}
+			else if (mailer != NULL && mailer->m_uid != 0)
+			{
+				RealUserName = DefUser;
+				RealUid = mailer->m_uid;
+			}
+			else
+			{
+				RealUserName = DefUser;
+				RealUid = DefUid;
+			}
+
+			/* select a new group to run as */
+			if (bitnset(M_SPECIFIC_UID, mailer->m_flags))
+				RealGid = mailer->m_gid;
+			else if (bitset(S_ISGID, mode))
+				RealGid = stb.st_gid;
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+				RealGid = ctladdr->q_gid;
+			else if (mailer != NULL && mailer->m_gid != 0)
+				RealGid = mailer->m_gid;
+			else
+				RealGid = DefGid;
+		}
+
+		/* last ditch */
+		if (!bitset(SFF_ROOTOK, sfflags))
+		{
+			if (RealUid == 0)
+				RealUid = DefUid;
+			if (RealGid == 0)
+				RealGid = DefGid;
+		}
+
+		/* set group id list (needs /etc/group access) */
+		if (RealUserName != NULL && !DontInitGroups)
+		{
+			if (initgroups(RealUserName, RealGid) == -1 && suidwarn)
+				syserr("mailfile: initgroups(%s, %d) failed",
+					RealUserName, RealGid);
+		}
+		else
+		{
+			GIDSET_T gidset[1];
+
+			gidset[0] = RealGid;
+			if (setgroups(1, gidset) == -1 && suidwarn)
+				syserr("mailfile: setgroups() failed");
+		}
+
+		/* if you have a safe environment, go into it */
+		if (SafeFileEnv != NULL && SafeFileEnv[0] != '\0')
+		{
+			int i;
+
+			if (chroot(SafeFileEnv) < 0)
+			{
+				syserr("mailfile: Cannot chroot(%s)",
+					SafeFileEnv);
+				exit(EX_CANTCREAT);
+			}
+			i = strlen(SafeFileEnv);
+			if (strncmp(SafeFileEnv, filename, i) == 0)
+				filename += i;
+		}
+		if (chdir("/") < 0)
+			syserr("mailfile: cannot chdir(/)");
+
+		/* now reset the group and user ids */
+		endpwent();
+		if (setgid(RealGid) < 0 && suidwarn)
+			syserr("mailfile: setgid(%ld) failed", (long) RealGid);
+		vendor_set_uid(RealUid);
+		if (setuid(RealUid) < 0 && suidwarn)
+			syserr("mailfile: setuid(%ld) failed", (long) RealUid);
+
+		/* move into some "safe" directory */
+		if (mailer->m_execdir != NULL)
+		{
+			char *q;
+			char buf[MAXLINE + 1];
+
+			for (p = mailer->m_execdir; p != NULL; p = q)
+			{
+				q = strchr(p, ':');
+				if (q != NULL)
+					*q = '\0';
+				expand(p, buf, sizeof buf, e);
+				if (q != NULL)
+					*q++ = ':';
+				if (tTd(11, 20))
+					printf("mailfile: trydir %s\n",
+					       buf);
+				if (buf[0] != '\0' && chdir(buf) >= 0)
+					break;
+			}
+		}
+
+		sfflags |= SFF_NOPATHCHECK;
+		if (!bitset(DBS_FILEDELIVERYTOSYMLINK, DontBlameSendmail))
+			sfflags |= SFF_NOSLINK;
+		if (!bitset(DBS_FILEDELIVERYTOHARDLINK, DontBlameSendmail))
+			sfflags |= SFF_NOHLINK;
+		sfflags &= ~SFF_OPENASROOT;
+		f = safefopen(filename, oflags, FileMode, sfflags);
+		if (f == NULL)
+		{
+			message("554 cannot open %s: %s",
+				shortenstring(filename, MAXSHORTSTR),
+				errstring(errno));
+			exit(EX_CANTCREAT);
+		}
+		if (filechanged(filename, fileno(f), &stb))
+		{
+			message("554 file changed after open");
+			exit(EX_CANTCREAT);
+		}
+		if (fstat(fileno(f), &stb) < 0)
+		{
+			message("554 cannot fstat %s", errstring(errno));
+			exit(EX_CANTCREAT);
+		}
+
+		if (ev != NULL)
+			clrevent(ev);
+
+		bzero(&mcibuf, sizeof mcibuf);
+		mcibuf.mci_mailer = mailer;
+		mcibuf.mci_out = f;
+		mcibuf.mci_contentlen = 0;
+		if (bitnset(M_7BITS, mailer->m_flags))
+			mcibuf.mci_flags |= MCIF_7BIT;
+
+		/* clear out per-message flags from connection structure */
+		mcibuf.mci_flags &= ~(MCIF_CVT7TO8|MCIF_CVT8TO7);
+
+		if (bitset(EF_HAS8BIT, e->e_flags) &&
+		    !bitset(EF_DONT_MIME, e->e_flags) &&
+		    bitnset(M_7BITS, mailer->m_flags))
+			mcibuf.mci_flags |= MCIF_CVT8TO7;
+
+#if MIME7TO8
+		if (bitnset(M_MAKE8BIT, mailer->m_flags) &&
+		    !bitset(MCIF_7BIT, mcibuf.mci_flags) &&
+		    (p = hvalue("Content-Transfer-Encoding", e->e_header)) != NULL &&
+		    (strcasecmp(p, "quoted-printable") == 0 ||
+		     strcasecmp(p, "base64") == 0) &&
+		    (p = hvalue("Content-Type", e->e_header)) != NULL)
+		{
+			/* may want to convert 7 -> 8 */
+			/* XXX should really parse it here -- and use a class XXX */
+			if (strncasecmp(p, "text/plain", 10) == 0 &&
+			        (p[10] == '\0' || p[10] == ' ' || p[10] == ';'))
+				mcibuf.mci_flags |= MCIF_CVT7TO8;
+		}
+#endif
+
+		putfromline(&mcibuf, e);
+		(*e->e_puthdr)(&mcibuf, e->e_header, e, M87F_OUTER);
+		(*e->e_putbody)(&mcibuf, e, NULL);
+		putline("\n", &mcibuf);
+		if (fflush(f) < 0 || ferror(f))
+		{
+			message("451 I/O error: %s", errstring(errno));
+			setstat(EX_IOERR);
+		}
+
+		/* reset ISUID & ISGID bits for paranoid systems */
+#if HASFCHMOD
+		(void) fchmod(fileno(f), (MODE_T) stb.st_mode);
+#else
+		(void) chmod(filename, (MODE_T) stb.st_mode);
+#endif
+		(void) xfclose(f, "mailfile", filename);
+		(void) fflush(stdout);
+		setuid(RealUid);
+		exit(ExitStat);
+		/*NOTREACHED*/
+	}
+	else
+	{
+		/* parent -- wait for exit status */
+		int st;
+
+		st = waitfor(pid);
+		if (st == -1)
+		{
+			syserr("mailfile: %s: wait", mailer->m_name);
+			return (EX_SOFTWARE);
+		}
+		if (WIFEXITED(st))
+			return (WEXITSTATUS(st));
+		else
+		{
+			syserr("mailfile: %s: child died on signal %d",
+			       mailer->m_name, st);
+			return (EX_UNAVAILABLE);
+		}
+		/*NOTREACHED*/
+	}
+	return EX_UNAVAILABLE;	/* avoid compiler warning on IRIX */
+}
+
+static void
+mailfiletimeout()
+{
+	longjmp(CtxMailfileTimeout, 1);
+}
+/*
+**  HOSTSIGNATURE -- return the "signature" for a host.
+**
+**	The signature describes how we are going to send this -- it
+**	can be just the hostname (for non-Internet hosts) or can be
+**	an ordered list of MX hosts.
+**
+**	Parameters:
+**		m -- the mailer describing this host.
+**		host -- the host name.
+**		e -- the current envelope.
+**
+**	Returns:
+**		The signature for this host.
+**
+**	Side Effects:
+**		Can tweak the symbol table.
+*/
+
+char *
+hostsignature(m, host, e)
+	register MAILER *m;
+	char *host;
+	ENVELOPE *e;
+{
+	register char *p;
+	register STAB *s;
+	int i;
+	int len;
+#if NAMED_BIND
+	int nmx;
+	char *hp;
+	char *endp;
+	int oldoptions = _res.options;
+	char *mxhosts[MAXMXHOSTS + 1];
+#endif
+
+	/*
+	**  Check to see if this uses IPC -- if not, it can't have MX records.
+	*/
+
+	p = m->m_mailer;
+	if (strcmp(p, "[IPC]") != 0 && strcmp(p, "[TCP]") != 0)
+	{
+		/* just an ordinary mailer */
+		return host;
+	}
+
+	/*
+	**  Look it up in the symbol table.
+	*/
+
+	s = stab(host, ST_HOSTSIG, ST_ENTER);
+	if (s->s_hostsig != NULL)
+		return s->s_hostsig;
+
+	/*
+	**  Not already there -- create a signature.
+	*/
+
+#if NAMED_BIND
+	if (ConfigLevel < 2)
+		_res.options &= ~(RES_DEFNAMES | RES_DNSRCH);	/* XXX */
+
+	for (hp = host; hp != NULL; hp = endp)
+	{
+		endp = strchr(hp, ':');
+		if (endp != NULL)
+			*endp = '\0';
+
+		if (bitnset(M_NOMX, m->m_flags))
+		{
+			/* skip MX lookups */
+			nmx = 1;
+			mxhosts[0] = hp;
+		}
+		else
+		{
+			auto int rcode;
+
+			nmx = getmxrr(hp, mxhosts, TRUE, &rcode);
+			if (nmx <= 0)
+			{
+				register MCI *mci;
+
+				/* update the connection info for this host */
+				mci = mci_get(hp, m);
+				mci->mci_errno = errno;
+				mci->mci_herrno = h_errno;
+				mci->mci_lastuse = curtime();
+				mci_setstat(mci, rcode, NULL, NULL);
+
+				/* use the original host name as signature */
+				nmx = 1;
+				mxhosts[0] = hp;
+			}
+		}
+
+		len = 0;
+		for (i = 0; i < nmx; i++)
+		{
+			len += strlen(mxhosts[i]) + 1;
+		}
+		if (s->s_hostsig != NULL)
+			len += strlen(s->s_hostsig) + 1;
+		p = xalloc(len);
+		if (s->s_hostsig != NULL)
+		{
+			(void) strcpy(p, s->s_hostsig);
+			free(s->s_hostsig);
+			s->s_hostsig = p;
+			p += strlen(p);
+			*p++ = ':';
+		}
+		else
+			s->s_hostsig = p;
+		for (i = 0; i < nmx; i++)
+		{
+			if (i != 0)
+				*p++ = ':';
+			strcpy(p, mxhosts[i]);
+			p += strlen(p);
+		}
+		if (endp != NULL)
+			*endp++ = ':';
+	}
+	makelower(s->s_hostsig);
+	if (ConfigLevel < 2)
+		_res.options = oldoptions;
+#else
+	/* not using BIND -- the signature is just the host name */
+	s->s_hostsig = host;
+#endif
+	if (tTd(17, 1))
+		printf("hostsignature(%s) = %s\n", host, s->s_hostsig);
+	return s->s_hostsig;
+}
+@
+
+
+1.12
+log
+@sendmail 8.9.3
+@
+text
+@@
+
+
+1.11
+log
+@sendmail 8.9.2
+@
+text
+@d14 1
+a14 1
+static char sccsid[] = "@@(#)deliver.c	8.366 (Berkeley) 12/18/1998";
+d2006 1
+a2006 1
+		(*e->e_puthdr)(mci, e->e_header, e);
+d3572 1
+a3572 1
+		(*e->e_puthdr)(&mcibuf, e->e_header, e);
+@
+
+
+1.10
+log
+@Update to sendmail.8.9.1a which adds support for MaxMimeHeaderLength option, to help avoid buffer oflows in stupid clients (only if enabled in .cf file)
+@
+text
+@d14 1
+a14 1
+static char sccsid[] = "@@(#)deliver.c	8.353 (Berkeley) 6/30/98";
+d363 1
+a363 1
+			if (LogLevel > 4)
+d555 1
+a555 1
+			finis();
+d573 9
+d598 1
+a598 1
+		finis();
+d616 1
+a616 1
+		finis();
+d1103 3
+a1105 2
+			/* do in-code checking */
+			rcode = checkcompat(to, e);
+d1113 16
+d1438 1
+a1438 1
+			setproctitle("%s %s: %s", e->e_id, hostbuf, "user open");
+d2125 1
+a2125 1
+				if (strlen(to->q_paddr) + strlen(tobuf) + 2 >= sizeof tobuf)
+d2856 1
+a2856 1
+			** If we can construct a UUCP path, do so
+d3326 1
+d3350 5
+a3354 1
+		if (lstat(filename, &stb) < 0)
+@
+
+
+1.9
+log
+@something hosed the sendmail import; fix up by hand
+@
+text
+@d2885 1
+a2926 2
+		char *boundaries[MAXMIMENESTING + 1];
+
+d2954 7
+a2974 1
+		/* we can pass it through unmodified */
+@
+
+
+1.8
+log
+@Upgrade to sendmail 8.8.8
+@
+text
+@d2 2
+a3 1
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman
+d7 3
+a9 15
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *	This product includes software developed by the University of
+ *	California, Berkeley and its contributors.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+a10 11
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+d14 1
+a14 1
+static char sccsid[] = "@@(#)deliver.c	8.296 (Berkeley) 10/22/97";
+d19 1
+a21 2
+
+extern int	h_errno;
+d63 17
+a79 1
+	extern void sendenvelope();
+d106 1
+a106 1
+		extern void printenvflags();
+d293 2
+a294 2
+			extern HDR *copyheader();
+			extern ADDRESS *copyqueue();
+d449 1
+d451 1
+d454 1
+a454 1
+		dropenvelope(e, FALSE);
+d471 1
+a471 1
+		**  descriptor, we have to unlock this envelope, and
+d475 12
+a486 1
+		unlockqueue(e);
+d488 11
+a498 1
+			unlockqueue(ee);
+d505 1
+d507 6
+a517 5
+			/* can't call unlockqueue to avoid unlink of xfp */
+			if (e->e_lockfp != NULL)
+				(void) xfclose(e->e_lockfp, "sendenvelope lockfp", e->e_id);
+			e->e_lockfp = NULL;
+
+d524 5
+d550 1
+d552 3
+d581 4
+a584 1
+		for (ee = splitenv; ee != NULL; ee = e->e_sibling)
+d586 2
+d613 1
+a613 1
+	char mode;
+d865 1
+d869 1
+a869 1
+	register volatile u_short port = 0;
+d880 1
+a880 1
+	extern int checkcompat();
+d914 12
+d945 1
+a945 1
+		p = shortenstring(p, 203);
+d1076 4
+a1079 1
+			to->q_status = "5.2.3";
+d1141 14
+a1154 1
+			rcode = mailfile(user, ctladdr, SFF_CREAT, e);
+d1156 1
+a1160 1
+				markstats(e, to);
+d1171 1
+d1281 1
+a1281 1
+			shortenstring(e->e_to, 203), m->m_name);
+a1357 1
+			register char *p;
+d1470 18
+d1512 1
+a1512 1
+				shortenstring(e->e_to, 203), m->m_name);
+d1524 1
+a1524 1
+				shortenstring(e->e_to, 203), m->m_name,
+d1543 2
+a1544 2
+					shortenstring(e->e_to, 203), m->m_name,
+					mpvect[0], mpvect[1]);
+d1547 3
+a1549 2
+					shortenstring(e->e_to, 203), m->m_name,
+					mpvect[0], mpvect[1], fileno(e->e_lockfp));
+d1560 2
+a1561 1
+					shortenstring(e->e_to, 203), m->m_name);
+a1586 1
+# ifdef SIGCHLD
+a1587 1
+# endif /* SIGCHLD */
+d1594 1
+a1594 1
+				shortenstring(e->e_to, 203), m->m_name);
+d1662 18
+a1679 3
+					(void) initgroups(ctladdr->q_ruser != NULL ?
+						ctladdr->q_ruser : ctladdr->q_user,
+						ctladdr->q_gid);
+d1685 13
+a1697 1
+					(void) initgroups(DefUser, DefGid);
+d1711 1
+a1711 1
+			if (bitset(S_ISUID, stb.st_mode))
+d1717 1
+a1717 1
+			else if (!bitnset(M_SPECIFIC_UID, m->m_flags))
+d1753 1
+a1753 1
+				char *p, *q;
+d1780 1
+a1780 1
+						shortenstring(e->e_to, 203),
+d1786 1
+a1786 2
+			else if (OpMode == MD_SMTP || OpMode == MD_DAEMON ||
+				  HoldErrs || DisConnected)
+d1792 1
+a1792 1
+						shortenstring(e->e_to, 203),
+d1801 2
+a1802 1
+					shortenstring(e->e_to, 203), m->m_name);
+d1811 1
+a1811 1
+					shortenstring(e->e_to, 203),
+d1843 5
+a1847 2
+		mci = (MCI *) xalloc(sizeof *mci);
+		bzero((char *) mci, sizeof *mci);
+d1849 9
+a1857 1
+		mci->mci_state = clever ? MCIS_OPENING : MCIS_OPEN;
+d1916 1
+d1978 1
+a1991 1
+		extern int smtpgetstat __P((MAILER *, MCI *, ENVELOPE *));
+a2072 1
+# if _FFR_LMTP
+d2075 1
+a2079 1
+# endif
+a2089 1
+# if _FFR_LMTP
+d2093 4
+a2096 1
+			rcode = smtpgetstat(m, mci, e);
+a2119 1
+# endif
+a2154 1
+# if _FFR_LMTP
+a2168 1
+# endif
+d2174 1
+a2174 1
+		markstats(e, tochain);
+d2195 1
+a2195 1
+					: shortenstring(e->e_to, 203),
+d2253 4
+a2256 1
+		q->q_rstatus = mci->mci_rstatus;
+d2459 1
+a2459 1
+	else if (i < 0 || i > N_SysEx)
+d2505 1
+a2505 1
+		if (*statmsg++ == ':')
+d2656 1
+a2656 2
+		char *p = macvalue('h', e);
+
+d2773 1
+a2773 2
+		char *p = macvalue('h', e);
+
+d2816 2
+d2946 1
+d2966 1
+d2981 1
+d3050 1
+d3054 1
+d3056 2
+d3062 1
+d3087 1
+d3120 1
+d3122 1
+d3138 1
+d3147 1
+d3164 1
+d3166 2
+d3175 1
+d3215 2
+d3230 1
+a3230 1
+static void	mailfiletimeout();
+d3233 1
+a3233 1
+mailfile(filename, ctladdr, sfflags, e)
+d3235 1
+d3244 1
+d3253 3
+d3267 13
+d3327 3
+a3329 1
+		else if (bitset(0111, stb.st_mode) || stb.st_nlink != 1 ||
+d3361 6
+a3366 1
+			if (bitset(S_ISUID, mode))
+d3379 1
+a3379 1
+			else if (FileMailer != NULL && FileMailer->m_uid != 0)
+d3382 1
+a3382 1
+				RealUid = FileMailer->m_uid;
+d3391 3
+a3393 1
+			if (bitset(S_ISGID, mode))
+d3397 2
+a3398 2
+			else if (FileMailer != NULL && FileMailer->m_gid != 0)
+				RealGid = FileMailer->m_gid;
+d3414 13
+a3426 1
+			(void) initgroups(RealUserName, RealGid);
+d3454 27
+a3480 1
+		sfflags |= SFF_NOPATHCHECK|SFF_NOLINK;
+d3485 3
+a3487 1
+			message("554 cannot open: %s", errstring(errno));
+d3490 1
+a3490 1
+		if (filechanged(filename, fileno(f), &stb, sfflags))
+d3505 1
+a3505 1
+		mcibuf.mci_mailer = FileMailer;
+d3507 2
+a3508 1
+		if (bitnset(M_7BITS, FileMailer->m_flags))
+d3511 24
+d3563 5
+d3572 2
+a3573 1
+			syserr("child died on signal %d", st);
+@
+
+
+1.7
+log
+@sendmail 8.8.7.
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.285 (Berkeley) 8/2/97";
+d47 4
+d84 1
+a84 1
+	bool somedeliveries = FALSE;
+d288 1
+d401 2
+a402 1
+		e->e_ntries++;
+d406 2
+a407 1
+			ee->e_ntries++;
+d476 1
+a476 1
+		**  descriptor, we have to flush this to the queue, and
+d480 1
+a480 12
+		{
+			/* save id for future use */
+			char *qid = e->e_id;
+
+			/* now drop the envelope in the parent */
+			e->e_flags |= EF_INQUEUE;
+			dropenvelope(e, FALSE);
+
+			/* arrange to reacquire lock after fork */
+			e->e_id = qid;
+		}
+
+d482 1
+a482 11
+		{
+			/* save id for future use */
+			char *qid = ee->e_id;
+
+			/* drop envelope in parent */
+			ee->e_flags |= EF_INQUEUE;
+			dropenvelope(ee, FALSE);
+
+			/* and save qid for reacquisition */
+			ee->e_id = qid;
+		}
+d1357 1
+a1357 1
+					hostbuf, port, m->m_name);
+d1566 1
+a1566 1
+						pwd, pwd->m_uid,
+d1890 1
+a1890 1
+				if (strlen(to->q_paddr) + (t - tobuf) + 2 >= sizeof tobuf)
+d2233 2
+d2322 3
+d2422 2
+a2423 1
+	if (LogLevel > ((stat == EX_TEMPFAIL) ? 8 : (stat == EX_OK) ? 7 : 6))
+d2736 1
+a2736 1
+	putxline(buf, strlen(buf), mci, PXLF_NOTHINGSPECIAL);
+d3091 3
+d3096 1
+a3096 1
+	char *filename;
+d3098 1
+a3098 1
+	int sfflags;
+d3103 1
+a3103 1
+	int mode = ST_MODE_NOFILE;
+d3105 1
+d3139 1
+a3139 1
+		int oflags = O_WRONLY|O_APPEND;
+d3151 10
+d3296 3
+d3343 6
+@
+
+
+1.6
+log
+@Sendmail 8.8.6.
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.282 (Berkeley) 6/11/97";
+d546 1
+a546 1
+		QuickAbort = OnlyOneError = FALSE;
+d3108 1
+a3108 1
+	int mode;
+d3156 1
+a3156 2
+		if ((SafeFileEnv != NULL ? lstat(filename, &stb)
+					 : stat(filename, &stb)) < 0)
+d3161 2
+a3162 1
+			stb.st_mode = FileMode;
+d3168 2
+a3169 1
+		mode = stb.st_mode;
+d3277 5
+@
+
+
+1.5
+log
+@Sendmail 8.8.5.
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1983, 1995, 1996 Eric P. Allman
+d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.266 (Berkeley) 1/17/97";
+d79 1
+a79 1
+	bool oldverbose = Verbose;
+a98 1
+	CurrentLA = getla();
+d297 1
+d363 2
+a364 32
+			{
+				char df1buf[20], df2buf[20];
+
+				ee->e_dfp = NULL;
+				snprintf(df1buf, sizeof df1buf, "%s",
+					queuename(e, 'd'));
+				snprintf(df2buf, sizeof df2buf, "%s",
+					queuename(ee, 'd'));
+				if (link(df1buf, df2buf) < 0)
+				{
+					int saverrno = errno;
+
+					syserr("sendall: link(%s, %s)",
+						df1buf, df2buf);
+					if (saverrno == EEXIST)
+					{
+						if (unlink(df2buf) < 0)
+						{
+							syserr("!sendall: unlink(%s): permanent",
+								df2buf);
+							/*NOTREACHED*/
+						}
+						if (link(df1buf, df2buf) < 0)
+						{
+							syserr("!sendall: link(%s, %s): permanent",
+								df1buf, df2buf);
+							/*NOTREACHED*/
+						}
+					}
+				}
+			}
+#ifdef LOG
+d366 3
+a368 3
+				syslog(LOG_INFO, "%s: clone %s, owner=%s",
+					ee->e_id, e->e_id, owner);
+#endif
+d393 9
+d444 1
+a444 1
+		Verbose = TRUE;
+d545 3
+a603 1
+#ifdef LOG
+d605 2
+a606 2
+		syslog(LOG_DEBUG, "%s: sendenvelope, flags=0x%x",
+			e->e_id == NULL ? "[NOQUEUE]" : e->e_id,
+a607 1
+#endif
+d692 45
+d854 1
+d1047 1
+d1324 5
+a1328 2
+			strncpy(hostbuf, curhost, p - curhost);
+			hostbuf[p - curhost] = '\0';
+d1351 3
+d1355 1
+d1360 1
+d1381 1
+d1394 2
+d1904 6
+a1909 1
+				if ((i = smtprcpt(to, m, mci, e)) != EX_OK)
+d1994 9
+a2002 2
+				strcat(tobuf, ",");
+				strcat(tobuf, to->q_paddr);
+d2021 2
+d2139 1
+d2259 1
+a2259 1
+#ifdef _FFR_TIMEOUT_WAIT
+a2483 1
+# ifdef LOG
+d2588 3
+a2590 2
+		syslog(LOG_INFO, "%s: to=%.*s [more]%s",
+			e->e_id, ++q - p, p, buf);
+d2593 1
+a2593 1
+	syslog(LOG_INFO, "%s: to=%s%s", e->e_id, p, buf);
+d2605 3
+a2607 2
+		syslog(LOG_INFO, "%s: to=%.*s [more]",
+			e->e_id, ++q - p, p);
+d2610 1
+a2610 1
+	syslog(LOG_INFO, "%s: to=%s", e->e_id, p);
+d2624 1
+a2624 1
+		syslog(LOG_INFO, "%s: %s", e->e_id, buf);
+d2642 1
+a2642 1
+	syslog(LOG_INFO, "%s: %.1000s", e->e_id, buf);
+d2669 1
+a2669 1
+		syslog(LOG_INFO, "%s: %.1000s", e->e_id, buf);
+d2671 1
+a2671 1
+	syslog(LOG_INFO, "%s: stat=%s", e->e_id, shortenstring(stat, 63));
+a2672 1
+# endif /* LOG */
+d2744 1
+a2744 1
+	putxline(buf, mci, PXLF_NOTHINGSPECIAL);
+d2884 1
+a2884 1
+#ifdef _FFR_NONULLS
+d2989 1
+a2989 1
+#ifdef _FFR_NONULLS
+d3270 1
+a3270 1
+		sfflags |= SFF_NOPATHCHECK;
+d3308 1
+@
+
+
+1.4
+log
+@Update to Sendmail 8.8.4, plus recent patches, plus OpenBSD support.
+Also include entire example configuration subset.
+Includes smrsh (using /usr/libexec/sm.bin).
+
+Of the top of my head, the only things I removed from the distribution were
+contrib/mail.local.linux, src/Makefiles, all the *.0 and *.ps files.
+Our praliases man page replaces the distributed one, ours is better.
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.260 (Berkeley) 12/1/96";
+d317 1
+a317 1
+			setsender(owner, ee, NULL, TRUE);
+d404 1
+a404 1
+		setsender(owner, e, NULL, TRUE);
+d473 7
+d557 1
+a557 1
+		disconnect(1, e);
+d798 1
+a798 1
+# define NO_UID		((uid_t) -1)
+d801 1
+a801 1
+# define NO_GID		((gid_t) -1)
+d1510 3
+a1512 3
+			uid_t new_euid = NO_UID;
+			uid_t new_ruid = NO_UID;
+			gid_t new_gid = NO_GID;
+d1775 3
+a1781 2
+	else
+		mci->mci_flags &= ~MCIF_CVT8TO7;
+d2011 1
+a2011 1
+		if (mci->mci_state == MCIS_ACTIVE)
+d2025 1
+a2025 1
+	if (clever && mci->mci_state != MCIS_CLOSED &&
+@
+
+
+1.3
+log
+@bring up to 8.7.6
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1983, 1995 Eric P. Allman
+d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.185.1.2 (Berkeley) 9/16/96";
+d47 1
+a47 1
+#ifdef SMTP
+d72 1
+a72 1
+	char mode;
+d81 1
+a81 1
+	int pid;
+d128 2
+d134 1
+a134 1
+#ifdef QUEUE
+d182 1
+a182 1
+				
+d188 7
+a194 1
+		
+d199 3
+d203 1
+a203 1
+		otherowners = 0;
+d218 5
+d227 4
+d232 1
+d237 4
+d246 3
+d253 3
+d259 2
+d309 2
+a310 2
+				printf("sendall: split %s into %s\n",
+					e->e_id, ee->e_id);
+d329 1
+a329 1
+			
+d335 4
+a338 1
+					q->q_flags &= ~QQUEUEUP;
+d346 4
+a349 1
+					q->q_flags &= ~QQUEUEUP;
+d354 5
+a358 2
+					q->q_flags &= ~(QHASNOTIFY|QPINGONSUCCESS);
+					q->q_flags |= QPINGONFAILURE|QPINGONDELAY;
+d413 1
+d425 1
+a425 1
+# ifdef QUEUE
+d428 1
+a428 1
+	    !bitset(EF_INQUEUE, e->e_flags))
+d437 3
+d445 1
+d447 15
+d493 1
+a493 1
+			dropenvelope(e);
+d495 2
+a496 2
+			/* and reacquire in the child */
+			(void) dowork(qid, TRUE, FALSE, e);
+d499 12
+a510 1
+		return;
+d512 1
+a512 1
+# else /* HASFLOCK */
+d521 1
+d533 4
+a537 1
+			e->e_flags &= ~EF_HAS_DF;
+d571 3
+a573 1
+# endif /* HASFLOCK */
+d575 9
+a583 1
+		break;
+d586 3
+a588 1
+	if (splitenv != NULL)
+d590 7
+a596 14
+		if (tTd(13, 2))
+		{
+			printf("\nsendall: Split queue; remaining queue:\n");
+			printaddr(e->e_sendqueue, TRUE);
+		}
+
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			CurEnv = ee;
+			if (mode != SM_VERIFY)
+				openxscript(ee);
+			sendenvelope(ee, mode);
+			dropenvelope(ee);
+		}
+a597 3
+		CurEnv = e;
+	}
+	sendenvelope(e, mode);
+d612 1
+a612 1
+		printf("sendenvelope(%s) e_flags=0x%x\n",
+d645 2
+d677 3
+a679 1
+# ifdef QUEUE
+d763 1
+a763 1
+	register int pid = -1;
+d790 7
+d809 1
+d816 1
+a816 1
+	int pid = -1;
+d818 1
+d820 2
+d835 2
+d844 1
+a844 1
+#endif 
+d850 1
+a850 1
+#ifdef SMTP
+d942 1
+a942 1
+# ifdef SMTP
+d987 1
+a987 1
+			ctladdr = getctladdr(to);
+d1020 9
+a1028 1
+		rcode = checkcompat(to, e);
+a1062 3
+		/* save statistics.... */
+		markstats(e, to);
+
+d1079 1
+d1081 1
+a1081 2
+				    (e->e_receiptto != NULL ||
+				     bitset(QPINGONSUCCESS, to->q_flags)))
+d1218 3
+d1234 1
+a1234 1
+#ifdef DAEMON
+a1235 1
+		register volatile u_short port = 0;
+d1278 1
+d1283 1
+a1283 1
+				p = &curhost[strlen(curhost)];
+d1316 6
+d1324 7
+a1330 4
+			message("Connecting to %s via %s...",
+				hostbuf, m->m_name);
+			i = makeconnection(hostbuf, port, mci,
+				bitnset(M_SECURE_PORT, m->m_flags));
+d1342 2
+a1343 2
+					fprintf(TrafficLogFile, "%05d == CONNECT %s\n",
+						getpid(), hostbuf);
+d1346 7
+a1352 3
+			else if (tTd(11, 1))
+				printf("openmailer: makeconnection => stat=%d, errno=%d\n",
+					i, errno);
+d1362 1
+a1362 1
+			rcode = EX_OSERR;
+d1388 1
+a1388 1
+			fprintf(TrafficLogFile, "%05d === EXEC", getpid());
+d1394 4
+d1409 3
+a1411 3
+		/* if this mailer speaks smtp, create a return pipe */
+#ifdef SMTP
+		if (clever && pipe(rpvect) < 0)
+d1413 4
+a1416 4
+			syserr("%s... openmailer(%s): pipe (from mailer)",
+				shortenstring(e->e_to, 203), m->m_name);
+			(void) close(mpvect[0]);
+			(void) close(mpvect[1]);
+d1422 40
+d1487 1
+a1487 1
+#ifdef SMTP
+d1503 3
+d1520 20
+d1546 1
+a1546 1
+				(void) setgid(m->m_gid);
+d1548 1
+a1548 1
+				(void) setgid(stb.st_gid);
+d1555 1
+a1555 1
+				(void) setgid(ctladdr->q_gid);
+d1562 1
+a1562 1
+					(void) setgid(DefGid);
+d1564 1
+a1564 1
+					(void) setgid(m->m_gid);
+d1566 3
+d1573 10
+d1584 1
+d1586 3
+a1588 1
+				(void) seteuid(m->m_uid);
+d1591 3
+a1593 1
+				(void) setreuid(-1, m->m_uid);
+d1595 3
+a1597 2
+				if (m->m_uid != geteuid())
+					(void) setuid(m->m_uid);
+d1601 1
+a1601 5
+			else if (bitset(S_ISUID, stb.st_mode))
+				(void) setuid(stb.st_uid);
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+				(void) setuid(ctladdr->q_uid);
+			else
+d1603 4
+a1606 4
+				if (m->m_uid == 0)
+					(void) setuid(DefUid);
+				else
+					(void) setuid(m->m_uid);
+d1611 1
+a1611 1
+					getuid(), geteuid());
+d1636 1
+a1636 1
+#ifdef SMTP
+d1718 1
+a1718 1
+#ifdef SMTP
+d1728 1
+a1728 1
+#ifdef SMTP
+d1757 1
+a1757 1
+	    (!clever || mci->mci_state == MCIS_CLOSED))
+d1759 1
+a1759 1
+#ifdef SMTP
+d1761 3
+d1765 1
+d1775 16
+d1808 4
+a1811 2
+			syserr("554 deliver: rcode=%d, mci_state=%d, sig=%s",
+				rcode, mci->mci_state, firstsig);
+d1814 1
+a1814 1
+#ifdef DAEMON
+d1836 1
+a1836 1
+#ifdef SMTP
+d1838 5
+a1884 4
+
+			/* now close the connection */
+			if (!bitset(MCIF_CACHED, mci->mci_flags))
+				smtpquit(m, mci, e);
+d1886 2
+a1887 1
+		if (rcode != EX_OK && curhost != NULL && *curhost != '\0')
+d1892 1
+d1906 2
+a1907 7
+	/* arrange a return receipt if requested */
+	if (rcode == EX_OK && e->e_receiptto != NULL &&
+	    bitnset(M_LOCALMAILER, m->m_flags))
+	{
+		e->e_flags |= EF_SENDRECEIPT;
+		/* do we want to send back more info? */
+	}
+d1917 12
+a1928 2
+	if (tobuf[0] != '\0')
+		giveresponse(rcode, m, mci, ctladdr, xstart, e);
+d1935 24
+a1958 2
+		/* mark bad addresses */
+		if (rcode != EX_OK)
+d1960 6
+a1965 2
+			markfailure(e, to, mci, rcode);
+			continue;
+d1973 1
+a1973 2
+		    (e->e_receiptto != NULL ||
+		     bitset(QPINGONSUCCESS, to->q_flags)))
+d1990 32
+d2087 2
+a2088 1
+	if (q->q_status == NULL && mci != NULL)
+d2090 4
+a2093 1
+	if (q->q_status == NULL)
+d2095 3
+a2097 1
+	if (q->q_status == NULL)
+d2198 4
+d2206 1
+a2206 1
+		syserr("endmailer %s: wait", pv[0]);
+d2311 1
+a2311 1
+#ifdef SMTP
+d2467 1
+a2467 1
+# ifdef DAEMON
+d2475 1
+a2475 1
+# ifdef DAEMON
+d2518 1
+a2518 1
+		
+d2538 1
+a2538 1
+	while (strlen(p) >= l)
+d2586 1
+a2586 1
+# ifdef DAEMON
+d2593 1
+a2593 1
+# ifdef DAEMON
+d2641 1
+a2648 1
+		char xbuf[MAXLINE];
+d2654 18
+a2671 2
+			errno = 0;
+			syserr("554 No ! in UUCP From address! (%s given)", buf);
+d2776 6
+d2789 1
+a2813 2
+			register char *xp;
+
+d2823 5
+d2862 2
+a2863 1
+					fprintf(TrafficLogFile, "%05d >>> ", getpid());
+d2919 1
+d2928 5
+d2949 17
+a2965 5
+				if (TrafficLogFile != NULL)
+					putc(c, TrafficLogFile);
+				putc(c, mci->mci_out);
+				pos++;
+				ostate = c == '\n' ? OS_HEAD : OS_INLINE;
+d2973 13
+a2985 2
+			*bp = '\0';
+			fputs(buf, mci->mci_out);
+d3046 1
+a3046 1
+	register int pid = -1;
+d3048 1
+d3060 8
+a3080 1
+		struct stat fsb;
+d3179 1
+a3179 2
+		/* now set the group and user ids */
+		endpwent();
+a3181 2
+		(void) setgid(RealGid);
+		(void) setuid(RealUid);
+d3201 8
+d3241 1
+a3241 1
+		(void) fchmod(fileno(f), (int) stb.st_mode);
+d3243 1
+a3243 1
+		(void) chmod(filename, (int) stb.st_mode);
+d3265 1
+a3297 1
+	auto int rcode;
+d3337 7
+a3343 3
+		nmx = getmxrr(hp, mxhosts, TRUE, &rcode);
+
+		if (nmx <= 0)
+d3345 1
+a3345 1
+			register MCI *mci;
+d3347 4
+a3350 6
+			/* update the connection info for this host */
+			mci = mci_get(hp, m);
+			mci->mci_lastuse = curtime();
+			mci->mci_exitstat = rcode;
+			mci->mci_errno = errno;
+			mci->mci_herrno = h_errno;
+d3352 11
+a3362 3
+			/* and return the original host name as the signature */
+			nmx = 1;
+			mxhosts[0] = hp;
+@
+
+
+1.2
+log
+@Sendmail 8.7.3 from NetBSD
+@
+text
+@d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.185 (Berkeley) 11/18/95";
+d325 4
+a328 2
+				strcpy(df1buf, queuename(e, 'd'));
+				strcpy(df2buf, queuename(ee, 'd'));
+d574 2
+a575 1
+		(void) sprintf(wbuf, "sendall(%.*s)", MAXNAME, q->q_paddr);
+d782 7
+a788 3
+	(void) strcpy(rpathbuf, remotename(p, m,
+					   RF_SENDERADDR|RF_CANONICAL,
+					   &rcode, e));
+d1097 1
+a1097 1
+		sprintf(wbuf, "%s... openmailer(%s)",
+d1745 1
+a1745 1
+		sprintf(wbuf, "%s... end of deliver(%s)",
+d1861 1
+a1861 1
+		(void) sprintf(buf, "%d", rcode);
+d1987 1
+a1987 1
+			(void) sprintf(buf, "%s (%s)",
+d1994 2
+a1995 1
+		(void) sprintf(buf, "554 unknown mailer error %d", stat);
+d2001 4
+a2004 1
+		(void) strcpy(buf, SysExMsg[i] + 1);
+d2023 1
+a2023 4
+		{
+			(void) strcat(buf, ": ");
+			(void) strcat(buf, statmsg);
+		}
+d2030 2
+a2031 1
+		(void) sprintf(buf, "%s (%s)", SysExMsg[i] + 1, statmsg);
+d2040 2
+a2041 1
+			(void) sprintf(buf, "%s: %s", statmsg, errstring(errno));
+d2063 1
+a2063 1
+		sprintf(mbuf, "%.3s %%s", statmsg);
+a2117 2
+#define SPACELEFT(bp)	(sizeof buf - ((bp) - buf))
+
+d2138 2
+a2139 2
+		strcpy(bp, ", ctladdr=");
+		strcat(bp, shortenstring(ctladdr->q_paddr, 83));
+d2143 1
+a2143 1
+			(void) snprintf(bp, SPACELEFT(bp), " (%d/%d)",
+d2150 1
+a2150 1
+	snprintf(bp, SPACELEFT(bp), ", delay=%s",
+d2156 1
+a2156 1
+		snprintf(bp, SPACELEFT(bp), ", xdelay=%s",
+d2164 1
+a2164 1
+		snprintf(bp, SPACELEFT(bp), ", mailer=%s", m->m_name);
+d2175 1
+a2175 1
+		snprintf(bp, SPACELEFT(bp), ", relay=%s",
+d2182 1
+a2182 1
+			snprintf(bp, SPACELEFT(bp), " [%s]",
+d2193 1
+a2193 1
+			snprintf(bp, SPACELEFT(bp), ", relay=%s",
+d2257 3
+a2259 4
+		strcpy(buf, "ctladdr=");
+		bp += strlen(buf);
+		strcpy(bp, shortenstring(ctladdr->q_paddr, 83));
+		bp += strlen(buf);
+d2262 1
+a2262 1
+			(void) sprintf(bp, " (%d/%d)",
+d2269 2
+a2270 1
+	sprintf(bp, "delay=%s", pintvl(curtime() - e->e_ctime, TRUE));
+d2274 2
+a2275 1
+		sprintf(bp, ", xdelay=%s", pintvl(curtime() - xstart, TRUE));
+d2281 1
+a2281 1
+		sprintf(bp, ", mailer=%s", m->m_name);
+d2287 1
+d2294 2
+a2295 1
+		sprintf(buf, "relay=%.100s", mci->mci_host);
+d2299 2
+a2300 1
+			sprintf(bp, " [%.100s]", anynet_ntoa(&CurHostAddr));
+d2308 1
+a2308 1
+			sprintf(buf, "relay=%.100s", p);
+a2316 2
+
+#undef SPACELEFT
+d2364 2
+a2365 1
+			(void) sprintf(xbuf, "From %.800s  \201d remote from %.100s\n",
+d2454 2
+a2455 1
+			sprintf(buf, "Content-Type: text/plain; charset=%s",
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d2 1
+a2 1
+ * Copyright (c) 1983 Eric P. Allman
+d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.84.1.4 (Berkeley) 3/28/95";
+a39 1
+#include <netdb.h>
+a41 1
+#include <arpa/nameser.h>
+d47 1
+d49 1
+d69 1
+d79 4
+a82 1
+	bool announcequeueup;
+d103 1
+a103 1
+		if (mode != SM_VERIFY &&
+a105 1
+		announcequeueup = mode == SM_QUEUE;
+a106 2
+	else
+		announcequeueup = FALSE;
+d110 2
+d115 2
+d132 3
+a134 1
+		queueup(e, TRUE, announcequeueup);
+d136 1
+a136 1
+		syserr("554 too many hops %d (%d max): from %s via %s, to %s",
+d140 1
+d162 1
+a162 1
+		(void) recipient(&e->e_from, &e->e_sendqueue, e);
+d196 5
+d202 3
+d206 1
+d230 29
+d282 1
+a282 1
+			ee->e_flags = e->e_flags & ~(EF_INQUEUE|EF_CLRQUEUE|EF_FATALERRS|EF_SENDRECEIPT);
+a292 1
+			ee->e_df = NULL;
+d298 1
+d304 1
+d306 1
+d312 7
+d320 1
+a320 1
+			if (e->e_df != NULL && mode != SM_VERIFY)
+d322 2
+d325 3
+a327 3
+				ee->e_df = queuename(ee, 'd');
+				ee->e_df = newstr(ee->e_df);
+				if (link(e->e_df, ee->e_df) < 0)
+d329 2
+d332 16
+a347 1
+						e->e_df, ee->e_df);
+d371 9
+d381 1
+a381 1
+	if ((mode == SM_QUEUE || mode == SM_FORK ||
+d386 1
+a386 1
+		queueup(e, TRUE, announcequeueup);
+d388 1
+a388 1
+			queueup(ee, TRUE, announcequeueup);
+a391 32
+	if (splitenv != NULL)
+	{
+		if (tTd(13, 1))
+		{
+			printf("\nsendall: Split queue; remaining queue:\n");
+			printaddr(e->e_sendqueue, TRUE);
+		}
+
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			CurEnv = ee;
+			if (mode != SM_VERIFY)
+				openxscript(ee);
+			sendenvelope(ee, mode);
+			dropenvelope(ee);
+		}
+
+		CurEnv = e;
+	}
+	sendenvelope(e, mode);
+}
+
+sendenvelope(e, mode)
+	register ENVELOPE *e;
+	char mode;
+{
+	bool oldverbose;
+	int pid;
+	register ADDRESS *q;
+	char *qf;
+	char *id;
+
+d393 1
+a393 4
+	**  If we have had global, fatal errors, don't bother sending
+	**  the message at all if we are in SMTP mode.  Local errors
+	**  (e.g., a single address failing) will still cause the other
+	**  addresses to be sent.
+d396 2
+a397 8
+	if (bitset(EF_FATALERRS, e->e_flags) &&
+	    (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+	{
+		e->e_flags |= EF_CLRQUEUE;
+		return;
+	}
+
+	oldverbose = Verbose;
+d405 1
+d407 2
+a408 1
+		e->e_flags |= EF_INQUEUE|EF_KEEPQUEUE;
+d423 3
+a425 2
+		/* save id for future use */
+		id = e->e_id;
+d427 3
+a429 3
+		/* now drop the envelope in the parent */
+		e->e_flags |= EF_INQUEUE|EF_KEEPQUEUE;
+		dropenvelope(e);
+d431 3
+a433 2
+		/* and reacquire in the child */
+		(void) dowork(id, TRUE, FALSE, e);
+d449 1
+a449 1
+				(void) xfclose(e->e_lockfp, "sendenvelope", "lockfp");
+d455 1
+a455 1
+				(void) xfclose(e->e_dfp, "sendenvelope", e->e_df);
+d457 2
+a458 1
+			e->e_id = e->e_df = NULL;
+d476 1
+a476 1
+			e->e_flags |= EF_INQUEUE|EF_KEEPQUEUE;
+d497 58
+d564 1
+d569 1
+a569 1
+#ifdef XDEBUG
+d572 1
+a572 1
+		(void) sprintf(wbuf, "sendall(%s)", q->q_paddr);
+d600 1
+a600 1
+				queueup(e, TRUE, FALSE);
+d605 1
+d608 5
+a612 1
+	Verbose = oldverbose;
+d614 1
+a614 1
+#ifdef XDEBUG
+a616 3
+
+	if (mode == SM_FORK)
+		finis();
+d674 1
+d677 1
+a677 1
+	register int pid;
+d704 1
+d715 2
+a716 2
+	ADDRESS *ctladdr;
+	register MCI *mci;
+d718 2
+a719 2
+	bool clever = FALSE;		/* running user smtp to this mailer */
+	ADDRESS *tochain = NULL;	/* chain of users in this mailer call */
+d722 3
+a724 2
+	int pid;
+	char *curhost;
+d729 2
+a730 2
+	char buf[MAXNAME];
+	char rpathbuf[MAXNAME];		/* translated return path */
+d732 1
+d751 1
+d753 2
+a762 27
+	**  If this mailer is expensive, and if we don't want to make
+	**  connections now, just mark these addresses and return.
+	**	This is useful if we want to batch connections to
+	**	reduce load.  This will cause the messages to be
+	**	queued up, and a daemon will come along to send the
+	**	messages later.
+	**		This should be on a per-mailer basis.
+	*/
+
+	if (NoConnect && bitnset(M_EXPENSIVE, m->m_flags) && !Verbose)
+	{
+		for (; to != NULL; to = to->q_next)
+		{
+			if (bitset(QDONTSEND|QBADADDR|QQUEUEUP, to->q_flags) ||
+			    to->q_mailer != m)
+				continue;
+			to->q_flags |= QQUEUEUP;
+			e->e_to = to->q_paddr;
+			message("queued");
+			if (LogLevel > 8)
+				logdelivery(m, NULL, "queued", NULL, e);
+		}
+		e->e_to = NULL;
+		return (0);
+	}
+
+	/*
+d775 5
+a779 1
+	(void) strcpy(rpathbuf, remotename(e->e_from.q_paddr, m,
+d821 1
+a821 1
+		expand(*mvp, buf, &buf[sizeof buf - 1], e);
+d883 1
+a883 3
+		/* XXX perhaps this should be to->q_mailer != LocalMailer ?? */
+		/* XXX perhaps it should be a mailer flag? */
+		if (to->q_mailer == ProgMailer || to->q_mailer == FileMailer)
+d886 6
+d908 2
+a909 1
+			NoReturn = TRUE;
+d911 1
+a911 1
+			giveresponse(EX_UNAVAILABLE, m, NULL, ctladdr, e);
+d914 3
+d920 2
+a921 2
+			markfailure(e, to, rcode);
+			giveresponse(rcode, m, NULL, ctladdr, e);
+d963 1
+a963 1
+		if (m == FileMailer)
+d965 3
+a967 2
+			rcode = mailfile(user, ctladdr, e);
+			giveresponse(rcode, m, NULL, ctladdr, e);
+d969 1
+d971 11
+d1009 1
+a1009 1
+			expand(*mvp, buf, &buf[sizeof buf - 1], e);
+d1035 1
+a1035 1
+		expand(*mvp, buf, &buf[sizeof buf - 1], e);
+d1051 1
+a1051 1
+	if (ctladdr == NULL && m != ProgMailer &&
+d1066 3
+d1070 1
+a1070 1
+	CurHostName = m->m_mailer;
+d1085 1
+a1085 1
+#ifdef XDEBUG
+d1090 2
+a1091 1
+		sprintf(wbuf, "%s... openmailer(%s)", e->e_to, m->m_name);
+d1096 14
+d1125 1
+a1125 1
+		register u_short port;
+d1151 12
+a1162 3
+			port = atoi(pv[2]);
+		else
+			port = 0;
+d1167 1
+a1167 1
+			static char hostbuf[MAXNAME];
+d1196 3
+d1207 1
+a1207 1
+			message("Connecting to %s (%s)...",
+d1211 1
+d1252 8
+d1274 1
+a1274 1
+				e->e_to, m->m_name);
+d1282 1
+d1286 1
+a1286 1
+				e->e_to, m->m_name);
+d1294 1
+d1316 1
+a1316 1
+				e->e_to, m->m_name);
+d1319 1
+d1325 1
+d1335 1
+a1335 3
+			char **ep;
+			char *env[MAXUSERENVIRON];
+			extern char **environ;
+d1346 21
+a1366 2
+			/* reset user and group */
+			if (!bitnset(M_RESTR, m->m_flags))
+d1368 1
+a1368 2
+				if (ctladdr == NULL || ctladdr->q_uid == 0)
+				{
+d1370 1
+d1372 26
+a1398 1
+				}
+d1400 1
+a1400 7
+				{
+					(void) initgroups(ctladdr->q_ruser?
+						ctladdr->q_ruser: ctladdr->q_user,
+						ctladdr->q_gid);
+					(void) setgid(ctladdr->q_gid);
+					(void) setuid(ctladdr->q_uid);
+				}
+d1411 1
+a1411 1
+				char buf[MAXLINE];
+d1418 1
+a1418 1
+					expand(p, buf, &buf[sizeof buf] - 1, e);
+d1430 1
+d1437 2
+a1438 1
+						e->e_to, m->m_name, rpvect[1]);
+d1450 2
+a1451 2
+						e->e_to, m->m_name,
+						fileno(e->e_xfp));
+d1455 1
+d1459 1
+a1459 1
+					e->e_to, m->m_name);
+d1468 2
+a1469 1
+					e->e_to, m->m_name, mpvect[0]);
+a1482 18
+			/*
+			**  Set up the mailer environment
+			**	TZ is timezone information.
+			**	SYSTYPE is Apollo software sys type (required).
+			**	ISP is Apollo hardware system type (required).
+			*/
+
+			i = 0;
+			env[i++] = "AGENT=sendmail";
+			for (ep = environ; *ep != NULL; ep++)
+			{
+				if (strncmp(*ep, "TZ=", 3) == 0 ||
+				    strncmp(*ep, "ISP=", 4) == 0 ||
+				    strncmp(*ep, "SYSTYPE=", 8) == 0)
+					env[i++] = *ep;
+			}
+			env[i++] = NULL;
+
+d1487 1
+a1487 1
+			execve(m->m_mailer, pv, env);
+d1490 2
+a1491 1
+			if (m == LocalMailer || transienterror(saveerrno))
+d1512 1
+d1518 1
+d1522 1
+d1539 1
+d1550 4
+a1554 1
+	{
+d1556 9
+a1564 1
+	}
+d1586 2
+a1587 1
+		else if (rcode == EX_TEMPFAIL && curhost != NULL && *curhost != '\0')
+d1592 1
+d1601 1
+a1601 2
+		(*e->e_puthdr)(mci, e);
+		putline("\n", mci);
+d1627 2
+a1628 2
+					markfailure(e, to, i);
+					giveresponse(i, m, mci, ctladdr, e);
+d1692 1
+a1692 1
+		giveresponse(rcode, m, mci, ctladdr, e);
+d1695 5
+a1700 2
+			markfailure(e, to, rcode);
+		else
+d1702 24
+a1725 8
+			to->q_flags |= QSENT;
+			e->e_nsent++;
+			if (e->e_receiptto != NULL &&
+			    bitnset(M_LOCALMAILER, m->m_flags))
+			{
+				fprintf(e->e_xfp, "%s... Successfully delivered\n",
+					to->q_paddr);
+			}
+d1733 1
+a1733 1
+#ifdef XDEBUG
+d1739 2
+a1740 1
+			e->e_to == NULL ? "NO-TO-LIST" : e->e_to,
+d1756 1
+d1768 2
+a1769 1
+markfailure(e, q, rcode)
+d1772 1
+d1775 1
+a1775 1
+	char buf[MAXLINE];
+d1792 65
+d1879 1
+d1943 2
+d1955 2
+a1956 1
+giveresponse(stat, m, mci, ctladdr, e)
+d1961 1
+d1980 2
+a1981 1
+			(void) sprintf(buf, "%s (%s)", statmsg, e->e_statmsg);
+d2065 1
+a2065 1
+		logdelivery(m, mci, &statmsg[4], ctladdr, e);
+d2097 2
+d2108 4
+a2111 1
+logdelivery(m, mci, stat, ctladdr, e)
+d2114 1
+a2114 1
+	char *stat;
+d2116 1
+d2123 1
+a2123 1
+	char buf[512];
+d2126 1
+d2135 1
+a2135 1
+			(void) sprintf(bp, " (%d/%d)",
+d2141 3
+a2143 1
+	(void) sprintf(bp, ", delay=%s", pintvl(curtime() - e->e_ctime, TRUE));
+d2146 8
+d2156 1
+a2156 2
+		(void) strcpy(bp, ", mailer=");
+		(void) strcat(bp, m->m_name);
+d2160 1
+d2167 3
+a2169 2
+		(void) strcpy(bp, ", relay=");
+		(void) strcat(bp, mci->mci_host);
+d2172 5
+a2176 3
+		(void) strcat(bp, " [");
+		(void) strcat(bp, anynet_ntoa(&CurHostAddr));
+		(void) strcat(bp, "]");
+d2185 2
+a2186 2
+			(void) strcpy(bp, ", relay=");
+			(void) strcat(bp, p);
+d2201 1
+d2215 1
+d2218 1
+a2218 1
+	while (strlen(p) >= l)
+d2264 5
+d2275 1
+a2275 1
+	syslog(LOG_INFO, "%s: %s", e->e_id, buf);
+d2284 1
+a2284 1
+		sprintf(buf, "relay=%s", mci->mci_host);
+d2287 2
+a2288 3
+		(void) strcat(buf, " [");
+		(void) strcat(buf, anynet_ntoa(&CurHostAddr));
+		(void) strcat(buf, "]");
+d2296 1
+a2296 1
+			sprintf(buf, "relay=%s", p);
+d2299 1
+a2299 1
+		syslog(LOG_INFO, "%s: %s", e->e_id, buf);
+d2305 2
+d2328 1
+d2333 1
+a2333 1
+	char *template = "\201l\n";
+a2338 1
+# ifdef UGLYUUCP
+d2344 1
+a2344 1
+		expand("\201g", buf, &buf[sizeof buf - 1], e);
+d2354 2
+a2355 1
+			(void) sprintf(xbuf, "From %s  \201d remote from %s\n", bang, buf);
+d2359 2
+a2360 3
+# endif /* UGLYUUCP */
+	expand(template, buf, &buf[sizeof buf - 1], e);
+	putline(buf, mci);
+d2378 6
+d2395 9
+d2406 1
+a2406 1
+		if (e->e_df != NULL)
+d2408 2
+a2409 4
+			e->e_dfp = fopen(e->e_df, "r");
+			if (e->e_dfp == NULL)
+				syserr("putbody: Cannot open %s for %s from %s",
+				e->e_df, e->e_to, e->e_from.q_paddr);
+d2411 9
+d2421 30
+a2450 1
+			putline("<<< No Message Collected >>>", mci);
+d2452 2
+a2453 1
+	if (e->e_dfp != NULL)
+d2455 27
+a2481 2
+		rewind(e->e_dfp);
+		while (!ferror(mci->mci_out) && fgets(buf, sizeof buf, e->e_dfp) != NULL)
+d2483 9
+a2491 5
+			if (buf[0] == 'F' &&
+			    bitnset(M_ESCFROM, mci->mci_mailer->m_flags) &&
+			    strncmp(buf, "From ", 5) == 0)
+				(void) putc('>', mci->mci_out);
+			if (buf[0] == '-' && buf[1] == '-' && separator != NULL)
+d2493 92
+a2584 2
+				/* possible separator */
+				int sl = strlen(separator);
+d2586 28
+a2613 2
+				if (strncmp(&buf[2], separator, sl) == 0)
+					(void) putc(' ', mci->mci_out);
+a2614 1
+			putline(buf, mci);
+d2617 2
+a2618 1
+		if (ferror(e->e_dfp))
+d2620 3
+a2622 2
+			syserr("putbody: %s: read error", e->e_df);
+			ExitStat = EX_IOERR;
+d2626 7
+d2664 2
+d2674 2
+a2675 1
+mailfile(filename, ctladdr, e)
+d2678 1
+d2682 1
+a2682 1
+	register int pid;
+d2713 1
+a2713 4
+		{
+			fclose(e->e_lockfp);
+			e->e_lockfp = NULL;
+		}
+d2719 2
+d2722 4
+d2727 1
+d2732 2
+a2733 1
+		else if (bitset(0111, stb.st_mode))
+d2741 1
+a2741 1
+		if (ctladdr != NULL)
+d2748 1
+a2748 1
+		if (e->e_dfp == NULL && e->e_df != NULL)
+d2750 3
+a2752 1
+			e->e_dfp = fopen(e->e_df, "r");
+d2756 1
+a2756 1
+					e->e_df, e->e_to, e->e_from.q_paddr);
+d2760 2
+a2761 1
+		if (!bitset(S_ISGID, mode) || setgid(stb.st_gid) < 0)
+d2763 14
+a2776 1
+			if (ctladdr == NULL || ctladdr->q_uid == 0)
+d2778 2
+a2779 1
+				(void) initgroups(DefUser, DefGid);
+d2783 2
+a2784 3
+				(void) initgroups(ctladdr->q_ruser ?
+					ctladdr->q_ruser : ctladdr->q_user,
+					ctladdr->q_gid);
+d2786 10
+d2797 3
+a2799 1
+		if (!bitset(S_ISUID, mode) || setuid(stb.st_uid) < 0)
+d2801 4
+a2804 4
+			if (ctladdr == NULL || ctladdr->q_uid == 0)
+				(void) setuid(DefUid);
+			else
+				(void) setuid(ctladdr->q_uid);
+d2806 29
+a2834 3
+		FileName = filename;
+		LineNumber = 0;
+		f = dfopen(filename, oflags, FileMode);
+d2840 1
+a2840 6
+		if (fstat(fileno(f), &fsb) < 0 ||
+		    !bitset(O_CREAT, oflags) &&
+		     (stb.st_nlink != fsb.st_nlink ||
+		      stb.st_dev != fsb.st_dev ||
+		      stb.st_ino != fsb.st_ino ||
+		      stb.st_uid != fsb.st_uid))
+d2842 1
+a2842 1
+			message("554 cannot write: file changed after open");
+d2853 1
+a2853 2
+		(*e->e_puthdr)(&mcibuf, e);
+		putline("\n", &mcibuf);
+d2856 1
+a2856 1
+		if (ferror(f))
+a2860 2
+		(void) xfclose(f, "mailfile", filename);
+		(void) fflush(stdout);
+d2863 3
+d2867 3
+d2923 1
+a2923 1
+	int oldoptions;
+a2951 2
+	{
+		oldoptions = _res.options;
+a2952 1
+	}
+d2968 1
+a2970 1
+#if NAMED_BIND
+a2971 1
+#endif
+@
+
+
+1.1.1.1
+log
+@initial import of NetBSD tree
+@
+text
+@@
+
+
+1.1.1.2
+log
+@sendmail 8.9.1
+@
+text
+@d2 1
+a2 2
+ * Copyright (c) 1998 Sendmail, Inc.  All rights reserved.
+ * Copyright (c) 1983, 1995-1997 Eric P. Allman.  All rights reserved.
+d6 15
+a20 3
+ * By using this file, you agree to the terms and conditions set
+ * forth in the LICENSE file which can be found at the top level of
+ * the sendmail distribution.
+d22 11
+d36 1
+a36 1
+static char sccsid[] = "@@(#)deliver.c	8.353 (Berkeley) 6/30/98";
+d40 1
+a41 1
+#include <grp.h>
+d43 1
+a44 1
+#endif
+d46 1
+a46 2
+#if HASSETUSERCONTEXT
+# include <login_cap.h>
+a48 1
+#if SMTP
+a49 1
+#endif
+a68 1
+void
+d71 1
+a71 1
+	int mode;
+d78 1
+a78 20
+	int oldverbose = Verbose;
+	bool somedeliveries = FALSE, expensive = FALSE;
+	pid_t pid;
+	void sendenvelope __P((ENVELOPE *, int));
+
+	/*
+	**  If this message is to be discarded, don't bother sending
+	**  the message at all.
+	*/
+
+	if (bitset(EF_DISCARD, e->e_flags))
+	{
+		if (tTd(13, 1))
+			printf("sendall: discarding id %s\n", e->e_id);
+		e->e_flags |= EF_CLRQUEUE;
+		if (LogLevel > 4)
+			sm_syslog(LOG_INFO, e->e_id, "discarded");
+		markstats(e, NULL, TRUE);
+		return;
+	}
+d95 1
+d99 1
+a99 1
+		if (mode != SM_VERIFY && mode != SM_DEFER &&
+d102 1
+d104 2
+a108 2
+		extern void printenvflags __P((ENVELOPE *));
+
+a111 2
+		printf("\te_flags = ");
+		printenvflags(e);
+a122 2
+	if (tTd(62, 1))
+		checkfds(NULL);
+d127 1
+a127 3
+#if QUEUE
+		queueup(e, mode == SM_QUEUE || mode == SM_DEFER);
+#endif
+d129 1
+a129 1
+		syserr("554 Too many hops %d (%d max): from %s via %s, to %s",
+a132 1
+		e->e_sendqueue->q_status = "5.4.6";
+d154 1
+a154 1
+		(void) recipient(&e->e_from, &e->e_sendqueue, 0, e);
+d172 1
+a172 1
+
+d178 1
+a178 7
+
+	if (tTd(13, 25))
+	{
+		printf("\nAfter first owner pass, sendq =\n");
+		printaddr(e->e_sendqueue, TRUE);
+	}
+
+a182 3
+		if (tTd(13, 28))
+			printf("owner = \"%s\", otherowners = %d\n",
+				owner, otherowners);
+d184 1
+a184 1
+		otherowners = bitset(EF_SENDRECEIPT, e->e_flags) ? 1 : 0;
+a187 5
+			if (tTd(13, 30))
+			{
+				printf("Checking ");
+				printaddr(q, FALSE);
+			}
+a188 3
+			{
+				if (tTd(13, 30))
+					printf("    ... QDONTSEND\n");
+a189 6
+			}
+			if (tTd(13, 29) && !tTd(13, 30))
+			{
+				printf("Checking ");
+				printaddr(q, FALSE);
+			}
+a193 4
+				{
+					if (tTd(13, 40))
+						printf("    ... First owner = \"%s\"\n",
+							q->q_owner);
+a194 1
+				}
+a198 4
+						if (tTd(13, 40))
+							printf("    ... Same owner = \"%s\"\n",
+								owner);
+
+a203 3
+						if (tTd(13, 40))
+							printf("    ... Another owner \"%s\"\n",
+								q->q_owner);
+a207 3
+				else if (tTd(13, 40))
+					printf("    ... Same owner = \"%s\"\n",
+						owner);
+a210 2
+				if (tTd(13, 40))
+					printf("    ... Null owner\n");
+a212 30
+
+			/*
+			**  If this mailer is expensive, and if we don't
+			**  want to make connections now, just mark these
+			**  addresses and return.  This is useful if we
+			**  want to batch connections to reduce load.  This
+			**  will cause the messages to be queued up, and a
+			**  daemon will come along to send the messages later.
+			*/
+
+			if (bitset(QBADADDR|QQUEUEUP, q->q_flags))
+			{
+				if (tTd(13, 30))
+					printf("    ... QBADADDR|QQUEUEUP\n");
+				continue;
+			}
+			if (NoConnect && !Verbose &&
+			    bitnset(M_EXPENSIVE, q->q_mailer->m_flags))
+			{
+				if (tTd(13, 30))
+					printf("    ... expensive\n");
+				q->q_flags |= QQUEUEUP;
+				expensive = TRUE;
+			}
+			else
+			{
+				if (tTd(13, 30))
+					printf("    ... deliverable\n");
+				somedeliveries = TRUE;
+			}
+d217 2
+a218 3
+			extern HDR *copyheader __P((HDR *));
+			extern ADDRESS *copyqueue __P((ADDRESS *));
+			extern void dup_queue_file __P((ENVELOPE *, ENVELOPE *, int));
+d230 2
+a231 2
+				printf("sendall: split %s into %s, owner = \"%s\", otherowners = %d\n",
+					e->e_id, ee->e_id, owner, otherowners);
+d236 1
+a236 1
+			ee->e_flags = e->e_flags & ~(EF_INQUEUE|EF_CLRQUEUE|EF_FATALERRS|EF_SENDRECEIPT|EF_RET_PARAM);
+d238 1
+a238 1
+			setsender(owner, ee, NULL, '\0', TRUE);
+d247 1
+d251 1
+a251 1
+
+a252 1
+			{
+d256 1
+a256 4
+					q->q_flags &= ~(QQUEUEUP|QBADADDR);
+					if (tTd(13, 6))
+						printf("\t... stripping %s from original envelope\n",
+							q->q_paddr);
+a257 1
+			}
+a258 1
+			{
+d262 1
+a262 4
+					q->q_flags &= ~(QQUEUEUP|QBADADDR);
+					if (tTd(13, 6))
+						printf("\t... dropping %s from cloned envelope\n",
+							q->q_paddr);
+d264 7
+a270 1
+				else
+d272 2
+a273 6
+					/* clear DSN parameters */
+					q->q_flags &= ~(QHASNOTIFY|Q_PINGFLAGS);
+					q->q_flags |= DefaultNotify & ~QPINGONSUCCESS;
+					if (tTd(13, 6))
+						printf("\t... moving %s to cloned envelope\n",
+							q->q_paddr);
+d276 1
+a276 4
+
+			if (mode != SM_VERIFY && bitset(EF_HAS_DF, e->e_flags))
+				dup_queue_file(e, ee, 'd');
+			openxscript(ee);
+d278 3
+a280 3
+				sm_syslog(LOG_INFO, ee->e_id,
+					"clone %s, owner=%s",
+					e->e_id, owner);
+d286 1
+a286 1
+		setsender(owner, e, NULL, '\0', TRUE);
+a294 1
+		e->e_flags &= ~EF_FATALERRS;
+d297 13
+a309 3
+	/* if nothing to be delivered, just queue up everything */
+	if (!somedeliveries && mode != SM_QUEUE && mode != SM_DEFER &&
+	    mode != SM_VERIFY)
+d311 5
+a315 3
+		if (tTd(13, 29))
+			printf("No deliveries: auto-queuing\n");
+		mode = SM_QUEUE;
+a316 4
+		/* treat this as a delivery in terms of counting tries */
+		e->e_dtime = curtime();
+		if (!expensive)
+			e->e_ntries++;
+d319 5
+a323 3
+			ee->e_dtime = curtime();
+			if (!expensive)
+				ee->e_ntries++;
+a324 1
+	}
+d326 1
+a326 9
+# if QUEUE
+	if ((mode == SM_QUEUE || mode == SM_DEFER || mode == SM_FORK ||
+	     (mode != SM_VERIFY && SuperSafe)) &&
+	    (!bitset(EF_INQUEUE, e->e_flags) || splitenv != NULL))
+	{
+		/* be sure everything is instantiated in the queue */
+		queueup(e, mode == SM_QUEUE || mode == SM_DEFER);
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+			queueup(ee, mode == SM_QUEUE || mode == SM_DEFER);
+d328 2
+a329 1
+#endif /* QUEUE */
+d331 9
+a339 2
+	if (tTd(62, 10))
+		checkfds("after envelope splitting");
+d342 4
+a345 1
+	**  If we belong in background, fork now.
+d348 2
+a349 1
+	if (tTd(13, 20))
+d351 2
+a352 15
+		printf("sendall: final mode = %c\n", mode);
+		if (tTd(13, 21))
+		{
+			printf("\n================ Final Send Queue(s) =====================\n");
+			printf("\n  *** Envelope %s, e_from=%s ***\n",
+				e->e_id, e->e_from.q_paddr);
+			printaddr(e->e_sendqueue, TRUE);
+			for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+			{
+				printf("\n  *** Envelope %s, e_from=%s ***\n",
+					ee->e_id, ee->e_from.q_paddr);
+				printaddr(ee->e_sendqueue, TRUE);
+			}
+			printf("==========================================================\n\n");
+		}
+d354 2
+d359 1
+a359 1
+		Verbose = 2;
+a362 2
+	  case SM_DEFER:
+# if HASFLOCK
+d364 1
+a364 10
+# endif
+		if (e->e_nrcpts > 0)
+			e->e_flags |= EF_INQUEUE;
+		dropenvelope(e, splitenv != NULL);
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			if (ee->e_nrcpts > 0)
+				ee->e_flags |= EF_INQUEUE;
+			dropenvelope(ee, FALSE);
+		}
+d379 2
+a380 3
+		{
+			/* save id for future use */
+			char *qid = e->e_id;
+d382 3
+a384 3
+			/* now drop the envelope in the parent */
+			e->e_flags |= EF_INQUEUE;
+			dropenvelope(e, splitenv != NULL);
+d386 2
+a387 3
+			/* arrange to reacquire lock after fork */
+			e->e_id = qid;
+		}
+d389 1
+a389 12
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			/* save id for future use */
+			char *qid = ee->e_id;
+
+			/* drop envelope in parent */
+			ee->e_flags |= EF_INQUEUE;
+			dropenvelope(ee, FALSE);
+
+			/* and save qid for reacquisition */
+			ee->e_id = qid;
+		}
+d391 1
+a391 1
+# endif /* !HASFLOCK */
+a395 1
+# if HASFLOCK
+a396 6
+# else
+			e->e_id = NULL;
+			for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+				ee->e_id = NULL;
+			return;
+# endif /* HASFLOCK */
+a399 1
+# if HASFLOCK
+d401 5
+d409 1
+a409 1
+				(void) xfclose(e->e_dfp, "sendenvelope dfp", e->e_id);
+d411 1
+a411 10
+			e->e_flags &= ~EF_HAS_DF;
+
+			/* can't call unlockqueue to avoid unlink of xfp */
+			if (e->e_lockfp != NULL)
+				(void) xfclose(e->e_lockfp, "sendenvelope lockfp", e->e_id);
+			e->e_lockfp = NULL;
+# endif
+
+			/* make sure the parent doesn't own the envelope */
+			e->e_id = NULL;
+d424 1
+a424 1
+		disconnect(2, e);
+d429 1
+a429 5
+# if HASFLOCK
+			e->e_flags |= EF_INQUEUE;
+# else
+			e->e_id = NULL;
+# endif /* HASFLOCK */
+a432 3
+		/* be sure to give error messages in child */
+		QuickAbort = FALSE;
+
+d445 2
+a446 1
+# if HASFLOCK
+a447 64
+# else
+
+		/*
+		**  Now reacquire and run the various queue files.
+		*/
+
+		for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+		{
+			ENVELOPE *sibling = ee->e_sibling;
+
+			(void) dowork(ee->e_id, FALSE, FALSE, ee);
+			ee->e_sibling = sibling;
+		}
+		(void) dowork(e->e_id, FALSE, FALSE, e);
+		finis();
+# endif /* !HASFLOCK */
+	}
+
+	sendenvelope(e, mode);
+	dropenvelope(e, TRUE);
+	for (ee = splitenv; ee != NULL; ee = ee->e_sibling)
+	{
+		CurEnv = ee;
+		if (mode != SM_VERIFY)
+			openxscript(ee);
+		sendenvelope(ee, mode);
+		dropenvelope(ee, TRUE);
+	}
+	CurEnv = e;
+
+	Verbose = oldverbose;
+	if (mode == SM_FORK)
+		finis();
+}
+
+void
+sendenvelope(e, mode)
+	register ENVELOPE *e;
+	int mode;
+{
+	register ADDRESS *q;
+	bool didany;
+
+	if (tTd(13, 10))
+		printf("sendenvelope(%s) e_flags=0x%lx\n",
+			e->e_id == NULL ? "[NOQUEUE]" : e->e_id,
+			e->e_flags);
+	if (LogLevel > 80)
+		sm_syslog(LOG_DEBUG, e->e_id,
+			"sendenvelope, flags=0x%x",
+			e->e_flags);
+
+	/*
+	**  If we have had global, fatal errors, don't bother sending
+	**  the message at all if we are in SMTP mode.  Local errors
+	**  (e.g., a single address failing) will still cause the other
+	**  addresses to be sent.
+	*/
+
+	if (bitset(EF_FATALERRS, e->e_flags) &&
+	    (OpMode == MD_SMTP || OpMode == MD_DAEMON))
+	{
+		e->e_flags |= EF_CLRQUEUE;
+		return;
+a458 3
+	define(macid("{envid}", NULL), e->e_envid, e);
+	define(macid("{bodytype}", NULL), e->e_bodytype, e);
+	didany = FALSE;
+d463 1
+a463 1
+#if XDEBUG
+d466 1
+a466 2
+		(void) snprintf(wbuf, sizeof wbuf, "sendall(%.*s)",
+			MAXNAME, q->q_paddr);
+d487 1
+a487 3
+			extern int deliver __P((ENVELOPE *, ADDRESS *));
+
+# if QUEUE
+d494 1
+a494 1
+				queueup(e, FALSE);
+a498 1
+			didany = TRUE;
+d501 1
+a501 5
+	if (didany)
+	{
+		e->e_dtime = curtime();
+		e->e_ntries++;
+	}
+d503 1
+a503 1
+#if XDEBUG
+a505 12
+}
+/*
+**  DUP_QUEUE_FILE -- duplicate a queue file into a split queue
+**
+**	Parameters:
+**		e -- the existing envelope
+**		ee -- the new envelope
+**		type -- the queue file type (e.g., 'd')
+**
+**	Returns:
+**		none
+*/
+d507 2
+a508 32
+void
+dup_queue_file(e, ee, type)
+	struct envelope *e, *ee;
+	int type;
+{
+	char f1buf[MAXQFNAME], f2buf[MAXQFNAME];
+
+	ee->e_dfp = NULL;
+	ee->e_xfp = NULL;
+	snprintf(f1buf, sizeof f1buf, "%s", queuename(e, type));
+	snprintf(f2buf, sizeof f2buf, "%s", queuename(ee, type));
+	if (link(f1buf, f2buf) < 0)
+	{
+		int saverrno = errno;
+
+		syserr("sendall: link(%s, %s)", f1buf, f2buf);
+		if (saverrno == EEXIST)
+		{
+			if (unlink(f2buf) < 0)
+			{
+				syserr("!sendall: unlink(%s): permanent",
+					f2buf);
+				/*NOTREACHED*/
+			}
+			if (link(f1buf, f2buf) < 0)
+			{
+				syserr("!sendall: link(%s, %s): permanent",
+					f1buf, f2buf);
+				/*NOTREACHED*/
+			}
+		}
+	}
+a565 1
+int
+d568 1
+a568 1
+	register pid_t pid = -1;
+a594 8
+#ifndef NO_UID
+# define NO_UID		-1
+#endif
+#ifndef NO_GID
+# define NO_GID		-1
+#endif
+
+int
+d605 2
+a606 3
+	ADDRESS *volatile ctladdr;
+	ADDRESS *volatile contextaddr = NULL;
+	register MCI *volatile mci;
+d608 2
+a609 2
+	volatile bool clever = FALSE;	/* running user smtp to this mailer */
+	ADDRESS *volatile tochain = NULL; /* users chain in this mailer call */
+a610 1
+	int lmtp_rcode = EX_OK;
+d612 2
+a613 7
+	pid_t pid = -1;
+	char *volatile curhost;
+	register u_short port = 0;
+	time_t xstart;
+	bool suidwarn;
+	bool anyok;			/* at least one address was OK */
+	bool goodmxfound = FALSE;	/* at least one MX was OK */
+d618 3
+a620 4
+	char buf[MAXNAME + 1];
+	char rpathbuf[MAXNAME + 1];	/* translated return path */
+	extern int checkcompat __P((ADDRESS *, ENVELOPE *));
+	extern void markfailure __P((ENVELOPE *, ADDRESS *, MCI *, int));
+a625 2
+	suidwarn = geteuid() == 0;
+
+d633 1
+a633 1
+#endif
+a638 1
+#if SMTP
+a639 2
+#endif
+	xstart = curtime();
+d648 7
+a654 2
+	**  Clear $&{client_*} macros if this is a bounce message to
+	**  prevent rejection by check_compat ruleset.
+d656 2
+a657 2
+	
+	if (bitset(EF_RESPONSE, e->e_flags))
+d659 13
+a671 3
+		define(macid("{client_name}", NULL), "", e);
+		define(macid("{client_addr}", NULL), "", e);
+		define(macid("{client_port}", NULL), "", e);
+d673 1
+a673 1
+	
+d687 3
+a689 11
+	if (bitnset(M_UDBENVELOPE, e->e_from.q_mailer->m_flags))
+		p = e->e_sender;
+	else
+		p = e->e_from.q_paddr;
+	p = remotename(p, m, RF_SENDERADDR|RF_CANONICAL, &rcode, e);
+	if (strlen(p) >= (SIZE_T) sizeof rpathbuf)
+	{
+		p = shortenstring(p, MAXSHORTSTR);
+		syserr("remotename: huge return %s", p);
+	}
+	snprintf(rpathbuf, sizeof rpathbuf, "%s", p);
+d729 1
+a729 1
+		expand(*mvp, buf, sizeof buf, e);
+d747 1
+a747 1
+# if SMTP
+d791 4
+a794 8
+		if (bitnset(M_RUNASRCPT, to->q_mailer->m_flags))
+			contextaddr = ctladdr = getctladdr(to);
+
+		if (tTd(10, 2))
+		{
+			printf("ctladdr=");
+			printaddr(ctladdr, FALSE);
+		}
+d812 1
+a812 5
+			e->e_flags |= EF_NO_BODY_RETN;
+			if (bitnset(M_LOCALMAILER, to->q_mailer->m_flags))
+				to->q_status = "5.2.3";
+			else
+				to->q_status = "5.3.4";
+d814 1
+a814 2
+			markfailure(e, to, NULL, EX_UNAVAILABLE);
+			giveresponse(EX_UNAVAILABLE, m, NULL, ctladdr, xstart, e);
+d817 1
+a817 12
+#if NAMED_BIND
+		h_errno = 0;
+#endif
+
+		/* do config file checking of compatibility */
+		rcode = rscheck("check_compat",
+				e->e_from.q_paddr, to->q_paddr, e);
+		if (rcode == EX_OK)
+		{
+			/* do in-code checking */
+			rcode = checkcompat(to, e);
+		}
+d820 2
+a821 2
+			markfailure(e, to, NULL, rcode);
+			giveresponse(rcode, m, NULL, ctladdr, xstart, e);
+d852 3
+d863 1
+a863 1
+		if (strcmp(m->m_mailer, "[FILE]") == 0)
+d865 2
+a866 17
+			define('u', user, e);	/* to user */
+			p = to->q_home;
+			if (p == NULL && ctladdr != NULL)
+				p = ctladdr->q_home;
+			define('z', p, e);	/* user's home */
+			expand(m->m_argv[1], buf, sizeof buf, e);
+			if (strlen(buf) > 0)
+				rcode = mailfile(buf, m, ctladdr, SFF_CREAT, e);
+			else
+			{
+				syserr("empty filename specification for mailer %s",
+				       m->m_name);
+				rcode = EX_CONFIG;
+			}
+			giveresponse(rcode, m, NULL, ctladdr, xstart, e);
+			markfailure(e, to, NULL, rcode);
+			e->e_nsent++;
+a867 1
+			{
+a868 11
+				if (bitnset(M_LOCALMAILER, m->m_flags) &&
+				    bitset(QPINGONSUCCESS, to->q_flags))
+				{
+					to->q_flags |= QDELIVERED;
+					to->q_status = "2.1.5";
+					fprintf(e->e_xfp, "%s... Successfully delivered\n",
+						to->q_paddr);
+				}
+			}
+			to->q_statdate = curtime();
+			markstats(e, to, FALSE);
+d896 1
+a896 1
+			expand(*mvp, buf, sizeof buf, e);
+d922 1
+a922 1
+		expand(*mvp, buf, sizeof buf, e);
+d938 1
+a938 1
+	if (ctladdr == NULL && m != ProgMailer && m != FileMailer &&
+a952 3
+#if NAMED_BIND
+	h_errno = 0;
+#endif
+d954 1
+a954 1
+	CurHostName = NULL;
+d969 1
+a969 1
+#if XDEBUG
+d974 1
+a974 2
+		snprintf(wbuf, sizeof wbuf, "%s... openmailer(%s)",
+			shortenstring(e->e_to, MAXSHORTSTR), m->m_name);
+a978 17
+	/* check for 8-bit available */
+	if (bitset(EF_HAS8BIT, e->e_flags) &&
+	    bitnset(M_7BITS, m->m_flags) &&
+	    (bitset(EF_DONT_MIME, e->e_flags) ||
+	     !(bitset(MM_MIME8BIT, MimeMode) ||
+	       (bitset(EF_IS_MIME, e->e_flags) &&
+	        bitset(MM_CVTMIME, MimeMode)))))
+	{
+		usrerr("554 Cannot send 8-bit data to 7-bit destination");
+		rcode = EX_DATAERR;
+		e->e_status = "5.6.3";
+		goto give_up;
+	}
+
+	if (tTd(62, 8))
+		checkfds("before delivery");
+
+d992 1
+a992 1
+#if DAEMON
+d994 1
+d1020 3
+a1022 12
+		{
+			port = htons(atoi(pv[2]));
+			if (port == 0)
+			{
+				struct servent *sp = getservbyname(pv[2], "tcp");
+
+				if (sp == NULL)
+					syserr("Service %s unknown", pv[2]);
+				else
+					port = sp->s_port;
+			}
+		}
+d1026 2
+a1027 2
+			static char hostbuf[MAXNAME + 1];
+			extern int makeconnection __P((char *, u_short, MCI *, ENVELOPE *));
+d1032 1
+a1032 1
+				p = (char *) &curhost[strlen(curhost)];
+d1039 2
+a1040 5
+			i = p - curhost;
+			if (i >= sizeof hostbuf)
+				i = sizeof hostbuf - 1;
+			strncpy(hostbuf, curhost, i);
+			hostbuf[i] = '\0';
+a1055 3
+				message("Using cached %sSMTP connection to %s via %s...",
+					bitset(MCIF_ESMTP, mci->mci_flags) ? "E" : "",
+					hostbuf, m->m_name);
+a1059 3
+			{
+				if (mci->mci_exitstat == EX_TEMPFAIL)
+					goodmxfound = TRUE;
+a1060 8
+			}
+
+			if (mci_lock_host(mci) != EX_OK)
+			{
+				mci_setstat(mci, EX_TEMPFAIL, "4.4.5", NULL);
+				goodmxfound = TRUE;
+				continue;
+			}
+d1064 4
+a1067 8
+			if (port == 0)
+				message("Connecting to %s via %s...",
+					hostbuf, m->m_name);
+			else
+				message("Connecting to %s port %d via %s...",
+					hostbuf, ntohs(port), m->m_name);
+			i = makeconnection(hostbuf, port, mci, e);
+			mci->mci_lastuse = curtime();
+a1074 1
+				goodmxfound = TRUE;
+d1078 2
+a1079 2
+					fprintf(TrafficLogFile, "%05d === CONNECT %s\n",
+						(int) getpid(), hostbuf);
+d1082 3
+a1084 9
+			else
+			{
+			    	if (tTd(11, 1))
+					printf("openmailer: makeconnection => stat=%d, errno=%d\n",
+						i, errno);
+				if (i == EX_TEMPFAIL)
+					goodmxfound = TRUE;
+				mci_unlock_host(mci);
+			}
+d1094 1
+a1094 1
+			rcode = EX_SOFTWARE;
+a1107 26
+		/* flush any expired connections */
+		(void) mci_scan(NULL);
+		mci = NULL;
+
+#if SMTP
+		if (bitnset(M_LMTP, m->m_flags))
+		{
+			/* try to get a cached connection */
+			mci = mci_get(m->m_name, m);
+			if (mci->mci_host == NULL)
+				mci->mci_host = m->m_name;
+			CurHostName = mci->mci_host;
+			if (mci->mci_state != MCIS_CLOSED)
+			{
+				message("Using cached LMTP connection for %s...",
+					m->m_name);
+				goto do_transfer;
+			}
+		}
+#endif
+
+		/* announce the connection to verbose listeners */
+		if (host == NULL || host[0] == '\0')
+			message("Connecting to %s...", m->m_name);
+		else
+			message("Connecting to %s via %s...", host, m->m_name);
+d1112 1
+a1112 1
+			fprintf(TrafficLogFile, "%05d === EXEC", (int) getpid());
+a1117 4
+#if XDEBUG
+		checkfd012("before creating mail pipe");
+#endif
+
+d1122 1
+a1122 1
+				shortenstring(e->e_to, MAXSHORTSTR), m->m_name);
+d1129 7
+a1135 8
+#if XDEBUG
+		/* make sure we didn't get one of the standard I/O files */
+		if (mpvect[0] < 3 || mpvect[1] < 3)
+		{
+			syserr("%s... openmailer(%s): bogus mpvect %d %d",
+				shortenstring(e->e_to, MAXSHORTSTR), m->m_name,
+				mpvect[0], mpvect[1]);
+			printopenfds(TRUE);
+a1141 43
+		/* make sure system call isn't dead meat */
+		checkfdopen(mpvect[0], "mpvect[0]");
+		checkfdopen(mpvect[1], "mpvect[1]");
+		if (mpvect[0] == mpvect[1] ||
+		    (e->e_lockfp != NULL &&
+		     (mpvect[0] == fileno(e->e_lockfp) ||
+		      mpvect[1] == fileno(e->e_lockfp))))
+		{
+			if (e->e_lockfp == NULL)
+				syserr("%s... openmailer(%s): overlapping mpvect %d %d",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name, mpvect[0], mpvect[1]);
+			else
+				syserr("%s... openmailer(%s): overlapping mpvect %d %d, lockfp = %d",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name, mpvect[0], mpvect[1],
+					fileno(e->e_lockfp));
+		}
+#endif
+
+		/* if this mailer speaks smtp, create a return pipe */
+#if SMTP
+		if (clever)
+		{
+			if (pipe(rpvect) < 0)
+			{
+				syserr("%s... openmailer(%s): pipe (from mailer)",
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name);
+				(void) close(mpvect[0]);
+				(void) close(mpvect[1]);
+				if (tTd(11, 1))
+					printf("openmailer: NULL\n");
+				rcode = EX_OSERR;
+				goto give_up;
+			}
+# if XDEBUG
+			checkfdopen(rpvect[0], "rpvect[0]");
+			checkfdopen(rpvect[1], "rpvect[1]");
+# endif
+		}
+#endif
+
+d1153 1
+d1155 1
+d1162 1
+a1162 1
+				shortenstring(e->e_to, MAXSHORTSTR), m->m_name);
+a1164 1
+#if SMTP
+a1169 1
+#endif
+d1179 3
+a1181 4
+			int new_euid = NO_UID;
+			int new_ruid = NO_UID;
+			int new_gid = NO_GID;
+			struct stat stb;
+d1192 2
+a1193 9
+			if (m != FileMailer || stat(tochain->q_user, &stb) < 0)
+				stb.st_mode = 0;
+
+#if HASSETUSERCONTEXT
+			/*
+			**  Set user resources.
+			*/
+
+			if (contextaddr != NULL)
+d1195 1
+a1195 48
+				struct passwd *pwd;
+
+				if (contextaddr->q_ruser != NULL)
+					pwd = sm_getpwnam(contextaddr->q_ruser);
+				else
+					pwd = sm_getpwnam(contextaddr->q_user);
+				if (pwd != NULL)
+					(void) setusercontext(NULL,
+						pwd, pwd->pw_uid,
+						LOGIN_SETRESOURCES|LOGIN_SETPRIORITY);
+			}
+#endif
+
+			/* tweak niceness */
+			if (m->m_nice != 0)
+				nice(m->m_nice);
+
+			/* reset group id */
+			if (bitnset(M_SPECIFIC_UID, m->m_flags))
+				new_gid = m->m_gid;
+			else if (bitset(S_ISGID, stb.st_mode))
+				new_gid = stb.st_gid;
+			else if (ctladdr != NULL && ctladdr->q_gid != 0)
+			{
+				if (!DontInitGroups)
+				{
+					char *u = ctladdr->q_ruser;
+
+					if (u == NULL)
+						u = ctladdr->q_user;
+
+					if (initgroups(u, ctladdr->q_gid) == -1 && suidwarn)
+						syserr("openmailer: initgroups(%s, %d) failed",
+							u, ctladdr->q_gid);
+				}
+				else
+				{
+					GIDSET_T gidset[1];
+
+					gidset[0] = ctladdr->q_gid;
+					if (setgroups(1, gidset) == -1 && suidwarn)
+						syserr("openmailer: setgroups() failed");
+				}
+				new_gid = ctladdr->q_gid;
+			}
+			else
+			{
+				if (!DontInitGroups)
+d1197 3
+a1199 3
+					if (initgroups(DefUser, DefGid) == -1 && suidwarn)
+						syserr("openmailer: initgroups(%s, %d) failed",
+							DefUser, DefGid);
+d1203 5
+a1207 5
+					GIDSET_T gidset[1];
+
+					gidset[0] = DefGid;
+					if (setgroups(1, gidset) == -1 && suidwarn)
+						syserr("openmailer: setgroups() failed");
+a1208 46
+				if (m->m_gid == 0)
+					new_gid = DefGid;
+				else
+					new_gid = m->m_gid;
+			}
+			if (new_gid != NO_GID && setgid(new_gid) < 0 && suidwarn)
+				syserr("openmailer: setgid(%ld) failed",
+					(long) new_gid);
+
+			/* reset user id */
+			endpwent();
+			if (bitnset(M_SPECIFIC_UID, m->m_flags))
+				new_euid = m->m_uid;
+			else if (bitset(S_ISUID, stb.st_mode))
+				new_ruid = stb.st_uid;
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+				new_ruid = ctladdr->q_uid;
+			else if (m->m_uid != 0)
+				new_ruid = m->m_uid;
+			else
+				new_ruid = DefUid;
+			if (new_euid != NO_UID)
+			{
+				vendor_set_uid(new_euid);
+#if USESETEUID
+				if (seteuid(new_euid) < 0 && suidwarn)
+					syserr("openmailer: seteuid(%ld) failed",
+						(long) new_euid);
+#else
+# if HASSETREUID
+				if (setreuid(new_ruid, new_euid) < 0 && suidwarn)
+					syserr("openmailer: setreuid(%ld, %ld) failed",
+						(long) new_ruid, (long) new_euid);
+# else
+				if (new_euid != geteuid() && setuid(new_euid) < 0 && suidwarn)
+					syserr("openmailer: setuid(%ld) failed",
+						(long) new_euid);
+# endif
+#endif
+			}
+			else if (new_ruid != NO_UID)
+			{
+				vendor_set_uid(new_ruid);
+				if (setuid(new_ruid) < 0 && suidwarn)
+					syserr("openmailer: setuid(%ld) failed",
+						(long) new_ruid);
+d1213 1
+a1213 1
+					(int) getuid(), (int) geteuid());
+d1218 2
+a1219 2
+				char *q;
+				char buf[MAXLINE + 1];
+d1226 1
+a1226 1
+					expand(p, buf, sizeof buf, e);
+a1237 1
+#if SMTP
+d1244 1
+a1244 2
+						shortenstring(e->e_to, MAXSHORTSTR),
+						m->m_name, rpvect[1]);
+d1249 2
+a1250 1
+			else
+d1256 2
+a1257 2
+						shortenstring(e->e_to, MAXSHORTSTR),
+						m->m_name, fileno(e->e_xfp));
+a1260 1
+#endif
+d1264 1
+a1264 2
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name);
+d1273 1
+a1273 2
+					shortenstring(e->e_to, MAXSHORTSTR),
+					m->m_name, mpvect[0]);
+d1287 18
+d1309 1
+a1309 1
+			execve(m->m_mailer, (ARGV_T) pv, (ARGV_T) UserEnviron);
+d1312 1
+a1312 2
+			if (bitnset(M_LOCALMAILER, m->m_flags) ||
+			    transienterror(saveerrno))
+d1321 2
+a1322 5
+		if (mci == NULL)
+		{
+			mci = (MCI *) xalloc(sizeof *mci);
+			bzero((char *) mci, sizeof *mci);
+		}
+d1324 1
+a1324 9
+		if (clever)
+		{
+			mci->mci_state = MCIS_OPENING;
+			mci_cache(mci);
+		}
+		else
+		{
+			mci->mci_state = MCIS_OPEN;
+		}
+a1332 1
+#if SMTP
+a1337 1
+#endif
+a1340 1
+#if SMTP
+a1356 1
+#endif
+a1366 4
+	if (bitnset(M_7BITS, m->m_flags) &&
+	    (!clever || mci->mci_state == MCIS_OPENING))
+		mci->mci_flags |= MCIF_7BIT;
+#if SMTP
+a1368 2
+		extern void smtpinit __P((MAILER *, MCI *, ENVELOPE *));
+
+a1370 27
+#endif
+
+do_transfer:
+	/* clear out per-message flags from connection structure */
+	mci->mci_flags &= ~(MCIF_CVT7TO8|MCIF_CVT8TO7);
+
+	if (bitset(EF_HAS8BIT, e->e_flags) &&
+	    !bitset(EF_DONT_MIME, e->e_flags) &&
+	    bitnset(M_7BITS, m->m_flags))
+		mci->mci_flags |= MCIF_CVT8TO7;
+
+#if MIME7TO8
+	if (bitnset(M_MAKE8BIT, m->m_flags) &&
+	    !bitset(MCIF_7BIT, mci->mci_flags) &&
+	    (p = hvalue("Content-Transfer-Encoding", e->e_header)) != NULL &&
+	     (strcasecmp(p, "quoted-printable") == 0 ||
+	      strcasecmp(p, "base64") == 0) &&
+	    (p = hvalue("Content-Type", e->e_header)) != NULL)
+	{
+		/* may want to convert 7 -> 8 */
+		/* XXX should really parse it here -- and use a class XXX */
+		if (strncasecmp(p, "text/plain", 10) == 0 &&
+		    (p[10] == '\0' || p[10] == ' ' || p[10] == ';'))
+			mci->mci_flags |= MCIF_CVT7TO8;
+	}
+#endif
+
+d1388 2
+a1389 4
+			syserr("554 deliver: mci=%lx rcode=%d errno=%d state=%d sig=%s",
+				(long) mci, rcode, errno, mci->mci_state,
+				firstsig);
+			mci_dump_all(TRUE);
+d1392 1
+a1392 2
+#if DAEMON
+		else if (curhost != NULL && *curhost != '\0')
+a1396 1
+#endif
+a1403 1
+		mci->mci_contentlen = 0;
+d1405 2
+a1406 1
+		(*e->e_puthdr)(mci, e->e_header, e);
+d1413 1
+a1413 1
+#if SMTP
+a1414 4
+		extern int smtpmailfrom __P((MAILER *, MCI *, ENVELOPE *));
+		extern int smtprcpt __P((ADDRESS *, MAILER *, MCI *, ENVELOPE *));
+		extern int smtpdata __P((MAILER *, MCI *, ENVELOPE *));
+
+d1430 1
+a1430 1
+				if (strlen(to->q_paddr) + (t - tobuf) + 2 > sizeof tobuf)
+d1432 2
+a1433 7
+					/* not enough room */
+					continue;
+				}
+				else if ((i = smtprcpt(to, m, mci, e)) != EX_OK)
+				{
+					markfailure(e, to, mci, i);
+					giveresponse(i, m, mci, ctladdr, xstart, e);
+d1457 4
+d1462 1
+a1462 2
+# if DAEMON
+		if (rcode == EX_TEMPFAIL && curhost != NULL && *curhost != '\0')
+a1466 1
+# endif
+d1480 7
+a1486 2
+	if (tTd(62, 1))
+		checkfds("after delivery");
+d1496 2
+a1497 11
+#if SMTP
+	if (bitnset(M_LMTP, m->m_flags))
+	{
+		lmtp_rcode = rcode;
+		tobuf[0] = '\0';
+		anyok = FALSE;
+	}
+	else
+#endif
+		anyok = rcode == EX_OK;
+
+d1500 2
+a1501 34
+		/* see if address already marked */
+		if (bitset(QBADADDR|QQUEUEUP, to->q_flags))
+			continue;
+
+#if SMTP
+		/* if running LMTP, get the status for each address */
+		if (bitnset(M_LMTP, m->m_flags))
+		{
+			extern int smtpgetstat __P((MAILER *, MCI *, ENVELOPE *));
+
+			if (lmtp_rcode == EX_OK)
+				rcode = smtpgetstat(m, mci, e);
+			if (rcode == EX_OK)
+			{
+				if (strlen(to->q_paddr) + strlen(tobuf) + 2 >= sizeof tobuf)
+				{
+					syserr("LMTP tobuf overflow");
+				}
+				else
+				{
+					strcat(tobuf, ",");
+					strcat(tobuf, to->q_paddr);
+				}
+				anyok = TRUE;
+			}
+			else
+			{
+				e->e_to = to->q_paddr;
+				markfailure(e, to, mci, rcode);
+				giveresponse(rcode, m, mci, ctladdr, xstart, e);
+				e->e_to = tobuf + 1;
+				continue;
+			}
+		}
+a1502 1
+#endif
+d1504 4
+a1507 2
+			/* mark bad addresses */
+			if (rcode != EX_OK)
+d1509 2
+a1510 4
+				if (goodmxfound && rcode == EX_NOHOST)
+					rcode = EX_TEMPFAIL;
+				markfailure(e, to, mci, rcode);
+				continue;
+a1512 21
+
+		/* successful delivery */
+		to->q_flags |= QSENT;
+		to->q_statdate = curtime();
+		e->e_nsent++;
+		if (bitnset(M_LOCALMAILER, m->m_flags) &&
+		    bitset(QPINGONSUCCESS, to->q_flags))
+		{
+			to->q_flags |= QDELIVERED;
+			to->q_status = "2.1.5";
+			fprintf(e->e_xfp, "%s... Successfully delivered\n",
+				to->q_paddr);
+		}
+		else if (bitset(QPINGONSUCCESS, to->q_flags) &&
+			 bitset(QPRIMARY, to->q_flags) &&
+			 !bitset(MCIF_DSN, mci->mci_flags))
+		{
+			to->q_flags |= QRELAYED;
+			fprintf(e->e_xfp, "%s... relayed; expect no further notifications\n",
+				to->q_paddr);
+		}
+a1514 30
+#if SMTP
+	if (bitnset(M_LMTP, m->m_flags))
+	{
+		/*
+		**  Global information applies to the last recipient only;
+		**  clear it out to avoid bogus errors.
+		*/
+
+		rcode = EX_OK;
+		e->e_statmsg = NULL;
+
+		/* reset the mci state for the next transaction */
+		if (mci != NULL && mci->mci_state == MCIS_ACTIVE)
+			mci->mci_state = MCIS_OPEN;
+	}
+#endif
+
+	if (tobuf[0] != '\0')
+		giveresponse(rcode, m, mci, ctladdr, xstart, e);
+	if (anyok)
+		markstats(e, tochain, FALSE);
+	mci_store_persistent(mci);
+
+#if SMTP
+	/* now close the connection */
+	if (clever && mci != NULL && mci->mci_state != MCIS_CLOSED &&
+	    !bitset(MCIF_CACHED, mci->mci_flags))
+		smtpquit(m, mci, e);
+#endif
+
+d1519 1
+a1519 1
+#if XDEBUG
+d1524 2
+a1525 3
+		snprintf(wbuf, sizeof wbuf, "%s... end of deliver(%s)",
+			e->e_to == NULL ? "NO-TO-LIST"
+					: shortenstring(e->e_to, MAXSHORTSTR),
+a1540 1
+**		mci -- mailer connection information.
+d1552 1
+a1552 2
+void
+markfailure(e, q, mci, rcode)
+a1554 1
+	register MCI *mci;
+d1557 1
+a1557 1
+	char *stat = NULL;
+a1567 1
+		q->q_flags &= ~QDONTSEND;
+a1573 74
+
+	/* find most specific error code possible */
+	if (mci != NULL && mci->mci_status != NULL)
+	{
+		q->q_status = mci->mci_status;
+		if (mci->mci_rstatus != NULL)
+			q->q_rstatus = newstr(mci->mci_rstatus);
+		else
+			q->q_rstatus = NULL;
+	}
+	else if (e->e_status != NULL)
+	{
+		q->q_status = e->e_status;
+		q->q_rstatus = NULL;
+	}
+	else
+	{
+		switch (rcode)
+		{
+		  case EX_USAGE:
+			stat = "5.5.4";
+			break;
+
+		  case EX_DATAERR:
+			stat = "5.5.2";
+			break;
+
+		  case EX_NOUSER:
+			stat = "5.1.1";
+			break;
+
+		  case EX_NOHOST:
+			stat = "5.1.2";
+			break;
+
+		  case EX_NOINPUT:
+		  case EX_CANTCREAT:
+		  case EX_NOPERM:
+			stat = "5.3.0";
+			break;
+
+		  case EX_UNAVAILABLE:
+		  case EX_SOFTWARE:
+		  case EX_OSFILE:
+		  case EX_PROTOCOL:
+		  case EX_CONFIG:
+			stat = "5.5.0";
+			break;
+
+		  case EX_OSERR:
+		  case EX_IOERR:
+			stat = "4.5.0";
+			break;
+
+		  case EX_TEMPFAIL:
+			stat = "4.2.0";
+			break;
+		}
+		if (stat != NULL)
+			q->q_status = stat;
+	}
+
+	q->q_statdate = curtime();
+	if (CurHostName != NULL && CurHostName[0] != '\0')
+		q->q_statmta = newstr(CurHostName);
+	if (rcode != EX_OK && q->q_rstatus == NULL &&
+	    q->q_mailer != NULL && q->q_mailer->m_diagtype != NULL &&
+	    strcasecmp(q->q_mailer->m_diagtype, "UNIX") == 0)
+	{
+		char buf[30];
+
+		(void) snprintf(buf, sizeof buf, "%d", rcode);
+		q->q_rstatus = newstr(buf);
+	}
+a1595 1
+int
+a1602 2
+	mci_unlock_host(mci);
+
+a1614 4
+#if _FFR_TIMEOUT_WAIT
+	put a timeout around the wait
+#endif
+
+d1619 1
+a1619 1
+		syserr("endmailer %s: wait", mci->mci_mailer->m_name);
+a1658 2
+**		xstart -- the transaction start time, for computing
+**			transaction delays.
+d1669 1
+a1669 2
+void
+giveresponse(stat, m, mci, ctladdr, xstart, e)
+a1673 1
+	time_t xstart;
+a1681 3
+	if (e == NULL)
+		syserr("giveresponse: null envelope");
+
+d1692 1
+a1692 2
+			(void) snprintf(buf, sizeof buf, "%s (%s)",
+				statmsg, shortenstring(e->e_statmsg, 403));
+d1696 1
+a1696 1
+	else if (i < 0 || i >= N_SysEx)
+d1698 1
+a1698 2
+		(void) snprintf(buf, sizeof buf, "554 unknown mailer error %d",
+			stat);
+d1704 1
+a1704 4
+		char *bp = buf;
+
+		snprintf(bp, SPACELEFT(buf, bp), "%s", SysExMsg[i] + 1);
+		bp += strlen(bp);
+d1715 1
+a1715 1
+#if SMTP
+d1723 4
+a1726 1
+			snprintf(bp, SPACELEFT(buf, bp), ": %s", statmsg);
+d1733 1
+a1733 2
+		(void) snprintf(buf, sizeof buf, "%s (%s)",
+			SysExMsg[i] + 1, statmsg);
+d1740 1
+a1740 1
+		if (*statmsg++ == ':' && errno != 0)
+d1742 1
+a1742 2
+			(void) snprintf(buf, sizeof buf, "%s: %s",
+				statmsg, errstring(errno));
+d1764 1
+a1764 1
+		snprintf(mbuf, sizeof mbuf, "%.3s %%s", statmsg);
+d1775 2
+a1776 3
+	if (OpMode != MD_VERIFY && !bitset(EF_VRFYONLY, e->e_flags) &&
+	    LogLevel > ((stat == EX_TEMPFAIL) ? 8 : (stat == EX_OK) ? 7 : 6))
+		logdelivery(m, mci, &statmsg[4], ctladdr, xstart, e);
+a1807 2
+**		xstart -- the transaction start time, used for
+**			computing transaction delay.
+d1817 1
+a1817 2
+void
+logdelivery(m, mci, stat, ctladdr, xstart, e)
+d1820 1
+a1820 1
+	const char *stat;
+a1821 1
+	time_t xstart;
+d1824 1
+d1828 1
+a1828 1
+	char buf[1024];
+a1830 1
+	/* ctladdr: max 106 bytes */
+d1834 2
+a1835 2
+		snprintf(bp, SPACELEFT(buf, bp), ", ctladdr=%s",
+			shortenstring(ctladdr->q_paddr, 83));
+d1839 1
+a1839 1
+			(void) snprintf(bp, SPACELEFT(buf, bp), " (%d/%d)",
+d1845 1
+a1845 3
+	/* delay & xdelay: max 41 bytes */
+	snprintf(bp, SPACELEFT(buf, bp), ", delay=%s",
+		pintvl(curtime() - e->e_ctime, TRUE));
+a1847 8
+	if (xstart != (time_t) 0)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", xdelay=%s",
+			pintvl(curtime() - xstart, TRUE));
+		bp += strlen(bp);
+	}
+
+	/* mailer: assume about 19 bytes (max 10 byte mailer name) */
+d1850 2
+a1851 1
+		snprintf(bp, SPACELEFT(buf, bp), ", mailer=%s", m->m_name);
+a1854 1
+	/* relay: max 66 bytes for IPv4 addresses */
+d1857 1
+a1857 1
+# if DAEMON
+d1861 2
+a1862 3
+		snprintf(bp, SPACELEFT(buf, bp), ", relay=%s",
+			shortenstring(mci->mci_host, 40));
+		bp += strlen(bp);
+d1864 4
+a1867 6
+# if DAEMON
+		if (CurHostAddr.sa.sa_family != 0)
+		{
+			snprintf(bp, SPACELEFT(buf, bp), " [%s]",
+				anynet_ntoa(&CurHostAddr));
+		}
+d1872 2
+a1873 1
+		p = macvalue('h', e);
+d1876 2
+a1877 2
+			snprintf(bp, SPACELEFT(buf, bp), ", relay=%s",
+				shortenstring(p, 40));
+a1891 1
+	/* stat: max 210 bytes */
+d1904 1
+a1904 2
+
+	/* id, to: max 13 + TOBUFSIZE bytes */
+d1907 1
+a1907 1
+	while (strlen(p) >= (SIZE_T) l)
+d1913 2
+a1914 3
+		sm_syslog(LOG_INFO, e->e_id,
+			"to=%.*s [more]%s",
+			++q - p, p, buf);
+d1917 1
+a1917 1
+	sm_syslog(LOG_INFO, e->e_id, "to=%s%s", p, buf);
+d1923 1
+a1923 1
+	while (strlen(p) >= (SIZE_T) l)
+d1929 2
+a1930 3
+		sm_syslog(LOG_INFO, e->e_id,
+			"to=%.*s [more]",
+			++q - p, p);
+d1933 1
+a1933 1
+	sm_syslog(LOG_INFO, e->e_id, "to=%s", p);
+d1938 4
+a1941 3
+		snprintf(bp, SPACELEFT(buf, bp), "ctladdr=%s",
+			shortenstring(ctladdr->q_paddr, 83));
+		bp += strlen(bp);
+d1944 1
+a1944 1
+			(void) snprintf(bp, SPACELEFT(buf, bp), " (%d/%d)",
+d1948 1
+a1948 1
+		sm_syslog(LOG_INFO, e->e_id, "%s", buf);
+d1951 1
+a1951 2
+	snprintf(bp, SPACELEFT(buf, bp), "delay=%s",
+		pintvl(curtime() - e->e_ctime, TRUE));
+a1952 6
+	if (xstart != (time_t) 0)
+	{
+		snprintf(bp, SPACELEFT(buf, bp), ", xdelay=%s",
+			pintvl(curtime() - xstart, TRUE));
+		bp += strlen(bp);
+	}
+d1956 1
+a1956 1
+		snprintf(bp, SPACELEFT(buf, bp), ", mailer=%s", m->m_name);
+d1959 1
+a1959 1
+	sm_syslog(LOG_INFO, e->e_id, "%.1000s", buf);
+a1961 1
+	bp = buf;
+d1964 1
+a1964 1
+# if DAEMON
+d1968 1
+a1968 2
+		snprintf(bp, SPACELEFT(buf, bp), "relay=%.100s", mci->mci_host);
+		bp += strlen(bp);
+d1970 4
+a1973 4
+# if DAEMON
+		if (CurHostAddr.sa.sa_family != 0)
+			snprintf(bp, SPACELEFT(buf, bp), " [%.100s]",
+				anynet_ntoa(&CurHostAddr));
+d1978 2
+a1979 1
+		p = macvalue('h', e);
+d1981 1
+a1981 1
+			snprintf(buf, sizeof buf, "relay=%.100s", p);
+d1984 1
+a1984 1
+		sm_syslog(LOG_INFO, e->e_id, "%.1000s", buf);
+d1986 1
+a1986 1
+	sm_syslog(LOG_INFO, e->e_id, "stat=%s", shortenstring(stat, 63));
+d1988 1
+a2010 1
+void
+d2015 1
+a2015 1
+	char *template = UnixFromLine;
+a2016 1
+	char xbuf[MAXLINE];
+d2021 1
+a2021 2
+	mci->mci_flags |= MCIF_INHEADER;
+
+d2025 1
+d2027 1
+a2027 1
+		expand("\201g", buf, sizeof buf, e);
+d2031 2
+a2032 18
+			char *at;
+			char hname[MAXNAME];
+
+		    	/*
+			** If we can construct a UUCP path, do so
+			*/
+
+			at = strrchr(buf, '@@');
+			if (at == NULL)
+			{
+				expand( "\201k", hname, sizeof hname, e);
+				at = hname;
+			}
+			else
+				*at++ = '\0';
+			(void) snprintf(xbuf, sizeof xbuf,
+				"From %.800s  \201d remote from %.100s\n",
+				buf, at);
+d2037 1
+a2037 3
+			(void) snprintf(xbuf, sizeof xbuf,
+				"From %.800s  \201d remote from %.100s\n",
+				bang, buf);
+d2041 3
+a2043 2
+	expand(template, buf, sizeof buf, e);
+	putxline(buf, strlen(buf), mci, PXLF_HEADER);
+a2060 6
+/* values for output state variable */
+#define OS_HEAD		0	/* at beginning of line */
+#define OS_CR		1	/* read a carriage return */
+#define OS_INLINE	2	/* putting rest of line */
+
+void
+a2071 9
+	if (e->e_dfp == NULL && bitset(EF_HAS_DF, e->e_flags))
+	{
+		char *df = queuename(e, 'd');
+
+		e->e_dfp = fopen(df, "r");
+		if (e->e_dfp == NULL)
+			syserr("putbody: Cannot open %s for %s from %s",
+				df, e->e_to, e->e_from.q_paddr);
+	}
+d2074 1
+a2074 1
+		if (bitset(MCIF_INHEADER, mci->mci_flags))
+d2076 4
+a2079 2
+			putline("", mci);
+			mci->mci_flags &= ~MCIF_INHEADER;
+a2080 9
+		putline("<<< No Message Collected >>>", mci);
+		goto endofmessage;
+	}
+	if (e->e_dfino == (ino_t) 0)
+	{
+		struct stat stbuf;
+
+		if (fstat(fileno(e->e_dfp), &stbuf) < 0)
+			e->e_dfino = -1;
+d2082 1
+a2082 4
+		{
+			e->e_dfdev = stbuf.st_dev;
+			e->e_dfino = stbuf.st_ino;
+		}
+d2084 1
+a2084 4
+	rewind(e->e_dfp);
+
+#if MIME8TO7
+	if (bitset(MCIF_CVT8TO7, mci->mci_flags))
+d2086 2
+a2087 62
+		char *boundaries[MAXMIMENESTING + 1];
+
+		/*
+		**  Do 8 to 7 bit MIME conversion.
+		*/
+
+		/* make sure it looks like a MIME message */
+		if (hvalue("MIME-Version", e->e_header) == NULL)
+			putline("MIME-Version: 1.0", mci);
+
+		if (hvalue("Content-Type", e->e_header) == NULL)
+		{
+			snprintf(buf, sizeof buf,
+				"Content-Type: text/plain; charset=%s",
+				defcharset(e));
+			putline(buf, mci);
+		}
+
+		/* now do the hard work */
+		boundaries[0] = NULL;
+		mci->mci_flags |= MCIF_INHEADER;
+		mime8to7(mci, e->e_header, e, boundaries, M87F_OUTER);
+	}
+# if MIME7TO8
+	else if (bitset(MCIF_CVT7TO8, mci->mci_flags))
+	{
+		mime7to8(mci, e->e_header, e);
+	}
+# endif
+	else
+#endif
+	{
+		int ostate;
+		register char *bp;
+		register char *pbp;
+		register int c;
+		register char *xp;
+		int padc;
+		char *buflim;
+		int pos = 0;
+		size_t eol_len;
+		char peekbuf[10];
+
+		/* we can pass it through unmodified */
+		if (bitset(MCIF_INHEADER, mci->mci_flags))
+		{
+			putline("", mci);
+			mci->mci_flags &= ~MCIF_INHEADER;
+		}
+
+		/* determine end of buffer; allow for short mailer lines */
+		buflim = &buf[sizeof buf - 1];
+		if (mci->mci_mailer->m_linelimit > 0 &&
+		    mci->mci_mailer->m_linelimit < sizeof buf - 1)
+			buflim = &buf[mci->mci_mailer->m_linelimit - 1];
+		eol_len = strlen(mci->mci_mailer->m_eol);
+
+		/* copy temp file to output with mapping */
+		ostate = OS_HEAD;
+		bp = buf;
+		pbp = peekbuf;
+		while (!ferror(mci->mci_out))
+d2089 8
+a2096 44
+			if (pbp > peekbuf)
+				c = *--pbp;
+			else if ((c = getc(e->e_dfp)) == EOF)
+				break;
+			if (bitset(MCIF_7BIT, mci->mci_flags))
+				c &= 0x7f;
+			switch (ostate)
+			{
+			  case OS_HEAD:
+#if _FFR_NONULLS
+				if (c == '\0' &&
+				    bitnset(M_NONULLS, mci->mci_mailer->m_flags))
+					break;
+#endif
+				if (c != '\r' && c != '\n' && bp < buflim)
+				{
+					*bp++ = c;
+					break;
+				}
+
+				/* check beginning of line for special cases */
+				*bp = '\0';
+				pos = 0;
+				padc = EOF;
+				if (buf[0] == 'F' &&
+				    bitnset(M_ESCFROM, mci->mci_mailer->m_flags) &&
+				    strncmp(buf, "From ", 5) == 0)
+				{
+					padc = '>';
+				}
+				if (buf[0] == '-' && buf[1] == '-' &&
+				    separator != NULL)
+				{
+					/* possible separator */
+					int sl = strlen(separator);
+
+					if (strncmp(&buf[2], separator, sl) == 0)
+						padc = ' ';
+				}
+				if (buf[0] == '.' &&
+				    bitnset(M_XDOT, mci->mci_mailer->m_flags))
+				{
+					padc = '.';
+				}
+d2098 2
+a2099 118
+				/* now copy out saved line */
+				if (TrafficLogFile != NULL)
+				{
+					fprintf(TrafficLogFile, "%05d >>> ",
+						(int) getpid());
+					if (padc != EOF)
+						putc(padc, TrafficLogFile);
+					for (xp = buf; xp < bp; xp++)
+						putc(*xp, TrafficLogFile);
+					if (c == '\n')
+						fputs(mci->mci_mailer->m_eol,
+						      TrafficLogFile);
+				}
+				if (padc != EOF)
+				{
+					putc(padc, mci->mci_out);
+					mci->mci_contentlen++;
+					pos++;
+				}
+				for (xp = buf; xp < bp; xp++)
+				{
+					putc(*xp, mci->mci_out);
+					mci->mci_contentlen++;
+				}
+				if (c == '\n')
+				{
+					fputs(mci->mci_mailer->m_eol,
+					      mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					pos = 0;
+				}
+				else
+				{
+					pos += bp - buf;
+					if (c != '\r')
+						*pbp++ = c;
+				}
+				bp = buf;
+
+				/* determine next state */
+				if (c == '\n')
+					ostate = OS_HEAD;
+				else if (c == '\r')
+					ostate = OS_CR;
+				else
+					ostate = OS_INLINE;
+				continue;
+
+			  case OS_CR:
+				if (c == '\n')
+				{
+					/* got CRLF */
+					fputs(mci->mci_mailer->m_eol, mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					if (TrafficLogFile != NULL)
+					{
+						fputs(mci->mci_mailer->m_eol,
+						      TrafficLogFile);
+					}
+					ostate = OS_HEAD;
+					continue;
+				}
+
+				/* had a naked carriage return */
+				*pbp++ = c;
+				c = '\r';
+				ostate = OS_INLINE;
+				goto putch;
+
+			  case OS_INLINE:
+				if (c == '\r')
+				{
+					ostate = OS_CR;
+					continue;
+				}
+#if _FFR_NONULLS
+				if (c == '\0' &&
+				    bitnset(M_NONULLS, mci->mci_mailer->m_flags))
+					break;
+#endif
+putch:
+				if (mci->mci_mailer->m_linelimit > 0 &&
+				    pos > mci->mci_mailer->m_linelimit &&
+				    c != '\n')
+				{
+					putc('!', mci->mci_out);
+					mci->mci_contentlen++;
+					fputs(mci->mci_mailer->m_eol, mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					if (TrafficLogFile != NULL)
+					{
+						fprintf(TrafficLogFile, "!%s",
+							mci->mci_mailer->m_eol);
+					}
+					ostate = OS_HEAD;
+					*pbp++ = c;
+					continue;
+				}
+				if (c == '\n')
+				{
+					if (TrafficLogFile != NULL)
+						fputs(mci->mci_mailer->m_eol,
+						      TrafficLogFile);
+					fputs(mci->mci_mailer->m_eol, mci->mci_out);
+					mci->mci_contentlen += eol_len;
+					pos = 0;
+					ostate = OS_HEAD;
+				}
+				else
+				{
+					if (TrafficLogFile != NULL)
+						putc(c, TrafficLogFile);
+					putc(c, mci->mci_out);
+					mci->mci_contentlen++;
+					pos++;
+					ostate = OS_INLINE;
+				}
+				break;
+d2101 1
+d2104 1
+a2104 16
+		/* make sure we are at the beginning of a line */
+		if (bp > buf)
+		{
+			if (TrafficLogFile != NULL)
+			{
+				for (xp = buf; xp < bp; xp++)
+					putc(*xp, TrafficLogFile);
+			}
+			for (xp = buf; xp < bp; xp++)
+			{
+				putc(*xp, mci->mci_out);
+				mci->mci_contentlen++;
+			}
+			pos += bp - buf;
+		}
+		if (pos > 0)
+d2106 2
+a2107 4
+			if (TrafficLogFile != NULL)
+				fputs(mci->mci_mailer->m_eol, TrafficLogFile);
+			fputs(mci->mci_mailer->m_eol, mci->mci_out);
+			mci->mci_contentlen += eol_len;
+a2110 7
+	if (ferror(e->e_dfp))
+	{
+		syserr("putbody: df%s: read error", e->e_id);
+		ExitStat = EX_IOERR;
+	}
+
+endofmessage:
+a2139 2
+**		mailer -- mailer definition for recipient -- if NULL,
+**			use FileMailer.
+a2141 2
+**		sfflags -- flags for opening.
+**		e -- the current envelope.
+d2150 2
+a2151 7
+static jmp_buf	CtxMailfileTimeout;
+static void	mailfiletimeout __P((void));
+
+int
+mailfile(filename, mailer, ctladdr, sfflags, e)
+	char *volatile filename;
+	MAILER *volatile mailer;
+a2152 1
+	volatile int sfflags;
+d2156 2
+a2157 5
+	register pid_t pid = -1;
+	volatile int mode = ST_MODE_NOFILE;
+	bool suidwarn = geteuid() == 0;
+	char *p;
+	EVENT *ev;
+a2164 3
+	if (mailer == NULL)
+		mailer = FileMailer;
+
+a2168 21
+	**  Special case /dev/null.  This allows us to restrict file
+	**  delivery to regular files only.
+	*/
+
+	if (strcmp(filename, "/dev/null") == 0)
+		return EX_OK;
+
+	/* check for 8-bit available */
+	if (bitset(EF_HAS8BIT, e->e_flags) &&
+	    bitnset(M_7BITS, mailer->m_flags) &&
+	    (bitset(EF_DONT_MIME, e->e_flags) ||
+	     !(bitset(MM_MIME8BIT, MimeMode) ||
+	       (bitset(EF_IS_MIME, e->e_flags) &&
+		bitset(MM_CVTMIME, MimeMode)))))
+	{
+		usrerr("554 Cannot send 8-bit data to 7-bit destination");
+		e->e_status = "5.6.3";
+		return(EX_DATAERR);
+	}
+
+	/*
+d2182 1
+d2184 1
+a2184 1
+		volatile int oflags = O_WRONLY|O_APPEND;
+d2187 4
+a2190 1
+			(void) close(fileno(e->e_lockfp));
+a2195 2
+		e->e_to = filename;
+		ExitStat = EX_OK;
+a2196 13
+		if (setjmp(CtxMailfileTimeout) != 0)
+		{
+			exit(EX_TEMPFAIL);
+		}
+
+		if (TimeOuts.to_fileopen > 0)
+			ev = setevent(TimeOuts.to_fileopen, mailfiletimeout, 0);
+		else
+			ev = NULL;
+
+#ifdef HASLSTAT
+		if (lstat(filename, &stb) < 0)
+#else
+a2197 1
+#endif
+d2199 1
+a2199 2
+			stb.st_mode = ST_MODE_NOFILE;
+			mode = FileMode;
+d2202 1
+a2202 4
+		else if (bitset(S_IXUSR|S_IXGRP|S_IXOTH, stb.st_mode) ||
+			 (!bitset(DBS_FILEDELIVERYTOHARDLINK, DontBlameSendmail) &&
+			  stb.st_nlink != 1) ||
+			 (SafeFileEnv != NULL && !S_ISREG(stb.st_mode)))
+d2204 1
+a2204 2
+		if (mode == ST_MODE_NOFILE)
+			mode = stb.st_mode;
+d2210 1
+a2210 1
+		if (ctladdr != NULL || bitset(SFF_RUNASREALUID, sfflags))
+d2217 1
+a2217 1
+		if (e->e_dfp == NULL && bitset(EF_HAS_DF, e->e_flags))
+d2219 1
+a2219 3
+			char *df = queuename(e, 'd');
+
+			e->e_dfp = fopen(df, "r");
+d2223 1
+a2223 1
+					df, e->e_to, e->e_from.q_paddr);
+d2227 1
+a2227 2
+		/* select a new user to run as */
+		if (!bitset(SFF_RUNASREALUID, sfflags))
+d2229 1
+a2229 19
+			if (bitnset(M_SPECIFIC_UID, mailer->m_flags))
+			{
+				RealUserName = NULL;
+				RealUid = mailer->m_uid;
+			}
+			else if (bitset(S_ISUID, mode))
+			{
+				RealUserName = NULL;
+				RealUid = stb.st_uid;
+			}
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+			{
+				if (ctladdr->q_ruser != NULL)
+					RealUserName = ctladdr->q_ruser;
+				else
+					RealUserName = ctladdr->q_user;
+				RealUid = ctladdr->q_uid;
+			}
+			else if (mailer != NULL && mailer->m_uid != 0)
+d2231 1
+a2231 2
+				RealUserName = DefUser;
+				RealUid = mailer->m_uid;
+d2235 3
+a2237 2
+				RealUserName = DefUser;
+				RealUid = DefUid;
+a2238 12
+
+			/* select a new group to run as */
+			if (bitnset(M_SPECIFIC_UID, mailer->m_flags))
+				RealGid = mailer->m_gid;
+			else if (bitset(S_ISGID, mode))
+				RealGid = stb.st_gid;
+			else if (ctladdr != NULL && ctladdr->q_uid != 0)
+				RealGid = ctladdr->q_gid;
+			else if (mailer != NULL && mailer->m_gid != 0)
+				RealGid = mailer->m_gid;
+			else
+				RealGid = DefGid;
+d2240 1
+a2240 3
+
+		/* last ditch */
+		if (!bitset(SFF_ROOTOK, sfflags))
+d2242 4
+a2245 68
+			if (RealUid == 0)
+				RealUid = DefUid;
+			if (RealGid == 0)
+				RealGid = DefGid;
+		}
+
+		/* set group id list (needs /etc/group access) */
+		if (RealUserName != NULL && !DontInitGroups)
+		{
+			if (initgroups(RealUserName, RealGid) == -1 && suidwarn)
+				syserr("mailfile: initgroups(%s, %d) failed",
+					RealUserName, RealGid);
+		}
+		else
+		{
+			GIDSET_T gidset[1];
+
+			gidset[0] = RealGid;
+			if (setgroups(1, gidset) == -1 && suidwarn)
+				syserr("mailfile: setgroups() failed");
+		}
+
+		/* if you have a safe environment, go into it */
+		if (SafeFileEnv != NULL && SafeFileEnv[0] != '\0')
+		{
+			int i;
+
+			if (chroot(SafeFileEnv) < 0)
+			{
+				syserr("mailfile: Cannot chroot(%s)",
+					SafeFileEnv);
+				exit(EX_CANTCREAT);
+			}
+			i = strlen(SafeFileEnv);
+			if (strncmp(SafeFileEnv, filename, i) == 0)
+				filename += i;
+		}
+		if (chdir("/") < 0)
+			syserr("mailfile: cannot chdir(/)");
+
+		/* now reset the group and user ids */
+		endpwent();
+		if (setgid(RealGid) < 0 && suidwarn)
+			syserr("mailfile: setgid(%ld) failed", (long) RealGid);
+		vendor_set_uid(RealUid);
+		if (setuid(RealUid) < 0 && suidwarn)
+			syserr("mailfile: setuid(%ld) failed", (long) RealUid);
+
+		/* move into some "safe" directory */
+		if (mailer->m_execdir != NULL)
+		{
+			char *q;
+			char buf[MAXLINE + 1];
+
+			for (p = mailer->m_execdir; p != NULL; p = q)
+			{
+				q = strchr(p, ':');
+				if (q != NULL)
+					*q = '\0';
+				expand(p, buf, sizeof buf, e);
+				if (q != NULL)
+					*q++ = ':';
+				if (tTd(11, 20))
+					printf("mailfile: trydir %s\n",
+					       buf);
+				if (buf[0] != '\0' && chdir(buf) >= 0)
+					break;
+			}
+d2247 3
+a2249 8
+
+		sfflags |= SFF_NOPATHCHECK;
+		if (!bitset(DBS_FILEDELIVERYTOSYMLINK, DontBlameSendmail))
+			sfflags |= SFF_NOSLINK;
+		if (!bitset(DBS_FILEDELIVERYTOHARDLINK, DontBlameSendmail))
+			sfflags |= SFF_NOHLINK;
+		sfflags &= ~SFF_OPENASROOT;
+		f = safefopen(filename, oflags, FileMode, sfflags);
+d2252 1
+a2252 3
+			message("554 cannot open %s: %s",
+				shortenstring(filename, MAXSHORTSTR),
+				errstring(errno));
+d2255 6
+a2260 1
+		if (filechanged(filename, fileno(f), &stb))
+d2262 1
+a2262 1
+			message("554 file changed after open");
+a2264 8
+		if (fstat(fileno(f), &stb) < 0)
+		{
+			message("554 cannot fstat %s", errstring(errno));
+			exit(EX_CANTCREAT);
+		}
+
+		if (ev != NULL)
+			clrevent(ev);
+d2267 1
+a2267 1
+		mcibuf.mci_mailer = mailer;
+d2269 1
+a2269 2
+		mcibuf.mci_contentlen = 0;
+		if (bitnset(M_7BITS, mailer->m_flags))
+a2271 24
+		/* clear out per-message flags from connection structure */
+		mcibuf.mci_flags &= ~(MCIF_CVT7TO8|MCIF_CVT8TO7);
+
+		if (bitset(EF_HAS8BIT, e->e_flags) &&
+		    !bitset(EF_DONT_MIME, e->e_flags) &&
+		    bitnset(M_7BITS, mailer->m_flags))
+			mcibuf.mci_flags |= MCIF_CVT8TO7;
+
+#if MIME7TO8
+		if (bitnset(M_MAKE8BIT, mailer->m_flags) &&
+		    !bitset(MCIF_7BIT, mcibuf.mci_flags) &&
+		    (p = hvalue("Content-Transfer-Encoding", e->e_header)) != NULL &&
+		    (strcasecmp(p, "quoted-printable") == 0 ||
+		     strcasecmp(p, "base64") == 0) &&
+		    (p = hvalue("Content-Type", e->e_header)) != NULL)
+		{
+			/* may want to convert 7 -> 8 */
+			/* XXX should really parse it here -- and use a class XXX */
+			if (strncasecmp(p, "text/plain", 10) == 0 &&
+			        (p[10] == '\0' || p[10] == ' ' || p[10] == ';'))
+				mcibuf.mci_flags |= MCIF_CVT7TO8;
+		}
+#endif
+
+d2273 2
+a2274 1
+		(*e->e_puthdr)(&mcibuf, e->e_header, e);
+d2277 1
+a2277 1
+		if (fflush(f) < 0 || ferror(f))
+d2282 2
+d2286 1
+a2286 8
+#if HASFCHMOD
+		(void) fchmod(fileno(f), (MODE_T) stb.st_mode);
+#else
+		(void) chmod(filename, (MODE_T) stb.st_mode);
+#endif
+		(void) xfclose(f, "mailfile", filename);
+		(void) fflush(stdout);
+		setuid(RealUid);
+a2295 5
+		if (st == -1)
+		{
+			syserr("mailfile: %s: wait", mailer->m_name);
+			return (EX_SOFTWARE);
+		}
+d2300 1
+a2300 2
+			syserr("mailfile: %s: child died on signal %d",
+			       mailer->m_name, st);
+a2304 7
+	return EX_UNAVAILABLE;	/* avoid compiler warning on IRIX */
+}
+
+static void
+mailfiletimeout()
+{
+	longjmp(CtxMailfileTimeout, 1);
+d2337 1
+d2340 1
+a2340 1
+	int oldoptions = _res.options;
+d2369 2
+d2372 1
+d2380 3
+a2382 1
+		if (bitnset(M_NOMX, m->m_flags))
+d2384 11
+a2394 1
+			/* skip MX lookups */
+a2396 21
+		}
+		else
+		{
+			auto int rcode;
+
+			nmx = getmxrr(hp, mxhosts, TRUE, &rcode);
+			if (nmx <= 0)
+			{
+				register MCI *mci;
+
+				/* update the connection info for this host */
+				mci = mci_get(hp, m);
+				mci->mci_errno = errno;
+				mci->mci_herrno = h_errno;
+				mci->mci_lastuse = curtime();
+				mci_setstat(mci, rcode, NULL, NULL);
+
+				/* use the original host name as signature */
+				nmx = 1;
+				mxhosts[0] = hp;
+			}
+@
+

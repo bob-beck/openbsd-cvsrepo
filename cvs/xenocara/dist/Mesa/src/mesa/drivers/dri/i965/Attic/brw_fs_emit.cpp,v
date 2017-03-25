@@ -1,0 +1,3250 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_5:1.3.0.2
+	OPENBSD_5_5_BASE:1.3
+	v9_2_5:1.1.1.2
+	v9_2_3:1.1.1.1
+	v9_2_2:1.1.1.1
+	v9_2_1:1.1.1.1
+	v9_2_0:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_4:1.1.0.4
+	OPENBSD_5_4_BASE:1.1
+	OPENBSD_5_3:1.1.0.2
+	OPENBSD_5_3_BASE:1.1;
+locks; strict;
+comment	@// @;
+
+
+1.4
+date	2014.07.09.21.08.59;	author jsg;	state dead;
+branches;
+next	1.3;
+commitid	WPD6rgPryPkvXOr9;
+
+1.3
+date	2014.01.19.03.13.15;	author jsg;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2013.09.05.14.04.18;	author jsg;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.08.17.13.58.15;	author mpi;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2013.09.05.13.15.33;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2014.01.19.03.04.26;	author jsg;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Merge Mesa 10.2.3
+tested by matthieu@@ kettenis@@ mpi@@ brett@@ and myself across a
+diverse range of hardware
+@
+text
+@/*
+ * Copyright © 2010 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+/** @@file brw_fs_emit.cpp
+ *
+ * This file supports emitting code from the FS LIR to the actual
+ * native instructions.
+ */
+
+extern "C" {
+#include "main/macros.h"
+#include "brw_context.h"
+#include "brw_eu.h"
+} /* extern "C" */
+
+#include "brw_fs.h"
+#include "brw_cfg.h"
+
+fs_generator::fs_generator(struct brw_context *brw,
+                           struct brw_wm_compile *c,
+                           struct gl_shader_program *prog,
+                           struct gl_fragment_program *fp,
+                           bool dual_source_output)
+
+   : brw(brw), c(c), prog(prog), fp(fp), dual_source_output(dual_source_output)
+{
+   ctx = &brw->ctx;
+
+   shader = prog ? prog->_LinkedShaders[MESA_SHADER_FRAGMENT] : NULL;
+
+   mem_ctx = c;
+
+   p = rzalloc(mem_ctx, struct brw_compile);
+   brw_init_compile(brw, p, mem_ctx);
+}
+
+fs_generator::~fs_generator()
+{
+}
+
+void
+fs_generator::patch_discard_jumps_to_fb_writes()
+{
+   if (brw->gen < 6 || this->discard_halt_patches.is_empty())
+      return;
+
+   /* There is a somewhat strange undocumented requirement of using
+    * HALT, according to the simulator.  If some channel has HALTed to
+    * a particular UIP, then by the end of the program, every channel
+    * must have HALTed to that UIP.  Furthermore, the tracking is a
+    * stack, so you can't do the final halt of a UIP after starting
+    * halting to a new UIP.
+    *
+    * Symptoms of not emitting this instruction on actual hardware
+    * included GPU hangs and sparkly rendering on the piglit discard
+    * tests.
+    */
+   struct brw_instruction *last_halt = gen6_HALT(p);
+   last_halt->bits3.break_cont.uip = 2;
+   last_halt->bits3.break_cont.jip = 2;
+
+   int ip = p->nr_insn;
+
+   foreach_list(node, &this->discard_halt_patches) {
+      ip_record *patch_ip = (ip_record *)node;
+      struct brw_instruction *patch = &p->store[patch_ip->ip];
+
+      assert(patch->header.opcode == BRW_OPCODE_HALT);
+      /* HALT takes a half-instruction distance from the pre-incremented IP. */
+      patch->bits3.break_cont.uip = (ip - patch_ip->ip) * 2;
+   }
+
+   this->discard_halt_patches.make_empty();
+}
+
+void
+fs_generator::generate_fb_write(fs_inst *inst)
+{
+   bool eot = inst->eot;
+   struct brw_reg implied_header;
+   uint32_t msg_control;
+
+   /* Header is 2 regs, g0 and g1 are the contents. g0 will be implied
+    * move, here's g1.
+    */
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+
+   if (fp->UsesKill || c->key.alpha_test_func) {
+      struct brw_reg pixel_mask;
+
+      if (brw->gen >= 6)
+         pixel_mask = retype(brw_vec1_grf(1, 7), BRW_REGISTER_TYPE_UW);
+      else
+         pixel_mask = retype(brw_vec1_grf(0, 0), BRW_REGISTER_TYPE_UW);
+
+      brw_MOV(p, pixel_mask, brw_flag_reg(0, 1));
+   }
+
+   if (inst->header_present) {
+      if (brw->gen >= 6) {
+	 brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 brw_MOV(p,
+		 retype(brw_message_reg(inst->base_mrf), BRW_REGISTER_TYPE_UD),
+		 retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UD));
+	 brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+
+         if (inst->target > 0 && c->key.replicate_alpha) {
+            /* Set "Source0 Alpha Present to RenderTarget" bit in message
+             * header.
+             */
+            brw_OR(p,
+		   vec1(retype(brw_message_reg(inst->base_mrf), BRW_REGISTER_TYPE_UD)),
+		   vec1(retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UD)),
+		   brw_imm_ud(0x1 << 11));
+         }
+
+	 if (inst->target > 0) {
+	    /* Set the render target index for choosing BLEND_STATE. */
+	    brw_MOV(p, retype(brw_vec1_reg(BRW_MESSAGE_REGISTER_FILE,
+					   inst->base_mrf, 2),
+			      BRW_REGISTER_TYPE_UD),
+		    brw_imm_ud(inst->target));
+	 }
+
+	 implied_header = brw_null_reg();
+      } else {
+	 implied_header = retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UW);
+
+	 brw_MOV(p,
+		 brw_message_reg(inst->base_mrf + 1),
+		 brw_vec8_grf(1, 0));
+      }
+   } else {
+      implied_header = brw_null_reg();
+   }
+
+   if (this->dual_source_output)
+      msg_control = BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD8_DUAL_SOURCE_SUBSPAN01;
+   else if (dispatch_width == 16)
+      msg_control = BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD16_SINGLE_SOURCE;
+   else
+      msg_control = BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD8_SINGLE_SOURCE_SUBSPAN01;
+
+   brw_pop_insn_state(p);
+
+   brw_fb_WRITE(p,
+		dispatch_width,
+		inst->base_mrf,
+		implied_header,
+		msg_control,
+		inst->target,
+		inst->mlen,
+		0,
+		eot,
+		inst->header_present);
+}
+
+/* Computes the integer pixel x,y values from the origin.
+ *
+ * This is the basis of gl_FragCoord computation, but is also used
+ * pre-gen6 for computing the deltas from v0 for computing
+ * interpolation.
+ */
+void
+fs_generator::generate_pixel_xy(struct brw_reg dst, bool is_x)
+{
+   struct brw_reg g1_uw = retype(brw_vec1_grf(1, 0), BRW_REGISTER_TYPE_UW);
+   struct brw_reg src;
+   struct brw_reg deltas;
+
+   if (is_x) {
+      src = stride(suboffset(g1_uw, 4), 2, 4, 0);
+      deltas = brw_imm_v(0x10101010);
+   } else {
+      src = stride(suboffset(g1_uw, 5), 2, 4, 0);
+      deltas = brw_imm_v(0x11001100);
+   }
+
+   if (dispatch_width == 16) {
+      dst = vec16(dst);
+   }
+
+   /* We do this 8 or 16-wide, but since the destination is UW we
+    * don't do compression in the 16-wide case.
+    */
+   brw_push_insn_state(p);
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_ADD(p, dst, src, deltas);
+   brw_pop_insn_state(p);
+}
+
+void
+fs_generator::generate_linterp(fs_inst *inst,
+			     struct brw_reg dst, struct brw_reg *src)
+{
+   struct brw_reg delta_x = src[0];
+   struct brw_reg delta_y = src[1];
+   struct brw_reg interp = src[2];
+
+   if (brw->has_pln &&
+       delta_y.nr == delta_x.nr + 1 &&
+       (brw->gen >= 6 || (delta_x.nr & 1) == 0)) {
+      brw_PLN(p, dst, interp, delta_x);
+   } else {
+      brw_LINE(p, brw_null_reg(), interp, delta_x);
+      brw_MAC(p, dst, suboffset(interp, 1), delta_y);
+   }
+}
+
+void
+fs_generator::generate_math1_gen7(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0)
+{
+   assert(inst->mlen == 0);
+   brw_math(p, dst,
+	    brw_math_function(inst->opcode),
+	    0, src0,
+	    BRW_MATH_DATA_VECTOR,
+	    BRW_MATH_PRECISION_FULL);
+}
+
+void
+fs_generator::generate_math2_gen7(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0,
+			        struct brw_reg src1)
+{
+   assert(inst->mlen == 0);
+   brw_math2(p, dst, brw_math_function(inst->opcode), src0, src1);
+}
+
+void
+fs_generator::generate_math1_gen6(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0)
+{
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen == 0);
+
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_math(p, dst,
+	    op,
+	    0, src0,
+	    BRW_MATH_DATA_VECTOR,
+	    BRW_MATH_PRECISION_FULL);
+
+   if (dispatch_width == 16) {
+      brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      brw_math(p, sechalf(dst),
+	       op,
+	       0, sechalf(src0),
+	       BRW_MATH_DATA_VECTOR,
+	       BRW_MATH_PRECISION_FULL);
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+   }
+}
+
+void
+fs_generator::generate_math2_gen6(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0,
+			        struct brw_reg src1)
+{
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen == 0);
+
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_math2(p, dst, op, src0, src1);
+
+   if (dispatch_width == 16) {
+      brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      brw_math2(p, sechalf(dst), op, sechalf(src0), sechalf(src1));
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+   }
+}
+
+void
+fs_generator::generate_math_gen4(fs_inst *inst,
+			       struct brw_reg dst,
+			       struct brw_reg src)
+{
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen >= 1);
+
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_math(p, dst,
+	    op,
+	    inst->base_mrf, src,
+	    BRW_MATH_DATA_VECTOR,
+	    BRW_MATH_PRECISION_FULL);
+
+   if (dispatch_width == 16) {
+      brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      brw_math(p, sechalf(dst),
+	       op,
+	       inst->base_mrf + 1, sechalf(src),
+	       BRW_MATH_DATA_VECTOR,
+	       BRW_MATH_PRECISION_FULL);
+
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+   }
+}
+
+void
+fs_generator::generate_math_g45(fs_inst *inst,
+                                struct brw_reg dst,
+                                struct brw_reg src)
+{
+   if (inst->opcode == SHADER_OPCODE_POW ||
+       inst->opcode == SHADER_OPCODE_INT_QUOTIENT ||
+       inst->opcode == SHADER_OPCODE_INT_REMAINDER) {
+      generate_math_gen4(inst, dst, src);
+      return;
+   }
+
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen >= 1);
+
+   brw_math(p, dst,
+            op,
+            inst->base_mrf, src,
+            BRW_MATH_DATA_VECTOR,
+            BRW_MATH_PRECISION_FULL);
+}
+
+void
+fs_generator::generate_tex(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+{
+   int msg_type = -1;
+   int rlen = 4;
+   uint32_t simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD8;
+   uint32_t return_format;
+
+   switch (dst.type) {
+   case BRW_REGISTER_TYPE_D:
+      return_format = BRW_SAMPLER_RETURN_FORMAT_SINT32;
+      break;
+   case BRW_REGISTER_TYPE_UD:
+      return_format = BRW_SAMPLER_RETURN_FORMAT_UINT32;
+      break;
+   default:
+      return_format = BRW_SAMPLER_RETURN_FORMAT_FLOAT32;
+      break;
+   }
+
+   if (dispatch_width == 16)
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+
+   if (brw->gen >= 5) {
+      switch (inst->opcode) {
+      case SHADER_OPCODE_TEX:
+	 if (inst->shadow_compare) {
+	    msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_COMPARE;
+	 } else {
+	    msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE;
+	 }
+	 break;
+      case FS_OPCODE_TXB:
+	 if (inst->shadow_compare) {
+	    msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_BIAS_COMPARE;
+	 } else {
+	    msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_BIAS;
+	 }
+	 break;
+      case SHADER_OPCODE_TXL:
+	 if (inst->shadow_compare) {
+	    msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LOD_COMPARE;
+	 } else {
+	    msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LOD;
+	 }
+	 break;
+      case SHADER_OPCODE_TXS:
+	 msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_RESINFO;
+	 break;
+      case SHADER_OPCODE_TXD:
+         if (inst->shadow_compare) {
+            /* Gen7.5+.  Otherwise, lowered by brw_lower_texture_gradients(). */
+            assert(brw->is_haswell);
+            msg_type = HSW_SAMPLER_MESSAGE_SAMPLE_DERIV_COMPARE;
+         } else {
+            msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_DERIVS;
+         }
+	 break;
+      case SHADER_OPCODE_TXF:
+	 msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LD;
+	 break;
+      case SHADER_OPCODE_TXF_MS:
+         if (brw->gen >= 7)
+            msg_type = GEN7_SAMPLER_MESSAGE_SAMPLE_LD2DMS;
+         else
+            msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LD;
+         break;
+      case SHADER_OPCODE_LOD:
+         msg_type = GEN5_SAMPLER_MESSAGE_LOD;
+         break;
+      default:
+	 assert(!"not reached");
+	 break;
+      }
+   } else {
+      switch (inst->opcode) {
+      case SHADER_OPCODE_TEX:
+	 /* Note that G45 and older determines shadow compare and dispatch width
+	  * from message length for most messages.
+	  */
+	 assert(dispatch_width == 8);
+	 msg_type = BRW_SAMPLER_MESSAGE_SIMD8_SAMPLE;
+	 if (inst->shadow_compare) {
+	    assert(inst->mlen == 6);
+	 } else {
+	    assert(inst->mlen <= 4);
+	 }
+	 break;
+      case FS_OPCODE_TXB:
+	 if (inst->shadow_compare) {
+	    assert(inst->mlen == 6);
+	    msg_type = BRW_SAMPLER_MESSAGE_SIMD8_SAMPLE_BIAS_COMPARE;
+	 } else {
+	    assert(inst->mlen == 9);
+	    msg_type = BRW_SAMPLER_MESSAGE_SIMD16_SAMPLE_BIAS;
+	    simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+	 }
+	 break;
+      case SHADER_OPCODE_TXL:
+	 if (inst->shadow_compare) {
+	    assert(inst->mlen == 6);
+	    msg_type = BRW_SAMPLER_MESSAGE_SIMD8_SAMPLE_LOD_COMPARE;
+	 } else {
+	    assert(inst->mlen == 9);
+	    msg_type = BRW_SAMPLER_MESSAGE_SIMD16_SAMPLE_LOD;
+	    simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+	 }
+	 break;
+      case SHADER_OPCODE_TXD:
+	 /* There is no sample_d_c message; comparisons are done manually */
+	 assert(inst->mlen == 7 || inst->mlen == 10);
+	 msg_type = BRW_SAMPLER_MESSAGE_SIMD8_SAMPLE_GRADIENTS;
+	 break;
+      case SHADER_OPCODE_TXF:
+	 assert(inst->mlen == 9);
+	 msg_type = BRW_SAMPLER_MESSAGE_SIMD16_LD;
+	 simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+	 break;
+      case SHADER_OPCODE_TXS:
+	 assert(inst->mlen == 3);
+	 msg_type = BRW_SAMPLER_MESSAGE_SIMD16_RESINFO;
+	 simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+	 break;
+      default:
+	 assert(!"not reached");
+	 break;
+      }
+   }
+   assert(msg_type != -1);
+
+   if (simd_mode == BRW_SAMPLER_SIMD_MODE_SIMD16) {
+      rlen = 8;
+      dst = vec16(dst);
+   }
+
+   /* Load the message header if present.  If there's a texture offset,
+    * we need to set it up explicitly and load the offset bitfield.
+    * Otherwise, we can use an implied move from g0 to the first message reg.
+    */
+   if (inst->texture_offset) {
+      brw_push_insn_state(p);
+      brw_set_mask_control(p, BRW_MASK_DISABLE);
+      brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+      /* Explicitly set up the message header by copying g0 to the MRF. */
+      brw_MOV(p, retype(brw_message_reg(inst->base_mrf), BRW_REGISTER_TYPE_UD),
+                 retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UD));
+
+      /* Then set the offset bits in DWord 2. */
+      brw_MOV(p, retype(brw_vec1_reg(BRW_MESSAGE_REGISTER_FILE,
+                                     inst->base_mrf, 2), BRW_REGISTER_TYPE_UD),
+                 brw_imm_ud(inst->texture_offset));
+      brw_pop_insn_state(p);
+   } else if (inst->header_present) {
+      /* Set up an implied move from g0 to the MRF. */
+      src = retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UW);
+   }
+
+   brw_SAMPLE(p,
+	      retype(dst, BRW_REGISTER_TYPE_UW),
+	      inst->base_mrf,
+	      src,
+              SURF_INDEX_TEXTURE(inst->sampler),
+	      inst->sampler,
+	      msg_type,
+	      rlen,
+	      inst->mlen,
+	      inst->header_present,
+	      simd_mode,
+	      return_format);
+}
+
+
+/* For OPCODE_DDX and OPCODE_DDY, per channel of output we've got input
+ * looking like:
+ *
+ * arg0: ss0.tl ss0.tr ss0.bl ss0.br ss1.tl ss1.tr ss1.bl ss1.br
+ *
+ * and we're trying to produce:
+ *
+ *           DDX                     DDY
+ * dst: (ss0.tr - ss0.tl)     (ss0.tl - ss0.bl)
+ *      (ss0.tr - ss0.tl)     (ss0.tr - ss0.br)
+ *      (ss0.br - ss0.bl)     (ss0.tl - ss0.bl)
+ *      (ss0.br - ss0.bl)     (ss0.tr - ss0.br)
+ *      (ss1.tr - ss1.tl)     (ss1.tl - ss1.bl)
+ *      (ss1.tr - ss1.tl)     (ss1.tr - ss1.br)
+ *      (ss1.br - ss1.bl)     (ss1.tl - ss1.bl)
+ *      (ss1.br - ss1.bl)     (ss1.tr - ss1.br)
+ *
+ * and add another set of two more subspans if in 16-pixel dispatch mode.
+ *
+ * For DDX, it ends up being easy: width = 2, horiz=0 gets us the same result
+ * for each pair, and vertstride = 2 jumps us 2 elements after processing a
+ * pair. But for DDY, it's harder, as we want to produce the pairs swizzled
+ * between each other.  We could probably do it like ddx and swizzle the right
+ * order later, but bail for now and just produce
+ * ((ss0.tl - ss0.bl)x4 (ss1.tl - ss1.bl)x4)
+ */
+void
+fs_generator::generate_ddx(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+{
+   struct brw_reg src0 = brw_reg(src.file, src.nr, 1,
+				 BRW_REGISTER_TYPE_F,
+				 BRW_VERTICAL_STRIDE_2,
+				 BRW_WIDTH_2,
+				 BRW_HORIZONTAL_STRIDE_0,
+				 BRW_SWIZZLE_XYZW, WRITEMASK_XYZW);
+   struct brw_reg src1 = brw_reg(src.file, src.nr, 0,
+				 BRW_REGISTER_TYPE_F,
+				 BRW_VERTICAL_STRIDE_2,
+				 BRW_WIDTH_2,
+				 BRW_HORIZONTAL_STRIDE_0,
+				 BRW_SWIZZLE_XYZW, WRITEMASK_XYZW);
+   brw_ADD(p, dst, src0, negate(src1));
+}
+
+/* The negate_value boolean is used to negate the derivative computation for
+ * FBOs, since they place the origin at the upper left instead of the lower
+ * left.
+ */
+void
+fs_generator::generate_ddy(fs_inst *inst, struct brw_reg dst, struct brw_reg src,
+                         bool negate_value)
+{
+   struct brw_reg src0 = brw_reg(src.file, src.nr, 0,
+				 BRW_REGISTER_TYPE_F,
+				 BRW_VERTICAL_STRIDE_4,
+				 BRW_WIDTH_4,
+				 BRW_HORIZONTAL_STRIDE_0,
+				 BRW_SWIZZLE_XYZW, WRITEMASK_XYZW);
+   struct brw_reg src1 = brw_reg(src.file, src.nr, 2,
+				 BRW_REGISTER_TYPE_F,
+				 BRW_VERTICAL_STRIDE_4,
+				 BRW_WIDTH_4,
+				 BRW_HORIZONTAL_STRIDE_0,
+				 BRW_SWIZZLE_XYZW, WRITEMASK_XYZW);
+   if (negate_value)
+      brw_ADD(p, dst, src1, negate(src0));
+   else
+      brw_ADD(p, dst, src0, negate(src1));
+}
+
+void
+fs_generator::generate_discard_jump(fs_inst *inst)
+{
+   assert(brw->gen >= 6);
+
+   /* This HALT will be patched up at FB write time to point UIP at the end of
+    * the program, and at brw_uip_jip() JIP will be set to the end of the
+    * current block (or the program).
+    */
+   this->discard_halt_patches.push_tail(new(mem_ctx) ip_record(p->nr_insn));
+
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   gen6_HALT(p);
+   brw_pop_insn_state(p);
+}
+
+void
+fs_generator::generate_spill(fs_inst *inst, struct brw_reg src)
+{
+   assert(inst->mlen != 0);
+
+   brw_MOV(p,
+	   retype(brw_message_reg(inst->base_mrf + 1), BRW_REGISTER_TYPE_UD),
+	   retype(src, BRW_REGISTER_TYPE_UD));
+   brw_oword_block_write_scratch(p, brw_message_reg(inst->base_mrf), 1,
+				 inst->offset);
+}
+
+void
+fs_generator::generate_unspill(fs_inst *inst, struct brw_reg dst)
+{
+   assert(inst->mlen != 0);
+
+   brw_oword_block_read_scratch(p, dst, brw_message_reg(inst->base_mrf), 1,
+				inst->offset);
+}
+
+void
+fs_generator::generate_uniform_pull_constant_load(fs_inst *inst,
+                                                  struct brw_reg dst,
+                                                  struct brw_reg index,
+                                                  struct brw_reg offset)
+{
+   assert(inst->mlen != 0);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   assert(offset.file == BRW_IMMEDIATE_VALUE &&
+	  offset.type == BRW_REGISTER_TYPE_UD);
+   uint32_t read_offset = offset.dw1.ud;
+
+   brw_oword_block_read(p, dst, brw_message_reg(inst->base_mrf),
+			read_offset, surf_index);
+}
+
+void
+fs_generator::generate_uniform_pull_constant_load_gen7(fs_inst *inst,
+                                                       struct brw_reg dst,
+                                                       struct brw_reg index,
+                                                       struct brw_reg offset)
+{
+   assert(inst->mlen == 0);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   assert(offset.file == BRW_GENERAL_REGISTER_FILE);
+   /* Reference just the dword we need, to avoid angering validate_reg(). */
+   offset = brw_vec1_grf(offset.nr, 0);
+
+   brw_push_insn_state(p);
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   struct brw_instruction *send = brw_next_insn(p, BRW_OPCODE_SEND);
+   brw_pop_insn_state(p);
+
+   /* We use the SIMD4x2 mode because we want to end up with 4 components in
+    * the destination loaded consecutively from the same offset (which appears
+    * in the first component, and the rest are ignored).
+    */
+   dst.width = BRW_WIDTH_4;
+   brw_set_dest(p, send, dst);
+   brw_set_src0(p, send, offset);
+   brw_set_sampler_message(p, send,
+                           surf_index,
+                           0, /* LD message ignores sampler unit */
+                           GEN5_SAMPLER_MESSAGE_SAMPLE_LD,
+                           1, /* rlen */
+                           1, /* mlen */
+                           false, /* no header */
+                           BRW_SAMPLER_SIMD_MODE_SIMD4X2,
+                           0);
+}
+
+void
+fs_generator::generate_varying_pull_constant_load(fs_inst *inst,
+                                                  struct brw_reg dst,
+                                                  struct brw_reg index,
+                                                  struct brw_reg offset)
+{
+   assert(brw->gen < 7); /* Should use the gen7 variant. */
+   assert(inst->header_present);
+   assert(inst->mlen);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   uint32_t simd_mode, rlen, msg_type;
+   if (dispatch_width == 16) {
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+      rlen = 8;
+   } else {
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD8;
+      rlen = 4;
+   }
+
+   if (brw->gen >= 5)
+      msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LD;
+   else {
+      /* We always use the SIMD16 message so that we only have to load U, and
+       * not V or R.
+       */
+      msg_type = BRW_SAMPLER_MESSAGE_SIMD16_LD;
+      assert(inst->mlen == 3);
+      assert(inst->regs_written == 8);
+      rlen = 8;
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+   }
+
+   struct brw_reg offset_mrf = retype(brw_message_reg(inst->base_mrf + 1),
+                                      BRW_REGISTER_TYPE_D);
+   brw_MOV(p, offset_mrf, offset);
+
+   struct brw_reg header = brw_vec8_grf(0, 0);
+   gen6_resolve_implied_move(p, &header, inst->base_mrf);
+
+   struct brw_instruction *send = brw_next_insn(p, BRW_OPCODE_SEND);
+   send->header.compression_control = BRW_COMPRESSION_NONE;
+   brw_set_dest(p, send, dst);
+   brw_set_src0(p, send, header);
+   if (brw->gen < 6)
+      send->header.destreg__conditionalmod = inst->base_mrf;
+
+   /* Our surface is set up as floats, regardless of what actual data is
+    * stored in it.
+    */
+   uint32_t return_format = BRW_SAMPLER_RETURN_FORMAT_FLOAT32;
+   brw_set_sampler_message(p, send,
+                           surf_index,
+                           0, /* sampler (unused) */
+                           msg_type,
+                           rlen,
+                           inst->mlen,
+                           inst->header_present,
+                           simd_mode,
+                           return_format);
+}
+
+void
+fs_generator::generate_varying_pull_constant_load_gen7(fs_inst *inst,
+                                                       struct brw_reg dst,
+                                                       struct brw_reg index,
+                                                       struct brw_reg offset)
+{
+   assert(brw->gen >= 7);
+   /* Varying-offset pull constant loads are treated as a normal expression on
+    * gen7, so the fact that it's a send message is hidden at the IR level.
+    */
+   assert(!inst->header_present);
+   assert(!inst->mlen);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   uint32_t simd_mode, rlen, mlen;
+   if (dispatch_width == 16) {
+      mlen = 2;
+      rlen = 8;
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+   } else {
+      mlen = 1;
+      rlen = 4;
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD8;
+   }
+
+   struct brw_instruction *send = brw_next_insn(p, BRW_OPCODE_SEND);
+   brw_set_dest(p, send, dst);
+   brw_set_src0(p, send, offset);
+   brw_set_sampler_message(p, send,
+                           surf_index,
+                           0, /* LD message ignores sampler unit */
+                           GEN5_SAMPLER_MESSAGE_SAMPLE_LD,
+                           rlen,
+                           mlen,
+                           false, /* no header */
+                           simd_mode,
+                           0);
+}
+
+/**
+ * Cause the current pixel/sample mask (from R1.7 bits 15:0) to be transferred
+ * into the flags register (f0.0).
+ *
+ * Used only on Gen6 and above.
+ */
+void
+fs_generator::generate_mov_dispatch_to_flags(fs_inst *inst)
+{
+   struct brw_reg flags = brw_flag_reg(0, inst->flag_subreg);
+   struct brw_reg dispatch_mask;
+
+   if (brw->gen >= 6)
+      dispatch_mask = retype(brw_vec1_grf(1, 7), BRW_REGISTER_TYPE_UW);
+   else
+      dispatch_mask = retype(brw_vec1_grf(0, 0), BRW_REGISTER_TYPE_UW);
+
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   brw_MOV(p, flags, dispatch_mask);
+   brw_pop_insn_state(p);
+}
+
+
+static uint32_t brw_file_from_reg(fs_reg *reg)
+{
+   switch (reg->file) {
+   case ARF:
+      return BRW_ARCHITECTURE_REGISTER_FILE;
+   case GRF:
+      return BRW_GENERAL_REGISTER_FILE;
+   case MRF:
+      return BRW_MESSAGE_REGISTER_FILE;
+   case IMM:
+      return BRW_IMMEDIATE_VALUE;
+   default:
+      assert(!"not reached");
+      return BRW_GENERAL_REGISTER_FILE;
+   }
+}
+
+static struct brw_reg
+brw_reg_from_fs_reg(fs_reg *reg)
+{
+   struct brw_reg brw_reg;
+
+   switch (reg->file) {
+   case GRF:
+   case ARF:
+   case MRF:
+      if (reg->smear == -1) {
+	 brw_reg = brw_vec8_reg(brw_file_from_reg(reg), reg->reg, 0);
+      } else {
+	 brw_reg = brw_vec1_reg(brw_file_from_reg(reg), reg->reg, reg->smear);
+      }
+      brw_reg = retype(brw_reg, reg->type);
+      if (reg->sechalf)
+	 brw_reg = sechalf(brw_reg);
+      break;
+   case IMM:
+      switch (reg->type) {
+      case BRW_REGISTER_TYPE_F:
+	 brw_reg = brw_imm_f(reg->imm.f);
+	 break;
+      case BRW_REGISTER_TYPE_D:
+	 brw_reg = brw_imm_d(reg->imm.i);
+	 break;
+      case BRW_REGISTER_TYPE_UD:
+	 brw_reg = brw_imm_ud(reg->imm.u);
+	 break;
+      default:
+	 assert(!"not reached");
+	 brw_reg = brw_null_reg();
+	 break;
+      }
+      break;
+   case HW_REG:
+      brw_reg = reg->fixed_hw_reg;
+      break;
+   case BAD_FILE:
+      /* Probably unused. */
+      brw_reg = brw_null_reg();
+      break;
+   case UNIFORM:
+      assert(!"not reached");
+      brw_reg = brw_null_reg();
+      break;
+   default:
+      assert(!"not reached");
+      brw_reg = brw_null_reg();
+      break;
+   }
+   if (reg->abs)
+      brw_reg = brw_abs(brw_reg);
+   if (reg->negate)
+      brw_reg = negate(brw_reg);
+
+   return brw_reg;
+}
+
+/**
+ * Sets the first word of a vgrf for gen7+ simd4x2 uniform pull constant
+ * sampler LD messages.
+ *
+ * We don't want to bake it into the send message's code generation because
+ * that means we don't get a chance to schedule the instructions.
+ */
+void
+fs_generator::generate_set_simd4x2_offset(fs_inst *inst,
+                                          struct brw_reg dst,
+                                          struct brw_reg value)
+{
+   assert(value.file == BRW_IMMEDIATE_VALUE);
+
+   brw_push_insn_state(p);
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   brw_MOV(p, retype(brw_vec1_reg(dst.file, dst.nr, 0), value.type), value);
+   brw_pop_insn_state(p);
+}
+
+/**
+ * Change the register's data type from UD to W, doubling the strides in order
+ * to compensate for halving the data type width.
+ */
+static struct brw_reg
+ud_reg_to_w(struct brw_reg r)
+{
+   assert(r.type == BRW_REGISTER_TYPE_UD);
+   r.type = BRW_REGISTER_TYPE_W;
+
+   /* The BRW_*_STRIDE enums are defined so that incrementing the field
+    * doubles the real stride.
+    */
+   if (r.hstride != 0)
+      ++r.hstride;
+   if (r.vstride != 0)
+      ++r.vstride;
+
+   return r;
+}
+
+void
+fs_generator::generate_pack_half_2x16_split(fs_inst *inst,
+                                            struct brw_reg dst,
+                                            struct brw_reg x,
+                                            struct brw_reg y)
+{
+   assert(brw->gen >= 7);
+   assert(dst.type == BRW_REGISTER_TYPE_UD);
+   assert(x.type == BRW_REGISTER_TYPE_F);
+   assert(y.type == BRW_REGISTER_TYPE_F);
+
+   /* From the Ivybridge PRM, Vol4, Part3, Section 6.27 f32to16:
+    *
+    *   Because this instruction does not have a 16-bit floating-point type,
+    *   the destination data type must be Word (W).
+    *
+    *   The destination must be DWord-aligned and specify a horizontal stride
+    *   (HorzStride) of 2. The 16-bit result is stored in the lower word of
+    *   each destination channel and the upper word is not modified.
+    */
+   struct brw_reg dst_w = ud_reg_to_w(dst);
+
+   /* Give each 32-bit channel of dst the form below , where "." means
+    * unchanged.
+    *   0x....hhhh
+    */
+   brw_F32TO16(p, dst_w, y);
+
+   /* Now the form:
+    *   0xhhhh0000
+    */
+   brw_SHL(p, dst, dst, brw_imm_ud(16u));
+
+   /* And, finally the form of packHalf2x16's output:
+    *   0xhhhhllll
+    */
+   brw_F32TO16(p, dst_w, x);
+}
+
+void
+fs_generator::generate_unpack_half_2x16_split(fs_inst *inst,
+                                              struct brw_reg dst,
+                                              struct brw_reg src)
+{
+   assert(brw->gen >= 7);
+   assert(dst.type == BRW_REGISTER_TYPE_F);
+   assert(src.type == BRW_REGISTER_TYPE_UD);
+
+   /* From the Ivybridge PRM, Vol4, Part3, Section 6.26 f16to32:
+    *
+    *   Because this instruction does not have a 16-bit floating-point type,
+    *   the source data type must be Word (W). The destination type must be
+    *   F (Float).
+    */
+   struct brw_reg src_w = ud_reg_to_w(src);
+
+   /* Each channel of src has the form of unpackHalf2x16's input: 0xhhhhllll.
+    * For the Y case, we wish to access only the upper word; therefore
+    * a 16-bit subregister offset is needed.
+    */
+   assert(inst->opcode == FS_OPCODE_UNPACK_HALF_2x16_SPLIT_X ||
+          inst->opcode == FS_OPCODE_UNPACK_HALF_2x16_SPLIT_Y);
+   if (inst->opcode == FS_OPCODE_UNPACK_HALF_2x16_SPLIT_Y)
+      src_w.subnr += 2;
+
+   brw_F16TO32(p, dst, src_w);
+}
+
+void
+fs_generator::generate_shader_time_add(fs_inst *inst,
+                                       struct brw_reg payload,
+                                       struct brw_reg offset,
+                                       struct brw_reg value)
+{
+   assert(brw->gen >= 7);
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, true);
+
+   assert(payload.file == BRW_GENERAL_REGISTER_FILE);
+   struct brw_reg payload_offset = retype(brw_vec1_grf(payload.nr, 0),
+                                          offset.type);
+   struct brw_reg payload_value = retype(brw_vec1_grf(payload.nr + 1, 0),
+                                         value.type);
+
+   assert(offset.file == BRW_IMMEDIATE_VALUE);
+   if (value.file == BRW_GENERAL_REGISTER_FILE) {
+      value.width = BRW_WIDTH_1;
+      value.hstride = BRW_HORIZONTAL_STRIDE_0;
+      value.vstride = BRW_VERTICAL_STRIDE_0;
+   } else {
+      assert(value.file == BRW_IMMEDIATE_VALUE);
+   }
+
+   /* Trying to deal with setup of the params from the IR is crazy in the FS8
+    * case, and we don't really care about squeezing every bit of performance
+    * out of this path, so we just emit the MOVs from here.
+    */
+   brw_MOV(p, payload_offset, offset);
+   brw_MOV(p, payload_value, value);
+   brw_shader_time_add(p, payload, SURF_INDEX_WM_SHADER_TIME);
+   brw_pop_insn_state(p);
+}
+
+void
+fs_generator::generate_code(exec_list *instructions)
+{
+   int last_native_insn_offset = p->next_insn_offset;
+   const char *last_annotation_string = NULL;
+   const void *last_annotation_ir = NULL;
+
+   if (unlikely(INTEL_DEBUG & DEBUG_WM)) {
+      if (shader) {
+         printf("Native code for fragment shader %d (%d-wide dispatch):\n",
+                prog->Name, dispatch_width);
+      } else {
+         printf("Native code for fragment program %d (%d-wide dispatch):\n",
+                fp->Base.Id, dispatch_width);
+      }
+   }
+
+   cfg_t *cfg = NULL;
+   if (unlikely(INTEL_DEBUG & DEBUG_WM))
+      cfg = new(mem_ctx) cfg_t(mem_ctx, instructions);
+
+   foreach_list(node, instructions) {
+      fs_inst *inst = (fs_inst *)node;
+      struct brw_reg src[3], dst;
+
+      if (unlikely(INTEL_DEBUG & DEBUG_WM)) {
+	 foreach_list(node, &cfg->block_list) {
+	    bblock_link *link = (bblock_link *)node;
+	    bblock_t *block = link->block;
+
+	    if (block->start == inst) {
+	       printf("   START B%d", block->block_num);
+	       foreach_list(predecessor_node, &block->parents) {
+		  bblock_link *predecessor_link =
+		     (bblock_link *)predecessor_node;
+		  bblock_t *predecessor_block = predecessor_link->block;
+		  printf(" <-B%d", predecessor_block->block_num);
+	       }
+	       printf("\n");
+	    }
+	 }
+
+	 if (last_annotation_ir != inst->ir) {
+	    last_annotation_ir = inst->ir;
+	    if (last_annotation_ir) {
+	       printf("   ");
+               if (shader)
+                  ((ir_instruction *)inst->ir)->print();
+               else {
+                  const prog_instruction *fpi;
+                  fpi = (const prog_instruction *)inst->ir;
+                  printf("%d: ", (int)(fpi - fp->Base.Instructions));
+                  _mesa_fprint_instruction_opt(stdout,
+                                               fpi,
+                                               0, PROG_PRINT_DEBUG, NULL);
+               }
+	       printf("\n");
+	    }
+	 }
+	 if (last_annotation_string != inst->annotation) {
+	    last_annotation_string = inst->annotation;
+	    if (last_annotation_string)
+	       printf("   %s\n", last_annotation_string);
+	 }
+      }
+
+      for (unsigned int i = 0; i < 3; i++) {
+	 src[i] = brw_reg_from_fs_reg(&inst->src[i]);
+
+	 /* The accumulator result appears to get used for the
+	  * conditional modifier generation.  When negating a UD
+	  * value, there is a 33rd bit generated for the sign in the
+	  * accumulator value, so now you can't check, for example,
+	  * equality with a 32-bit value.  See piglit fs-op-neg-uvec4.
+	  */
+	 assert(!inst->conditional_mod ||
+		inst->src[i].type != BRW_REGISTER_TYPE_UD ||
+		!inst->src[i].negate);
+      }
+      dst = brw_reg_from_fs_reg(&inst->dst);
+
+      brw_set_conditionalmod(p, inst->conditional_mod);
+      brw_set_predicate_control(p, inst->predicate);
+      brw_set_predicate_inverse(p, inst->predicate_inverse);
+      brw_set_flag_reg(p, 0, inst->flag_subreg);
+      brw_set_saturate(p, inst->saturate);
+      brw_set_mask_control(p, inst->force_writemask_all);
+
+      if (inst->force_uncompressed || dispatch_width == 8) {
+	 brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+      } else if (inst->force_sechalf) {
+	 brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      } else {
+	 brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+      }
+
+      switch (inst->opcode) {
+      case BRW_OPCODE_MOV:
+	 brw_MOV(p, dst, src[0]);
+	 break;
+      case BRW_OPCODE_ADD:
+	 brw_ADD(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_MUL:
+	 brw_MUL(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_MACH:
+	 brw_set_acc_write_control(p, 1);
+	 brw_MACH(p, dst, src[0], src[1]);
+	 brw_set_acc_write_control(p, 0);
+	 break;
+
+      case BRW_OPCODE_MAD:
+	 brw_set_access_mode(p, BRW_ALIGN_16);
+	 if (dispatch_width == 16) {
+	    brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+	    brw_MAD(p, dst, src[0], src[1], src[2]);
+	    brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	    brw_MAD(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+	    brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 } else {
+	    brw_MAD(p, dst, src[0], src[1], src[2]);
+	 }
+	 brw_set_access_mode(p, BRW_ALIGN_1);
+	 break;
+
+      case BRW_OPCODE_LRP:
+	 brw_set_access_mode(p, BRW_ALIGN_16);
+	 if (dispatch_width == 16) {
+	    brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+	    brw_LRP(p, dst, src[0], src[1], src[2]);
+	    brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	    brw_LRP(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+	    brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 } else {
+	    brw_LRP(p, dst, src[0], src[1], src[2]);
+	 }
+	 brw_set_access_mode(p, BRW_ALIGN_1);
+	 break;
+
+      case BRW_OPCODE_FRC:
+	 brw_FRC(p, dst, src[0]);
+	 break;
+      case BRW_OPCODE_RNDD:
+	 brw_RNDD(p, dst, src[0]);
+	 break;
+      case BRW_OPCODE_RNDE:
+	 brw_RNDE(p, dst, src[0]);
+	 break;
+      case BRW_OPCODE_RNDZ:
+	 brw_RNDZ(p, dst, src[0]);
+	 break;
+
+      case BRW_OPCODE_AND:
+	 brw_AND(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_OR:
+	 brw_OR(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_XOR:
+	 brw_XOR(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_NOT:
+	 brw_NOT(p, dst, src[0]);
+	 break;
+      case BRW_OPCODE_ASR:
+	 brw_ASR(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_SHR:
+	 brw_SHR(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_SHL:
+	 brw_SHL(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_F32TO16:
+         brw_F32TO16(p, dst, src[0]);
+         break;
+      case BRW_OPCODE_F16TO32:
+         brw_F16TO32(p, dst, src[0]);
+         break;
+      case BRW_OPCODE_CMP:
+	 brw_CMP(p, dst, inst->conditional_mod, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_SEL:
+	 brw_SEL(p, dst, src[0], src[1]);
+	 break;
+      case BRW_OPCODE_BFREV:
+         /* BFREV only supports UD type for src and dst. */
+         brw_BFREV(p, retype(dst, BRW_REGISTER_TYPE_UD),
+                      retype(src[0], BRW_REGISTER_TYPE_UD));
+         break;
+      case BRW_OPCODE_FBH:
+         /* FBH only supports UD type for dst. */
+         brw_FBH(p, retype(dst, BRW_REGISTER_TYPE_UD), src[0]);
+         break;
+      case BRW_OPCODE_FBL:
+         /* FBL only supports UD type for dst. */
+         brw_FBL(p, retype(dst, BRW_REGISTER_TYPE_UD), src[0]);
+         break;
+      case BRW_OPCODE_CBIT:
+         /* CBIT only supports UD type for dst. */
+         brw_CBIT(p, retype(dst, BRW_REGISTER_TYPE_UD), src[0]);
+         break;
+
+      case BRW_OPCODE_BFE:
+         brw_set_access_mode(p, BRW_ALIGN_16);
+         if (dispatch_width == 16) {
+            brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+            brw_BFE(p, dst, src[0], src[1], src[2]);
+            brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+            brw_BFE(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+            brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+         } else {
+            brw_BFE(p, dst, src[0], src[1], src[2]);
+         }
+         brw_set_access_mode(p, BRW_ALIGN_1);
+         break;
+
+      case BRW_OPCODE_BFI1:
+         brw_BFI1(p, dst, src[0], src[1]);
+         break;
+      case BRW_OPCODE_BFI2:
+         brw_set_access_mode(p, BRW_ALIGN_16);
+         if (dispatch_width == 16) {
+            brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+            brw_BFI2(p, dst, src[0], src[1], src[2]);
+            brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+            brw_BFI2(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+            brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+         } else {
+            brw_BFI2(p, dst, src[0], src[1], src[2]);
+         }
+         brw_set_access_mode(p, BRW_ALIGN_1);
+         break;
+
+      case BRW_OPCODE_IF:
+	 if (inst->src[0].file != BAD_FILE) {
+	    /* The instruction has an embedded compare (only allowed on gen6) */
+	    assert(brw->gen == 6);
+	    gen6_IF(p, inst->conditional_mod, src[0], src[1]);
+	 } else {
+	    brw_IF(p, dispatch_width == 16 ? BRW_EXECUTE_16 : BRW_EXECUTE_8);
+	 }
+	 break;
+
+      case BRW_OPCODE_ELSE:
+	 brw_ELSE(p);
+	 break;
+      case BRW_OPCODE_ENDIF:
+	 brw_ENDIF(p);
+	 break;
+
+      case BRW_OPCODE_DO:
+	 brw_DO(p, BRW_EXECUTE_8);
+	 break;
+
+      case BRW_OPCODE_BREAK:
+	 brw_BREAK(p);
+	 brw_set_predicate_control(p, BRW_PREDICATE_NONE);
+	 break;
+      case BRW_OPCODE_CONTINUE:
+	 /* FINISHME: We need to write the loop instruction support still. */
+	 if (brw->gen >= 6)
+	    gen6_CONT(p);
+	 else
+	    brw_CONT(p);
+	 brw_set_predicate_control(p, BRW_PREDICATE_NONE);
+	 break;
+
+      case BRW_OPCODE_WHILE:
+	 brw_WHILE(p);
+	 break;
+
+      case SHADER_OPCODE_RCP:
+      case SHADER_OPCODE_RSQ:
+      case SHADER_OPCODE_SQRT:
+      case SHADER_OPCODE_EXP2:
+      case SHADER_OPCODE_LOG2:
+      case SHADER_OPCODE_SIN:
+      case SHADER_OPCODE_COS:
+	 if (brw->gen >= 7) {
+	    generate_math1_gen7(inst, dst, src[0]);
+	 } else if (brw->gen == 6) {
+	    generate_math1_gen6(inst, dst, src[0]);
+	 } else if (brw->gen == 5 || brw->is_g4x) {
+	    generate_math_g45(inst, dst, src[0]);
+	 } else {
+	    generate_math_gen4(inst, dst, src[0]);
+	 }
+	 break;
+      case SHADER_OPCODE_INT_QUOTIENT:
+      case SHADER_OPCODE_INT_REMAINDER:
+      case SHADER_OPCODE_POW:
+	 if (brw->gen >= 7) {
+	    generate_math2_gen7(inst, dst, src[0], src[1]);
+	 } else if (brw->gen == 6) {
+	    generate_math2_gen6(inst, dst, src[0], src[1]);
+	 } else {
+	    generate_math_gen4(inst, dst, src[0]);
+	 }
+	 break;
+      case FS_OPCODE_PIXEL_X:
+	 generate_pixel_xy(dst, true);
+	 break;
+      case FS_OPCODE_PIXEL_Y:
+	 generate_pixel_xy(dst, false);
+	 break;
+      case FS_OPCODE_CINTERP:
+	 brw_MOV(p, dst, src[0]);
+	 break;
+      case FS_OPCODE_LINTERP:
+	 generate_linterp(inst, dst, src);
+	 break;
+      case SHADER_OPCODE_TEX:
+      case FS_OPCODE_TXB:
+      case SHADER_OPCODE_TXD:
+      case SHADER_OPCODE_TXF:
+      case SHADER_OPCODE_TXF_MS:
+      case SHADER_OPCODE_TXL:
+      case SHADER_OPCODE_TXS:
+      case SHADER_OPCODE_LOD:
+	 generate_tex(inst, dst, src[0]);
+	 break;
+      case FS_OPCODE_DDX:
+	 generate_ddx(inst, dst, src[0]);
+	 break;
+      case FS_OPCODE_DDY:
+         /* Make sure fp->UsesDFdy flag got set (otherwise there's no
+          * guarantee that c->key.render_to_fbo is set).
+          */
+         assert(fp->UsesDFdy);
+	 generate_ddy(inst, dst, src[0], c->key.render_to_fbo);
+	 break;
+
+      case FS_OPCODE_SPILL:
+	 generate_spill(inst, src[0]);
+	 break;
+
+      case FS_OPCODE_UNSPILL:
+	 generate_unspill(inst, dst);
+	 break;
+
+      case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD:
+	 generate_uniform_pull_constant_load(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD_GEN7:
+	 generate_uniform_pull_constant_load_gen7(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD:
+	 generate_varying_pull_constant_load(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD_GEN7:
+	 generate_varying_pull_constant_load_gen7(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_FB_WRITE:
+	 generate_fb_write(inst);
+	 break;
+
+      case FS_OPCODE_MOV_DISPATCH_TO_FLAGS:
+         generate_mov_dispatch_to_flags(inst);
+         break;
+
+      case FS_OPCODE_DISCARD_JUMP:
+         generate_discard_jump(inst);
+         break;
+
+      case SHADER_OPCODE_SHADER_TIME_ADD:
+         generate_shader_time_add(inst, src[0], src[1], src[2]);
+         break;
+
+      case FS_OPCODE_SET_SIMD4X2_OFFSET:
+         generate_set_simd4x2_offset(inst, dst, src[0]);
+         break;
+
+      case FS_OPCODE_PACK_HALF_2x16_SPLIT:
+          generate_pack_half_2x16_split(inst, dst, src[0], src[1]);
+          break;
+
+      case FS_OPCODE_UNPACK_HALF_2x16_SPLIT_X:
+      case FS_OPCODE_UNPACK_HALF_2x16_SPLIT_Y:
+         generate_unpack_half_2x16_split(inst, dst, src[0]);
+         break;
+
+      case FS_OPCODE_PLACEHOLDER_HALT:
+         /* This is the place where the final HALT needs to be inserted if
+          * we've emitted any discards.  If not, this will emit no code.
+          */
+         patch_discard_jumps_to_fb_writes();
+         break;
+
+      default:
+	 if (inst->opcode < (int) ARRAY_SIZE(opcode_descs)) {
+	    _mesa_problem(ctx, "Unsupported opcode `%s' in FS",
+			  opcode_descs[inst->opcode].name);
+	 } else {
+	    _mesa_problem(ctx, "Unsupported opcode %d in FS", inst->opcode);
+	 }
+	 abort();
+      }
+
+      if (unlikely(INTEL_DEBUG & DEBUG_WM)) {
+	 brw_dump_compile(p, stdout,
+			  last_native_insn_offset, p->next_insn_offset);
+
+	 foreach_list(node, &cfg->block_list) {
+	    bblock_link *link = (bblock_link *)node;
+	    bblock_t *block = link->block;
+
+	    if (block->end == inst) {
+	       printf("   END B%d", block->block_num);
+	       foreach_list(successor_node, &block->children) {
+		  bblock_link *successor_link =
+		     (bblock_link *)successor_node;
+		  bblock_t *successor_block = successor_link->block;
+		  printf(" ->B%d", successor_block->block_num);
+	       }
+	       printf("\n");
+	    }
+	 }
+      }
+
+      last_native_insn_offset = p->next_insn_offset;
+   }
+
+   if (unlikely(INTEL_DEBUG & DEBUG_WM)) {
+      printf("\n");
+   }
+
+   brw_set_uip_jip(p);
+
+   /* OK, while the INTEL_DEBUG=wm above is very nice for debugging FS
+    * emit issues, it doesn't get the jump distances into the output,
+    * which is often something we want to debug.  So this is here in
+    * case you're doing that.
+    */
+   if (0) {
+      brw_dump_compile(p, stdout, 0, p->next_insn_offset);
+   }
+}
+
+const unsigned *
+fs_generator::generate_assembly(exec_list *simd8_instructions,
+                                exec_list *simd16_instructions,
+                                unsigned *assembly_size)
+{
+   dispatch_width = 8;
+   generate_code(simd8_instructions);
+
+   if (simd16_instructions) {
+      /* We have to do a compaction pass now, or the one at the end of
+       * execution will squash down where our prog_offset start needs
+       * to be.
+       */
+      brw_compact_instructions(p);
+
+      /* align to 64 byte boundary. */
+      while ((p->nr_insn * sizeof(struct brw_instruction)) % 64) {
+         brw_NOP(p);
+      }
+
+      /* Save off the start of this 16-wide program */
+      c->prog_data.prog_offset_16 = p->nr_insn * sizeof(struct brw_instruction);
+
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+
+      dispatch_width = 16;
+      generate_code(simd16_instructions);
+   }
+
+   return brw_get_program(p, assembly_size);
+}
+@
+
+
+1.3
+log
+@Merge Mesa 9.2.5
+@
+text
+@@
+
+
+1.2
+log
+@Merge Mesa 9.2.0
+@
+text
+@d110 1
+a110 1
+   if (fp->UsesKill) {
+@
+
+
+1.1
+log
+@Upate to libGL 7.11.2
+
+Tested by jsg@@, matthieu@@ and ajacoutot@@, ok mattieu@@
+@
+text
+@d37 23
+a59 1
+#include "../glsl/ir_print_visitor.h"
+d62 1
+a62 1
+fs_visitor::generate_fb_write(fs_inst *inst)
+d64 36
+a99 1
+   GLboolean eot = inst->eot;
+d101 1
+d110 11
+d122 1
+a122 1
+      if (intel->gen >= 6) {
+d129 10
+d159 7
+d169 1
+a169 1
+		c->dispatch_width,
+d172 1
+d187 1
+a187 1
+fs_visitor::generate_pixel_xy(struct brw_reg dst, bool is_x)
+d201 1
+a201 1
+   if (c->dispatch_width == 16) {
+d215 1
+a215 1
+fs_visitor::generate_linterp(fs_inst *inst,
+d224 1
+a224 1
+       (intel->gen >= 6 || (delta_x.nr & 1) == 0)) {
+d233 3
+a235 2
+fs_visitor::generate_math(fs_inst *inst,
+			  struct brw_reg dst, struct brw_reg *src)
+d237 17
+a253 1
+   int op;
+d255 24
+a278 29
+   switch (inst->opcode) {
+   case FS_OPCODE_RCP:
+      op = BRW_MATH_FUNCTION_INV;
+      break;
+   case FS_OPCODE_RSQ:
+      op = BRW_MATH_FUNCTION_RSQ;
+      break;
+   case FS_OPCODE_SQRT:
+      op = BRW_MATH_FUNCTION_SQRT;
+      break;
+   case FS_OPCODE_EXP2:
+      op = BRW_MATH_FUNCTION_EXP;
+      break;
+   case FS_OPCODE_LOG2:
+      op = BRW_MATH_FUNCTION_LOG;
+      break;
+   case FS_OPCODE_POW:
+      op = BRW_MATH_FUNCTION_POW;
+      break;
+   case FS_OPCODE_SIN:
+      op = BRW_MATH_FUNCTION_SIN;
+      break;
+   case FS_OPCODE_COS:
+      op = BRW_MATH_FUNCTION_COS;
+      break;
+   default:
+      assert(!"not reached: unknown math function");
+      op = 0;
+      break;
+d280 1
+d282 12
+a293 2
+   if (intel->gen >= 6) {
+      assert(inst->mlen == 0);
+d295 6
+a300 3
+      if (inst->opcode == FS_OPCODE_POW) {
+	 brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+	 brw_math2(p, dst, op, src[0], src[1]);
+d302 6
+a307 14
+	 if (c->dispatch_width == 16) {
+	    brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	    brw_math2(p, sechalf(dst), op, sechalf(src[0]), sechalf(src[1]));
+	    brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 }
+      } else {
+	 brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+	 brw_math(p, dst,
+		  op,
+		  inst->saturate ? BRW_MATH_SATURATE_SATURATE :
+		  BRW_MATH_SATURATE_NONE,
+		  0, src[0],
+		  BRW_MATH_DATA_VECTOR,
+		  BRW_MATH_PRECISION_FULL);
+d309 1
+a309 14
+	 if (c->dispatch_width == 16) {
+	    brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	    brw_math(p, sechalf(dst),
+		     op,
+		     inst->saturate ? BRW_MATH_SATURATE_SATURATE :
+		     BRW_MATH_SATURATE_NONE,
+		     0, sechalf(src[0]),
+		     BRW_MATH_DATA_VECTOR,
+		     BRW_MATH_PRECISION_FULL);
+	    brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 }
+      }
+   } else /* gen <= 5 */{
+      assert(inst->mlen >= 1);
+d311 10
+a320 2
+      brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+      brw_math(p, dst,
+d322 1
+a322 3
+	       inst->saturate ? BRW_MATH_SATURATE_SATURATE :
+	       BRW_MATH_SATURATE_NONE,
+	       inst->base_mrf, src[0],
+d326 3
+a328 9
+      if (c->dispatch_width == 16) {
+	 brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	 brw_math(p, sechalf(dst),
+		  op,
+		  inst->saturate ? BRW_MATH_SATURATE_SATURATE :
+		  BRW_MATH_SATURATE_NONE,
+		  inst->base_mrf + 1, sechalf(src[0]),
+		  BRW_MATH_DATA_VECTOR,
+		  BRW_MATH_PRECISION_FULL);
+d330 10
+a339 2
+	 brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+      }
+d341 10
+d354 1
+a354 1
+fs_visitor::generate_tex(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+d359 13
+d373 1
+a373 1
+   if (c->dispatch_width == 16)
+d376 1
+a376 1
+   if (intel->gen >= 5) {
+d378 1
+a378 1
+      case FS_OPCODE_TEX:
+d392 1
+a392 1
+      case FS_OPCODE_TXL:
+d399 26
+a424 3
+      case FS_OPCODE_TXD:
+	 /* There is no sample_d_c message; comparisons are done manually */
+	 msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_DERIVS;
+d429 1
+a429 1
+      case FS_OPCODE_TEX:
+d433 1
+a433 1
+	 assert(c->dispatch_width == 8);
+d451 1
+a451 1
+      case FS_OPCODE_TXL:
+d461 1
+a461 1
+      case FS_OPCODE_TXD:
+d466 13
+d488 22
+a515 1
+	      WRITEMASK_XYZW,
+a518 1
+	      0,
+d520 2
+a521 1
+	      simd_mode);
+d552 1
+a552 1
+fs_visitor::generate_ddx(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+d569 4
+d574 2
+a575 1
+fs_visitor::generate_ddy(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+d589 4
+a592 1
+   brw_ADD(p, dst, src0, negate(src1));
+d596 1
+a596 1
+fs_visitor::generate_discard(fs_inst *inst)
+d598 1
+a598 1
+   struct brw_reg f0 = brw_flag_reg();
+d600 5
+a604 3
+   if (intel->gen >= 6) {
+      struct brw_reg g1 = retype(brw_vec1_grf(1, 7), BRW_REGISTER_TYPE_UW);
+      struct brw_reg some_register;
+d606 4
+a609 41
+      /* As of gen6, we no longer have the mask register to look at,
+       * so life gets a bit more complicated.
+       */
+
+      /* Load the flag register with all ones. */
+      brw_push_insn_state(p);
+      brw_set_mask_control(p, BRW_MASK_DISABLE);
+      brw_MOV(p, f0, brw_imm_uw(0xffff));
+      brw_pop_insn_state(p);
+
+      /* Do a comparison that should always fail, to produce 0s in the flag
+       * reg where we have active channels.
+       */
+      some_register = retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UW);
+      brw_CMP(p, retype(brw_null_reg(), BRW_REGISTER_TYPE_UD),
+	      BRW_CONDITIONAL_NZ, some_register, some_register);
+
+      /* Undo CMP's whacking of predication*/
+      brw_set_predicate_control(p, BRW_PREDICATE_NONE);
+
+      brw_push_insn_state(p);
+      brw_set_mask_control(p, BRW_MASK_DISABLE);
+      brw_AND(p, g1, f0, g1);
+      brw_pop_insn_state(p);
+   } else {
+      struct brw_reg g0 = retype(brw_vec1_grf(0, 0), BRW_REGISTER_TYPE_UW);
+
+      brw_push_insn_state(p);
+      brw_set_mask_control(p, BRW_MASK_DISABLE);
+      brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+
+      /* Unlike the 965, we have the mask reg, so we just need
+       * somewhere to invert that (containing channels to be disabled)
+       * so it can be ANDed with the mask of pixels still to be
+       * written. Use the flag reg for consistency with gen6+.
+       */
+      brw_NOT(p, f0, brw_mask_reg(1)); /* IMASK */
+      brw_AND(p, g0, f0, g0);
+
+      brw_pop_insn_state(p);
+   }
+d613 1
+a613 1
+fs_visitor::generate_spill(fs_inst *inst, struct brw_reg src)
+d625 13
+a637 1
+fs_visitor::generate_unspill(fs_inst *inst, struct brw_reg dst)
+d641 37
+a677 9
+   /* Clear any post destination dependencies that would be ignored by
+    * the block read.  See the B-Spec for pre-gen5 send instruction.
+    *
+    * This could use a better solution, since texture sampling and
+    * math reads could potentially run into it as well -- anywhere
+    * that we have a SEND with a destination that is a register that
+    * was written but not read within the last N instructions (what's
+    * N?  unsure).  This is rare because of dead code elimination, but
+    * not impossible.
+d679 13
+a691 2
+   if (intel->gen == 4 && !intel->is_g4x)
+      brw_MOV(p, brw_null_reg(), dst);
+d693 22
+a714 2
+   brw_oword_block_read_scratch(p, dst, brw_message_reg(inst->base_mrf), 1,
+				inst->offset);
+d716 5
+a720 4
+   if (intel->gen == 4 && !intel->is_g4x) {
+      /* gen4 errata: destination from a send can't be used as a
+       * destination until it's been read.  Just read it so we don't
+       * have to worry.
+d722 5
+a726 1
+      brw_MOV(p, brw_null_reg(), dst);
+d728 28
+d759 4
+a762 1
+fs_visitor::generate_pull_constant_load(fs_inst *inst, struct brw_reg dst)
+d764 52
+a815 1
+   assert(inst->mlen != 0);
+d817 5
+a821 12
+   /* Clear any post destination dependencies that would be ignored by
+    * the block read.  See the B-Spec for pre-gen5 send instruction.
+    *
+    * This could use a better solution, since texture sampling and
+    * math reads could potentially run into it as well -- anywhere
+    * that we have a SEND with a destination that is a register that
+    * was written but not read within the last N instructions (what's
+    * N?  unsure).  This is rare because of dead code elimination, but
+    * not impossible.
+    */
+   if (intel->gen == 4 && !intel->is_g4x)
+      brw_MOV(p, brw_null_reg(), dst);
+a822 2
+   brw_oword_block_read(p, dst, brw_message_reg(inst->base_mrf),
+			inst->offset, SURF_INDEX_FRAG_CONST_BUFFER);
+d824 14
+a837 6
+   if (intel->gen == 4 && !intel->is_g4x) {
+      /* gen4 errata: destination from a send can't be used as a
+       * destination until it's been read.  Just read it so we don't
+       * have to worry.
+       */
+      brw_MOV(p, brw_null_reg(), dst);
+d851 1
+a851 2
+	 brw_reg = brw_vec8_reg(reg->file,
+				reg->hw_reg, 0);
+d853 1
+a853 2
+	 brw_reg = brw_vec1_reg(reg->file,
+				reg->hw_reg, reg->smear);
+d876 1
+a876 1
+   case FIXED_HW_REG:
+d900 110
+d1011 4
+a1014 1
+fs_visitor::generate_code()
+d1016 18
+a1033 3
+   int last_native_inst = p->nr_insn;
+   const char *last_annotation_string = NULL;
+   ir_instruction *last_annotation_ir = NULL;
+d1035 9
+a1043 6
+   int loop_stack_array_size = 16;
+   int loop_stack_depth = 0;
+   brw_instruction **loop_stack =
+      rzalloc_array(this->mem_ctx, brw_instruction *, loop_stack_array_size);
+   int *if_depth_in_loop =
+      rzalloc_array(this->mem_ctx, int, loop_stack_array_size);
+d1045 6
+d1053 7
+a1059 2
+      printf("Native code for fragment shader %d (%d-wide dispatch):\n",
+	     prog->Name, c->dispatch_width);
+d1062 6
+a1067 2
+   foreach_iter(exec_list_iterator, iter, this->instructions) {
+      fs_inst *inst = (fs_inst *)iter.get();
+d1071 16
+d1091 10
+a1100 1
+	       last_annotation_ir->print();
+d1113 10
+d1127 1
+a1127 1
+      brw_set_predicate_control(p, inst->predicated);
+d1129 1
+d1131 1
+d1133 1
+a1133 1
+      if (inst->force_uncompressed || c->dispatch_width == 8) {
+d1151 33
+d1219 6
+a1224 1
+
+d1231 48
+d1283 1
+a1283 1
+	    assert(intel->gen == 6);
+d1286 1
+a1286 1
+	    brw_IF(p, c->dispatch_width == 16 ? BRW_EXECUTE_16 : BRW_EXECUTE_8);
+a1287 1
+	 if_depth_in_loop[loop_stack_depth]++;
+a1294 1
+	 if_depth_in_loop[loop_stack_depth]--;
+d1298 1
+a1298 9
+	 loop_stack[loop_stack_depth++] = brw_DO(p, BRW_EXECUTE_8);
+	 if (loop_stack_array_size <= loop_stack_depth) {
+	    loop_stack_array_size *= 2;
+	    loop_stack = reralloc(this->mem_ctx, loop_stack, brw_instruction *,
+				  loop_stack_array_size);
+	    if_depth_in_loop = reralloc(this->mem_ctx, if_depth_in_loop, int,
+				        loop_stack_array_size);
+	 }
+	 if_depth_in_loop[loop_stack_depth] = 0;
+d1302 1
+a1302 1
+	 brw_BREAK(p, if_depth_in_loop[loop_stack_depth]);
+d1307 2
+a1308 2
+	 if (intel->gen >= 6)
+	    gen6_CONT(p, loop_stack[loop_stack_depth - 1]);
+d1310 1
+a1310 1
+	    brw_CONT(p, if_depth_in_loop[loop_stack_depth]);
+d1314 19
+a1332 23
+      case BRW_OPCODE_WHILE: {
+	 struct brw_instruction *inst0, *inst1;
+	 GLuint br = 1;
+
+	 if (intel->gen >= 5)
+	    br = 2;
+
+	 assert(loop_stack_depth > 0);
+	 loop_stack_depth--;
+	 inst0 = inst1 = brw_WHILE(p, loop_stack[loop_stack_depth]);
+	 if (intel->gen < 6) {
+	    /* patch all the BREAK/CONT instructions from last BGNLOOP */
+	    while (inst0 > loop_stack[loop_stack_depth]) {
+	       inst0--;
+	       if (inst0->header.opcode == BRW_OPCODE_BREAK &&
+		   inst0->bits3.if_else.jump_count == 0) {
+		  inst0->bits3.if_else.jump_count = br * (inst1 - inst0 + 1);
+	    }
+	       else if (inst0->header.opcode == BRW_OPCODE_CONTINUE &&
+			inst0->bits3.if_else.jump_count == 0) {
+		  inst0->bits3.if_else.jump_count = br * (inst1 - inst0);
+	       }
+	    }
+a1333 1
+      }
+d1335 10
+a1344 10
+
+      case FS_OPCODE_RCP:
+      case FS_OPCODE_RSQ:
+      case FS_OPCODE_SQRT:
+      case FS_OPCODE_EXP2:
+      case FS_OPCODE_LOG2:
+      case FS_OPCODE_POW:
+      case FS_OPCODE_SIN:
+      case FS_OPCODE_COS:
+	 generate_math(inst, dst, src);
+d1358 1
+a1358 1
+      case FS_OPCODE_TEX:
+d1360 6
+a1365 2
+      case FS_OPCODE_TXD:
+      case FS_OPCODE_TXL:
+a1367 3
+      case FS_OPCODE_DISCARD:
+	 generate_discard(inst);
+	 break;
+d1372 5
+a1376 1
+	 generate_ddy(inst, dst, src[0]);
+d1387 14
+a1400 2
+      case FS_OPCODE_PULL_CONSTANT_LOAD:
+	 generate_pull_constant_load(inst, dst);
+d1406 33
+d1440 1
+a1440 1
+	 if (inst->opcode < (int)ARRAY_SIZE(brw_opcodes)) {
+d1442 1
+a1442 1
+			  brw_opcodes[inst->opcode].name);
+d1446 1
+a1446 1
+	 fail("unsupported opcode in FS\n");
+d1450 16
+a1465 7
+	 for (unsigned int i = last_native_inst; i < p->nr_insn; i++) {
+	    if (0) {
+	       printf("0x%08x 0x%08x 0x%08x 0x%08x ",
+		      ((uint32_t *)&p->store[i])[3],
+		      ((uint32_t *)&p->store[i])[2],
+		      ((uint32_t *)&p->store[i])[1],
+		      ((uint32_t *)&p->store[i])[0]);
+a1466 1
+	    brw_disasm(stdout, &p->store[i], intel->gen);
+d1470 1
+a1470 1
+      last_native_inst = p->nr_insn;
+a1476 3
+   ralloc_free(loop_stack);
+   ralloc_free(if_depth_in_loop);
+
+d1485 22
+a1506 9
+      if (unlikely(INTEL_DEBUG & DEBUG_WM)) {
+	 for (unsigned int i = 0; i < p->nr_insn; i++) {
+	    printf("0x%08x 0x%08x 0x%08x 0x%08x ",
+		   ((uint32_t *)&p->store[i])[3],
+		   ((uint32_t *)&p->store[i])[2],
+		   ((uint32_t *)&p->store[i])[1],
+		   ((uint32_t *)&p->store[i])[0]);
+	    brw_disasm(stdout, &p->store[i], intel->gen);
+	 }
+d1508 8
+d1517 2
+@
+
+
+1.1.1.1
+log
+@Import Mesa 9.2.0
+@
+text
+@d37 1
+a37 23
+#include "brw_cfg.h"
+
+fs_generator::fs_generator(struct brw_context *brw,
+                           struct brw_wm_compile *c,
+                           struct gl_shader_program *prog,
+                           struct gl_fragment_program *fp,
+                           bool dual_source_output)
+
+   : brw(brw), c(c), prog(prog), fp(fp), dual_source_output(dual_source_output)
+{
+   ctx = &brw->ctx;
+
+   shader = prog ? prog->_LinkedShaders[MESA_SHADER_FRAGMENT] : NULL;
+
+   mem_ctx = c;
+
+   p = rzalloc(mem_ctx, struct brw_compile);
+   brw_init_compile(brw, p, mem_ctx);
+}
+
+fs_generator::~fs_generator()
+{
+}
+d40 1
+a40 1
+fs_generator::patch_discard_jumps_to_fb_writes()
+d42 1
+a42 36
+   if (brw->gen < 6 || this->discard_halt_patches.is_empty())
+      return;
+
+   /* There is a somewhat strange undocumented requirement of using
+    * HALT, according to the simulator.  If some channel has HALTed to
+    * a particular UIP, then by the end of the program, every channel
+    * must have HALTed to that UIP.  Furthermore, the tracking is a
+    * stack, so you can't do the final halt of a UIP after starting
+    * halting to a new UIP.
+    *
+    * Symptoms of not emitting this instruction on actual hardware
+    * included GPU hangs and sparkly rendering on the piglit discard
+    * tests.
+    */
+   struct brw_instruction *last_halt = gen6_HALT(p);
+   last_halt->bits3.break_cont.uip = 2;
+   last_halt->bits3.break_cont.jip = 2;
+
+   int ip = p->nr_insn;
+
+   foreach_list(node, &this->discard_halt_patches) {
+      ip_record *patch_ip = (ip_record *)node;
+      struct brw_instruction *patch = &p->store[patch_ip->ip];
+
+      assert(patch->header.opcode == BRW_OPCODE_HALT);
+      /* HALT takes a half-instruction distance from the pre-incremented IP. */
+      patch->bits3.break_cont.uip = (ip - patch_ip->ip) * 2;
+   }
+
+   this->discard_halt_patches.make_empty();
+}
+
+void
+fs_generator::generate_fb_write(fs_inst *inst)
+{
+   bool eot = inst->eot;
+a43 1
+   uint32_t msg_control;
+a51 11
+   if (fp->UsesKill) {
+      struct brw_reg pixel_mask;
+
+      if (brw->gen >= 6)
+         pixel_mask = retype(brw_vec1_grf(1, 7), BRW_REGISTER_TYPE_UW);
+      else
+         pixel_mask = retype(brw_vec1_grf(0, 0), BRW_REGISTER_TYPE_UW);
+
+      brw_MOV(p, pixel_mask, brw_flag_reg(0, 1));
+   }
+
+d53 1
+a53 1
+      if (brw->gen >= 6) {
+a59 10
+         if (inst->target > 0 && c->key.replicate_alpha) {
+            /* Set "Source0 Alpha Present to RenderTarget" bit in message
+             * header.
+             */
+            brw_OR(p,
+		   vec1(retype(brw_message_reg(inst->base_mrf), BRW_REGISTER_TYPE_UD)),
+		   vec1(retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UD)),
+		   brw_imm_ud(0x1 << 11));
+         }
+
+a79 7
+   if (this->dual_source_output)
+      msg_control = BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD8_DUAL_SOURCE_SUBSPAN01;
+   else if (dispatch_width == 16)
+      msg_control = BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD16_SINGLE_SOURCE;
+   else
+      msg_control = BRW_DATAPORT_RENDER_TARGET_WRITE_SIMD8_SINGLE_SOURCE_SUBSPAN01;
+
+d83 1
+a83 1
+		dispatch_width,
+a85 1
+		msg_control,
+d100 1
+a100 1
+fs_generator::generate_pixel_xy(struct brw_reg dst, bool is_x)
+d114 1
+a114 1
+   if (dispatch_width == 16) {
+d128 1
+a128 1
+fs_generator::generate_linterp(fs_inst *inst,
+d137 1
+a137 1
+       (brw->gen >= 6 || (delta_x.nr & 1) == 0)) {
+d146 2
+a147 3
+fs_generator::generate_math1_gen7(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0)
+d149 1
+a149 7
+   assert(inst->mlen == 0);
+   brw_math(p, dst,
+	    brw_math_function(inst->opcode),
+	    0, src0,
+	    BRW_MATH_DATA_VECTOR,
+	    BRW_MATH_PRECISION_FULL);
+}
+d151 29
+a179 34
+void
+fs_generator::generate_math2_gen7(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0,
+			        struct brw_reg src1)
+{
+   assert(inst->mlen == 0);
+   brw_math2(p, dst, brw_math_function(inst->opcode), src0, src1);
+}
+
+void
+fs_generator::generate_math1_gen6(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0)
+{
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen == 0);
+
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_math(p, dst,
+	    op,
+	    0, src0,
+	    BRW_MATH_DATA_VECTOR,
+	    BRW_MATH_PRECISION_FULL);
+
+   if (dispatch_width == 16) {
+      brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      brw_math(p, sechalf(dst),
+	       op,
+	       0, sechalf(src0),
+	       BRW_MATH_DATA_VECTOR,
+	       BRW_MATH_PRECISION_FULL);
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+a180 1
+}
+d182 2
+a183 7
+void
+fs_generator::generate_math2_gen6(fs_inst *inst,
+			        struct brw_reg dst,
+			        struct brw_reg src0,
+			        struct brw_reg src1)
+{
+   int op = brw_math_function(inst->opcode);
+d185 3
+a187 1
+   assert(inst->mlen == 0);
+d189 14
+a202 2
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_math2(p, dst, op, src0, src1);
+d204 14
+a217 6
+   if (dispatch_width == 16) {
+      brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      brw_math2(p, sechalf(dst), op, sechalf(src0), sechalf(src1));
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+   }
+}
+d219 2
+a220 19
+void
+fs_generator::generate_math_gen4(fs_inst *inst,
+			       struct brw_reg dst,
+			       struct brw_reg src)
+{
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen >= 1);
+
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_math(p, dst,
+	    op,
+	    inst->base_mrf, src,
+	    BRW_MATH_DATA_VECTOR,
+	    BRW_MATH_PRECISION_FULL);
+
+   if (dispatch_width == 16) {
+      brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+      brw_math(p, sechalf(dst),
+d222 3
+a224 1
+	       inst->base_mrf + 1, sechalf(src),
+d228 9
+a236 3
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+   }
+}
+d238 2
+a239 10
+void
+fs_generator::generate_math_g45(fs_inst *inst,
+                                struct brw_reg dst,
+                                struct brw_reg src)
+{
+   if (inst->opcode == SHADER_OPCODE_POW ||
+       inst->opcode == SHADER_OPCODE_INT_QUOTIENT ||
+       inst->opcode == SHADER_OPCODE_INT_REMAINDER) {
+      generate_math_gen4(inst, dst, src);
+      return;
+a240 10
+
+   int op = brw_math_function(inst->opcode);
+
+   assert(inst->mlen >= 1);
+
+   brw_math(p, dst,
+            op,
+            inst->base_mrf, src,
+            BRW_MATH_DATA_VECTOR,
+            BRW_MATH_PRECISION_FULL);
+d244 1
+a244 1
+fs_generator::generate_tex(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+a248 13
+   uint32_t return_format;
+
+   switch (dst.type) {
+   case BRW_REGISTER_TYPE_D:
+      return_format = BRW_SAMPLER_RETURN_FORMAT_SINT32;
+      break;
+   case BRW_REGISTER_TYPE_UD:
+      return_format = BRW_SAMPLER_RETURN_FORMAT_UINT32;
+      break;
+   default:
+      return_format = BRW_SAMPLER_RETURN_FORMAT_FLOAT32;
+      break;
+   }
+d250 1
+a250 1
+   if (dispatch_width == 16)
+d253 1
+a253 1
+   if (brw->gen >= 5) {
+d255 1
+a255 1
+      case SHADER_OPCODE_TEX:
+d269 1
+a269 1
+      case SHADER_OPCODE_TXL:
+d276 3
+a278 26
+      case SHADER_OPCODE_TXS:
+	 msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_RESINFO;
+	 break;
+      case SHADER_OPCODE_TXD:
+         if (inst->shadow_compare) {
+            /* Gen7.5+.  Otherwise, lowered by brw_lower_texture_gradients(). */
+            assert(brw->is_haswell);
+            msg_type = HSW_SAMPLER_MESSAGE_SAMPLE_DERIV_COMPARE;
+         } else {
+            msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_DERIVS;
+         }
+	 break;
+      case SHADER_OPCODE_TXF:
+	 msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LD;
+	 break;
+      case SHADER_OPCODE_TXF_MS:
+         if (brw->gen >= 7)
+            msg_type = GEN7_SAMPLER_MESSAGE_SAMPLE_LD2DMS;
+         else
+            msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LD;
+         break;
+      case SHADER_OPCODE_LOD:
+         msg_type = GEN5_SAMPLER_MESSAGE_LOD;
+         break;
+      default:
+	 assert(!"not reached");
+d283 1
+a283 1
+      case SHADER_OPCODE_TEX:
+d287 1
+a287 1
+	 assert(dispatch_width == 8);
+d305 1
+a305 1
+      case SHADER_OPCODE_TXL:
+d315 1
+a315 1
+      case SHADER_OPCODE_TXD:
+a319 13
+      case SHADER_OPCODE_TXF:
+	 assert(inst->mlen == 9);
+	 msg_type = BRW_SAMPLER_MESSAGE_SIMD16_LD;
+	 simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+	 break;
+      case SHADER_OPCODE_TXS:
+	 assert(inst->mlen == 3);
+	 msg_type = BRW_SAMPLER_MESSAGE_SIMD16_RESINFO;
+	 simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+	 break;
+      default:
+	 assert(!"not reached");
+	 break;
+a328 22
+   /* Load the message header if present.  If there's a texture offset,
+    * we need to set it up explicitly and load the offset bitfield.
+    * Otherwise, we can use an implied move from g0 to the first message reg.
+    */
+   if (inst->texture_offset) {
+      brw_push_insn_state(p);
+      brw_set_mask_control(p, BRW_MASK_DISABLE);
+      brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+      /* Explicitly set up the message header by copying g0 to the MRF. */
+      brw_MOV(p, retype(brw_message_reg(inst->base_mrf), BRW_REGISTER_TYPE_UD),
+                 retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UD));
+
+      /* Then set the offset bits in DWord 2. */
+      brw_MOV(p, retype(brw_vec1_reg(BRW_MESSAGE_REGISTER_FILE,
+                                     inst->base_mrf, 2), BRW_REGISTER_TYPE_UD),
+                 brw_imm_ud(inst->texture_offset));
+      brw_pop_insn_state(p);
+   } else if (inst->header_present) {
+      /* Set up an implied move from g0 to the MRF. */
+      src = retype(brw_vec8_grf(0, 0), BRW_REGISTER_TYPE_UW);
+   }
+
+d335 1
+d339 1
+d341 1
+a341 2
+	      simd_mode,
+	      return_format);
+d372 1
+a372 1
+fs_generator::generate_ddx(fs_inst *inst, struct brw_reg dst, struct brw_reg src)
+a388 4
+/* The negate_value boolean is used to negate the derivative computation for
+ * FBOs, since they place the origin at the upper left instead of the lower
+ * left.
+ */
+d390 1
+a390 2
+fs_generator::generate_ddy(fs_inst *inst, struct brw_reg dst, struct brw_reg src,
+                         bool negate_value)
+d404 1
+a404 4
+   if (negate_value)
+      brw_ADD(p, dst, src1, negate(src0));
+   else
+      brw_ADD(p, dst, src0, negate(src1));
+d408 1
+a408 1
+fs_generator::generate_discard_jump(fs_inst *inst)
+d410 36
+a445 1
+   assert(brw->gen >= 6);
+d447 7
+a453 5
+   /* This HALT will be patched up at FB write time to point UIP at the end of
+    * the program, and at brw_uip_jip() JIP will be set to the end of the
+    * current block (or the program).
+    */
+   this->discard_halt_patches.push_tail(new(mem_ctx) ip_record(p->nr_insn));
+d455 2
+a456 4
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   gen6_HALT(p);
+   brw_pop_insn_state(p);
+d460 1
+a460 1
+fs_generator::generate_spill(fs_inst *inst, struct brw_reg src)
+d472 1
+a472 1
+fs_generator::generate_unspill(fs_inst *inst, struct brw_reg dst)
+d476 13
+d491 8
+d502 1
+a502 4
+fs_generator::generate_uniform_pull_constant_load(fs_inst *inst,
+                                                  struct brw_reg dst,
+                                                  struct brw_reg index,
+                                                  struct brw_reg offset)
+d506 12
+a517 7
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   assert(offset.file == BRW_IMMEDIATE_VALUE &&
+	  offset.type == BRW_REGISTER_TYPE_UD);
+   uint32_t read_offset = offset.dw1.ud;
+d520 1
+a520 65
+			read_offset, surf_index);
+}
+
+void
+fs_generator::generate_uniform_pull_constant_load_gen7(fs_inst *inst,
+                                                       struct brw_reg dst,
+                                                       struct brw_reg index,
+                                                       struct brw_reg offset)
+{
+   assert(inst->mlen == 0);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   assert(offset.file == BRW_GENERAL_REGISTER_FILE);
+   /* Reference just the dword we need, to avoid angering validate_reg(). */
+   offset = brw_vec1_grf(offset.nr, 0);
+
+   brw_push_insn_state(p);
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   struct brw_instruction *send = brw_next_insn(p, BRW_OPCODE_SEND);
+   brw_pop_insn_state(p);
+
+   /* We use the SIMD4x2 mode because we want to end up with 4 components in
+    * the destination loaded consecutively from the same offset (which appears
+    * in the first component, and the rest are ignored).
+    */
+   dst.width = BRW_WIDTH_4;
+   brw_set_dest(p, send, dst);
+   brw_set_src0(p, send, offset);
+   brw_set_sampler_message(p, send,
+                           surf_index,
+                           0, /* LD message ignores sampler unit */
+                           GEN5_SAMPLER_MESSAGE_SAMPLE_LD,
+                           1, /* rlen */
+                           1, /* mlen */
+                           false, /* no header */
+                           BRW_SAMPLER_SIMD_MODE_SIMD4X2,
+                           0);
+}
+
+void
+fs_generator::generate_varying_pull_constant_load(fs_inst *inst,
+                                                  struct brw_reg dst,
+                                                  struct brw_reg index,
+                                                  struct brw_reg offset)
+{
+   assert(brw->gen < 7); /* Should use the gen7 variant. */
+   assert(inst->header_present);
+   assert(inst->mlen);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   uint32_t simd_mode, rlen, msg_type;
+   if (dispatch_width == 16) {
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+      rlen = 8;
+   } else {
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD8;
+      rlen = 4;
+   }
+d522 4
+a525 5
+   if (brw->gen >= 5)
+      msg_type = GEN5_SAMPLER_MESSAGE_SAMPLE_LD;
+   else {
+      /* We always use the SIMD16 message so that we only have to load U, and
+       * not V or R.
+d527 1
+a527 116
+      msg_type = BRW_SAMPLER_MESSAGE_SIMD16_LD;
+      assert(inst->mlen == 3);
+      assert(inst->regs_written == 8);
+      rlen = 8;
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+   }
+
+   struct brw_reg offset_mrf = retype(brw_message_reg(inst->base_mrf + 1),
+                                      BRW_REGISTER_TYPE_D);
+   brw_MOV(p, offset_mrf, offset);
+
+   struct brw_reg header = brw_vec8_grf(0, 0);
+   gen6_resolve_implied_move(p, &header, inst->base_mrf);
+
+   struct brw_instruction *send = brw_next_insn(p, BRW_OPCODE_SEND);
+   send->header.compression_control = BRW_COMPRESSION_NONE;
+   brw_set_dest(p, send, dst);
+   brw_set_src0(p, send, header);
+   if (brw->gen < 6)
+      send->header.destreg__conditionalmod = inst->base_mrf;
+
+   /* Our surface is set up as floats, regardless of what actual data is
+    * stored in it.
+    */
+   uint32_t return_format = BRW_SAMPLER_RETURN_FORMAT_FLOAT32;
+   brw_set_sampler_message(p, send,
+                           surf_index,
+                           0, /* sampler (unused) */
+                           msg_type,
+                           rlen,
+                           inst->mlen,
+                           inst->header_present,
+                           simd_mode,
+                           return_format);
+}
+
+void
+fs_generator::generate_varying_pull_constant_load_gen7(fs_inst *inst,
+                                                       struct brw_reg dst,
+                                                       struct brw_reg index,
+                                                       struct brw_reg offset)
+{
+   assert(brw->gen >= 7);
+   /* Varying-offset pull constant loads are treated as a normal expression on
+    * gen7, so the fact that it's a send message is hidden at the IR level.
+    */
+   assert(!inst->header_present);
+   assert(!inst->mlen);
+
+   assert(index.file == BRW_IMMEDIATE_VALUE &&
+	  index.type == BRW_REGISTER_TYPE_UD);
+   uint32_t surf_index = index.dw1.ud;
+
+   uint32_t simd_mode, rlen, mlen;
+   if (dispatch_width == 16) {
+      mlen = 2;
+      rlen = 8;
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD16;
+   } else {
+      mlen = 1;
+      rlen = 4;
+      simd_mode = BRW_SAMPLER_SIMD_MODE_SIMD8;
+   }
+
+   struct brw_instruction *send = brw_next_insn(p, BRW_OPCODE_SEND);
+   brw_set_dest(p, send, dst);
+   brw_set_src0(p, send, offset);
+   brw_set_sampler_message(p, send,
+                           surf_index,
+                           0, /* LD message ignores sampler unit */
+                           GEN5_SAMPLER_MESSAGE_SAMPLE_LD,
+                           rlen,
+                           mlen,
+                           false, /* no header */
+                           simd_mode,
+                           0);
+}
+
+/**
+ * Cause the current pixel/sample mask (from R1.7 bits 15:0) to be transferred
+ * into the flags register (f0.0).
+ *
+ * Used only on Gen6 and above.
+ */
+void
+fs_generator::generate_mov_dispatch_to_flags(fs_inst *inst)
+{
+   struct brw_reg flags = brw_flag_reg(0, inst->flag_subreg);
+   struct brw_reg dispatch_mask;
+
+   if (brw->gen >= 6)
+      dispatch_mask = retype(brw_vec1_grf(1, 7), BRW_REGISTER_TYPE_UW);
+   else
+      dispatch_mask = retype(brw_vec1_grf(0, 0), BRW_REGISTER_TYPE_UW);
+
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   brw_MOV(p, flags, dispatch_mask);
+   brw_pop_insn_state(p);
+}
+
+
+static uint32_t brw_file_from_reg(fs_reg *reg)
+{
+   switch (reg->file) {
+   case ARF:
+      return BRW_ARCHITECTURE_REGISTER_FILE;
+   case GRF:
+      return BRW_GENERAL_REGISTER_FILE;
+   case MRF:
+      return BRW_MESSAGE_REGISTER_FILE;
+   case IMM:
+      return BRW_IMMEDIATE_VALUE;
+   default:
+      assert(!"not reached");
+      return BRW_GENERAL_REGISTER_FILE;
+d541 2
+a542 1
+	 brw_reg = brw_vec8_reg(brw_file_from_reg(reg), reg->reg, 0);
+d544 2
+a545 1
+	 brw_reg = brw_vec1_reg(brw_file_from_reg(reg), reg->reg, reg->smear);
+d568 1
+a568 1
+   case HW_REG:
+a591 7
+/**
+ * Sets the first word of a vgrf for gen7+ simd4x2 uniform pull constant
+ * sampler LD messages.
+ *
+ * We don't want to bake it into the send message's code generation because
+ * that means we don't get a chance to schedule the instructions.
+ */
+d593 1
+a593 3
+fs_generator::generate_set_simd4x2_offset(fs_inst *inst,
+                                          struct brw_reg dst,
+                                          struct brw_reg value)
+d595 3
+a597 85
+   assert(value.file == BRW_IMMEDIATE_VALUE);
+
+   brw_push_insn_state(p);
+   brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+   brw_set_mask_control(p, BRW_MASK_DISABLE);
+   brw_MOV(p, retype(brw_vec1_reg(dst.file, dst.nr, 0), value.type), value);
+   brw_pop_insn_state(p);
+}
+
+/**
+ * Change the register's data type from UD to W, doubling the strides in order
+ * to compensate for halving the data type width.
+ */
+static struct brw_reg
+ud_reg_to_w(struct brw_reg r)
+{
+   assert(r.type == BRW_REGISTER_TYPE_UD);
+   r.type = BRW_REGISTER_TYPE_W;
+
+   /* The BRW_*_STRIDE enums are defined so that incrementing the field
+    * doubles the real stride.
+    */
+   if (r.hstride != 0)
+      ++r.hstride;
+   if (r.vstride != 0)
+      ++r.vstride;
+
+   return r;
+}
+
+void
+fs_generator::generate_pack_half_2x16_split(fs_inst *inst,
+                                            struct brw_reg dst,
+                                            struct brw_reg x,
+                                            struct brw_reg y)
+{
+   assert(brw->gen >= 7);
+   assert(dst.type == BRW_REGISTER_TYPE_UD);
+   assert(x.type == BRW_REGISTER_TYPE_F);
+   assert(y.type == BRW_REGISTER_TYPE_F);
+
+   /* From the Ivybridge PRM, Vol4, Part3, Section 6.27 f32to16:
+    *
+    *   Because this instruction does not have a 16-bit floating-point type,
+    *   the destination data type must be Word (W).
+    *
+    *   The destination must be DWord-aligned and specify a horizontal stride
+    *   (HorzStride) of 2. The 16-bit result is stored in the lower word of
+    *   each destination channel and the upper word is not modified.
+    */
+   struct brw_reg dst_w = ud_reg_to_w(dst);
+
+   /* Give each 32-bit channel of dst the form below , where "." means
+    * unchanged.
+    *   0x....hhhh
+    */
+   brw_F32TO16(p, dst_w, y);
+
+   /* Now the form:
+    *   0xhhhh0000
+    */
+   brw_SHL(p, dst, dst, brw_imm_ud(16u));
+
+   /* And, finally the form of packHalf2x16's output:
+    *   0xhhhhllll
+    */
+   brw_F32TO16(p, dst_w, x);
+}
+
+void
+fs_generator::generate_unpack_half_2x16_split(fs_inst *inst,
+                                              struct brw_reg dst,
+                                              struct brw_reg src)
+{
+   assert(brw->gen >= 7);
+   assert(dst.type == BRW_REGISTER_TYPE_F);
+   assert(src.type == BRW_REGISTER_TYPE_UD);
+
+   /* From the Ivybridge PRM, Vol4, Part3, Section 6.26 f16to32:
+    *
+    *   Because this instruction does not have a 16-bit floating-point type,
+    *   the source data type must be Word (W). The destination type must be
+    *   F (Float).
+    */
+   struct brw_reg src_w = ud_reg_to_w(src);
+d599 6
+a604 36
+   /* Each channel of src has the form of unpackHalf2x16's input: 0xhhhhllll.
+    * For the Y case, we wish to access only the upper word; therefore
+    * a 16-bit subregister offset is needed.
+    */
+   assert(inst->opcode == FS_OPCODE_UNPACK_HALF_2x16_SPLIT_X ||
+          inst->opcode == FS_OPCODE_UNPACK_HALF_2x16_SPLIT_Y);
+   if (inst->opcode == FS_OPCODE_UNPACK_HALF_2x16_SPLIT_Y)
+      src_w.subnr += 2;
+
+   brw_F16TO32(p, dst, src_w);
+}
+
+void
+fs_generator::generate_shader_time_add(fs_inst *inst,
+                                       struct brw_reg payload,
+                                       struct brw_reg offset,
+                                       struct brw_reg value)
+{
+   assert(brw->gen >= 7);
+   brw_push_insn_state(p);
+   brw_set_mask_control(p, true);
+
+   assert(payload.file == BRW_GENERAL_REGISTER_FILE);
+   struct brw_reg payload_offset = retype(brw_vec1_grf(payload.nr, 0),
+                                          offset.type);
+   struct brw_reg payload_value = retype(brw_vec1_grf(payload.nr + 1, 0),
+                                         value.type);
+
+   assert(offset.file == BRW_IMMEDIATE_VALUE);
+   if (value.file == BRW_GENERAL_REGISTER_FILE) {
+      value.width = BRW_WIDTH_1;
+      value.hstride = BRW_HORIZONTAL_STRIDE_0;
+      value.vstride = BRW_VERTICAL_STRIDE_0;
+   } else {
+      assert(value.file == BRW_IMMEDIATE_VALUE);
+   }
+a605 16
+   /* Trying to deal with setup of the params from the IR is crazy in the FS8
+    * case, and we don't really care about squeezing every bit of performance
+    * out of this path, so we just emit the MOVs from here.
+    */
+   brw_MOV(p, payload_offset, offset);
+   brw_MOV(p, payload_value, value);
+   brw_shader_time_add(p, payload, SURF_INDEX_WM_SHADER_TIME);
+   brw_pop_insn_state(p);
+}
+
+void
+fs_generator::generate_code(exec_list *instructions)
+{
+   int last_native_insn_offset = p->next_insn_offset;
+   const char *last_annotation_string = NULL;
+   const void *last_annotation_ir = NULL;
+d608 2
+a609 7
+      if (shader) {
+         printf("Native code for fragment shader %d (%d-wide dispatch):\n",
+                prog->Name, dispatch_width);
+      } else {
+         printf("Native code for fragment program %d (%d-wide dispatch):\n",
+                fp->Base.Id, dispatch_width);
+      }
+d612 2
+a613 6
+   cfg_t *cfg = NULL;
+   if (unlikely(INTEL_DEBUG & DEBUG_WM))
+      cfg = new(mem_ctx) cfg_t(mem_ctx, instructions);
+
+   foreach_list(node, instructions) {
+      fs_inst *inst = (fs_inst *)node;
+a616 16
+	 foreach_list(node, &cfg->block_list) {
+	    bblock_link *link = (bblock_link *)node;
+	    bblock_t *block = link->block;
+
+	    if (block->start == inst) {
+	       printf("   START B%d", block->block_num);
+	       foreach_list(predecessor_node, &block->parents) {
+		  bblock_link *predecessor_link =
+		     (bblock_link *)predecessor_node;
+		  bblock_t *predecessor_block = predecessor_link->block;
+		  printf(" <-B%d", predecessor_block->block_num);
+	       }
+	       printf("\n");
+	    }
+	 }
+
+d621 1
+a621 10
+               if (shader)
+                  ((ir_instruction *)inst->ir)->print();
+               else {
+                  const prog_instruction *fpi;
+                  fpi = (const prog_instruction *)inst->ir;
+                  printf("%d: ", (int)(fpi - fp->Base.Instructions));
+                  _mesa_fprint_instruction_opt(stdout,
+                                               fpi,
+                                               0, PROG_PRINT_DEBUG, NULL);
+               }
+a633 10
+
+	 /* The accumulator result appears to get used for the
+	  * conditional modifier generation.  When negating a UD
+	  * value, there is a 33rd bit generated for the sign in the
+	  * accumulator value, so now you can't check, for example,
+	  * equality with a 32-bit value.  See piglit fs-op-neg-uvec4.
+	  */
+	 assert(!inst->conditional_mod ||
+		inst->src[i].type != BRW_REGISTER_TYPE_UD ||
+		!inst->src[i].negate);
+d638 1
+a638 1
+      brw_set_predicate_control(p, inst->predicate);
+a639 1
+      brw_set_flag_reg(p, 0, inst->flag_subreg);
+a640 1
+      brw_set_mask_control(p, inst->force_writemask_all);
+d642 1
+a642 1
+      if (inst->force_uncompressed || dispatch_width == 8) {
+a659 33
+      case BRW_OPCODE_MACH:
+	 brw_set_acc_write_control(p, 1);
+	 brw_MACH(p, dst, src[0], src[1]);
+	 brw_set_acc_write_control(p, 0);
+	 break;
+
+      case BRW_OPCODE_MAD:
+	 brw_set_access_mode(p, BRW_ALIGN_16);
+	 if (dispatch_width == 16) {
+	    brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+	    brw_MAD(p, dst, src[0], src[1], src[2]);
+	    brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	    brw_MAD(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+	    brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 } else {
+	    brw_MAD(p, dst, src[0], src[1], src[2]);
+	 }
+	 brw_set_access_mode(p, BRW_ALIGN_1);
+	 break;
+
+      case BRW_OPCODE_LRP:
+	 brw_set_access_mode(p, BRW_ALIGN_16);
+	 if (dispatch_width == 16) {
+	    brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+	    brw_LRP(p, dst, src[0], src[1], src[2]);
+	    brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+	    brw_LRP(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+	    brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+	 } else {
+	    brw_LRP(p, dst, src[0], src[1], src[2]);
+	 }
+	 brw_set_access_mode(p, BRW_ALIGN_1);
+	 break;
+d695 1
+a695 6
+      case BRW_OPCODE_F32TO16:
+         brw_F32TO16(p, dst, src[0]);
+         break;
+      case BRW_OPCODE_F16TO32:
+         brw_F16TO32(p, dst, src[0]);
+         break;
+a701 48
+      case BRW_OPCODE_BFREV:
+         /* BFREV only supports UD type for src and dst. */
+         brw_BFREV(p, retype(dst, BRW_REGISTER_TYPE_UD),
+                      retype(src[0], BRW_REGISTER_TYPE_UD));
+         break;
+      case BRW_OPCODE_FBH:
+         /* FBH only supports UD type for dst. */
+         brw_FBH(p, retype(dst, BRW_REGISTER_TYPE_UD), src[0]);
+         break;
+      case BRW_OPCODE_FBL:
+         /* FBL only supports UD type for dst. */
+         brw_FBL(p, retype(dst, BRW_REGISTER_TYPE_UD), src[0]);
+         break;
+      case BRW_OPCODE_CBIT:
+         /* CBIT only supports UD type for dst. */
+         brw_CBIT(p, retype(dst, BRW_REGISTER_TYPE_UD), src[0]);
+         break;
+
+      case BRW_OPCODE_BFE:
+         brw_set_access_mode(p, BRW_ALIGN_16);
+         if (dispatch_width == 16) {
+            brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+            brw_BFE(p, dst, src[0], src[1], src[2]);
+            brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+            brw_BFE(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+            brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+         } else {
+            brw_BFE(p, dst, src[0], src[1], src[2]);
+         }
+         brw_set_access_mode(p, BRW_ALIGN_1);
+         break;
+
+      case BRW_OPCODE_BFI1:
+         brw_BFI1(p, dst, src[0], src[1]);
+         break;
+      case BRW_OPCODE_BFI2:
+         brw_set_access_mode(p, BRW_ALIGN_16);
+         if (dispatch_width == 16) {
+            brw_set_compression_control(p, BRW_COMPRESSION_NONE);
+            brw_BFI2(p, dst, src[0], src[1], src[2]);
+            brw_set_compression_control(p, BRW_COMPRESSION_2NDHALF);
+            brw_BFI2(p, sechalf(dst), sechalf(src[0]), sechalf(src[1]), sechalf(src[2]));
+            brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+         } else {
+            brw_BFI2(p, dst, src[0], src[1], src[2]);
+         }
+         brw_set_access_mode(p, BRW_ALIGN_1);
+         break;
+d706 1
+a706 1
+	    assert(brw->gen == 6);
+d709 1
+a709 1
+	    brw_IF(p, dispatch_width == 16 ? BRW_EXECUTE_16 : BRW_EXECUTE_8);
+d711 1
+d719 1
+d723 9
+a731 1
+	 brw_DO(p, BRW_EXECUTE_8);
+d735 1
+a735 1
+	 brw_BREAK(p);
+d740 2
+a741 2
+	 if (brw->gen >= 6)
+	    gen6_CONT(p);
+d743 1
+a743 1
+	    brw_CONT(p);
+d747 25
+a771 2
+      case BRW_OPCODE_WHILE:
+	 brw_WHILE(p);
+d774 9
+a782 27
+      case SHADER_OPCODE_RCP:
+      case SHADER_OPCODE_RSQ:
+      case SHADER_OPCODE_SQRT:
+      case SHADER_OPCODE_EXP2:
+      case SHADER_OPCODE_LOG2:
+      case SHADER_OPCODE_SIN:
+      case SHADER_OPCODE_COS:
+	 if (brw->gen >= 7) {
+	    generate_math1_gen7(inst, dst, src[0]);
+	 } else if (brw->gen == 6) {
+	    generate_math1_gen6(inst, dst, src[0]);
+	 } else if (brw->gen == 5 || brw->is_g4x) {
+	    generate_math_g45(inst, dst, src[0]);
+	 } else {
+	    generate_math_gen4(inst, dst, src[0]);
+	 }
+	 break;
+      case SHADER_OPCODE_INT_QUOTIENT:
+      case SHADER_OPCODE_INT_REMAINDER:
+      case SHADER_OPCODE_POW:
+	 if (brw->gen >= 7) {
+	    generate_math2_gen7(inst, dst, src[0], src[1]);
+	 } else if (brw->gen == 6) {
+	    generate_math2_gen6(inst, dst, src[0], src[1]);
+	 } else {
+	    generate_math_gen4(inst, dst, src[0]);
+	 }
+d796 1
+a796 1
+      case SHADER_OPCODE_TEX:
+d798 2
+a799 6
+      case SHADER_OPCODE_TXD:
+      case SHADER_OPCODE_TXF:
+      case SHADER_OPCODE_TXF_MS:
+      case SHADER_OPCODE_TXL:
+      case SHADER_OPCODE_TXS:
+      case SHADER_OPCODE_LOD:
+d802 3
+d809 1
+a809 5
+         /* Make sure fp->UsesDFdy flag got set (otherwise there's no
+          * guarantee that c->key.render_to_fbo is set).
+          */
+         assert(fp->UsesDFdy);
+	 generate_ddy(inst, dst, src[0], c->key.render_to_fbo);
+d820 2
+a821 14
+      case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD:
+	 generate_uniform_pull_constant_load(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_UNIFORM_PULL_CONSTANT_LOAD_GEN7:
+	 generate_uniform_pull_constant_load_gen7(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD:
+	 generate_varying_pull_constant_load(inst, dst, src[0], src[1]);
+	 break;
+
+      case FS_OPCODE_VARYING_PULL_CONSTANT_LOAD_GEN7:
+	 generate_varying_pull_constant_load_gen7(inst, dst, src[0], src[1]);
+a826 33
+
+      case FS_OPCODE_MOV_DISPATCH_TO_FLAGS:
+         generate_mov_dispatch_to_flags(inst);
+         break;
+
+      case FS_OPCODE_DISCARD_JUMP:
+         generate_discard_jump(inst);
+         break;
+
+      case SHADER_OPCODE_SHADER_TIME_ADD:
+         generate_shader_time_add(inst, src[0], src[1], src[2]);
+         break;
+
+      case FS_OPCODE_SET_SIMD4X2_OFFSET:
+         generate_set_simd4x2_offset(inst, dst, src[0]);
+         break;
+
+      case FS_OPCODE_PACK_HALF_2x16_SPLIT:
+          generate_pack_half_2x16_split(inst, dst, src[0], src[1]);
+          break;
+
+      case FS_OPCODE_UNPACK_HALF_2x16_SPLIT_X:
+      case FS_OPCODE_UNPACK_HALF_2x16_SPLIT_Y:
+         generate_unpack_half_2x16_split(inst, dst, src[0]);
+         break;
+
+      case FS_OPCODE_PLACEHOLDER_HALT:
+         /* This is the place where the final HALT needs to be inserted if
+          * we've emitted any discards.  If not, this will emit no code.
+          */
+         patch_discard_jumps_to_fb_writes();
+         break;
+
+d828 1
+a828 1
+	 if (inst->opcode < (int) ARRAY_SIZE(opcode_descs)) {
+d830 1
+a830 1
+			  opcode_descs[inst->opcode].name);
+d834 1
+a834 1
+	 abort();
+d838 7
+a844 16
+	 brw_dump_compile(p, stdout,
+			  last_native_insn_offset, p->next_insn_offset);
+
+	 foreach_list(node, &cfg->block_list) {
+	    bblock_link *link = (bblock_link *)node;
+	    bblock_t *block = link->block;
+
+	    if (block->end == inst) {
+	       printf("   END B%d", block->block_num);
+	       foreach_list(successor_node, &block->children) {
+		  bblock_link *successor_link =
+		     (bblock_link *)successor_node;
+		  bblock_t *successor_block = successor_link->block;
+		  printf(" ->B%d", successor_block->block_num);
+	       }
+	       printf("\n");
+d846 1
+d850 1
+a850 1
+      last_native_insn_offset = p->next_insn_offset;
+d857 3
+d868 9
+a876 22
+      brw_dump_compile(p, stdout, 0, p->next_insn_offset);
+   }
+}
+
+const unsigned *
+fs_generator::generate_assembly(exec_list *simd8_instructions,
+                                exec_list *simd16_instructions,
+                                unsigned *assembly_size)
+{
+   dispatch_width = 8;
+   generate_code(simd8_instructions);
+
+   if (simd16_instructions) {
+      /* We have to do a compaction pass now, or the one at the end of
+       * execution will squash down where our prog_offset start needs
+       * to be.
+       */
+      brw_compact_instructions(p);
+
+      /* align to 64 byte boundary. */
+      while ((p->nr_insn * sizeof(struct brw_instruction)) % 64) {
+         brw_NOP(p);
+a877 8
+
+      /* Save off the start of this 16-wide program */
+      c->prog_data.prog_offset_16 = p->nr_insn * sizeof(struct brw_instruction);
+
+      brw_set_compression_control(p, BRW_COMPRESSION_COMPRESSED);
+
+      dispatch_width = 16;
+      generate_code(simd16_instructions);
+a878 2
+
+   return brw_get_program(p, assembly_size);
+@
+
+
+1.1.1.2
+log
+@Import Mesa 9.2.5
+@
+text
+@d110 1
+a110 1
+   if (fp->UsesKill || c->key.alpha_test_func) {
+@
+
+

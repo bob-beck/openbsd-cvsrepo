@@ -1,0 +1,536 @@
+head	1.10;
+access;
+symbols
+	OPENBSD_5_8:1.9.0.4
+	OPENBSD_5_8_BASE:1.9
+	OPENBSD_5_7:1.9.0.2
+	OPENBSD_5_7_BASE:1.9
+	OPENBSD_5_6:1.8.0.4
+	OPENBSD_5_6_BASE:1.8
+	OPENBSD_5_5:1.7.0.4
+	OPENBSD_5_5_BASE:1.7
+	OPENBSD_5_4:1.5.0.2
+	OPENBSD_5_4_BASE:1.5
+	OPENBSD_5_3:1.4.0.6
+	OPENBSD_5_3_BASE:1.4
+	OPENBSD_5_2:1.4.0.4
+	OPENBSD_5_2_BASE:1.4
+	OPENBSD_5_1_BASE:1.4
+	OPENBSD_5_1:1.4.0.2
+	OPENBSD_5_0:1.3.0.8
+	OPENBSD_5_0_BASE:1.3
+	OPENBSD_4_9:1.3.0.6
+	OPENBSD_4_9_BASE:1.3
+	OPENBSD_4_8:1.3.0.4
+	OPENBSD_4_8_BASE:1.3
+	OPENBSD_4_7:1.3.0.2
+	OPENBSD_4_7_BASE:1.3;
+locks; strict;
+comment	@ * @;
+
+
+1.10
+date	2016.01.14.16.17.40;	author markus;	state dead;
+branches;
+next	1.9;
+commitid	W9ye0gltieEl87AJ;
+
+1.9
+date	2015.01.27.12.54.06;	author okan;	state Exp;
+branches;
+next	1.8;
+commitid	hLG4Epd56gGTFJL3;
+
+1.8
+date	2014.04.29.18.01.49;	author markus;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2014.01.09.23.20.00;	author djm;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2013.10.16.02.31.46;	author djm;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2013.05.17.00.13.14;	author djm;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2011.12.07.05.44.38;	author djm;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2010.01.18.01.50.27;	author dtucker;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2010.01.09.05.17.00;	author dtucker;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.10.24.11.22.37;	author andreas;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.10
+log
+@remove roaming support; ok djm@@
+@
+text
+@/* $OpenBSD: roaming_client.c,v 1.9 2015/01/27 12:54:06 okan Exp $ */
+/*
+ * Copyright (c) 2004-2009 AppGate Network Security AB
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "xmalloc.h"
+#include "buffer.h"
+#include "channels.h"
+#include "cipher.h"
+#include "dispatch.h"
+#include "clientloop.h"
+#include "log.h"
+#include "match.h"
+#include "misc.h"
+#include "packet.h"
+#include "ssh.h"
+#include "key.h"
+#include "kex.h"
+#include "readconf.h"
+#include "roaming.h"
+#include "ssh2.h"
+#include "sshconnect.h"
+#include "digest.h"
+
+/* import */
+extern Options options;
+extern char *host;
+extern struct sockaddr_storage hostaddr;
+extern int session_resumed;
+
+static u_int32_t roaming_id;
+static u_int64_t cookie;
+static u_int64_t lastseenchall;
+static u_int64_t key1, key2, oldkey1, oldkey2;
+
+void
+roaming_reply(int type, u_int32_t seq, void *ctxt)
+{
+	if (type == SSH2_MSG_REQUEST_FAILURE) {
+		logit("Server denied roaming");
+		return;
+	}
+	verbose("Roaming enabled");
+	roaming_id = packet_get_int();
+	cookie = packet_get_int64();
+	key1 = oldkey1 = packet_get_int64();
+	key2 = oldkey2 = packet_get_int64();
+	set_out_buffer_size(packet_get_int() + get_snd_buf_size());
+	roaming_enabled = 1;
+}
+
+void
+request_roaming(void)
+{
+	packet_start(SSH2_MSG_GLOBAL_REQUEST);
+	packet_put_cstring(ROAMING_REQUEST);
+	packet_put_char(1);
+	packet_put_int(get_recv_buf_size());
+	packet_send();
+	client_register_global_confirm(roaming_reply, NULL);
+}
+
+static void
+roaming_auth_required(void)
+{
+	u_char digest[SSH_DIGEST_MAX_LENGTH];
+	Buffer b;
+	u_int64_t chall, oldchall;
+
+	chall = packet_get_int64();
+	oldchall = packet_get_int64();
+	if (oldchall != lastseenchall) {
+		key1 = oldkey1;
+		key2 = oldkey2;
+	}
+	lastseenchall = chall;
+
+	buffer_init(&b);
+	buffer_put_int64(&b, cookie);
+	buffer_put_int64(&b, chall);
+	if (ssh_digest_buffer(SSH_DIGEST_SHA1, &b, digest, sizeof(digest)) != 0)
+		fatal("%s: ssh_digest_buffer failed", __func__);
+	buffer_free(&b);
+
+	packet_start(SSH2_MSG_KEX_ROAMING_AUTH);
+	packet_put_int64(key1 ^ get_recv_bytes());
+	packet_put_raw(digest, ssh_digest_bytes(SSH_DIGEST_SHA1));
+	packet_send();
+
+	oldkey1 = key1;
+	oldkey2 = key2;
+	calculate_new_key(&key1, cookie, chall);
+	calculate_new_key(&key2, cookie, chall);
+
+	debug("Received %llu bytes", (unsigned long long)get_recv_bytes());
+	debug("Sent roaming_auth packet");
+}
+
+int
+resume_kex(void)
+{
+	/*
+	 * This should not happen - if the client sends the kex method
+	 * resume@@appgate.com then the kex is done in roaming_resume().
+	 */
+	return 1;
+}
+
+static int
+roaming_resume(void)
+{
+	u_int64_t recv_bytes;
+	char *str = NULL, *kexlist = NULL, *c;
+	int i, type;
+	int timeout_ms = options.connection_timeout * 1000;
+	u_int len;
+	u_int32_t rnd = 0;
+
+	resume_in_progress = 1;
+
+	/* Exchange banners */
+	ssh_exchange_identification(timeout_ms);
+	packet_set_nonblocking();
+
+	/* Send a kexinit message with resume@@appgate.com as only kex algo */
+	packet_start(SSH2_MSG_KEXINIT);
+	for (i = 0; i < KEX_COOKIE_LEN; i++) {
+		if (i % 4 == 0)
+			rnd = arc4random();
+		packet_put_char(rnd & 0xff);
+		rnd >>= 8;
+	}
+	packet_put_cstring(KEX_RESUME);
+	for (i = 1; i < PROPOSAL_MAX; i++) {
+		/* kex algorithm added so start with i=1 and not 0 */
+		packet_put_cstring(""); /* Not used when we resume */
+	}
+	packet_put_char(1); /* first kex_packet follows */
+	packet_put_int(0); /* reserved */
+	packet_send();
+
+	/* Assume that resume@@appgate.com will be accepted */
+	packet_start(SSH2_MSG_KEX_ROAMING_RESUME);
+	packet_put_int(roaming_id);
+	packet_send();
+
+	/* Read the server's kexinit and check for resume@@appgate.com */
+	if ((type = packet_read()) != SSH2_MSG_KEXINIT) {
+		debug("expected kexinit on resume, got %d", type);
+		goto fail;
+	}
+	for (i = 0; i < KEX_COOKIE_LEN; i++)
+		(void)packet_get_char();
+	kexlist = packet_get_string(&len);
+	if (!kexlist
+	    || (str = match_list(KEX_RESUME, kexlist, NULL)) == NULL) {
+		debug("server doesn't allow resume");
+		goto fail;
+	}
+	free(str);
+	for (i = 1; i < PROPOSAL_MAX; i++) {
+		/* kex algorithm taken care of so start with i=1 and not 0 */
+		free(packet_get_string(&len));
+	}
+	i = packet_get_char(); /* first_kex_packet_follows */
+	if (i && (c = strchr(kexlist, ',')))
+		*c = 0;
+	if (i && strcmp(kexlist, KEX_RESUME)) {
+		debug("server's kex guess (%s) was wrong, skipping", kexlist);
+		(void)packet_read(); /* Wrong guess - discard packet */
+	}
+
+	/*
+	 * Read the ROAMING_AUTH_REQUIRED challenge from the server and
+	 * send ROAMING_AUTH
+	 */
+	if ((type = packet_read()) != SSH2_MSG_KEX_ROAMING_AUTH_REQUIRED) {
+		debug("expected roaming_auth_required, got %d", type);
+		goto fail;
+	}
+	roaming_auth_required();
+
+	/* Read ROAMING_AUTH_OK from the server */
+	if ((type = packet_read()) != SSH2_MSG_KEX_ROAMING_AUTH_OK) {
+		debug("expected roaming_auth_ok, got %d", type);
+		goto fail;
+	}
+	recv_bytes = packet_get_int64() ^ oldkey2;
+	debug("Peer received %llu bytes", (unsigned long long)recv_bytes);
+	resend_bytes(packet_get_connection_out(), &recv_bytes);
+
+	resume_in_progress = 0;
+
+	session_resumed = 1; /* Tell clientloop */
+
+	return 0;
+
+fail:
+	free(kexlist);
+	if (packet_get_connection_in() == packet_get_connection_out())
+		close(packet_get_connection_in());
+	else {
+		close(packet_get_connection_in());
+		close(packet_get_connection_out());
+	}
+	return 1;
+}
+
+int
+wait_for_roaming_reconnect(void)
+{
+	static int reenter_guard = 0;
+	int timeout_ms = options.connection_timeout * 1000;
+	int c;
+
+	if (reenter_guard != 0)
+		fatal("Server refused resume, roaming timeout may be exceeded");
+	reenter_guard = 1;
+
+	fprintf(stderr, "[connection suspended, press return to resume]");
+	fflush(stderr);
+	packet_backup_state();
+	/* TODO Perhaps we should read from tty here */
+	while ((c = fgetc(stdin)) != EOF) {
+		if (c == 'Z' - 64) {
+			kill(getpid(), SIGTSTP);
+			continue;
+		}
+		if (c != '\n' && c != '\r')
+			continue;
+
+		if (ssh_connect(host, NULL, &hostaddr, options.port,
+		    options.address_family, 1, &timeout_ms,
+		    options.tcp_keep_alive, options.use_privileged_port) == 0 &&
+		    roaming_resume() == 0) {
+			packet_restore_state();
+			reenter_guard = 0;
+			fprintf(stderr, "[connection resumed]\n");
+			fflush(stderr);
+			return 0;
+		}
+
+		fprintf(stderr, "[reconnect failed, press return to retry]");
+		fflush(stderr);
+	}
+	fprintf(stderr, "[exiting]\n");
+	fflush(stderr);
+	exit(0);
+}
+@
+
+
+1.9
+log
+@Since r1.2 removed the use of PRI* macros, inttypes.h is no longer
+required.
+
+ok djm@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.8 2014/04/29 18:01:49 markus Exp $ */
+@
+
+
+1.8
+log
+@make compiling against OpenSSL optional (make OPENSSL=no);
+reduces algorithms to curve25519, aes-ctr, chacha, ed25519;
+allows us to explore further options; with and ok djm
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.7 2014/01/09 23:20:00 djm Exp $ */
+a21 1
+#include <inttypes.h>
+@
+
+
+1.7
+log
+@Introduce digest API and use it to perform all hashing operations
+rather than calling OpenSSL EVP_Digest* directly. Will make it easier
+to build a reduced-feature OpenSSH without OpenSSL in future;
+feedback, ok markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.6 2013/10/16 02:31:46 djm Exp $ */
+a25 3
+
+#include <openssl/crypto.h>
+#include <openssl/sha.h>
+@
+
+
+1.6
+log
+@Implement client-side hostname canonicalisation to allow an explicit
+search path of domain suffixes to use to convert unqualified host names
+to fully-qualified ones for host key matching.
+This is particularly useful for host certificates, which would otherwise
+need to list unqualified names alongside fully-qualified ones (and this
+causes a number of problems).
+
+"looks fine" markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.5 2013/05/17 00:13:14 djm Exp $ */
+d47 1
+d90 1
+a90 2
+	u_char digest[SHA_DIGEST_LENGTH];
+	EVP_MD_CTX md;
+a91 1
+	const EVP_MD *evp_md = EVP_sha1();
+d105 2
+a106 3
+	EVP_DigestInit(&md, evp_md);
+	EVP_DigestUpdate(&md, buffer_ptr(&b), buffer_len(&b));
+	EVP_DigestFinal(&md, digest, NULL);
+d111 1
+a111 1
+	packet_put_raw(digest, sizeof(digest));
+@
+
+
+1.5
+log
+@bye, bye xfree(); ok markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.4 2011/12/07 05:44:38 djm Exp $ */
+d258 1
+a258 1
+		if (ssh_connect(host, &hostaddr, options.port,
+d260 2
+a261 2
+		    options.tcp_keep_alive, options.use_privileged_port,
+		    options.proxy_command) == 0 && roaming_resume() == 0) {
+@
+
+
+1.4
+log
+@fix some harmless and/or unreachable int overflows;
+reported Xi Wang, ok markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.3 2010/01/18 01:50:27 dtucker Exp $ */
+d186 1
+a186 1
+	xfree(str);
+d189 1
+a189 1
+		xfree(packet_get_string(&len));
+d225 1
+a225 2
+	if (kexlist)
+		xfree(kexlist);
+@
+
+
+1.3
+log
+@s/long long unsigned/unsigned long long/, from tim via portable
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.2 2010/01/09 05:17:00 dtucker Exp $ */
+d71 1
+a71 1
+	set_out_buffer_size(packet_get_int() +  get_snd_buf_size());
+@
+
+
+1.2
+log
+@Remove a PRIu64 format string that snuck in with roaming.  ok djm@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: roaming_client.c,v 1.1 2009/10/24 11:22:37 andreas Exp $ */
+d121 1
+a121 1
+	debug("Received %llu bytes", (long long unsigned)get_recv_bytes());
+d215 1
+a215 1
+	debug("Peer received %llu bytes", (long long unsigned)recv_bytes);
+@
+
+
+1.1
+log
+@Do the actual suspend/resume in the client. This won't be useful until
+the server side supports roaming.
+Most code from Martin Forssen, maf at appgate dot com. Some changes by
+me and markus@@
+ok markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD$ */
+d121 1
+a121 1
+	debug("Received %" PRIu64 " bytes", get_recv_bytes());
+d215 1
+a215 1
+	debug("Peer received %" PRIu64 " bytes", recv_bytes);
+@
+

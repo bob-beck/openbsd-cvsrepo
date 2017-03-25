@@ -1,0 +1,1564 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_5_4:1.7.0.4
+	OPENBSD_5_4_BASE:1.7
+	OPENBSD_5_3:1.7.0.2
+	OPENBSD_5_3_BASE:1.7
+	OPENBSD_5_2:1.6.0.4
+	OPENBSD_5_2_BASE:1.6
+	OPENBSD_5_1_BASE:1.6
+	OPENBSD_5_1:1.6.0.2
+	v7_10_3:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_0:1.5.0.6
+	OPENBSD_5_0_BASE:1.5
+	OPENBSD_4_9:1.5.0.2
+	OPENBSD_4_9_BASE:1.5
+	OPENBSD_4_8:1.5.0.4
+	OPENBSD_4_8_BASE:1.5
+	OPENBSD_4_7:1.4.0.4
+	OPENBSD_4_7_BASE:1.4
+	OPENBSD_4_6:1.4.0.2
+	OPENBSD_4_6_BASE:1.4
+	OPENBSD_4_5:1.3.0.2
+	OPENBSD_4_5_BASE:1.3;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2013.09.05.14.04.34;	author jsg;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	2012.08.17.13.58.15;	author mpi;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2011.10.23.13.37.39;	author matthieu;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2010.05.22.20.06.19;	author matthieu;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2009.05.17.20.26.39;	author matthieu;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2009.01.10.15.56.13;	author oga;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.01.10.15.27.14;	author oga;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.11.02.14.58.16;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.10.23.13.29.38;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@Merge Mesa 9.2.0
+@
+text
+@/**************************************************************************
+ * 
+ * Copyright 2006 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * All Rights Reserved.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ * 
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL TUNGSTEN GRAPHICS AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * 
+ **************************************************************************/
+
+/* Provide additional functionality on top of bufmgr buffers:
+ *   - 2d semantics and blit operations
+ *   - refcounting of buffers for multiple images in a buffer.
+ *   - refcounting of buffer mappings.
+ *   - some logic for moving the buffers to the best memory pools for
+ *     given operations.
+ *
+ * Most of this is to make it easier to implement the fixed-layout
+ * mipmap tree required by intel hardware in the face of GL's
+ * programming interface where each image can be specifed in random
+ * order and it isn't clear what layout the tree should have until the
+ * last moment.
+ */
+
+#include <sys/ioctl.h>
+#include <errno.h>
+
+#include "main/hash.h"
+#include "intel_context.h"
+#include "intel_regions.h"
+#include "intel_blit.h"
+#include "intel_buffer_objects.h"
+#include "intel_bufmgr.h"
+#include "intel_batchbuffer.h"
+
+#define FILE_DEBUG_FLAG DEBUG_REGION
+
+/* This should be set to the maximum backtrace size desired.
+ * Set it to 0 to disable backtrace debugging.
+ */
+#define DEBUG_BACKTRACE_SIZE 0
+
+#if DEBUG_BACKTRACE_SIZE == 0
+/* Use the standard debug output */
+#define _DBG(...) DBG(__VA_ARGS__)
+#else
+/* Use backtracing debug output */
+#define _DBG(...) {debug_backtrace(); DBG(__VA_ARGS__);}
+
+/* Backtracing debug support */
+#include <execinfo.h>
+
+static void
+debug_backtrace(void)
+{
+   void *trace[DEBUG_BACKTRACE_SIZE];
+   char **strings = NULL;
+   int traceSize;
+   register int i;
+
+   traceSize = backtrace(trace, DEBUG_BACKTRACE_SIZE);
+   strings = backtrace_symbols(trace, traceSize);
+   if (strings == NULL) {
+      DBG("no backtrace:");
+      return;
+   }
+
+   /* Spit out all the strings with a colon separator.  Ignore
+    * the first, since we don't really care about the call
+    * to debug_backtrace() itself.  Skip until the final "/" in
+    * the trace to avoid really long lines.
+    */
+   for (i = 1; i < traceSize; i++) {
+      char *p = strings[i], *slash = strings[i];
+      while (*p) {
+         if (*p++ == '/') {
+            slash = p;
+         }
+      }
+
+      DBG("%s:", slash);
+   }
+
+   /* Free up the memory, and we're done */
+   free(strings);
+}
+
+#endif
+
+
+
+/* XXX: Thread safety?
+ */
+GLubyte *
+intel_region_map(struct intel_context *intel, struct intel_region *region)
+{
+   intel_flush(&intel->ctx);
+
+   _DBG("%s %p\n", __FUNCTION__, region);
+   if (!region->map_refcount++) {
+      if (region->pbo)
+         intel_region_cow(intel, region);
+
+      if (region->tiling != I915_TILING_NONE)
+	 drm_intel_gem_bo_map_gtt(region->buffer);
+      else
+	 drm_intel_bo_map(region->buffer, GL_TRUE);
+      region->map = region->buffer->virtual;
+   }
+
+   return region->map;
+}
+
+void
+intel_region_unmap(struct intel_context *intel, struct intel_region *region)
+{
+   _DBG("%s %p\n", __FUNCTION__, region);
+   if (!--region->map_refcount) {
+      if (region->tiling != I915_TILING_NONE)
+	 drm_intel_gem_bo_unmap_gtt(region->buffer);
+      else
+	 drm_intel_bo_unmap(region->buffer);
+      region->map = NULL;
+   }
+}
+
+static struct intel_region *
+intel_region_alloc_internal(struct intel_screen *screen,
+			    GLuint cpp,
+			    GLuint width, GLuint height, GLuint pitch,
+			    uint32_t tiling, drm_intel_bo *buffer)
+{
+   struct intel_region *region;
+
+   region = calloc(sizeof(*region), 1);
+   if (region == NULL)
+      return region;
+
+   region->cpp = cpp;
+   region->width = width;
+   region->height = height;
+   region->pitch = pitch;
+   region->refcount = 1;
+   region->buffer = buffer;
+   region->tiling = tiling;
+   region->screen = screen;
+
+   _DBG("%s <-- %p\n", __FUNCTION__, region);
+   return region;
+}
+
+struct intel_region *
+intel_region_alloc(struct intel_screen *screen,
+		   uint32_t tiling,
+                   GLuint cpp, GLuint width, GLuint height,
+		   GLboolean expect_accelerated_upload)
+{
+   drm_intel_bo *buffer;
+   unsigned long flags = 0;
+   unsigned long aligned_pitch;
+   struct intel_region *region;
+
+   if (expect_accelerated_upload)
+      flags |= BO_ALLOC_FOR_RENDER;
+
+   buffer = drm_intel_bo_alloc_tiled(screen->bufmgr, "region",
+				     width, height, cpp,
+				     &tiling, &aligned_pitch, flags);
+   if (buffer == NULL)
+      return NULL;
+
+   region = intel_region_alloc_internal(screen, cpp, width, height,
+                                        aligned_pitch / cpp, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   return region;
+}
+
+GLboolean
+intel_region_flink(struct intel_region *region, uint32_t *name)
+{
+   if (region->name == 0) {
+      if (drm_intel_bo_flink(region->buffer, &region->name))
+	 return GL_FALSE;
+      
+      _mesa_HashInsert(region->screen->named_regions,
+		       region->name, region);
+   }
+
+   *name = region->name;
+
+   return GL_TRUE;
+}
+
+struct intel_region *
+intel_region_alloc_for_handle(struct intel_screen *screen,
+			      GLuint cpp,
+			      GLuint width, GLuint height, GLuint pitch,
+			      GLuint handle, const char *name)
+{
+   struct intel_region *region, *dummy;
+   drm_intel_bo *buffer;
+   int ret;
+   uint32_t bit_6_swizzle, tiling;
+
+   region = _mesa_HashLookup(screen->named_regions, handle);
+   if (region != NULL) {
+      dummy = NULL;
+      if (region->width != width || region->height != height ||
+	  region->cpp != cpp || region->pitch != pitch) {
+	 fprintf(stderr,
+		 "Region for name %d already exists but is not compatible\n",
+		 handle);
+	 return NULL;
+      }
+      intel_region_reference(&dummy, region);
+      return dummy;
+   }
+
+   buffer = intel_bo_gem_create_from_name(screen->bufmgr, name, handle);
+   if (buffer == NULL)
+      return NULL;
+   ret = drm_intel_bo_get_tiling(buffer, &tiling, &bit_6_swizzle);
+   if (ret != 0) {
+      fprintf(stderr, "Couldn't get tiling of buffer %d (%s): %s\n",
+	      handle, name, strerror(-ret));
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   region = intel_region_alloc_internal(screen, cpp,
+					width, height, pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   region->name = handle;
+   _mesa_HashInsert(screen->named_regions, handle, region);
+
+   return region;
+}
+
+void
+intel_region_reference(struct intel_region **dst, struct intel_region *src)
+{
+   _DBG("%s: %p(%d) -> %p(%d)\n", __FUNCTION__,
+	*dst, *dst ? (*dst)->refcount : 0, src, src ? src->refcount : 0);
+
+   if (src != *dst) {
+      if (*dst)
+	 intel_region_release(dst);
+
+      if (src)
+         src->refcount++;
+      *dst = src;
+   }
+}
+
+void
+intel_region_release(struct intel_region **region_handle)
+{
+   struct intel_region *region = *region_handle;
+
+   if (region == NULL) {
+      _DBG("%s NULL\n", __FUNCTION__);
+      return;
+   }
+
+   _DBG("%s %p %d\n", __FUNCTION__, region, region->refcount - 1);
+
+   ASSERT(region->refcount > 0);
+   region->refcount--;
+
+   if (region->refcount == 0) {
+      assert(region->map_refcount == 0);
+
+      if (region->pbo)
+	 region->pbo->region = NULL;
+      region->pbo = NULL;
+      drm_intel_bo_unreference(region->buffer);
+
+      if (region->name > 0)
+	 _mesa_HashRemove(region->screen->named_regions, region->name);
+
+      free(region);
+   }
+   *region_handle = NULL;
+}
+
+/*
+ * XXX Move this into core Mesa?
+ */
+void
+_mesa_copy_rect(GLubyte * dst,
+                GLuint cpp,
+                GLuint dst_pitch,
+                GLuint dst_x,
+                GLuint dst_y,
+                GLuint width,
+                GLuint height,
+                const GLubyte * src,
+                GLuint src_pitch, GLuint src_x, GLuint src_y)
+{
+   GLuint i;
+
+   dst_pitch *= cpp;
+   src_pitch *= cpp;
+   dst += dst_x * cpp;
+   src += src_x * cpp;
+   dst += dst_y * dst_pitch;
+   src += src_y * src_pitch;
+   width *= cpp;
+
+   if (width == dst_pitch && width == src_pitch)
+      memcpy(dst, src, height * width);
+   else {
+      for (i = 0; i < height; i++) {
+         memcpy(dst, src, width);
+         dst += dst_pitch;
+         src += src_pitch;
+      }
+   }
+}
+
+
+/* Upload data to a rectangular sub-region.  Lots of choices how to do this:
+ *
+ * - memcpy by span to current destination
+ * - upload data as new buffer and blit
+ *
+ * Currently always memcpy.
+ */
+void
+intel_region_data(struct intel_context *intel,
+                  struct intel_region *dst,
+                  GLuint dst_offset,
+                  GLuint dstx, GLuint dsty,
+                  const void *src, GLuint src_pitch,
+                  GLuint srcx, GLuint srcy, GLuint width, GLuint height)
+{
+   _DBG("%s\n", __FUNCTION__);
+
+   if (intel == NULL)
+      return;
+
+   if (dst->pbo) {
+      if (dstx == 0 &&
+          dsty == 0 && width == dst->pitch && height == dst->height)
+         intel_region_release_pbo(intel, dst);
+      else
+         intel_region_cow(intel, dst);
+   }
+
+   intel_prepare_render(intel);
+
+   _mesa_copy_rect(intel_region_map(intel, dst) + dst_offset,
+                   dst->cpp,
+                   dst->pitch,
+                   dstx, dsty, width, height, src, src_pitch, srcx, srcy);
+
+   intel_region_unmap(intel, dst);
+}
+
+/* Copy rectangular sub-regions. Need better logic about when to
+ * push buffers into AGP - will currently do so whenever possible.
+ */
+GLboolean
+intel_region_copy(struct intel_context *intel,
+                  struct intel_region *dst,
+                  GLuint dst_offset,
+                  GLuint dstx, GLuint dsty,
+                  struct intel_region *src,
+                  GLuint src_offset,
+                  GLuint srcx, GLuint srcy, GLuint width, GLuint height,
+		  GLboolean flip,
+		  GLenum logicop)
+{
+   uint32_t src_pitch = src->pitch;
+
+   _DBG("%s\n", __FUNCTION__);
+
+   if (intel == NULL)
+      return GL_FALSE;
+
+   if (dst->pbo) {
+      if (dstx == 0 &&
+          dsty == 0 && width == dst->pitch && height == dst->height)
+         intel_region_release_pbo(intel, dst);
+      else
+         intel_region_cow(intel, dst);
+   }
+
+   assert(src->cpp == dst->cpp);
+
+   if (flip)
+      src_pitch = -src_pitch;
+
+   return intelEmitCopyBlit(intel,
+			    dst->cpp,
+			    src_pitch, src->buffer, src_offset, src->tiling,
+			    dst->pitch, dst->buffer, dst_offset, dst->tiling,
+			    srcx, srcy, dstx, dsty, width, height,
+			    logicop);
+}
+
+/* Attach to a pbo, discarding our data.  Effectively zero-copy upload
+ * the pbo's data.
+ */
+void
+intel_region_attach_pbo(struct intel_context *intel,
+                        struct intel_region *region,
+                        struct intel_buffer_object *pbo)
+{
+   drm_intel_bo *buffer;
+
+   if (region->pbo == pbo)
+      return;
+
+   _DBG("%s %p %p\n", __FUNCTION__, region, pbo);
+
+   /* If there is already a pbo attached, break the cow tie now.
+    * Don't call intel_region_release_pbo() as that would
+    * unnecessarily allocate a new buffer we would have to immediately
+    * discard.
+    */
+   if (region->pbo) {
+      region->pbo->region = NULL;
+      region->pbo = NULL;
+   }
+
+   if (region->buffer) {
+      drm_intel_bo_unreference(region->buffer);
+      region->buffer = NULL;
+   }
+
+   /* make sure pbo has a buffer of its own */
+   buffer = intel_bufferobj_buffer(intel, pbo, INTEL_WRITE_FULL);
+
+   region->pbo = pbo;
+   region->pbo->region = region;
+   drm_intel_bo_reference(buffer);
+   region->buffer = buffer;
+   region->tiling = I915_TILING_NONE;
+}
+
+
+/* Break the COW tie to the pbo and allocate a new buffer.
+ * The pbo gets to keep the data.
+ */
+void
+intel_region_release_pbo(struct intel_context *intel,
+                         struct intel_region *region)
+{
+   _DBG("%s %p\n", __FUNCTION__, region);
+   assert(region->buffer == region->pbo->buffer);
+   region->pbo->region = NULL;
+   region->pbo = NULL;
+   drm_intel_bo_unreference(region->buffer);
+   region->buffer = NULL;
+
+   region->buffer = drm_intel_bo_alloc(intel->bufmgr, "region",
+				       region->pitch * region->cpp *
+				       region->height,
+				       64);
+}
+
+/* Break the COW tie to the pbo.  Both the pbo and the region end up
+ * with a copy of the data.
+ */
+void
+intel_region_cow(struct intel_context *intel, struct intel_region *region)
+{
+   struct intel_buffer_object *pbo = region->pbo;
+   GLboolean ok;
+
+   intel_region_release_pbo(intel, region);
+
+   assert(region->cpp * region->pitch * region->height == pbo->Base.Size);
+
+   _DBG("%s %p (%d bytes)\n", __FUNCTION__, region, (int)pbo->Base.Size);
+
+   /* Now blit from the texture buffer to the new buffer: 
+    */
+
+   intel_prepare_render(intel);
+   ok = intelEmitCopyBlit(intel,
+                          region->cpp,
+                          region->pitch, pbo->buffer, 0, region->tiling,
+                          region->pitch, region->buffer, 0, region->tiling,
+                          0, 0, 0, 0,
+                          region->pitch, region->height,
+                          GL_COPY);
+   assert(ok);
+}
+
+drm_intel_bo *
+intel_region_buffer(struct intel_context *intel,
+                    struct intel_region *region, GLuint flag)
+{
+   if (region->pbo) {
+      if (flag == INTEL_WRITE_PART)
+         intel_region_cow(intel, region);
+      else if (flag == INTEL_WRITE_FULL)
+         intel_region_release_pbo(intel, region);
+   }
+
+   return region->buffer;
+}
+@
+
+
+1.7
+log
+@Upate to libGL 7.11.2
+
+Tested by jsg@@, matthieu@@ and ajacoutot@@, ok mattieu@@
+@
+text
+@@
+
+
+1.6
+log
+@Merge Mesa 7.10.3
+@
+text
+@a151 5
+   if (buffer == NULL) {
+      _DBG("%s <-- NULL\n", __FUNCTION__);
+      return NULL;
+   }
+
+d178 1
+d186 9
+d196 1
+a196 2
+   return intel_region_alloc_internal(screen, cpp, width, height,
+				      aligned_pitch / cpp, tiling, buffer);
+d267 6
+a272 2
+   if (src)
+      _DBG("%s %p %d\n", __FUNCTION__, src, src->refcount);
+d274 2
+a275 3
+   assert(*dst == NULL);
+   if (src) {
+      src->refcount++;
+d501 1
+a501 1
+   _DBG("%s %p (%d bytes)\n", __FUNCTION__, region, pbo->Base.Size);
+@
+
+
+1.5
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@d114 1
+a114 1
+   intelFlush(&intel->ctx);
+d124 1
+a124 1
+	 dri_bo_map(region->buffer, GL_TRUE);
+d139 1
+a139 1
+	 dri_bo_unmap(region->buffer);
+d145 1
+a145 1
+intel_region_alloc_internal(struct intel_context *intel,
+d148 1
+a148 1
+			    dri_bo *buffer)
+d158 3
+d167 2
+a168 3
+
+   /* Default to no tiling */
+   region->tiling = I915_TILING_NONE;
+d175 1
+a175 1
+intel_region_alloc(struct intel_context *intel,
+d180 1
+a180 2
+   dri_bo *buffer;
+   struct intel_region *region;
+d187 1
+a187 1
+   buffer = drm_intel_bo_alloc_tiled(intel->bufmgr, "region",
+d191 16
+a206 3
+   region = intel_region_alloc_internal(intel, cpp, width, height,
+					aligned_pitch / cpp, buffer);
+   region->tiling = tiling;
+d208 1
+a208 1
+   return region;
+d212 1
+a212 1
+intel_region_alloc_for_handle(struct intel_context *intel,
+d218 1
+a218 1
+   dri_bo *buffer;
+d220 1
+a220 1
+   uint32_t bit_6_swizzle;
+d222 1
+a222 1
+   region = _mesa_HashLookup(intel->intelScreen->named_regions, handle);
+d236 4
+a239 9
+   buffer = intel_bo_gem_create_from_name(intel->bufmgr, name, handle);
+
+   region = intel_region_alloc_internal(intel, cpp,
+					width, height, pitch, buffer);
+   if (region == NULL)
+      return region;
+
+   ret = dri_bo_get_tiling(region->buffer, &region->tiling,
+			   &bit_6_swizzle);
+d243 8
+a250 1
+      intel_region_release(&region);
+d255 1
+a255 2
+   region->screen = intel->intelScreen;
+   _mesa_HashInsert(intel->intelScreen->named_regions, handle, region);
+d294 1
+a294 1
+      dri_bo_unreference(region->buffer);
+d428 1
+a428 1
+   dri_bo *buffer;
+d446 1
+a446 1
+      dri_bo_unreference(region->buffer);
+d455 1
+a455 1
+   dri_bo_reference(buffer);
+d472 1
+a472 1
+   dri_bo_unreference(region->buffer);
+d475 4
+a478 3
+   region->buffer = dri_bo_alloc(intel->bufmgr, "region",
+				 region->pitch * region->cpp * region->height,
+				 64);
+d510 1
+a510 1
+dri_bo *
+@
+
+
+1.4
+log
+@Update to Mesa 7.4.2. Tested by oga@@, ckuethe@@ and naddy@@.
+@
+text
+@d45 1
+a51 1
+#include "intel_chipset.h"
+d55 54
+d114 3
+a116 1
+   DBG("%s\n", __FUNCTION__);
+d121 4
+a124 1
+      dri_bo_map(region->buffer, GL_TRUE);
+d134 1
+a134 1
+   DBG("%s\n", __FUNCTION__);
+d136 4
+a139 1
+      dri_bo_unmap(region->buffer);
+d152 2
+a153 3
+   DBG("%s\n", __FUNCTION__);
+
+   if (buffer == NULL)
+d155 1
+a166 1
+   region->bit_6_swizzle = I915_BIT_6_SWIZZLE_NONE;
+d168 1
+d174 2
+a175 1
+                   GLuint cpp, GLuint width, GLuint height, GLuint pitch,
+d179 3
+d183 10
+a192 7
+   if (expect_accelerated_upload) {
+      buffer = drm_intel_bo_alloc_for_render(intel->bufmgr, "region",
+					     pitch * cpp * height, 64);
+   } else {
+      buffer = drm_intel_bo_alloc(intel->bufmgr, "region",
+				  pitch * cpp * height, 64);
+   }
+d194 1
+a194 1
+   return intel_region_alloc_internal(intel, cpp, width, height, pitch, buffer);
+d203 1
+a203 1
+   struct intel_region *region;
+d206 15
+d230 1
+a230 1
+			   &region->bit_6_swizzle);
+d238 4
+d249 1
+a249 1
+      DBG("%s %d\n", __FUNCTION__, src->refcount);
+d263 2
+a264 1
+   if (region == NULL)
+d266 1
+d268 1
+a268 1
+   DBG("%s %d\n", __FUNCTION__, region->refcount - 1);
+d281 2
+a282 4
+      if (region->classic_map != NULL) {
+	 drmUnmap(region->classic_map,
+			region->pitch * region->cpp * region->height);
+      }
+d310 1
+a310 1
+   src += src_y * dst_pitch;
+d340 1
+a340 3
+   GLboolean locked = GL_FALSE;
+
+   DBG("%s\n", __FUNCTION__);
+d353 1
+a353 4
+   if (!intel->locked) {
+      LOCK_HARDWARE(intel);
+      locked = GL_TRUE;
+   }
+a360 4
+
+   if (locked)
+      UNLOCK_HARDWARE(intel);
+
+d366 1
+a366 1
+void
+d373 3
+a375 1
+                  GLuint srcx, GLuint srcy, GLuint width, GLuint height)
+d377 3
+a379 1
+   DBG("%s\n", __FUNCTION__);
+d382 1
+a382 1
+      return;
+d394 2
+a395 7
+   intelEmitCopyBlit(intel,
+                     dst->cpp,
+                     src->pitch, src->buffer, src_offset, src->tiling,
+                     dst->pitch, dst->buffer, dst_offset, dst->tiling,
+                     srcx, srcy, dstx, dsty, width, height,
+		     GL_COPY);
+}
+d397 6
+a402 27
+/* Fill a rectangular sub-region.  Need better logic about when to
+ * push buffers into AGP - will currently do so whenever possible.
+ */
+void
+intel_region_fill(struct intel_context *intel,
+                  struct intel_region *dst,
+                  GLuint dst_offset,
+                  GLuint dstx, GLuint dsty,
+                  GLuint width, GLuint height, GLuint color)
+{
+   DBG("%s\n", __FUNCTION__);
+
+   if (intel == NULL)
+      return;   
+
+   if (dst->pbo) {
+      if (dstx == 0 &&
+          dsty == 0 && width == dst->pitch && height == dst->height)
+         intel_region_release_pbo(intel, dst);
+      else
+         intel_region_cow(intel, dst);
+   }
+
+   intelEmitFillBlit(intel,
+                     dst->cpp,
+                     dst->pitch, dst->buffer, dst_offset, dst->tiling,
+                     dstx, dsty, width, height, color);
+d413 2
+d418 2
+d435 3
+d440 3
+a442 2
+   dri_bo_reference(pbo->buffer);
+   region->buffer = pbo->buffer;
+d453 1
+d472 1
+a472 4
+   GLboolean was_locked = intel->locked;
+
+   if (intel == NULL)
+      return;
+d478 1
+a478 1
+   DBG("%s (%d bytes)\n", __FUNCTION__, pbo->Base.Size);
+d483 9
+a491 14
+   was_locked = intel->locked;
+   if (!was_locked)
+      LOCK_HARDWARE(intel);
+
+   intelEmitCopyBlit(intel,
+		     region->cpp,
+		     region->pitch, region->buffer, 0, region->tiling,
+		     region->pitch, pbo->buffer, 0, region->tiling,
+		     0, 0, 0, 0,
+		     region->pitch, region->height,
+		     GL_COPY);
+
+   if (!was_locked)
+      UNLOCK_HARDWARE(intel);
+a505 118
+}
+
+static struct intel_region *
+intel_recreate_static(struct intel_context *intel,
+		      const char *name,
+		      struct intel_region *region,
+		      intelRegion *region_desc)
+{
+   intelScreenPrivate *intelScreen = intel->intelScreen;
+   int ret;
+
+   if (region == NULL) {
+      region = calloc(sizeof(*region), 1);
+      region->refcount = 1;
+   }
+
+   if (intel->ctx.Visual.rgbBits == 24)
+      region->cpp = 4;
+   else
+      region->cpp = intel->ctx.Visual.rgbBits / 8;
+   region->pitch = intelScreen->pitch;
+   region->height = intelScreen->height;     /* needed? */
+
+   if (region->buffer != NULL) {
+      dri_bo_unreference(region->buffer);
+      region->buffer = NULL;
+   }
+
+   if (intel->ttm) {
+      assert(region_desc->bo_handle != -1);
+      region->buffer = intel_bo_gem_create_from_name(intel->bufmgr,
+						     name,
+						     region_desc->bo_handle);
+
+      ret = dri_bo_get_tiling(region->buffer, &region->tiling,
+			      &region->bit_6_swizzle);
+      if (ret != 0) {
+	 fprintf(stderr, "Couldn't get tiling of buffer %d (%s): %s\n",
+		 region_desc->bo_handle, name, strerror(-ret));
+	 intel_region_release(&region);
+	 return NULL;
+      }
+   } else {
+      if (region->classic_map != NULL) {
+	 drmUnmap(region->classic_map,
+		  region->pitch * region->cpp * region->height);
+	 region->classic_map = NULL;
+      }
+      ret = drmMap(intel->driFd, region_desc->handle,
+		   region->pitch * region->cpp * region->height,
+		   &region->classic_map);
+      if (ret != 0) {
+	 fprintf(stderr, "Failed to drmMap %s buffer\n", name);
+	 free(region);
+	 return NULL;
+      }
+
+      region->buffer = intel_bo_fake_alloc_static(intel->bufmgr,
+						  name,
+						  region_desc->offset,
+						  region->pitch * region->cpp *
+						  region->height,
+						  region->classic_map);
+
+      /* The sarea just gives us a boolean for whether it's tiled or not,
+       * instead of which tiling mode it is.  Guess.
+       */
+      if (region_desc->tiled) {
+	 if (IS_965(intel->intelScreen->deviceID) &&
+	     region_desc == &intelScreen->depth)
+	    region->tiling = I915_TILING_Y;
+	 else
+	    region->tiling = I915_TILING_X;
+      } else {
+	 region->tiling = I915_TILING_NONE;
+      }
+
+      region->bit_6_swizzle = I915_BIT_6_SWIZZLE_NONE;
+   }
+
+   assert(region->buffer != NULL);
+
+   return region;
+}
+
+/**
+ * Create intel_region structs to describe the static front, back, and depth
+ * buffers created by the xserver.
+ *
+ * Although FBO's mean we now no longer use these as render targets in
+ * all circumstances, they won't go away until the back and depth
+ * buffers become private, and the front buffer will remain even then.
+ *
+ * Note that these don't allocate video memory, just describe
+ * allocations alread made by the X server.
+ */
+void
+intel_recreate_static_regions(struct intel_context *intel)
+{
+   intelScreenPrivate *intelScreen = intel->intelScreen;
+
+   intel->front_region =
+      intel_recreate_static(intel, "front",
+			    intel->front_region,
+			    &intelScreen->front);
+
+   intel->back_region =
+      intel_recreate_static(intel, "back",
+			    intel->back_region,
+			    &intelScreen->back);
+
+   /* Still assumes front.cpp == depth.cpp.  We can kill this when we move to
+    * private buffers.
+    */
+   intel->depth_region =
+      intel_recreate_static(intel, "depth",
+			    intel->depth_region,
+			    &intelScreen->depth);
+@
+
+
+1.3
+log
+@Remove ttm entrypoints. That memory manager interface isn't going to see the
+light of day and has already been removed in mesa master (ages ago).
+
+As a bonus, removes the annoying "falling back to classic" message on
+launching a gl application.
+
+ok matthieu@@.
+@
+text
+@d42 3
+d49 1
+a49 1
+#include "dri_bufmgr.h"
+d51 1
+d84 3
+a86 2
+			    GLuint cpp, GLuint pitch, GLuint height,
+			    GLuint tiled, dri_bo *buffer)
+d97 2
+a99 1
+   region->height = height;     /* needed? */
+a100 1
+   region->tiled = tiled;
+d103 4
+d112 21
+a132 1
+                   GLuint cpp, GLuint pitch, GLuint height)
+d134 1
+d136 3
+d140 13
+a152 5
+   buffer = dri_bo_alloc(intel->bufmgr, "region",
+			 pitch * cpp * height, 64,
+			 DRM_BO_FLAG_MEM_LOCAL |
+			 DRM_BO_FLAG_CACHED |
+			 DRM_BO_FLAG_CACHED_MAPPED);
+d154 1
+a154 1
+   return intel_region_alloc_internal(intel, cpp, pitch, height, 0, buffer);
+d160 3
+d171 1
+a171 1
+intel_region_release(struct intel_region **region)
+d173 3
+a175 1
+   if (!*region)
+d178 4
+a181 1
+   DBG("%s %d\n", __FUNCTION__, (*region)->refcount - 1);
+d183 2
+a184 2
+   ASSERT((*region)->refcount > 0);
+   (*region)->refcount--;
+d186 9
+a194 2
+   if ((*region)->refcount == 0) {
+      assert((*region)->map_refcount == 0);
+d196 1
+a196 5
+      if ((*region)->pbo)
+	 (*region)->pbo->region = NULL;
+      (*region)->pbo = NULL;
+      dri_bo_unreference((*region)->buffer);
+      free(*region);
+d198 1
+a198 1
+   *region = NULL;
+d313 2
+a314 2
+                     src->pitch, src->buffer, src_offset, src->tiled,
+                     dst->pitch, dst->buffer, dst_offset, dst->tiled,
+d344 1
+a344 1
+                     dst->pitch, dst->buffer, dst_offset, dst->tiled,
+d396 1
+a396 4
+				 64,
+				 DRM_BO_FLAG_MEM_LOCAL |
+				 DRM_BO_FLAG_CACHED |
+				 DRM_BO_FLAG_CACHED_MAPPED);
+a419 2
+   intel_batchbuffer_flush(intel->batch);
+
+d421 1
+a421 1
+   if (intel->locked)
+d426 2
+a427 2
+		     region->pitch, region->buffer, 0, region->tiled,
+		     region->pitch, pbo->buffer, 0, region->tiled,
+d432 1
+a432 3
+   intel_batchbuffer_flush(intel->batch);
+
+   if (was_locked)
+d457 1
+a469 1
+   region->tiled = region_desc->tiled;
+d471 56
+a526 7
+   region->buffer = dri_bo_alloc_static(intel->bufmgr,
+					name,
+					region_desc->offset,
+					intelScreen->pitch *
+					intelScreen->height,
+					region_desc->map,
+					DRM_BO_FLAG_MEM_TT);
+@
+
+
+1.2
+log
+@remove the triple buffering support from the intel driver, the support
+from this was removed from the kernel and is very much deprecated.
+Pageflipping is also probably broken and should not be used. Similar
+change happened in mesa master a while back.
+
+ok matthieu@@
+@
+text
+@a46 1
+#include "intel_bufmgr_ttm.h"
+a115 13
+struct intel_region *
+intel_region_alloc_for_handle(struct intel_context *intel,
+			      GLuint cpp, GLuint pitch, GLuint height,
+			      GLuint tiled, GLuint handle)
+{
+   dri_bo *buffer;
+
+   buffer = intel_ttm_bo_create_from_handle(intel->bufmgr, "region", handle);
+
+   return intel_region_alloc_internal(intel,
+				      cpp, pitch, height, tiled, buffer);
+}
+
+d426 7
+a432 14
+   if (intel->ttm) {
+      assert(region_desc->bo_handle != -1);
+      region->buffer = intel_ttm_bo_create_from_handle(intel->bufmgr,
+						       name,
+						       region_desc->bo_handle);
+   } else {
+      region->buffer = dri_bo_alloc_static(intel->bufmgr,
+					   name,
+					   region_desc->offset,
+					   intelScreen->pitch *
+					   intelScreen->height,
+					   region_desc->map,
+					   DRM_BO_FLAG_MEM_TT);
+   }
+@
+
+
+1.1
+log
+@Mesa 7.2, Tested by ckuethe@@, naddy@@, oga@@, and others.
+@
+text
+@a485 9
+#ifdef I915
+   if (intelScreen->third.handle) {
+      intel->third_region =
+	 intel_recreate_static(intel, "third",
+			       intel->third_region,
+			       &intelScreen->third);
+   }
+#endif /* I915 */
+
+@
+
+
+1.1.1.1
+log
+@Import Mesa 7.10.3
+@
+text
+@a41 4
+#include <sys/ioctl.h>
+#include <errno.h>
+
+#include "main/hash.h"
+d46 2
+a47 1
+#include "intel_bufmgr.h"
+a51 54
+/* This should be set to the maximum backtrace size desired.
+ * Set it to 0 to disable backtrace debugging.
+ */
+#define DEBUG_BACKTRACE_SIZE 0
+
+#if DEBUG_BACKTRACE_SIZE == 0
+/* Use the standard debug output */
+#define _DBG(...) DBG(__VA_ARGS__)
+#else
+/* Use backtracing debug output */
+#define _DBG(...) {debug_backtrace(); DBG(__VA_ARGS__);}
+
+/* Backtracing debug support */
+#include <execinfo.h>
+
+static void
+debug_backtrace(void)
+{
+   void *trace[DEBUG_BACKTRACE_SIZE];
+   char **strings = NULL;
+   int traceSize;
+   register int i;
+
+   traceSize = backtrace(trace, DEBUG_BACKTRACE_SIZE);
+   strings = backtrace_symbols(trace, traceSize);
+   if (strings == NULL) {
+      DBG("no backtrace:");
+      return;
+   }
+
+   /* Spit out all the strings with a colon separator.  Ignore
+    * the first, since we don't really care about the call
+    * to debug_backtrace() itself.  Skip until the final "/" in
+    * the trace to avoid really long lines.
+    */
+   for (i = 1; i < traceSize; i++) {
+      char *p = strings[i], *slash = strings[i];
+      while (*p) {
+         if (*p++ == '/') {
+            slash = p;
+         }
+      }
+
+      DBG("%s:", slash);
+   }
+
+   /* Free up the memory, and we're done */
+   free(strings);
+}
+
+#endif
+
+
+
+d57 1
+a57 3
+   intel_flush(&intel->ctx);
+
+   _DBG("%s %p\n", __FUNCTION__, region);
+d62 1
+a62 4
+      if (region->tiling != I915_TILING_NONE)
+	 drm_intel_gem_bo_map_gtt(region->buffer);
+      else
+	 drm_intel_bo_map(region->buffer, GL_TRUE);
+d72 1
+a72 1
+   _DBG("%s %p\n", __FUNCTION__, region);
+d74 1
+a74 4
+      if (region->tiling != I915_TILING_NONE)
+	 drm_intel_gem_bo_unmap_gtt(region->buffer);
+      else
+	 drm_intel_bo_unmap(region->buffer);
+d80 3
+a82 4
+intel_region_alloc_internal(struct intel_screen *screen,
+			    GLuint cpp,
+			    GLuint width, GLuint height, GLuint pitch,
+			    uint32_t tiling, drm_intel_bo *buffer)
+d86 3
+a88 2
+   if (buffer == NULL) {
+      _DBG("%s <-- NULL\n", __FUNCTION__);
+a89 1
+   }
+a91 3
+   if (region == NULL)
+      return region;
+
+a92 2
+   region->width = width;
+   region->height = height;
+d94 1
+d96 1
+a97 2
+   region->tiling = tiling;
+   region->screen = screen;
+a98 1
+   _DBG("%s <-- %p\n", __FUNCTION__, region);
+d103 2
+a104 4
+intel_region_alloc(struct intel_screen *screen,
+		   uint32_t tiling,
+                   GLuint cpp, GLuint width, GLuint height,
+		   GLboolean expect_accelerated_upload)
+d106 1
+a106 3
+   drm_intel_bo *buffer;
+   unsigned long flags = 0;
+   unsigned long aligned_pitch;
+d108 5
+a112 2
+   if (expect_accelerated_upload)
+      flags |= BO_ALLOC_FOR_RENDER;
+d114 1
+a114 6
+   buffer = drm_intel_bo_alloc_tiled(screen->bufmgr, "region",
+				     width, height, cpp,
+				     &tiling, &aligned_pitch, flags);
+
+   return intel_region_alloc_internal(screen, cpp, width, height,
+				      aligned_pitch / cpp, tiling, buffer);
+d117 4
+a120 2
+GLboolean
+intel_region_flink(struct intel_region *region, uint32_t *name)
+d122 1
+a122 55
+   if (region->name == 0) {
+      if (drm_intel_bo_flink(region->buffer, &region->name))
+	 return GL_FALSE;
+      
+      _mesa_HashInsert(region->screen->named_regions,
+		       region->name, region);
+   }
+
+   *name = region->name;
+
+   return GL_TRUE;
+}
+
+struct intel_region *
+intel_region_alloc_for_handle(struct intel_screen *screen,
+			      GLuint cpp,
+			      GLuint width, GLuint height, GLuint pitch,
+			      GLuint handle, const char *name)
+{
+   struct intel_region *region, *dummy;
+   drm_intel_bo *buffer;
+   int ret;
+   uint32_t bit_6_swizzle, tiling;
+
+   region = _mesa_HashLookup(screen->named_regions, handle);
+   if (region != NULL) {
+      dummy = NULL;
+      if (region->width != width || region->height != height ||
+	  region->cpp != cpp || region->pitch != pitch) {
+	 fprintf(stderr,
+		 "Region for name %d already exists but is not compatible\n",
+		 handle);
+	 return NULL;
+      }
+      intel_region_reference(&dummy, region);
+      return dummy;
+   }
+
+   buffer = intel_bo_gem_create_from_name(screen->bufmgr, name, handle);
+   if (buffer == NULL)
+      return NULL;
+   ret = drm_intel_bo_get_tiling(buffer, &tiling, &bit_6_swizzle);
+   if (ret != 0) {
+      fprintf(stderr, "Couldn't get tiling of buffer %d (%s): %s\n",
+	      handle, name, strerror(-ret));
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   region = intel_region_alloc_internal(screen, cpp,
+					width, height, pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+d124 1
+a124 2
+   region->name = handle;
+   _mesa_HashInsert(screen->named_regions, handle, region);
+d126 2
+a127 1
+   return region;
+a132 3
+   if (src)
+      _DBG("%s %p %d\n", __FUNCTION__, src, src->refcount);
+
+d141 1
+a141 1
+intel_region_release(struct intel_region **region_handle)
+d143 1
+a143 4
+   struct intel_region *region = *region_handle;
+
+   if (region == NULL) {
+      _DBG("%s NULL\n", __FUNCTION__);
+a144 6
+   }
+
+   _DBG("%s %p %d\n", __FUNCTION__, region, region->refcount - 1);
+
+   ASSERT(region->refcount > 0);
+   region->refcount--;
+d146 1
+a146 2
+   if (region->refcount == 0) {
+      assert(region->map_refcount == 0);
+d148 2
+a149 4
+      if (region->pbo)
+	 region->pbo->region = NULL;
+      region->pbo = NULL;
+      drm_intel_bo_unreference(region->buffer);
+d151 2
+a152 2
+      if (region->name > 0)
+	 _mesa_HashRemove(region->screen->named_regions, region->name);
+d154 5
+a158 1
+      free(region);
+d160 1
+a160 1
+   *region_handle = NULL;
+d184 1
+a184 1
+   src += src_y * src_pitch;
+d214 3
+a216 1
+   _DBG("%s\n", __FUNCTION__);
+d229 4
+a232 1
+   intel_prepare_render(intel);
+d240 4
+d249 1
+a249 1
+GLboolean
+d256 1
+a256 3
+                  GLuint srcx, GLuint srcy, GLuint width, GLuint height,
+		  GLboolean flip,
+		  GLenum logicop)
+d258 1
+a258 3
+   uint32_t src_pitch = src->pitch;
+
+   _DBG("%s\n", __FUNCTION__);
+d261 1
+a261 1
+      return GL_FALSE;
+d273 30
+a302 2
+   if (flip)
+      src_pitch = -src_pitch;
+d304 4
+a307 6
+   return intelEmitCopyBlit(intel,
+			    dst->cpp,
+			    src_pitch, src->buffer, src_offset, src->tiling,
+			    dst->pitch, dst->buffer, dst_offset, dst->tiling,
+			    srcx, srcy, dstx, dsty, width, height,
+			    logicop);
+a317 2
+   drm_intel_bo *buffer;
+
+a320 2
+   _DBG("%s %p %p\n", __FUNCTION__, region, pbo);
+
+d332 1
+a332 1
+      drm_intel_bo_unreference(region->buffer);
+a335 3
+   /* make sure pbo has a buffer of its own */
+   buffer = intel_bufferobj_buffer(intel, pbo, INTEL_WRITE_FULL);
+
+d338 2
+a339 3
+   drm_intel_bo_reference(buffer);
+   region->buffer = buffer;
+   region->tiling = I915_TILING_NONE;
+a349 1
+   _DBG("%s %p\n", __FUNCTION__, region);
+d353 1
+a353 1
+   drm_intel_bo_unreference(region->buffer);
+d356 6
+a361 4
+   region->buffer = drm_intel_bo_alloc(intel->bufmgr, "region",
+				       region->pitch * region->cpp *
+				       region->height,
+				       64);
+d371 4
+a374 1
+   GLboolean ok;
+d380 1
+a380 1
+   _DBG("%s %p (%d bytes)\n", __FUNCTION__, region, pbo->Base.Size);
+d385 18
+a402 9
+   intel_prepare_render(intel);
+   ok = intelEmitCopyBlit(intel,
+                          region->cpp,
+                          region->pitch, pbo->buffer, 0, region->tiling,
+                          region->pitch, region->buffer, 0, region->tiling,
+                          0, 0, 0, 0,
+                          region->pitch, region->height,
+                          GL_COPY);
+   assert(ok);
+d405 1
+a405 1
+drm_intel_bo *
+d417 85
+@
+
+

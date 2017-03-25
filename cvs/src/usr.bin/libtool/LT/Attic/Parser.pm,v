@@ -1,0 +1,824 @@
+head	1.12;
+access;
+symbols;
+locks; strict;
+comment	@# @;
+
+
+1.12
+date	2012.07.12.17.07.12;	author espie;	state dead;
+branches;
+next	1.11;
+
+1.11
+date	2012.07.12.13.03.28;	author espie;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2012.07.12.11.43.46;	author espie;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2012.07.12.09.43.34;	author espie;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2012.07.12.07.35.45;	author espie;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2012.07.11.13.54.48;	author espie;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2012.07.11.13.25.44;	author espie;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2012.07.10.17.05.34;	author espie;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2012.07.10.16.41.00;	author espie;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.07.06.11.30.41;	author espie;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.07.04.12.39.34;	author espie;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.06.19.09.30.44;	author espie;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.12
+log
+@okay, now the parser module is totally part of Mode/Link.pm, no reason
+for a separate file
+@
+text
+@# $OpenBSD: Parser.pm,v 1.11 2012/07/12 13:03:28 espie Exp $
+
+# Copyright (c) 2007-2010 Steven Mestdagh <steven@@openbsd.org>
+# Copyright (c) 2012 Marc Espie <espie@@openbsd.org>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use strict;
+use warnings;
+use feature qw(say switch state);
+
+package LT::Parser;
+use File::Basename;
+use Cwd qw(abs_path);
+use LT::Util;
+use LT::Library;
+use LT::Trace;
+
+my $calls = 0;
+
+sub build_cache
+{
+	my ($self, $lainfo, $level) = @@_;
+	my $o = $lainfo->{cached} = {
+	    deplibs => [], libdirs => [], result => []};
+	$self->internal_resolve_la($o, $lainfo->deplib_list, 
+	    $level+1);
+	push(@@{$o->{deplibs}}, @@{$lainfo->deplib_list});
+	if ($lainfo->{libdir} ne '') {
+		push(@@{$o->{libdirs}}, $lainfo->{libdir});
+	}
+	for my $e (qw(deplibs libdirs result)) {
+		if (@@{$o->{$e}} > 50) {
+			$o->{$e} = reverse_zap_duplicates_ref($o->{$e});
+		}
+	}
+}
+
+sub internal_resolve_la
+{
+	my ($self, $o, $args, $level) = @@_;
+	$level //= 0;
+	tsay {"resolve level: $level"};
+	$o->{pthread} = 0;
+	foreach my $_ (@@$args) {
+		if ($_ eq '-pthread') {
+			$o->{pthread}++;
+			next;
+		}
+		push(@@{$o->{result}}, $_);
+		next unless m/\.la$/;
+		require LT::LaFile;
+		my $lainfo = LT::LaFile->parse($_);
+		if  (!exists $lainfo->{cached}) {
+			$self->build_cache($lainfo, $level+1);
+		}
+		$o->{pthread} += $lainfo->{cached}{pthread};
+		for my $e (qw(deplibs libdirs result)) {
+			push(@@{$o->{$e}}, @@{$lainfo->{cached}{$e}});
+		}
+	}
+	$calls++;
+}
+
+END
+{
+	LT::Trace::print { "Calls to resolve_la: $calls\n" } if $calls;
+}
+
+# resolve .la files until a level with empty dependency_libs is reached.
+sub resolve_la
+{
+	my ($self, $deplibs, $libdirs) = @@_;
+
+	tsay {"argvstring (pre resolve_la): @@{$self->{args}}"};
+	my $o = { result => [], deplibs => $deplibs, libdirs => $libdirs};
+
+	$self->internal_resolve_la($o, $self->{args});
+	if ($o->{pthread}) {
+		unshift(@@{$o->{result}}, '-pthread');
+		unshift(@@{$o->{deplibs}}, '-pthread');
+	}
+
+	tsay {"argvstring (post resolve_la): @@{$self->{args}}"};
+	$self->{args} = $o->{result};
+}
+
+# parse link flags and arguments
+# eliminate all -L and -l flags in the argument string and add the
+# corresponding directories and library names to the dirs/libs hashes.
+# fill deplibs, to be taken up as dependencies in the resulting .la file...
+# set up a hash for library files which haven't been found yet.
+# deplibs are formed by collecting the original -L/-l flags, plus
+# any .la files passed on the command line, EXCEPT when the .la file
+# does not point to a shared library.
+# pass 1
+# -Lfoo, -lfoo, foo.a, foo.la
+# recursively find .la files corresponding to -l flags; if there is no .la
+# file, just inspect the library file itself for any dependencies.
+sub internal_parse_linkargs1
+{
+	my ($self, $deplibs, $gp, $dirs, $libs, $args, $level) = @@_;
+
+	$level //= 0;
+	tsay {"parse_linkargs1, level: $level"};
+	tsay {"  args: @@$args"};
+	my $result   = $self->{result};
+
+	# first read all directories where we can search libraries
+	foreach my $_ (@@$args) {
+		if (m/^-L(.*)/) {
+			if (!exists $dirs->{$1}) {
+				$dirs->{$1} = 1;
+				tsay {"    adding $_ to deplibs"} 
+				    if $level == 0;
+				push @@$deplibs, $_;
+			}
+		}
+	}
+	foreach my $_ (@@$args) {
+		tsay {"  processing $_"};
+		if (!$_ || $_ eq '' || m/^\s+$/) {
+			# skip empty arguments
+		} elsif ($_ eq '-pthread') {
+			$self->{pthread} = 1;
+		} elsif (m/^-L(.*)/) {
+			# already read earlier, do nothing
+		} elsif (m/^-R(.*)/) {
+			# -R options originating from .la resolution
+			# those from @@ARGV are in @@Ropts
+			$gp->add_R($1);
+		} elsif (m/^-l(\S+)/) {
+			my @@largs = ();
+			my $key = $1;
+			if (!exists $libs->{$key}) {
+				$libs->{$key} = LT::Library->new($key);
+				require LT::LaFile;
+				my $lafile = LT::LaFile->find($key, $dirs);
+				if ($lafile) {
+					$libs->{$key}->{lafile} = $lafile;
+					my $absla = abs_path($lafile);
+					tsay {"    adding $absla to deplibs"} 
+					    if $level == 0;
+					push @@$deplibs, $absla;
+					push @@$result, $lafile;
+					next;
+				} else {
+					$libs->{$key}->resolve_library($dirs, 1, 0, 'notyet', $gp);
+					my @@deps = $libs->{$key}->inspect;
+					foreach my $d (@@deps) {
+						my $k = basename($d);
+						$k =~ s/^(\S+)\.so.*$/$1/;
+						$k =~ s/^lib//;
+						push(@@largs, "-l$k");
+					}
+				}
+			}
+			tsay {"    adding $_ to deplibs"} if $level == 0;
+			push @@$deplibs, $_;
+			push(@@$result, $_);
+			my $dummy = []; # no need to add deplibs recursively
+			$self->internal_parse_linkargs1($dummy, $gp, $dirs, 
+			    $libs, \@@largs, $level+1) if @@largs;
+		} elsif (m/(\S+\/)*(\S+)\.a$/) {
+			(my $key = $2) =~ s/^lib//;
+			if (!exists $libs->{$key}) {
+				$libs->{$key} = LT::Library->new($key);
+			}
+			$dirs->{abs_dir($_)} = 1;
+			$libs->{$key}->{fullpath} = $_;
+			push(@@$result, $_);
+		} elsif (m/(\S+\/)*(\S+)\.la$/) {
+			(my $key = $2) =~ s/^lib//;
+			$dirs->{abs_dir($_)} = 1;
+			my $fulla = abs_path($_);
+			require LT::LaFile;
+			my $lainfo = LT::LaFile->parse($fulla);
+			my $dlname = $lainfo->{'dlname'};
+			my $oldlib = $lainfo->{'old_library'};
+			my $libdir = $lainfo->{'libdir'};
+			if ($dlname ne '') {
+				if (!exists $libs->{$key}) {
+					$libs->{$key} = LT::Library->new($key);
+					$libs->{$key}->{lafile} = $fulla;
+				}
+			}
+			push(@@$result, $_);
+			push(@@$deplibs, $fulla) if $libdir ne '';
+		} elsif (m/(\S+\/)*(\S+)\.so(\.\d+){2}/) {
+			(my $key = $2) =~ s/^lib//;
+			$dirs->{abs_dir($_)} = 1;
+			if (!exists $libs->{$key}) {
+				$libs->{$key} = LT::Library->new($key);
+			}
+			# not really normal argument
+			# -lfoo should be used instead, so convert it
+			push(@@$result, "-l$key");
+		} else {
+			push(@@$result, $_);
+		}
+	}
+}
+
+sub parse_linkargs1
+{
+	my ($self, $deplibs, $gp, $dirs, $libs, $args) = @@_;
+	$self->{result} = [];
+	$self->internal_parse_linkargs1($deplibs, $gp, $dirs, $libs, 
+	    $self->{args});
+    	push(@@$deplibs, '-pthread') if $self->{pthread};
+	$self->{args} = $self->{result};
+}
+
+# pass 2
+# -Lfoo, -lfoo, foo.a
+# no recursion in pass 2
+# fill orderedlibs array, which is the sequence of shared libraries
+#   after resolving all .la
+# (this list may contain duplicates)
+# fill staticlibs array, which is the sequence of static and convenience
+#   libraries
+# XXX the variable $parser->{seen_la_shared} will register whether or not
+#     a .la file is found which refers to a shared library and which is not
+#     yet installed
+#     this is used to decide where to link executables and create wrappers
+sub parse_linkargs2
+{
+	my ($self, $gp, $orderedlibs, $staticlibs, $dirs, $libs) = @@_;
+	tsay {"parse_linkargs2"};
+	tsay {"  args: @@{$self->{args}}"};
+	$self->{result} = [];
+	my $result = $self->{result};
+
+	foreach my $_ (@@{$self->{args}}) {
+		tsay {"  processing $_"};
+		if (!$_ || $_ eq '' || m/^\s+$/) {
+			# skip empty arguments
+		} elsif ($_ eq '-lc') {
+			# don't link explicitly with libc (just remove -lc)
+		} elsif ($_ eq '-pthread') {
+			$self->{pthread} = 1;
+		} elsif (m/^-L(.*)/) {
+			if (!exists $dirs->{$1}) {
+				$dirs->{$1} = 1;
+			}
+		} elsif (m/^-R(.*)/) {
+			# -R options originating from .la resolution
+			# those from @@ARGV are in @@Ropts
+			$gp->add_R($1);
+		} elsif (m/^-l(.*)/) {
+			my @@largs = ();
+			my $key = $1;
+			if (!exists $libs->{$key}) {
+				$libs->{$key} = LT::Library->new($key);
+			}
+			push @@$orderedlibs, $key;
+		} elsif (m/(\S+\/)*(\S+)\.a$/) {
+			(my $key = $2) =~ s/^lib//;
+			if (!exists $libs->{$key}) {
+				$libs->{$key} = LT::Library->new($key);
+			}
+			$libs->{$key}->{fullpath} = $_;
+			push(@@$staticlibs, $_);
+		} elsif (m/(\S+\/)*(\S+)\.la$/) {
+			(my $key = $2) =~ s/^lib//;
+			my $d = abs_dir($_);
+			$dirs->{$d} = 1;
+			my $fulla = abs_path($_);
+			require LT::LaFile;
+			my $lainfo = LT::LaFile->parse($fulla);
+			my $dlname = $lainfo->stringize('dlname');
+			my $oldlib = $lainfo->stringize('old_library');
+			my $installed = $lainfo->stringize('installed');
+			if ($dlname ne '' && $installed eq 'no') {
+				tsay {"seen uninstalled la shared in $_"};
+				$self->{seen_la_shared} = 1;
+			}
+			if ($dlname eq '' && -f "$d/$ltdir/$oldlib") {
+				push @@$staticlibs, "$d/$ltdir/$oldlib";
+			} else {
+				if (!exists $libs->{$key}) {
+					$libs->{$key} = LT::Library->new($key);
+					$libs->{$key}->{lafile} = $fulla;
+				}
+				push @@$orderedlibs, $key;
+			}
+		} elsif (m/^-Wl,(\S+)$/) {
+			# libtool accepts a list of -Wl options separated
+			# by commas, and possibly with a trailing comma
+			# which is not accepted by the linker
+			my @@Wlflags = split(/,/, $1);
+			foreach my $f (@@Wlflags) {
+				push(@@$result, "-Wl,$f");
+			}
+		} else {
+			push(@@$result, $_);
+		}
+	}
+	tsay {"end parse_linkargs2"};
+	return $self->{result};
+}
+
+sub new
+{
+	my ($class, $args) = @@_;
+	bless { args => $args, pthread => 0 }, $class;
+}
+1;
+@
+
+
+1.11
+log
+@perlify: $_ is subject
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.10 2012/07/12 11:43:46 espie Exp $
+@
+
+
+1.10
+log
+@deal with -pthread as a "once on" option.
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.9 2012/07/12 09:43:34 espie Exp $
+d55 2
+a56 2
+	foreach my $a (@@$args) {
+		if ($a eq '-pthread') {
+d60 2
+a61 2
+		push(@@{$o->{result}}, $a);
+		next if $a !~ m/\.la$/;
+d63 1
+a63 1
+		my $lainfo = LT::LaFile->parse($a);
+d120 2
+a121 2
+	foreach my $a (@@$args) {
+		if ($a =~ m/^-L(.*)/) {
+d124 1
+a124 1
+				tsay {"    adding $a to deplibs"} 
+d126 1
+a126 1
+				push @@$deplibs, $a;
+d130 3
+a132 3
+	foreach my $a (@@$args) {
+		tsay {"  processing $a"};
+		if (!$a || $a eq '' || $a =~ m/^\s+$/) {
+d134 1
+a134 1
+		} elsif ($a eq '-pthread') {
+d136 1
+a136 1
+		} elsif ($a =~ m/^-L(.*)/) {
+d138 1
+a138 1
+		} elsif ($a =~ m/^-R(.*)/) {
+d142 1
+a142 1
+		} elsif ($a =~ m/^-l(\S+)/) {
+d168 3
+a170 3
+			tsay {"    adding $a to deplibs"} if $level == 0;
+			push @@$deplibs, $a;
+			push(@@$result, $a);
+d172 3
+a174 3
+			$self->internal_parse_linkargs1($dummy, $gp, $dirs, $libs,
+			       	\@@largs, $level+1) if @@largs;
+		} elsif ($a =~ m/(\S+\/)*(\S+)\.a$/) {
+d179 4
+a182 4
+			$dirs->{abs_dir($a)} = 1;
+			$libs->{$key}->{fullpath} = $a;
+			push(@@$result, $a);
+		} elsif ($a =~ m/(\S+\/)*(\S+)\.la$/) {
+d184 2
+a185 2
+			$dirs->{abs_dir($a)} = 1;
+			my $fulla = abs_path($a);
+d197 1
+a197 1
+			push(@@$result, $a);
+d199 1
+a199 1
+		} elsif ($a =~ m/(\S+\/)*(\S+)\.so(\.\d+){2}/) {
+d201 1
+a201 1
+			$dirs->{abs_dir($a)} = 1;
+d209 1
+a209 1
+			push(@@$result, $a);
+d244 3
+a246 3
+	foreach my $a (@@{$self->{args}}) {
+		tsay {"  processing $a"};
+		if (!$a || $a eq '' || $a =~ m/^\s+$/) {
+d248 1
+a248 1
+		} elsif ($a eq '-lc') {
+d250 1
+a250 1
+		} elsif ($a eq '-pthread') {
+d252 1
+a252 1
+		} elsif ($a =~ m/^-L(.*)/) {
+d256 1
+a256 1
+		} elsif ($a =~ m/^-R(.*)/) {
+d260 1
+a260 1
+		} elsif ($a =~ m/^-l(.*)/) {
+d267 1
+a267 1
+		} elsif ($a =~ m/(\S+\/)*(\S+)\.a$/) {
+d272 3
+a274 3
+			$libs->{$key}->{fullpath} = $a;
+			push(@@$staticlibs, $a);
+		} elsif ($a =~ m/(\S+\/)*(\S+)\.la$/) {
+d276 1
+a276 1
+			my $d = abs_dir($a);
+d278 1
+a278 1
+			my $fulla = abs_path($a);
+d285 1
+a285 1
+				tsay {"seen uninstalled la shared in $a"};
+d297 1
+a297 1
+		} elsif ($a =~ m/^-Wl,(\S+)/) {
+d306 1
+a306 1
+			push(@@$result, $a);
+@
+
+
+1.9
+log
+@simplify yet a bit more
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.8 2012/07/12 07:35:45 espie Exp $
+d134 1
+a134 3
+		} elsif ($a eq '-pthread' && !$self->{pthread}) {
+			# XXX special treatment since it's not a -l flag
+			push @@$deplibs, $a;
+a135 1
+			push(@@$result, $a);
+d220 1
+d250 1
+a250 2
+		} elsif ($a eq '-pthread' && !$self->{pthread}) {
+			# XXX special treatment since it's not a -l flag
+a251 1
+			push(@@$result, $a);
+@
+
+
+1.8
+log
+@move a bit of stuff around
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.7 2012/07/11 13:54:48 espie Exp $
+d85 1
+d94 2
+a95 2
+	$self->{result} = $o->{result};
+	return $o->{result};
+d113 2
+d222 1
+a222 1
+	    $self->{args}, 0);
+@
+
+
+1.7
+log
+@try to make code vaguely sane
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.6 2012/07/11 13:25:44 espie Exp $
+a110 1
+	state $seen_pthread = 0;
+d131 1
+a131 1
+		} elsif ($a eq '-pthread' && !$seen_pthread) {
+d134 1
+a134 1
+			$seen_pthread = 1;
+d198 1
+a198 1
+			push(@@$deplibs, $fulla) if ($libdir ne '');
+d217 1
+a236 1
+	state $seen_pthread = 0;
+d249 1
+a249 1
+		} elsif ($a eq '-pthread' && !$seen_pthread) {
+d251 1
+a251 1
+			$seen_pthread = 1;
+d317 1
+a317 1
+	bless { args => $args, result => [] }, $class;
+@
+
+
+1.6
+log
+@simplify cache code a bit
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.5 2012/07/10 17:05:34 espie Exp $
+a86 2
+	$self->{result} = [];
+
+d94 1
+a94 1
+	return $self->{result};
+d109 1
+a109 1
+sub parse_linkargs1
+d173 1
+a173 1
+			$self->parse_linkargs1($dummy, $gp, $dirs, $libs,
+d215 8
+d318 1
+a318 1
+	bless { args => $args }, $class;
+@
+
+
+1.5
+log
+@unconfuse myself.
+having two methods that do completely different things with the same name (!)
+is evil...
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.4 2012/07/10 16:41:00 espie Exp $
+d31 18
+d51 2
+a52 1
+	my ($self, $level, $result, $rdeplibs, $rlibdirs, $args) = @@_;
+d54 1
+a54 1
+	my $seen_pthread = 0;
+d57 1
+a57 1
+			$seen_pthread++;
+d60 1
+a60 1
+		push(@@$result, $a);
+d64 6
+a69 25
+		if (!exists $lainfo->{'cached_deplibs'}) {
+		    $lainfo->{'cached_deplibs'} = [];
+		    $lainfo->{'cached_result'} = [];
+		    $lainfo->{'cached_libdirs'} = [];
+		    $lainfo->{'cached_pthread'} =
+			$self->internal_resolve_la($level+1,
+			    $lainfo->{'cached_result'},
+			    $lainfo->{'cached_deplibs'},
+			    $lainfo->{'cached_libdirs'},
+			    $lainfo->deplib_list);
+		    push(@@{$lainfo->{'cached_deplibs'}},
+			@@{$lainfo->deplib_list});
+		    if ($lainfo->{'libdir'} ne '') {
+			push(@@{$lainfo->{'cached_libdirs'}},
+			    $lainfo->{'libdir'});
+		    }
+		    if (@@{$lainfo->{'cached_deplibs'}} > 50) {
+		    	$lainfo->{'cached_deplibs'} = reverse_zap_duplicates_ref($lainfo->{'cached_deplibs'});
+		    }
+		    if (@@{$lainfo->{'cached_libdirs'}} > 50) {
+		    	$lainfo->{'cached_libdirs'} = reverse_zap_duplicates_ref($lainfo->{'cached_libdirs'});
+		    }
+		    if (@@{$lainfo->{'cached_result'}} > 50) {
+		    	$lainfo->{'cached_result'} = reverse_zap_duplicates_ref($lainfo->{'cached_result'});
+		    }
+a70 4
+		$seen_pthread += $lainfo->{'cached_pthread'};
+		push(@@$result, @@{$lainfo->{'cached_result'}});
+		push(@@$rdeplibs, @@{$lainfo->{'cached_deplibs'}});
+		push(@@$rlibdirs, @@{$lainfo->{'cached_libdirs'}});
+a72 1
+	return $seen_pthread;
+d84 3
+d88 5
+a92 3
+	if ($self->internal_resolve_la(0, $self->{result}, $deplibs, $libdirs, $self->{args})) {
+		unshift(@@{$self->{result}}, '-pthread');
+		unshift(@@$deplibs, '-pthread');
+d94 2
+@
+
+
+1.4
+log
+@ouch, Rresolved and libsearchdirs no longer live in main, so make them
+part of $gp as they should be...
+
+Oh, and create an actual linker object for later.
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.3 2012/07/06 11:30:41 espie Exp $
+d159 1
+a159 1
+					$libs->{$key}->find($dirs, 1, 0, 'notyet', [$gp->libsearchdirs]);
+d162 1
+a162 1
+						my $k = basename $d;
+@
+
+
+1.3
+log
+@add my copyright, since I'm going to do yet MORE changes...
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.2 2012/07/04 12:39:34 espie Exp $
+d112 1
+a112 2
+	my ($self, $deplibs, $Rresolved, $libsearchdirs,
+	    $dirs, $libs, $args, $level) = @@_;
+d142 1
+a142 1
+			push @@$Rresolved, $1;
+d159 1
+a159 1
+					$libs->{$key}->find($dirs, 1, 0, 'notyet', $libsearchdirs);
+d173 1
+a173 2
+			$self->parse_linkargs1($dummy, $Rresolved,
+				$libsearchdirs, $dirs, $libs,
+d230 1
+a230 2
+	my ($self, $Rresolved, $libsearchdirs, $orderedlibs, $staticlibs,
+	    $dirs, $libs) = @@_;
+d253 1
+a253 1
+			push @@$Rresolved, $1;
+@
+
+
+1.2
+log
+@- start cleaning up options handling: put things into a separate package
+that encapsulates accesses to Getopt::Long (which is badly suited for us
+actually)
+- simplify LT::Trace syntax
+- implement --tag checks that mimic actual libtool
+- add libtool comp support, as per libtool2
+(but keep implicit modes as per libtool1)
+- prevent shell code in nm execution
+
+okay jasper@@, steven@@
+@
+text
+@d1 1
+a1 1
+# $OpenBSD: Parser.pm,v 1.1 2012/06/19 09:30:44 espie Exp $
+d4 1
+@
+
+
+1.1
+log
+@add libtool to base, okay deraadt@@, jasper@@, millert@@...
+(as requested by matthieu@@ so we can work on xenocara).
+@
+text
+@d1 1
+a1 1
+# $OpenBSD$
+d26 2
+d33 1
+a33 1
+	LT::Trace::debug {"resolve level: $level\n"};
+d113 2
+a114 2
+	LT::Trace::debug {"parse_linkargs1, level: $level\n"};
+	LT::Trace::debug {"  args: @@$args\n"};
+d122 2
+a123 1
+				LT::Trace::debug {"    adding $a to deplibs\n"} if ($level == 0);
+d129 1
+a129 1
+		LT::Trace::debug {"  processing $a\n"};
+d153 2
+a154 1
+					LT::Trace::debug {"    adding $absla to deplibs\n"} if ($level == 0);
+d169 1
+a169 1
+			LT::Trace::debug {"    adding $a to deplibs\n"} if ($level == 0);
+d233 2
+a234 2
+	LT::Trace::debug {"parse_linkargs2\n"};
+	LT::Trace::debug {"  args: @@{$self->{args}}\n"};
+d239 1
+a239 1
+		LT::Trace::debug {"  processing $a\n"};
+d281 1
+a281 1
+				LT::Trace::debug {"seen uninstalled la shared in $a\n"};
+d305 1
+a305 1
+	LT::Trace::debug {"end parse_linkargs2\n"};
+@
+

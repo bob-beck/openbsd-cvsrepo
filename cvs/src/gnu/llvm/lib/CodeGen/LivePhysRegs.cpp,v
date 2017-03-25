@@ -1,0 +1,370 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.46.59;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.46.59;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.00;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.37;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===--- LivePhysRegs.cpp - Live Physical Register Set --------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements the LivePhysRegs utility for tracking liveness of
+// physical registers across machine instructions in forward or backward order.
+// A more detailed description can be found in the corresponding header file.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBundle.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+using namespace llvm;
+
+
+/// \brief Remove all registers from the set that get clobbered by the register
+/// mask.
+/// The clobbers set will be the list of live registers clobbered
+/// by the regmask.
+void LivePhysRegs::removeRegsInMask(const MachineOperand &MO,
+        SmallVectorImpl<std::pair<unsigned, const MachineOperand*>> *Clobbers) {
+  SparseSet<unsigned>::iterator LRI = LiveRegs.begin();
+  while (LRI != LiveRegs.end()) {
+    if (MO.clobbersPhysReg(*LRI)) {
+      if (Clobbers)
+        Clobbers->push_back(std::make_pair(*LRI, &MO));
+      LRI = LiveRegs.erase(LRI);
+    } else
+      ++LRI;
+  }
+}
+
+/// Simulates liveness when stepping backwards over an instruction(bundle):
+/// Remove Defs, add uses. This is the recommended way of calculating liveness.
+void LivePhysRegs::stepBackward(const MachineInstr &MI) {
+  // Remove defined registers and regmask kills from the set.
+  for (ConstMIBundleOperands O(&MI); O.isValid(); ++O) {
+    if (O->isReg()) {
+      if (!O->isDef())
+        continue;
+      unsigned Reg = O->getReg();
+      if (Reg == 0)
+        continue;
+      removeReg(Reg);
+    } else if (O->isRegMask())
+      removeRegsInMask(*O, nullptr);
+  }
+
+  // Add uses to the set.
+  for (ConstMIBundleOperands O(&MI); O.isValid(); ++O) {
+    if (!O->isReg() || !O->readsReg() || O->isUndef())
+      continue;
+    unsigned Reg = O->getReg();
+    if (Reg == 0)
+      continue;
+    addReg(Reg);
+  }
+}
+
+/// Simulates liveness when stepping forward over an instruction(bundle): Remove
+/// killed-uses, add defs. This is the not recommended way, because it depends
+/// on accurate kill flags. If possible use stepBackward() instead of this
+/// function.
+void LivePhysRegs::stepForward(const MachineInstr &MI,
+        SmallVectorImpl<std::pair<unsigned, const MachineOperand*>> &Clobbers) {
+  // Remove killed registers from the set.
+  for (ConstMIBundleOperands O(&MI); O.isValid(); ++O) {
+    if (O->isReg()) {
+      unsigned Reg = O->getReg();
+      if (Reg == 0)
+        continue;
+      if (O->isDef()) {
+        // Note, dead defs are still recorded.  The caller should decide how to
+        // handle them.
+        Clobbers.push_back(std::make_pair(Reg, &*O));
+      } else {
+        if (!O->isKill())
+          continue;
+        assert(O->isUse());
+        removeReg(Reg);
+      }
+    } else if (O->isRegMask())
+      removeRegsInMask(*O, &Clobbers);
+  }
+
+  // Add defs to the set.
+  for (auto Reg : Clobbers) {
+    // Skip dead defs.  They shouldn't be added to the set.
+    if (Reg.second->isReg() && Reg.second->isDead())
+      continue;
+    addReg(Reg.first);
+  }
+}
+
+/// Prin the currently live registers to OS.
+void LivePhysRegs::print(raw_ostream &OS) const {
+  OS << "Live Registers:";
+  if (!TRI) {
+    OS << " (uninitialized)\n";
+    return;
+  }
+
+  if (empty()) {
+    OS << " (empty)\n";
+    return;
+  }
+
+  for (const_iterator I = begin(), E = end(); I != E; ++I)
+    OS << " " << PrintReg(*I, TRI);
+  OS << "\n";
+}
+
+/// Dumps the currently live registers to the debug output.
+void LivePhysRegs::dump() const {
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+  dbgs() << "  " << *this;
+#endif
+}
+
+/// Add live-in registers of basic block \p MBB to \p LiveRegs.
+static void addLiveIns(LivePhysRegs &LiveRegs, const MachineBasicBlock &MBB) {
+  for (const auto &LI : MBB.liveins())
+    LiveRegs.addReg(LI.PhysReg);
+}
+
+/// Add pristine registers to the given \p LiveRegs. This function removes
+/// actually saved callee save registers when \p InPrologueEpilogue is false.
+static void addPristines(LivePhysRegs &LiveRegs, const MachineFunction &MF,
+                         const TargetRegisterInfo &TRI) {
+  const MachineFrameInfo &MFI = *MF.getFrameInfo();
+  if (!MFI.isCalleeSavedInfoValid())
+    return;
+
+  for (const MCPhysReg *CSR = TRI.getCalleeSavedRegs(&MF); CSR && *CSR; ++CSR)
+    LiveRegs.addReg(*CSR);
+  for (const CalleeSavedInfo &Info : MFI.getCalleeSavedInfo())
+    LiveRegs.removeReg(Info.getReg());
+}
+
+void LivePhysRegs::addLiveOuts(const MachineBasicBlock *MBB,
+                               bool AddPristinesAndCSRs) {
+  if (AddPristinesAndCSRs) {
+    const MachineFunction &MF = *MBB->getParent();
+    addPristines(*this, MF, *TRI);
+    if (!MBB->isReturnBlock()) {
+      // The return block has no successors whose live-ins we could merge
+      // below. So instead we add the callee saved registers manually.
+      for (const MCPhysReg *I = TRI->getCalleeSavedRegs(&MF); *I; ++I)
+        addReg(*I);
+    }
+  }
+
+  // To get the live-outs we simply merge the live-ins of all successors.
+  for (const MachineBasicBlock *Succ : MBB->successors())
+    ::addLiveIns(*this, *Succ);
+}
+
+void LivePhysRegs::addLiveIns(const MachineBasicBlock *MBB,
+                              bool AddPristines) {
+  if (AddPristines) {
+    const MachineFunction &MF = *MBB->getParent();
+    addPristines(*this, MF, *TRI);
+  }
+  ::addLiveIns(*this, *MBB);
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@a19 1
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+d46 1
+a46 1
+  for (ConstMIBundleOperands O(MI); O.isValid(); ++O) {
+d59 2
+a60 2
+  for (ConstMIBundleOperands O(MI); O.isValid(); ++O) {
+    if (!O->isReg() || !O->readsReg())
+d76 1
+a76 1
+  for (ConstMIBundleOperands O(MI); O.isValid(); ++O) {
+d123 1
+a123 1
+LLVM_DUMP_METHOD void LivePhysRegs::dump() const {
+a128 13
+bool LivePhysRegs::available(const MachineRegisterInfo &MRI,
+                             unsigned Reg) const {
+  if (LiveRegs.count(Reg))
+    return false;
+  if (MRI.isReserved(Reg))
+    return false;
+  for (MCRegAliasIterator R(Reg, TRI, false); R.isValid(); ++R) {
+    if (LiveRegs.count(*R))
+      return false;
+  }
+  return true;
+}
+
+a137 1
+                         const MachineFrameInfo &MFI,
+d139 4
+d149 6
+a154 11
+void LivePhysRegs::addLiveOutsNoPristines(const MachineBasicBlock &MBB) {
+  // To get the live-outs we simply merge the live-ins of all successors.
+  for (const MachineBasicBlock *Succ : MBB.successors())
+    ::addLiveIns(*this, *Succ);
+}
+
+void LivePhysRegs::addLiveOuts(const MachineBasicBlock &MBB) {
+  const MachineFunction &MF = *MBB.getParent();
+  const MachineFrameInfo &MFI = *MF.getFrameInfo();
+  if (MFI.isCalleeSavedInfoValid()) {
+    if (MBB.isReturnBlock()) {
+a158 2
+    } else {
+      addPristines(*this, MF, MFI, *TRI);
+d162 3
+a164 1
+  addLiveOutsNoPristines(MBB);
+d167 7
+a173 6
+void LivePhysRegs::addLiveIns(const MachineBasicBlock &MBB) {
+  const MachineFunction &MF = *MBB.getParent();
+  const MachineFrameInfo &MFI = *MF.getFrameInfo();
+  if (MFI.isCalleeSavedInfoValid())
+    addPristines(*this, MF, MFI, *TRI);
+  ::addLiveIns(*this, MBB);
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d52 1
+a52 1
+      if (!TargetRegisterInfo::isPhysicalRegister(Reg))
+d64 1
+a64 1
+    if (!TargetRegisterInfo::isPhysicalRegister(Reg))
+d80 1
+a80 1
+      if (!TargetRegisterInfo::isPhysicalRegister(Reg))
+d144 3
+a146 13
+void LivePhysRegs::addBlockLiveIns(const MachineBasicBlock &MBB) {
+  for (const auto &LI : MBB.liveins()) {
+    MCSubRegIndexIterator S(LI.PhysReg, TRI);
+    if (LI.LaneMask.all() || (LI.LaneMask.any() && !S.isValid())) {
+      addReg(LI.PhysReg);
+      continue;
+    }
+    for (; S.isValid(); ++S) {
+      unsigned SI = S.getSubRegIndex();
+      if ((LI.LaneMask & TRI->getSubRegIndexLaneMask(SI)).any())
+        addReg(S.getSubReg());
+    }
+  }
+d163 1
+a163 1
+    addBlockLiveIns(*Succ);
+d168 1
+a168 1
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+d185 1
+a185 1
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+d188 1
+a188 24
+  addBlockLiveIns(MBB);
+}
+
+void llvm::computeLiveIns(LivePhysRegs &LiveRegs, const TargetRegisterInfo &TRI,
+                          MachineBasicBlock &MBB) {
+  assert(MBB.livein_empty());
+  LiveRegs.init(TRI);
+  LiveRegs.addLiveOutsNoPristines(MBB);
+  for (MachineInstr &MI : make_range(MBB.rbegin(), MBB.rend()))
+    LiveRegs.stepBackward(MI);
+
+  for (unsigned Reg : LiveRegs) {
+    // Skip the register if we are about to add one of its super registers.
+    bool ContainsSuperReg = false;
+    for (MCSuperRegIterator SReg(Reg, &TRI); SReg.isValid(); ++SReg) {
+      if (LiveRegs.contains(*SReg)) {
+        ContainsSuperReg = true;
+        break;
+      }
+    }
+    if (ContainsSuperReg)
+      continue;
+    MBB.addLiveIn(Reg);
+  }
+@
+
+

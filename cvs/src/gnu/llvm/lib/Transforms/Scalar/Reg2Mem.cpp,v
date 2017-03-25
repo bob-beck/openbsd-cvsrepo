@@ -1,0 +1,215 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.2
+	LLVM_4_0_0_RC1:1.1.1.2
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.02;	author patrick;	state Exp;
+branches;
+next	;
+commitid	qMUxATnKgqN83Oct;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===- Reg2Mem.cpp - Convert registers to allocas -------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file demotes all registers to memory references.  It is intended to be
+// the inverse of PromoteMemoryToRegister.  By converting to loads, the only
+// values live across basic blocks are allocas and loads before phi nodes.
+// It is intended that this should make CFG hacking much easier.
+// To make later hacking easier, the entry block is split into two, such that
+// all introduced allocas and nothing else are in the entry block.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Pass.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include <list>
+using namespace llvm;
+
+#define DEBUG_TYPE "reg2mem"
+
+STATISTIC(NumRegsDemoted, "Number of registers demoted");
+STATISTIC(NumPhisDemoted, "Number of phi-nodes demoted");
+
+namespace {
+  struct RegToMem : public FunctionPass {
+    static char ID; // Pass identification, replacement for typeid
+    RegToMem() : FunctionPass(ID) {
+      initializeRegToMemPass(*PassRegistry::getPassRegistry());
+    }
+
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequiredID(BreakCriticalEdgesID);
+      AU.addPreservedID(BreakCriticalEdgesID);
+    }
+
+    bool valueEscapes(const Instruction *Inst) const {
+      const BasicBlock *BB = Inst->getParent();
+      for (const User *U : Inst->users()) {
+        const Instruction *UI = cast<Instruction>(U);
+        if (UI->getParent() != BB || isa<PHINode>(UI))
+          return true;
+      }
+      return false;
+    }
+
+    bool runOnFunction(Function &F) override;
+  };
+}
+
+char RegToMem::ID = 0;
+INITIALIZE_PASS_BEGIN(RegToMem, "reg2mem", "Demote all values to stack slots",
+                false, false)
+INITIALIZE_PASS_DEPENDENCY(BreakCriticalEdges)
+INITIALIZE_PASS_END(RegToMem, "reg2mem", "Demote all values to stack slots",
+                false, false)
+
+bool RegToMem::runOnFunction(Function &F) {
+  if (F.isDeclaration())
+    return false;
+
+  // Insert all new allocas into entry block.
+  BasicBlock *BBEntry = &F.getEntryBlock();
+  assert(pred_empty(BBEntry) &&
+         "Entry block to function must not have predecessors!");
+
+  // Find first non-alloca instruction and create insertion point. This is
+  // safe if block is well-formed: it always have terminator, otherwise
+  // we'll get and assertion.
+  BasicBlock::iterator I = BBEntry->begin();
+  while (isa<AllocaInst>(I)) ++I;
+
+  CastInst *AllocaInsertionPoint = new BitCastInst(
+      Constant::getNullValue(Type::getInt32Ty(F.getContext())),
+      Type::getInt32Ty(F.getContext()), "reg2mem alloca point", &*I);
+
+  // Find the escaped instructions. But don't create stack slots for
+  // allocas in entry block.
+  std::list<Instruction*> WorkList;
+  for (Function::iterator ibb = F.begin(), ibe = F.end();
+       ibb != ibe; ++ibb)
+    for (BasicBlock::iterator iib = ibb->begin(), iie = ibb->end();
+         iib != iie; ++iib) {
+      if (!(isa<AllocaInst>(iib) && iib->getParent() == BBEntry) &&
+          valueEscapes(&*iib)) {
+        WorkList.push_front(&*iib);
+      }
+    }
+
+  // Demote escaped instructions
+  NumRegsDemoted += WorkList.size();
+  for (std::list<Instruction*>::iterator ilb = WorkList.begin(),
+       ile = WorkList.end(); ilb != ile; ++ilb)
+    DemoteRegToStack(**ilb, false, AllocaInsertionPoint);
+
+  WorkList.clear();
+
+  // Find all phi's
+  for (Function::iterator ibb = F.begin(), ibe = F.end();
+       ibb != ibe; ++ibb)
+    for (BasicBlock::iterator iib = ibb->begin(), iie = ibb->end();
+         iib != iie; ++iib)
+      if (isa<PHINode>(iib))
+        WorkList.push_front(&*iib);
+
+  // Demote phi nodes
+  NumPhisDemoted += WorkList.size();
+  for (std::list<Instruction*>::iterator ilb = WorkList.begin(),
+       ile = WorkList.end(); ilb != ile; ++ilb)
+    DemotePHIToStack(cast<PHINode>(*ilb), AllocaInsertionPoint);
+
+  return true;
+}
+
+
+// createDemoteRegisterToMemory - Provide an entry point to create this pass.
+char &llvm::DemoteRegisterToMemoryID = RegToMem::ID;
+FunctionPass *llvm::createDemoteRegisterToMemoryPass() {
+  return new RegToMem();
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d71 1
+a71 1
+  if (F.isDeclaration() || skipFunction(F))
+d92 4
+a95 3
+  for (BasicBlock &ibb : F)
+    for (BasicBlock::iterator iib = ibb.begin(), iie = ibb.end(); iib != iie;
+         ++iib) {
+d104 3
+a106 2
+  for (Instruction *ilb : WorkList)
+    DemoteRegToStack(*ilb, false, AllocaInsertionPoint);
+d111 4
+a114 3
+  for (BasicBlock &ibb : F)
+    for (BasicBlock::iterator iib = ibb.begin(), iie = ibb.end(); iib != iie;
+         ++iib)
+d120 3
+a122 2
+  for (Instruction *ilb : WorkList)
+    DemotePHIToStack(cast<PHINode>(ilb), AllocaInsertionPoint);
+@
+

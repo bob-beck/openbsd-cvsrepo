@@ -1,0 +1,994 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.46.55;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.46.55;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.55.45;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.01;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===- llvm-profdata.cpp - LLVM profile data tool -------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// llvm-profdata merges .profdata files.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/ProfileData/InstrProfReader.h"
+#include "llvm/ProfileData/InstrProfWriter.h"
+#include "llvm/ProfileData/SampleProfReader.h"
+#include "llvm/ProfileData/SampleProfWriter.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Errc.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <tuple>
+
+using namespace llvm;
+
+enum ProfileFormat { PF_None = 0, PF_Text, PF_Binary, PF_GCC };
+
+static void exitWithError(const Twine &Message, StringRef Whence = "",
+                          StringRef Hint = "") {
+  errs() << "error: ";
+  if (!Whence.empty())
+    errs() << Whence << ": ";
+  errs() << Message << "\n";
+  if (!Hint.empty())
+    errs() << Hint << "\n";
+  ::exit(1);
+}
+
+static void exitWithErrorCode(const std::error_code &Error,
+                              StringRef Whence = "") {
+  if (Error.category() == instrprof_category()) {
+    instrprof_error instrError = static_cast<instrprof_error>(Error.value());
+    if (instrError == instrprof_error::unrecognized_format) {
+      // Hint for common error of forgetting -sample for sample profiles.
+      exitWithError(Error.message(), Whence,
+                    "Perhaps you forgot to use the -sample option?");
+    }
+  }
+  exitWithError(Error.message(), Whence);
+}
+
+namespace {
+enum ProfileKinds { instr, sample };
+}
+
+static void handleMergeWriterError(std::error_code &Error,
+                                   StringRef WhenceFile = "",
+                                   StringRef WhenceFunction = "",
+                                   bool ShowHint = true) {
+  if (!WhenceFile.empty())
+    errs() << WhenceFile << ": ";
+  if (!WhenceFunction.empty())
+    errs() << WhenceFunction << ": ";
+  errs() << Error.message() << "\n";
+
+  if (ShowHint) {
+    StringRef Hint = "";
+    if (Error.category() == instrprof_category()) {
+      instrprof_error instrError = static_cast<instrprof_error>(Error.value());
+      switch (instrError) {
+      case instrprof_error::hash_mismatch:
+      case instrprof_error::count_mismatch:
+      case instrprof_error::value_site_count_mismatch:
+        Hint = "Make sure that all profile data to be merged is generated "
+               "from the same binary.";
+        break;
+      default:
+        break;
+      }
+    }
+
+    if (!Hint.empty())
+      errs() << Hint << "\n";
+  }
+}
+
+struct WeightedFile {
+  StringRef Filename;
+  uint64_t Weight;
+
+  WeightedFile() {}
+
+  WeightedFile(StringRef F, uint64_t W) : Filename{F}, Weight{W} {}
+};
+typedef SmallVector<WeightedFile, 5> WeightedFileVector;
+
+static void mergeInstrProfile(const WeightedFileVector &Inputs,
+                              StringRef OutputFilename,
+                              ProfileFormat OutputFormat) {
+  if (OutputFilename.compare("-") == 0)
+    exitWithError("Cannot write indexed profdata format to stdout.");
+
+  if (OutputFormat != PF_Binary && OutputFormat != PF_Text)
+    exitWithError("Unknown format is specified.");
+
+  std::error_code EC;
+  raw_fd_ostream Output(OutputFilename.data(), EC, sys::fs::F_None);
+  if (EC)
+    exitWithErrorCode(EC, OutputFilename);
+
+  InstrProfWriter Writer;
+  SmallSet<std::error_code, 4> WriterErrorCodes;
+  for (const auto &Input : Inputs) {
+    auto ReaderOrErr = InstrProfReader::create(Input.Filename);
+    if (std::error_code ec = ReaderOrErr.getError())
+      exitWithErrorCode(ec, Input.Filename);
+
+    auto Reader = std::move(ReaderOrErr.get());
+    for (auto &I : *Reader) {
+      if (std::error_code EC = Writer.addRecord(std::move(I), Input.Weight)) {
+        // Only show hint the first time an error occurs.
+        bool firstTime = WriterErrorCodes.insert(EC).second;
+        handleMergeWriterError(EC, Input.Filename, I.Name, firstTime);
+      }
+    }
+    if (Reader->hasError())
+      exitWithErrorCode(Reader->getError(), Input.Filename);
+  }
+  if (OutputFormat == PF_Text)
+    Writer.writeText(Output);
+  else
+    Writer.write(Output);
+}
+
+static sampleprof::SampleProfileFormat FormatMap[] = {
+    sampleprof::SPF_None, sampleprof::SPF_Text, sampleprof::SPF_Binary,
+    sampleprof::SPF_GCC};
+
+static void mergeSampleProfile(const WeightedFileVector &Inputs,
+                               StringRef OutputFilename,
+                               ProfileFormat OutputFormat) {
+  using namespace sampleprof;
+  auto WriterOrErr =
+      SampleProfileWriter::create(OutputFilename, FormatMap[OutputFormat]);
+  if (std::error_code EC = WriterOrErr.getError())
+    exitWithErrorCode(EC, OutputFilename);
+
+  auto Writer = std::move(WriterOrErr.get());
+  StringMap<FunctionSamples> ProfileMap;
+  SmallVector<std::unique_ptr<sampleprof::SampleProfileReader>, 5> Readers;
+  for (const auto &Input : Inputs) {
+    auto ReaderOrErr =
+        SampleProfileReader::create(Input.Filename, getGlobalContext());
+    if (std::error_code EC = ReaderOrErr.getError())
+      exitWithErrorCode(EC, Input.Filename);
+
+    // We need to keep the readers around until after all the files are
+    // read so that we do not lose the function names stored in each
+    // reader's memory. The function names are needed to write out the
+    // merged profile map.
+    Readers.push_back(std::move(ReaderOrErr.get()));
+    const auto Reader = Readers.back().get();
+    if (std::error_code EC = Reader->read())
+      exitWithErrorCode(EC, Input.Filename);
+
+    StringMap<FunctionSamples> &Profiles = Reader->getProfiles();
+    for (StringMap<FunctionSamples>::iterator I = Profiles.begin(),
+                                              E = Profiles.end();
+         I != E; ++I) {
+      StringRef FName = I->first();
+      FunctionSamples &Samples = I->second;
+      sampleprof_error Result = ProfileMap[FName].merge(Samples, Input.Weight);
+      if (Result != sampleprof_error::success) {
+        std::error_code EC = make_error_code(Result);
+        handleMergeWriterError(EC, Input.Filename, FName);
+      }
+    }
+  }
+  Writer->write(ProfileMap);
+}
+
+static WeightedFile parseWeightedFile(const StringRef &WeightedFilename) {
+  StringRef WeightStr, FileName;
+  std::tie(WeightStr, FileName) = WeightedFilename.split(',');
+
+  uint64_t Weight;
+  if (WeightStr.getAsInteger(10, Weight) || Weight < 1)
+    exitWithError("Input weight must be a positive integer.");
+
+  if (!sys::fs::exists(FileName))
+    exitWithErrorCode(make_error_code(errc::no_such_file_or_directory),
+                      FileName);
+
+  return WeightedFile(FileName, Weight);
+}
+
+static int merge_main(int argc, const char *argv[]) {
+  cl::list<std::string> InputFilenames(cl::Positional,
+                                       cl::desc("<filename...>"));
+  cl::list<std::string> WeightedInputFilenames("weighted-input",
+                                               cl::desc("<weight>,<filename>"));
+  cl::opt<std::string> OutputFilename("output", cl::value_desc("output"),
+                                      cl::init("-"), cl::Required,
+                                      cl::desc("Output file"));
+  cl::alias OutputFilenameA("o", cl::desc("Alias for --output"),
+                            cl::aliasopt(OutputFilename));
+  cl::opt<ProfileKinds> ProfileKind(
+      cl::desc("Profile kind:"), cl::init(instr),
+      cl::values(clEnumVal(instr, "Instrumentation profile (default)"),
+                 clEnumVal(sample, "Sample profile"), clEnumValEnd));
+
+  cl::opt<ProfileFormat> OutputFormat(
+      cl::desc("Format of output profile"), cl::init(PF_Binary),
+      cl::values(clEnumValN(PF_Binary, "binary", "Binary encoding (default)"),
+                 clEnumValN(PF_Text, "text", "Text encoding"),
+                 clEnumValN(PF_GCC, "gcc",
+                            "GCC encoding (only meaningful for -sample)"),
+                 clEnumValEnd));
+
+  cl::ParseCommandLineOptions(argc, argv, "LLVM profile data merger\n");
+
+  if (InputFilenames.empty() && WeightedInputFilenames.empty())
+    exitWithError("No input files specified. See " +
+                  sys::path::filename(argv[0]) + " -help");
+
+  WeightedFileVector WeightedInputs;
+  for (StringRef Filename : InputFilenames)
+    WeightedInputs.push_back(WeightedFile(Filename, 1));
+  for (StringRef WeightedFilename : WeightedInputFilenames)
+    WeightedInputs.push_back(parseWeightedFile(WeightedFilename));
+
+  if (ProfileKind == instr)
+    mergeInstrProfile(WeightedInputs, OutputFilename, OutputFormat);
+  else
+    mergeSampleProfile(WeightedInputs, OutputFilename, OutputFormat);
+
+  return 0;
+}
+
+static int showInstrProfile(std::string Filename, bool ShowCounts,
+                            bool ShowIndirectCallTargets, bool ShowAllFunctions,
+                            std::string ShowFunction, bool TextFormat,
+                            raw_fd_ostream &OS) {
+  auto ReaderOrErr = InstrProfReader::create(Filename);
+  if (std::error_code EC = ReaderOrErr.getError())
+    exitWithErrorCode(EC, Filename);
+
+  auto Reader = std::move(ReaderOrErr.get());
+  uint64_t MaxFunctionCount = 0, MaxBlockCount = 0;
+  size_t ShownFunctions = 0, TotalFunctions = 0;
+  for (const auto &Func : *Reader) {
+    bool Show =
+        ShowAllFunctions || (!ShowFunction.empty() &&
+                             Func.Name.find(ShowFunction) != Func.Name.npos);
+
+    bool doTextFormatDump = (Show && ShowCounts && TextFormat);
+
+    if (doTextFormatDump) {
+      InstrProfSymtab &Symtab = Reader->getSymtab();
+      InstrProfWriter::writeRecordInText(Func, Symtab, OS);
+      continue;
+    }
+
+    ++TotalFunctions;
+    assert(Func.Counts.size() > 0 && "function missing entry counter");
+    if (Func.Counts[0] > MaxFunctionCount)
+      MaxFunctionCount = Func.Counts[0];
+
+    for (size_t I = 1, E = Func.Counts.size(); I < E; ++I) {
+      if (Func.Counts[I] > MaxBlockCount)
+        MaxBlockCount = Func.Counts[I];
+    }
+
+    if (Show) {
+
+      if (!ShownFunctions)
+        OS << "Counters:\n";
+
+      ++ShownFunctions;
+
+      OS << "  " << Func.Name << ":\n"
+         << "    Hash: " << format("0x%016" PRIx64, Func.Hash) << "\n"
+         << "    Counters: " << Func.Counts.size() << "\n"
+         << "    Function count: " << Func.Counts[0] << "\n";
+
+      if (ShowIndirectCallTargets)
+        OS << "    Indirect Call Site Count: "
+           << Func.getNumValueSites(IPVK_IndirectCallTarget) << "\n";
+
+      if (ShowCounts) {
+        OS << "    Block counts: [";
+        for (size_t I = 1, E = Func.Counts.size(); I < E; ++I) {
+          OS << (I == 1 ? "" : ", ") << Func.Counts[I];
+        }
+        OS << "]\n";
+      }
+
+      if (ShowIndirectCallTargets) {
+        InstrProfSymtab &Symtab = Reader->getSymtab();
+        uint32_t NS = Func.getNumValueSites(IPVK_IndirectCallTarget);
+        OS << "    Indirect Target Results: \n";
+        for (size_t I = 0; I < NS; ++I) {
+          uint32_t NV = Func.getNumValueDataForSite(IPVK_IndirectCallTarget, I);
+          std::unique_ptr<InstrProfValueData[]> VD =
+              Func.getValueForSite(IPVK_IndirectCallTarget, I);
+          for (uint32_t V = 0; V < NV; V++) {
+            OS << "\t[ " << I << ", ";
+            OS << Symtab.getFuncName(VD[V].Value) << ", " << VD[V].Count
+               << " ]\n";
+          }
+        }
+      }
+    }
+  }
+
+  if (Reader->hasError())
+    exitWithErrorCode(Reader->getError(), Filename);
+
+  if (ShowCounts && TextFormat)
+    return 0;
+
+  if (ShowAllFunctions || !ShowFunction.empty())
+    OS << "Functions shown: " << ShownFunctions << "\n";
+  OS << "Total functions: " << TotalFunctions << "\n";
+  OS << "Maximum function count: " << MaxFunctionCount << "\n";
+  OS << "Maximum internal block count: " << MaxBlockCount << "\n";
+  return 0;
+}
+
+static int showSampleProfile(std::string Filename, bool ShowCounts,
+                             bool ShowAllFunctions, std::string ShowFunction,
+                             raw_fd_ostream &OS) {
+  using namespace sampleprof;
+  auto ReaderOrErr = SampleProfileReader::create(Filename, getGlobalContext());
+  if (std::error_code EC = ReaderOrErr.getError())
+    exitWithErrorCode(EC, Filename);
+
+  auto Reader = std::move(ReaderOrErr.get());
+  if (std::error_code EC = Reader->read())
+    exitWithErrorCode(EC, Filename);
+
+  if (ShowAllFunctions || ShowFunction.empty())
+    Reader->dump(OS);
+  else
+    Reader->dumpFunctionProfile(ShowFunction, OS);
+
+  return 0;
+}
+
+static int show_main(int argc, const char *argv[]) {
+  cl::opt<std::string> Filename(cl::Positional, cl::Required,
+                                cl::desc("<profdata-file>"));
+
+  cl::opt<bool> ShowCounts("counts", cl::init(false),
+                           cl::desc("Show counter values for shown functions"));
+  cl::opt<bool> TextFormat(
+      "text", cl::init(false),
+      cl::desc("Show instr profile data in text dump format"));
+  cl::opt<bool> ShowIndirectCallTargets(
+      "ic-targets", cl::init(false),
+      cl::desc("Show indirect call site target values for shown functions"));
+  cl::opt<bool> ShowAllFunctions("all-functions", cl::init(false),
+                                 cl::desc("Details for every function"));
+  cl::opt<std::string> ShowFunction("function",
+                                    cl::desc("Details for matching functions"));
+
+  cl::opt<std::string> OutputFilename("output", cl::value_desc("output"),
+                                      cl::init("-"), cl::desc("Output file"));
+  cl::alias OutputFilenameA("o", cl::desc("Alias for --output"),
+                            cl::aliasopt(OutputFilename));
+  cl::opt<ProfileKinds> ProfileKind(
+      cl::desc("Profile kind:"), cl::init(instr),
+      cl::values(clEnumVal(instr, "Instrumentation profile (default)"),
+                 clEnumVal(sample, "Sample profile"), clEnumValEnd));
+
+  cl::ParseCommandLineOptions(argc, argv, "LLVM profile data summary\n");
+
+  if (OutputFilename.empty())
+    OutputFilename = "-";
+
+  std::error_code EC;
+  raw_fd_ostream OS(OutputFilename.data(), EC, sys::fs::F_Text);
+  if (EC)
+    exitWithErrorCode(EC, OutputFilename);
+
+  if (ShowAllFunctions && !ShowFunction.empty())
+    errs() << "warning: -function argument ignored: showing all functions\n";
+
+  if (ProfileKind == instr)
+    return showInstrProfile(Filename, ShowCounts, ShowIndirectCallTargets,
+                            ShowAllFunctions, ShowFunction, TextFormat, OS);
+  else
+    return showSampleProfile(Filename, ShowCounts, ShowAllFunctions,
+                             ShowFunction, OS);
+}
+
+int main(int argc, const char *argv[]) {
+  // Print a stack trace if we signal out.
+  sys::PrintStackTraceOnErrorSignal();
+  PrettyStackTraceProgram X(argc, argv);
+  llvm_shutdown_obj Y; // Call llvm_shutdown() on exit.
+
+  StringRef ProgName(sys::path::filename(argv[0]));
+  if (argc > 1) {
+    int (*func)(int, const char *[]) = nullptr;
+
+    if (strcmp(argv[1], "merge") == 0)
+      func = merge_main;
+    else if (strcmp(argv[1], "show") == 0)
+      func = show_main;
+
+    if (func) {
+      std::string Invocation(ProgName.str() + " " + argv[1]);
+      argv[1] = Invocation.c_str();
+      return func(argc - 1, argv + 1);
+    }
+
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "-help") == 0 ||
+        strcmp(argv[1], "--help") == 0) {
+
+      errs() << "OVERVIEW: LLVM profile data tools\n\n"
+             << "USAGE: " << ProgName << " <command> [args...]\n"
+             << "USAGE: " << ProgName << " <command> -help\n\n"
+             << "Available commands: merge, show\n";
+      return 0;
+    }
+  }
+
+  if (argc < 2)
+    errs() << ProgName << ": No command specified!\n";
+  else
+    errs() << ProgName << ": Unknown command!\n";
+
+  errs() << "USAGE: " << ProgName << " <merge|show> [args...]\n";
+  return 1;
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@a19 1
+#include "llvm/ProfileData/ProfileCommon.h"
+d33 1
+d50 9
+a58 11
+static void exitWithError(Error E, StringRef Whence = "") {
+  if (E.isA<InstrProfError>()) {
+    handleAllErrors(std::move(E), [&](const InstrProfError &IPE) {
+      instrprof_error instrError = IPE.get();
+      StringRef Hint = "";
+      if (instrError == instrprof_error::unrecognized_format) {
+        // Hint for common error of forgetting -sample for sample profiles.
+        Hint = "Perhaps you forgot to use the -sample option?";
+      }
+      exitWithError(IPE.message(), Whence, Hint);
+    });
+d60 1
+a60 6
+
+  exitWithError(toString(std::move(E)), Whence);
+}
+
+static void exitWithErrorCode(std::error_code EC, StringRef Whence = "") {
+  exitWithError(EC.message(), Whence);
+d67 2
+a68 1
+static void handleMergeWriterError(Error E, StringRef WhenceFile = "",
+d75 1
+a75 8
+
+  auto IPE = instrprof_error::success;
+  E = handleErrors(std::move(E),
+                   [&IPE](std::unique_ptr<InstrProfError> E) -> Error {
+                     IPE = E->get();
+                     return Error(std::move(E));
+                   });
+  errs() << toString(std::move(E)) << "\n";
+d79 3
+a81 2
+    if (IPE != instrprof_error::success) {
+      switch (IPE) {
+d110 1
+a110 1
+                              ProfileFormat OutputFormat, bool OutputSparse) {
+d122 2
+a123 2
+  InstrProfWriter Writer(OutputSparse);
+  SmallSet<instrprof_error, 4> WriterErrorCodes;
+d126 2
+a127 2
+    if (Error E = ReaderOrErr.takeError())
+      exitWithError(std::move(E), Input.Filename);
+a129 4
+    bool IsIRProfile = Reader->isIRLevelProfile();
+    if (Writer.setIsIRLevelProfile(IsIRProfile))
+      exitWithError("Merge IR generated profile with Clang generated profile.");
+
+d131 1
+a131 1
+      if (Error E = Writer.addRecord(std::move(I), Input.Weight)) {
+d133 2
+a134 4
+        instrprof_error IPE = InstrProfError::take(std::move(E));
+        bool firstTime = WriterErrorCodes.insert(IPE).second;
+        handleMergeWriterError(make_error<InstrProfError>(IPE), Input.Filename,
+                               I.Name, firstTime);
+d138 1
+a138 1
+      exitWithError(Reader->getError(), Input.Filename);
+a161 1
+  LLVMContext Context;
+d163 2
+a164 1
+    auto ReaderOrErr = SampleProfileReader::create(Input.Filename, Context);
+d186 1
+a186 1
+        handleMergeWriterError(errorCodeToError(EC), Input.Filename, FName);
+a207 33
+static std::unique_ptr<MemoryBuffer>
+getInputFilenamesFileBuf(const StringRef &InputFilenamesFile) {
+  if (InputFilenamesFile == "")
+    return {};
+
+  auto BufOrError = MemoryBuffer::getFileOrSTDIN(InputFilenamesFile);
+  if (!BufOrError)
+    exitWithErrorCode(BufOrError.getError(), InputFilenamesFile);
+
+  return std::move(*BufOrError);
+}
+
+static void parseInputFilenamesFile(MemoryBuffer *Buffer,
+                                    WeightedFileVector &WFV) {
+  if (!Buffer)
+    return;
+
+  SmallVector<StringRef, 8> Entries;
+  StringRef Data = Buffer->getBuffer();
+  Data.split(Entries, '\n', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  for (const StringRef &FileWeightEntry : Entries) {
+    StringRef SanitizedEntry = FileWeightEntry.trim(" \t\v\f\r");
+    // Skip comments.
+    if (SanitizedEntry.startswith("#"))
+      continue;
+    // If there's no comma, it's an unweighted profile.
+    else if (SanitizedEntry.find(',') == StringRef::npos)
+      WFV.emplace_back(SanitizedEntry, 1);
+    else
+      WFV.emplace_back(parseWeightedFile(SanitizedEntry));
+  }
+}
+
+a212 9
+  cl::opt<std::string> InputFilenamesFile(
+      "input-files", cl::init(""),
+      cl::desc("Path to file containing newline-separated "
+               "[<weight>,]<filename> entries"));
+  cl::alias InputFilenamesFileA("f", cl::desc("Alias for --input-files"),
+                                cl::aliasopt(InputFilenamesFile));
+  cl::opt<bool> DumpInputFileList(
+      "dump-input-file-list", cl::init(false), cl::Hidden,
+      cl::desc("Dump the list of input files and their weights, then exit"));
+d222 1
+a229 2
+  cl::opt<bool> OutputSparse("sparse", cl::init(false),
+      cl::desc("Generate a sparse profile (only meaningful for -instr)"));
+d233 4
+d239 1
+a239 1
+    WeightedInputs.emplace_back(Filename, 1);
+d241 1
+a241 16
+    WeightedInputs.emplace_back(parseWeightedFile(WeightedFilename));
+
+  // Make sure that the file buffer stays alive for the duration of the
+  // weighted input vector's lifetime.
+  auto Buffer = getInputFilenamesFileBuf(InputFilenamesFile);
+  parseInputFilenamesFile(Buffer.get(), WeightedInputs);
+
+  if (WeightedInputs.empty())
+    exitWithError("No input files specified. See " +
+                  sys::path::filename(argv[0]) + " -help");
+
+  if (DumpInputFileList) {
+    for (auto &WF : WeightedInputs)
+      outs() << WF.Weight << "," << WF.Filename << "\n";
+    return 0;
+  }
+d244 1
+a244 2
+    mergeInstrProfile(WeightedInputs, OutputFilename, OutputFormat,
+                      OutputSparse);
+d251 3
+a253 6
+static int showInstrProfile(const std::string &Filename, bool ShowCounts,
+                            bool ShowIndirectCallTargets,
+                            bool ShowDetailedSummary,
+                            std::vector<uint32_t> DetailedSummaryCutoffs,
+                            bool ShowAllFunctions,
+                            const std::string &ShowFunction, bool TextFormat,
+d256 2
+a257 7
+  std::vector<uint32_t> Cutoffs = std::move(DetailedSummaryCutoffs);
+  if (ShowDetailedSummary && Cutoffs.empty()) {
+    Cutoffs = {800000, 900000, 950000, 990000, 999000, 999900, 999990};
+  }
+  InstrProfSummaryBuilder Builder(std::move(Cutoffs));
+  if (Error E = ReaderOrErr.takeError())
+    exitWithError(std::move(E), Filename);
+d260 2
+a261 5
+  bool IsIRInstr = Reader->isIRLevelProfile();
+  size_t ShownFunctions = 0;
+  uint64_t TotalNumValueSites = 0;
+  uint64_t TotalNumValueSitesWithValueProfile = 0;
+  uint64_t TotalNumValues = 0;
+d275 1
+d277 7
+a283 1
+    Builder.addRecord(Func);
+d294 2
+a295 3
+         << "    Counters: " << Func.Counts.size() << "\n";
+      if (!IsIRInstr)
+        OS << "    Function count: " << Func.Counts[0] << "\n";
+d303 2
+a304 3
+        size_t Start = (IsIRInstr ? 0 : 1);
+        for (size_t I = Start, E = Func.Counts.size(); I < E; ++I) {
+          OS << (I == Start ? "" : ", ") << Func.Counts[I];
+a312 1
+        TotalNumValueSites += NS;
+a316 3
+          TotalNumValues += NV;
+          if (NV)
+            TotalNumValueSitesWithValueProfile++;
+d326 1
+d328 1
+a328 1
+    exitWithError(Reader->getError(), Filename);
+d332 1
+a332 1
+  std::unique_ptr<ProfileSummary> PS(Builder.getSummary());
+d335 3
+a337 22
+  OS << "Total functions: " << PS->getNumFunctions() << "\n";
+  OS << "Maximum function count: " << PS->getMaxFunctionCount() << "\n";
+  OS << "Maximum internal block count: " << PS->getMaxInternalCount() << "\n";
+  if (ShownFunctions && ShowIndirectCallTargets) {
+    OS << "Total Number of Indirect Call Sites : " << TotalNumValueSites
+       << "\n";
+    OS << "Total Number of Sites With Values : "
+       << TotalNumValueSitesWithValueProfile << "\n";
+    OS << "Total Number of Profiled Values : " << TotalNumValues << "\n";
+  }
+
+  if (ShowDetailedSummary) {
+    OS << "Detailed summary:\n";
+    OS << "Total number of blocks: " << PS->getNumCounts() << "\n";
+    OS << "Total count: " << PS->getTotalCount() << "\n";
+    for (auto Entry : PS->getDetailedSummary()) {
+      OS << Entry.NumCounts << " blocks with count >= " << Entry.MinCount
+         << " account for "
+         << format("%0.6g", (float)Entry.Cutoff / ProfileSummary::Scale * 100)
+         << " percentage of the total counts.\n";
+    }
+  }
+d341 2
+a342 3
+static int showSampleProfile(const std::string &Filename, bool ShowCounts,
+                             bool ShowAllFunctions,
+                             const std::string &ShowFunction,
+d345 1
+a345 2
+  LLVMContext Context;
+  auto ReaderOrErr = SampleProfileReader::create(Filename, Context);
+a372 7
+  cl::opt<bool> ShowDetailedSummary("detailed-summary", cl::init(false),
+                                    cl::desc("Show detailed profile summary"));
+  cl::list<uint32_t> DetailedSummaryCutoffs(
+      cl::CommaSeparated, "detailed-summary-cutoffs",
+      cl::desc(
+          "Cutoff percentages (times 10000) for generating detailed summary"),
+      cl::value_desc("800000,901000,999999"));
+a399 2
+  std::vector<uint32_t> Cutoffs(DetailedSummaryCutoffs.begin(),
+                                DetailedSummaryCutoffs.end());
+a401 1
+                            ShowDetailedSummary, DetailedSummaryCutoffs,
+d410 1
+a410 1
+  sys::PrintStackTraceOnErrorSignal(argv[0]);
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@a31 1
+#include "llvm/Support/ThreadPool.h"
+d111 1
+a111 1
+  std::string Filename;
+d113 4
+a119 64
+/// Keep track of merged data and reported errors.
+struct WriterContext {
+  std::mutex Lock;
+  InstrProfWriter Writer;
+  Error Err;
+  StringRef ErrWhence;
+  std::mutex &ErrLock;
+  SmallSet<instrprof_error, 4> &WriterErrorCodes;
+
+  WriterContext(bool IsSparse, std::mutex &ErrLock,
+                SmallSet<instrprof_error, 4> &WriterErrorCodes)
+      : Lock(), Writer(IsSparse), Err(Error::success()), ErrWhence(""),
+        ErrLock(ErrLock), WriterErrorCodes(WriterErrorCodes) {}
+};
+
+/// Load an input into a writer context.
+static void loadInput(const WeightedFile &Input, WriterContext *WC) {
+  std::unique_lock<std::mutex> CtxGuard{WC->Lock};
+
+  // If there's a pending hard error, don't do more work.
+  if (WC->Err)
+    return;
+
+  WC->ErrWhence = Input.Filename;
+
+  auto ReaderOrErr = InstrProfReader::create(Input.Filename);
+  if (Error E = ReaderOrErr.takeError()) {
+    // Skip the empty profiles by returning sliently.
+    instrprof_error IPE = InstrProfError::take(std::move(E));
+    if (IPE != instrprof_error::empty_raw_profile)
+      WC->Err = make_error<InstrProfError>(IPE);
+    return;
+  }
+
+  auto Reader = std::move(ReaderOrErr.get());
+  bool IsIRProfile = Reader->isIRLevelProfile();
+  if (WC->Writer.setIsIRLevelProfile(IsIRProfile)) {
+    WC->Err = make_error<StringError>(
+        "Merge IR generated profile with Clang generated profile.",
+        std::error_code());
+    return;
+  }
+
+  for (auto &I : *Reader) {
+    const StringRef FuncName = I.Name;
+    if (Error E = WC->Writer.addRecord(std::move(I), Input.Weight)) {
+      // Only show hint the first time an error occurs.
+      instrprof_error IPE = InstrProfError::take(std::move(E));
+      std::unique_lock<std::mutex> ErrGuard{WC->ErrLock};
+      bool firstTime = WC->WriterErrorCodes.insert(IPE).second;
+      handleMergeWriterError(make_error<InstrProfError>(IPE), Input.Filename,
+                             FuncName, firstTime);
+    }
+  }
+  if (Reader->hasError())
+    WC->Err = Reader->getError();
+}
+
+/// Merge the \p Src writer context into \p Dst.
+static void mergeWriterContexts(WriterContext *Dst, WriterContext *Src) {
+  if (Error E = Dst->Writer.mergeRecordsFromWriter(std::move(Src->Writer)))
+    Dst->Err = std::move(E);
+}
+
+d122 1
+a122 2
+                              ProfileFormat OutputFormat, bool OutputSparse,
+                              unsigned NumThreads) {
+d134 1
+a134 1
+  std::mutex ErrorLock;
+d136 18
+a153 23
+
+  // If NumThreads is not specified, auto-detect a good default.
+  if (NumThreads == 0)
+    NumThreads = std::max(1U, std::min(std::thread::hardware_concurrency(),
+                                       unsigned(Inputs.size() / 2)));
+
+  // Initialize the writer contexts.
+  SmallVector<std::unique_ptr<WriterContext>, 4> Contexts;
+  for (unsigned I = 0; I < NumThreads; ++I)
+    Contexts.emplace_back(llvm::make_unique<WriterContext>(
+        OutputSparse, ErrorLock, WriterErrorCodes));
+
+  if (NumThreads == 1) {
+    for (const auto &Input : Inputs)
+      loadInput(Input, Contexts[0].get());
+  } else {
+    ThreadPool Pool(NumThreads);
+
+    // Load the inputs in parallel (N/NumThreads serial steps).
+    unsigned Ctx = 0;
+    for (const auto &Input : Inputs) {
+      Pool.async(loadInput, Input, Contexts[Ctx].get());
+      Ctx = (Ctx + 1) % NumThreads;
+d155 2
+a156 19
+    Pool.wait();
+
+    // Merge the writer contexts together (~ lg(NumThreads) serial steps).
+    unsigned Mid = Contexts.size() / 2;
+    unsigned End = Contexts.size();
+    assert(Mid > 0 && "Expected more than one context");
+    do {
+      for (unsigned I = 0; I < Mid; ++I)
+        Pool.async(mergeWriterContexts, Contexts[I].get(),
+                   Contexts[I + Mid].get());
+      Pool.wait();
+      if (End & 1) {
+        Pool.async(mergeWriterContexts, Contexts[0].get(),
+                   Contexts[End - 1].get());
+        Pool.wait();
+      }
+      End = Mid;
+      Mid /= 2;
+    } while (Mid > 0);
+a157 7
+
+  // Handle deferred hard errors encountered during merging.
+  for (std::unique_ptr<WriterContext> &WC : Contexts)
+    if (WC->Err)
+      exitWithError(std::move(WC->Err), WC->ErrWhence);
+
+  InstrProfWriter &Writer = Contexts[0]->Writer;
+d219 5
+a223 1
+  return {FileName, Weight};
+a237 34
+static void addWeightedInput(WeightedFileVector &WNI, const WeightedFile &WF) {
+  StringRef Filename = WF.Filename;
+  uint64_t Weight = WF.Weight;
+
+  // If it's STDIN just pass it on.
+  if (Filename == "-") {
+    WNI.push_back({Filename, Weight});
+    return;
+  }
+
+  llvm::sys::fs::file_status Status;
+  llvm::sys::fs::status(Filename, Status);
+  if (!llvm::sys::fs::exists(Status))
+    exitWithErrorCode(make_error_code(errc::no_such_file_or_directory),
+                      Filename);
+  // If it's a source file, collect it.
+  if (llvm::sys::fs::is_regular_file(Status)) {
+    WNI.push_back({Filename, Weight});
+    return;
+  }
+
+  if (llvm::sys::fs::is_directory(Status)) {
+    std::error_code EC;
+    for (llvm::sys::fs::recursive_directory_iterator F(Filename, EC), E;
+         F != E && !EC; F.increment(EC)) {
+      if (llvm::sys::fs::is_regular_file(F->path())) {
+        addWeightedInput(WNI, {F->path(), Weight});
+      }
+    }
+    if (EC)
+      exitWithErrorCode(EC, Filename);
+  }
+}
+
+d253 1
+a253 1
+      addWeightedInput(WFV, {SanitizedEntry, 1});
+d255 1
+a255 1
+      addWeightedInput(WFV, parseWeightedFile(SanitizedEntry));
+d281 1
+a281 1
+                 clEnumVal(sample, "Sample profile")));
+d287 2
+a288 1
+                            "GCC encoding (only meaningful for -sample)")));
+a290 5
+  cl::opt<unsigned> NumThreads(
+      "num-threads", cl::init(0),
+      cl::desc("Number of merge threads to use (default: autodetect)"));
+  cl::alias NumThreadsA("j", cl::desc("Alias for --num-threads"),
+                        cl::aliasopt(NumThreads));
+d296 1
+a296 1
+    addWeightedInput(WeightedInputs, {Filename, 1});
+d298 1
+a298 1
+    addWeightedInput(WeightedInputs, parseWeightedFile(WeightedFilename));
+d317 1
+a317 1
+                      OutputSparse, NumThreads);
+a345 1
+  std::vector<unsigned> ICHistogram;
+d398 1
+a398 1
+          if (NV) {
+a399 4
+            if (NV > ICHistogram.size())
+              ICHistogram.resize(NV, 0);
+            ICHistogram[NV - 1]++;
+          }
+a425 5
+
+    OS << "IC Value histogram : \n\tNumTargets, SiteCount\n";
+    for (unsigned I = 0; I < ICHistogram.size(); I++) {
+      OS << "\t" << I + 1 << ", " << ICHistogram[I] << "\n";
+    }
+d495 1
+a495 1
+                 clEnumVal(sample, "Sample profile")));
+a547 1
+             << "See each individual command --help for more details.\n"
+@
+
+

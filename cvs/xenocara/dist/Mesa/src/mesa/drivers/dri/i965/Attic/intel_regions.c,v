@@ -1,0 +1,1095 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_5:1.3.0.2
+	OPENBSD_5_5_BASE:1.3
+	v9_2_5:1.1.1.4
+	v9_2_3:1.1.1.4
+	v9_2_2:1.1.1.4
+	v9_2_1:1.1.1.4
+	v9_2_0:1.1.1.4
+	OPENBSD_4_4:1.1.1.3.0.4
+	OPENBSD_4_4_BASE:1.1.1.3
+	OPENBSD_4_3_BASE:1.1.1.3
+	OPENBSD_4_3:1.1.1.3.0.2
+	v7_0_1:1.1.1.3
+	OPENBSD_4_2:1.1.1.2.0.2
+	OPENBSD_4_2_BASE:1.1.1.2
+	v6_5_2:1.1.1.2
+	v6_5_1:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2014.07.09.21.08.59;	author jsg;	state dead;
+branches;
+next	1.3;
+commitid	WPD6rgPryPkvXOr9;
+
+1.3
+date	2013.09.05.14.04.27;	author jsg;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2008.11.02.14.58.15;	author matthieu;	state dead;
+branches;
+next	1.1;
+
+1.1
+date	2006.11.25.18.52.52;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2006.11.25.18.52.52;	author matthieu;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2007.03.03.11.57.18;	author matthieu;	state Exp;
+branches;
+next	1.1.1.3;
+
+1.1.1.3
+date	2007.11.24.17.28.42;	author matthieu;	state Exp;
+branches;
+next	1.1.1.4;
+
+1.1.1.4
+date	2013.09.05.13.15.48;	author jsg;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Merge Mesa 10.2.3
+tested by matthieu@@ kettenis@@ mpi@@ brett@@ and myself across a
+diverse range of hardware
+@
+text
+@/**************************************************************************
+ * 
+ * Copyright 2006 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * All Rights Reserved.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ * 
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL TUNGSTEN GRAPHICS AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ * 
+ **************************************************************************/
+
+/* Provide additional functionality on top of bufmgr buffers:
+ *   - 2d semantics and blit operations
+ *   - refcounting of buffers for multiple images in a buffer.
+ *   - refcounting of buffer mappings.
+ *   - some logic for moving the buffers to the best memory pools for
+ *     given operations.
+ *
+ * Most of this is to make it easier to implement the fixed-layout
+ * mipmap tree required by intel hardware in the face of GL's
+ * programming interface where each image can be specifed in random
+ * order and it isn't clear what layout the tree should have until the
+ * last moment.
+ */
+
+#include <sys/ioctl.h>
+#include <errno.h>
+
+#include "main/hash.h"
+#include "brw_context.h"
+#include "intel_regions.h"
+#include "intel_blit.h"
+#include "intel_buffer_objects.h"
+#include "intel_bufmgr.h"
+#include "intel_batchbuffer.h"
+
+#define FILE_DEBUG_FLAG DEBUG_REGION
+
+/* This should be set to the maximum backtrace size desired.
+ * Set it to 0 to disable backtrace debugging.
+ */
+#define DEBUG_BACKTRACE_SIZE 0
+
+#if DEBUG_BACKTRACE_SIZE == 0
+/* Use the standard debug output */
+#define _DBG(...) DBG(__VA_ARGS__)
+#else
+/* Use backtracing debug output */
+#define _DBG(...) {debug_backtrace(); DBG(__VA_ARGS__);}
+
+/* Backtracing debug support */
+#include <execinfo.h>
+
+static void
+debug_backtrace(void)
+{
+   void *trace[DEBUG_BACKTRACE_SIZE];
+   char **strings = NULL;
+   int traceSize;
+   register int i;
+
+   traceSize = backtrace(trace, DEBUG_BACKTRACE_SIZE);
+   strings = backtrace_symbols(trace, traceSize);
+   if (strings == NULL) {
+      DBG("no backtrace:");
+      return;
+   }
+
+   /* Spit out all the strings with a colon separator.  Ignore
+    * the first, since we don't really care about the call
+    * to debug_backtrace() itself.  Skip until the final "/" in
+    * the trace to avoid really long lines.
+    */
+   for (i = 1; i < traceSize; i++) {
+      char *p = strings[i], *slash = strings[i];
+      while (*p) {
+         if (*p++ == '/') {
+            slash = p;
+         }
+      }
+
+      DBG("%s:", slash);
+   }
+
+   /* Free up the memory, and we're done */
+   free(strings);
+}
+
+#endif
+
+static struct intel_region *
+intel_region_alloc_internal(struct intel_screen *screen,
+			    GLuint cpp,
+			    GLuint width, GLuint height, GLuint pitch,
+			    uint32_t tiling, drm_intel_bo *buffer)
+{
+   struct intel_region *region;
+
+   region = calloc(sizeof(*region), 1);
+   if (region == NULL)
+      return region;
+
+   region->cpp = cpp;
+   region->width = width;
+   region->height = height;
+   region->pitch = pitch;
+   region->refcount = 1;
+   region->bo = buffer;
+   region->tiling = tiling;
+
+   _DBG("%s <-- %p\n", __FUNCTION__, region);
+   return region;
+}
+
+struct intel_region *
+intel_region_alloc(struct intel_screen *screen,
+		   uint32_t tiling,
+                   GLuint cpp, GLuint width, GLuint height,
+		   bool expect_accelerated_upload)
+{
+   drm_intel_bo *buffer;
+   unsigned long flags = 0;
+   unsigned long aligned_pitch;
+   struct intel_region *region;
+
+   if (expect_accelerated_upload)
+      flags |= BO_ALLOC_FOR_RENDER;
+
+   buffer = drm_intel_bo_alloc_tiled(screen->bufmgr, "region",
+				     width, height, cpp,
+				     &tiling, &aligned_pitch, flags);
+   if (buffer == NULL)
+      return NULL;
+
+   region = intel_region_alloc_internal(screen, cpp, width, height,
+                                        aligned_pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   return region;
+}
+
+bool
+intel_region_flink(struct intel_region *region, uint32_t *name)
+{
+   if (region->name == 0) {
+      if (drm_intel_bo_flink(region->bo, &region->name))
+	 return false;
+   }
+
+   *name = region->name;
+
+   return true;
+}
+
+struct intel_region *
+intel_region_alloc_for_handle(struct intel_screen *screen,
+			      GLuint cpp,
+			      GLuint width, GLuint height, GLuint pitch,
+			      GLuint handle, const char *name)
+{
+   struct intel_region *region;
+   drm_intel_bo *buffer;
+   int ret;
+   uint32_t bit_6_swizzle, tiling;
+
+   buffer = intel_bo_gem_create_from_name(screen->bufmgr, name, handle);
+   if (buffer == NULL)
+      return NULL;
+   ret = drm_intel_bo_get_tiling(buffer, &tiling, &bit_6_swizzle);
+   if (ret != 0) {
+      fprintf(stderr, "Couldn't get tiling of buffer %d (%s): %s\n",
+	      handle, name, strerror(-ret));
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   region = intel_region_alloc_internal(screen, cpp,
+					width, height, pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   region->name = handle;
+
+   return region;
+}
+
+struct intel_region *
+intel_region_alloc_for_fd(struct intel_screen *screen,
+                          GLuint cpp,
+                          GLuint width, GLuint height, GLuint pitch,
+                          int fd, const char *name)
+{
+   struct intel_region *region;
+   drm_intel_bo *buffer;
+   int ret;
+   uint32_t bit_6_swizzle, tiling;
+
+   buffer = drm_intel_bo_gem_create_from_prime(screen->bufmgr,
+                                               fd, height * pitch);
+   if (buffer == NULL)
+      return NULL;
+   ret = drm_intel_bo_get_tiling(buffer, &tiling, &bit_6_swizzle);
+   if (ret != 0) {
+      fprintf(stderr, "Couldn't get tiling of buffer (%s): %s\n",
+	      name, strerror(-ret));
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   region = intel_region_alloc_internal(screen, cpp,
+					width, height, pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   return region;
+}
+
+void
+intel_region_reference(struct intel_region **dst, struct intel_region *src)
+{
+   _DBG("%s: %p(%d) -> %p(%d)\n", __FUNCTION__,
+	*dst, *dst ? (*dst)->refcount : 0, src, src ? src->refcount : 0);
+
+   if (src != *dst) {
+      if (*dst)
+	 intel_region_release(dst);
+
+      if (src)
+         src->refcount++;
+      *dst = src;
+   }
+}
+
+void
+intel_region_release(struct intel_region **region_handle)
+{
+   struct intel_region *region = *region_handle;
+
+   if (region == NULL) {
+      _DBG("%s NULL\n", __FUNCTION__);
+      return;
+   }
+
+   _DBG("%s %p %d\n", __FUNCTION__, region, region->refcount - 1);
+
+   ASSERT(region->refcount > 0);
+   region->refcount--;
+
+   if (region->refcount == 0) {
+      drm_intel_bo_unreference(region->bo);
+
+      free(region);
+   }
+   *region_handle = NULL;
+}
+
+/**
+ * This function computes masks that may be used to select the bits of the X
+ * and Y coordinates that indicate the offset within a tile.  If the region is
+ * untiled, the masks are set to 0.
+ */
+void
+intel_region_get_tile_masks(struct intel_region *region,
+                            uint32_t *mask_x, uint32_t *mask_y,
+                            bool map_stencil_as_y_tiled)
+{
+   int cpp = region->cpp;
+   uint32_t tiling = region->tiling;
+
+   if (map_stencil_as_y_tiled)
+      tiling = I915_TILING_Y;
+
+   switch (tiling) {
+   default:
+      assert(false);
+   case I915_TILING_NONE:
+      *mask_x = *mask_y = 0;
+      break;
+   case I915_TILING_X:
+      *mask_x = 512 / cpp - 1;
+      *mask_y = 7;
+      break;
+   case I915_TILING_Y:
+      *mask_x = 128 / cpp - 1;
+      *mask_y = 31;
+      break;
+   }
+}
+
+/**
+ * Compute the offset (in bytes) from the start of the region to the given x
+ * and y coordinate.  For tiled regions, caller must ensure that x and y are
+ * multiples of the tile size.
+ */
+uint32_t
+intel_region_get_aligned_offset(struct intel_region *region, uint32_t x,
+                                uint32_t y, bool map_stencil_as_y_tiled)
+{
+   int cpp = region->cpp;
+   uint32_t pitch = region->pitch;
+   uint32_t tiling = region->tiling;
+
+   if (map_stencil_as_y_tiled) {
+      tiling = I915_TILING_Y;
+
+      /* When mapping a W-tiled stencil buffer as Y-tiled, each 64-high W-tile
+       * gets transformed into a 32-high Y-tile.  Accordingly, the pitch of
+       * the resulting region is twice the pitch of the original region, since
+       * each row in the Y-tiled view corresponds to two rows in the actual
+       * W-tiled surface.  So we need to correct the pitch before computing
+       * the offsets.
+       */
+      pitch *= 2;
+   }
+
+   switch (tiling) {
+   default:
+      assert(false);
+   case I915_TILING_NONE:
+      return y * pitch + x * cpp;
+   case I915_TILING_X:
+      assert((x % (512 / cpp)) == 0);
+      assert((y % 8) == 0);
+      return y * pitch + x / (512 / cpp) * 4096;
+   case I915_TILING_Y:
+      assert((x % (128 / cpp)) == 0);
+      assert((y % 32) == 0);
+      return y * pitch + x / (128 / cpp) * 4096;
+   }
+}
+@
+
+
+1.3
+log
+@Merge Mesa 9.2.0
+@
+text
+@@
+
+
+1.2
+log
+@Mesa 7.2, Tested by ckuethe@@, naddy@@, oga@@, and others.
+@
+text
+@d42 5
+a46 1
+#include "intel_context.h"
+d49 5
+a53 2
+#include "bufmgr.h"
+#include "imports.h"
+d55 2
+a56 1
+/* XXX: Thread safety?
+d58 14
+a71 1
+GLubyte *intel_region_map(struct intel_context *intel, struct intel_region *region)
+d73 10
+a82 5
+   DBG("%s\n", __FUNCTION__);
+   if (!region->map_refcount++) {
+      region->map = bmMapBuffer(intel, region->buffer, 0);
+      if (!region->map)
+	 region->map_refcount--;
+d85 12
+a96 2
+   return region->map;
+}
+d98 1
+a98 7
+void intel_region_unmap(struct intel_context *intel, 
+			struct intel_region *region)
+{
+   DBG("%s\n", __FUNCTION__);
+   if (!--region->map_refcount) {
+      bmUnmapBufferAUB(intel, region->buffer, 0, 0);
+      region->map = NULL;
+d100 3
+d105 7
+a111 4
+struct intel_region *intel_region_alloc( struct intel_context *intel, 
+					 GLuint cpp,
+					 GLuint pitch, 
+					 GLuint height )
+d113 1
+a113 1
+   struct intel_region *region = calloc(sizeof(*region), 1);
+d115 3
+a117 2
+   DBG("%s %dx%dx%d == 0x%x bytes\n", __FUNCTION__,
+       cpp, pitch, height, cpp*pitch*height);
+d120 2
+a122 1
+   region->height = height; 	/* needed? */
+d124 2
+d127 1
+a127 3
+   bmGenBuffers(intel, "tex", 1, &region->buffer, 6);
+   bmBufferData(intel, region->buffer, pitch * cpp * height, NULL, 0);
+
+d131 5
+a135 2
+void intel_region_reference( struct intel_region **dst,
+			     struct intel_region *src)
+d137 22
+a158 3
+   src->refcount++;
+   assert(*dst == NULL);
+   *dst = src;
+d161 2
+a162 2
+void intel_region_release( struct intel_context *intel,
+			   struct intel_region **region )
+d164 6
+a169 2
+   if (!*region)
+      return;
+d171 1
+a171 8
+   DBG("%s %d\n", __FUNCTION__, (*region)->refcount-1);
+   
+   if (--(*region)->refcount == 0) {
+      assert((*region)->map_refcount == 0);
+      bmDeleteBuffers(intel, 1, &(*region)->buffer);
+      free(*region);
+   }
+   *region = NULL;
+d174 21
+d196 6
+a201 12
+struct intel_region *intel_region_create_static( struct intel_context *intel, 
+						 GLuint mem_type,
+						 GLuint offset,
+						 void *virtual,
+						 GLuint cpp,
+						 GLuint pitch, 
+						 GLuint height,
+						 GLboolean tiled )
+{
+   struct intel_region *region = calloc(sizeof(*region), 1);
+   GLuint size = cpp * pitch * height;
+   GLint pool;
+d203 1
+a203 1
+   DBG("%s\n", __FUNCTION__);
+d205 2
+a206 5
+   region->cpp = cpp;
+   region->pitch = pitch;
+   region->height = height; 	/* needed? */
+   region->refcount = 1;
+   region->tiled = tiled;
+d208 21
+a228 12
+   /* Recipe for creating a static buffer - create a static pool with
+    * the right offset and size, generate a buffer and use a special
+    * call to bind it to all of the memory in that pool.
+    */
+   pool = bmInitPool(intel, offset, virtual, size, 
+		     (BM_MEM_AGP |
+		      BM_NO_UPLOAD | 
+		      BM_NO_EVICT | 
+		      BM_NO_MOVE));
+   if (pool < 0) {
+      _mesa_printf("bmInitPool failed for static region\n");
+      exit(1);
+d231 6
+a236 1
+   region->buffer = bmGenBufferStatic(intel, pool);
+d241 5
+d247 9
+d257 4
+d262 3
+a264 31
+void _mesa_copy_rect( GLubyte *dst,
+		      GLuint cpp,
+		      GLuint dst_pitch,
+		      GLuint dst_x, 
+		      GLuint dst_y,
+		      GLuint width,
+		      GLuint height,
+		      const GLubyte *src,
+		      GLuint src_pitch,
+		      GLuint src_x,
+		      GLuint src_y )
+{
+   GLuint i;
+
+   dst_pitch *= cpp;
+   src_pitch *= cpp;
+   dst += dst_x * cpp;
+   src += src_x * cpp;
+   dst += dst_y * dst_pitch;
+   src += src_y * dst_pitch;
+   width *= cpp;
+
+   if (width == dst_pitch && 
+       width == src_pitch)
+      do_memcpy(dst, src, height * width);
+   else {
+      for (i = 0; i < height; i++) {
+	 do_memcpy(dst, src, width);
+	 dst += dst_pitch;
+	 src += src_pitch;
+      }
+a265 1
+}
+d267 7
+d275 1
+a275 51
+/* Upload data to a rectangular sub-region.  Lots of choices how to do this:
+ *
+ * - memcpy by span to current destination
+ * - upload data as new buffer and blit
+ *
+ * Currently always memcpy.
+ */
+GLboolean intel_region_data(struct intel_context *intel, 
+			    struct intel_region *dst,
+			    GLuint dst_offset,
+			    GLuint dstx, GLuint dsty,
+			    const void *src, GLuint src_pitch,
+			    GLuint srcx, GLuint srcy,
+			    GLuint width, GLuint height)
+{
+   DBG("%s\n", __FUNCTION__);
+
+   if (width == dst->pitch && 
+       width == src_pitch &&
+       dst_offset == 0 &&
+       height == dst->height &&
+       srcx == 0 &&
+       srcy == 0) 
+   {
+      return (bmBufferDataAUB(intel,
+			      dst->buffer,
+			      dst->cpp * width * dst->height,
+			      src, 0, 0, 0) == 0);
+   }
+   else {
+      GLubyte *map = intel_region_map(intel, dst);
+
+      if (map) {
+	 assert (dst_offset + dstx + width + 
+		 (dsty + height - 1) * dst->pitch * dst->cpp <= 
+		 dst->pitch * dst->cpp * dst->height);
+	 
+	 _mesa_copy_rect(map + dst_offset,
+			 dst->cpp,
+			 dst->pitch,
+			 dstx, dsty,
+			 width, height,
+			 src,
+			 src_pitch,
+			 srcx, srcy);      
+	 
+	 intel_region_unmap(intel, dst);
+	 return GL_TRUE;
+      }
+      else 
+	 return GL_FALSE;
+d277 1
+d279 5
+a283 3
+			  
+/* Copy rectangular sub-regions. Need better logic about when to
+ * push buffers into AGP - will currently do so whenever possible.
+d285 26
+a310 20
+void intel_region_copy( struct intel_context *intel,
+			struct intel_region *dst,
+			GLuint dst_offset,
+			GLuint dstx, GLuint dsty,
+			struct intel_region *src,
+			GLuint src_offset,
+			GLuint srcx, GLuint srcy,
+			GLuint width, GLuint height )
+{
+   DBG("%s\n", __FUNCTION__);
+
+   assert(src->cpp == dst->cpp);
+
+   intelEmitCopyBlit(intel,
+		     dst->cpp,
+		     src->pitch, src->buffer, src_offset, src->tiled,
+		     dst->pitch, dst->buffer, dst_offset, dst->tiled,
+		     srcx, srcy,
+		     dstx, dsty,
+		     width, height);
+d313 4
+a316 2
+/* Fill a rectangular sub-region.  Need better logic about when to
+ * push buffers into AGP - will currently do so whenever possible.
+d318 35
+a352 15
+void intel_region_fill( struct intel_context *intel,
+			struct intel_region *dst,
+			GLuint dst_offset,
+			GLuint dstx, GLuint dsty,
+			GLuint width, GLuint height,
+			GLuint color )
+{
+   DBG("%s\n", __FUNCTION__);
+   
+   intelEmitFillBlit(intel,
+		     dst->cpp,
+		     dst->pitch, dst->buffer, dst_offset, dst->tiled,
+		     dstx, dsty,
+		     width, height,
+		     color );
+a353 1
+
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Import MesaLibs 6.5.1. (in dist/ since its code is shared between lib 
+and xserver)...
+@
+text
+@@
+
+
+1.1.1.2
+log
+@import MesaLibs version 6.5.2
+@
+text
+@d272 1
+a272 2
+		     width, height,
+		     GL_COPY );
+@
+
+
+1.1.1.3
+log
+@Mesa 7.0.1
+@
+text
+@a124 1
+						 GLuint size,
+d128 1
+@
+
+
+1.1.1.4
+log
+@Import Mesa 9.2.0
+@
+text
+@d42 1
+a42 5
+#include <sys/ioctl.h>
+#include <errno.h>
+
+#include "main/hash.h"
+#include "brw_context.h"
+d45 2
+a46 5
+#include "intel_buffer_objects.h"
+#include "intel_bufmgr.h"
+#include "intel_batchbuffer.h"
+
+#define FILE_DEBUG_FLAG DEBUG_REGION
+d48 1
+a48 2
+/* This should be set to the maximum backtrace size desired.
+ * Set it to 0 to disable backtrace debugging.
+d50 1
+a50 14
+#define DEBUG_BACKTRACE_SIZE 0
+
+#if DEBUG_BACKTRACE_SIZE == 0
+/* Use the standard debug output */
+#define _DBG(...) DBG(__VA_ARGS__)
+#else
+/* Use backtracing debug output */
+#define _DBG(...) {debug_backtrace(); DBG(__VA_ARGS__);}
+
+/* Backtracing debug support */
+#include <execinfo.h>
+
+static void
+debug_backtrace(void)
+d52 5
+a56 10
+   void *trace[DEBUG_BACKTRACE_SIZE];
+   char **strings = NULL;
+   int traceSize;
+   register int i;
+
+   traceSize = backtrace(trace, DEBUG_BACKTRACE_SIZE);
+   strings = backtrace_symbols(trace, traceSize);
+   if (strings == NULL) {
+      DBG("no backtrace:");
+      return;
+d59 2
+a60 12
+   /* Spit out all the strings with a colon separator.  Ignore
+    * the first, since we don't really care about the call
+    * to debug_backtrace() itself.  Skip until the final "/" in
+    * the trace to avoid really long lines.
+    */
+   for (i = 1; i < traceSize; i++) {
+      char *p = strings[i], *slash = strings[i];
+      while (*p) {
+         if (*p++ == '/') {
+            slash = p;
+         }
+      }
+d62 7
+a68 1
+      DBG("%s:", slash);
+a69 3
+
+   /* Free up the memory, and we're done */
+   free(strings);
+d72 4
+a75 7
+#endif
+
+static struct intel_region *
+intel_region_alloc_internal(struct intel_screen *screen,
+			    GLuint cpp,
+			    GLuint width, GLuint height, GLuint pitch,
+			    uint32_t tiling, drm_intel_bo *buffer)
+d77 1
+a77 1
+   struct intel_region *region;
+d79 2
+a80 3
+   region = calloc(sizeof(*region), 1);
+   if (region == NULL)
+      return region;
+a82 2
+   region->width = width;
+   region->height = height;
+d84 1
+a85 2
+   region->bo = buffer;
+   region->tiling = tiling;
+d87 3
+a89 1
+   _DBG("%s <-- %p\n", __FUNCTION__, region);
+d93 2
+a94 5
+struct intel_region *
+intel_region_alloc(struct intel_screen *screen,
+		   uint32_t tiling,
+                   GLuint cpp, GLuint width, GLuint height,
+		   bool expect_accelerated_upload)
+d96 3
+a98 22
+   drm_intel_bo *buffer;
+   unsigned long flags = 0;
+   unsigned long aligned_pitch;
+   struct intel_region *region;
+
+   if (expect_accelerated_upload)
+      flags |= BO_ALLOC_FOR_RENDER;
+
+   buffer = drm_intel_bo_alloc_tiled(screen->bufmgr, "region",
+				     width, height, cpp,
+				     &tiling, &aligned_pitch, flags);
+   if (buffer == NULL)
+      return NULL;
+
+   region = intel_region_alloc_internal(screen, cpp, width, height,
+                                        aligned_pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+
+   return region;
+d101 2
+a102 2
+bool
+intel_region_flink(struct intel_region *region, uint32_t *name)
+d104 2
+a105 4
+   if (region->name == 0) {
+      if (drm_intel_bo_flink(region->bo, &region->name))
+	 return false;
+   }
+d107 9
+a115 1
+   *name = region->name;
+a116 2
+   return true;
+}
+d118 9
+a126 5
+struct intel_region *
+intel_region_alloc_for_handle(struct intel_screen *screen,
+			      GLuint cpp,
+			      GLuint width, GLuint height, GLuint pitch,
+			      GLuint handle, const char *name)
+d128 2
+a129 15
+   struct intel_region *region;
+   drm_intel_bo *buffer;
+   int ret;
+   uint32_t bit_6_swizzle, tiling;
+
+   buffer = intel_bo_gem_create_from_name(screen->bufmgr, name, handle);
+   if (buffer == NULL)
+      return NULL;
+   ret = drm_intel_bo_get_tiling(buffer, &tiling, &bit_6_swizzle);
+   if (ret != 0) {
+      fprintf(stderr, "Couldn't get tiling of buffer %d (%s): %s\n",
+	      handle, name, strerror(-ret));
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+d131 1
+a131 6
+   region = intel_region_alloc_internal(screen, cpp,
+					width, height, pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+d133 5
+a137 1
+   region->name = handle;
+d139 12
+a150 24
+   return region;
+}
+
+struct intel_region *
+intel_region_alloc_for_fd(struct intel_screen *screen,
+                          GLuint cpp,
+                          GLuint width, GLuint height, GLuint pitch,
+                          int fd, const char *name)
+{
+   struct intel_region *region;
+   drm_intel_bo *buffer;
+   int ret;
+   uint32_t bit_6_swizzle, tiling;
+
+   buffer = drm_intel_bo_gem_create_from_prime(screen->bufmgr,
+                                               fd, height * pitch);
+   if (buffer == NULL)
+      return NULL;
+   ret = drm_intel_bo_get_tiling(buffer, &tiling, &bit_6_swizzle);
+   if (ret != 0) {
+      fprintf(stderr, "Couldn't get tiling of buffer (%s): %s\n",
+	      name, strerror(-ret));
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+d153 1
+a153 6
+   region = intel_region_alloc_internal(screen, cpp,
+					width, height, pitch, tiling, buffer);
+   if (region == NULL) {
+      drm_intel_bo_unreference(buffer);
+      return NULL;
+   }
+a157 5
+void
+intel_region_reference(struct intel_region **dst, struct intel_region *src)
+{
+   _DBG("%s: %p(%d) -> %p(%d)\n", __FUNCTION__,
+	*dst, *dst ? (*dst)->refcount : 0, src, src ? src->refcount : 0);
+a158 9
+   if (src != *dst) {
+      if (*dst)
+	 intel_region_release(dst);
+
+      if (src)
+         src->refcount++;
+      *dst = src;
+   }
+}
+a159 4
+void
+intel_region_release(struct intel_region **region_handle)
+{
+   struct intel_region *region = *region_handle;
+d161 31
+a191 3
+   if (region == NULL) {
+      _DBG("%s NULL\n", __FUNCTION__);
+      return;
+d193 1
+a194 1
+   _DBG("%s %p %d\n", __FUNCTION__, region, region->refcount - 1);
+d196 51
+a246 7
+   ASSERT(region->refcount > 0);
+   region->refcount--;
+
+   if (region->refcount == 0) {
+      drm_intel_bo_unreference(region->bo);
+
+      free(region);
+a247 1
+   *region_handle = NULL;
+d249 3
+a251 5
+
+/**
+ * This function computes masks that may be used to select the bits of the X
+ * and Y coordinates that indicate the offset within a tile.  If the region is
+ * untiled, the masks are set to 0.
+d253 21
+a273 26
+void
+intel_region_get_tile_masks(struct intel_region *region,
+                            uint32_t *mask_x, uint32_t *mask_y,
+                            bool map_stencil_as_y_tiled)
+{
+   int cpp = region->cpp;
+   uint32_t tiling = region->tiling;
+
+   if (map_stencil_as_y_tiled)
+      tiling = I915_TILING_Y;
+
+   switch (tiling) {
+   default:
+      assert(false);
+   case I915_TILING_NONE:
+      *mask_x = *mask_y = 0;
+      break;
+   case I915_TILING_X:
+      *mask_x = 512 / cpp - 1;
+      *mask_y = 7;
+      break;
+   case I915_TILING_Y:
+      *mask_x = 128 / cpp - 1;
+      *mask_y = 31;
+      break;
+   }
+d276 2
+a277 4
+/**
+ * Compute the offset (in bytes) from the start of the region to the given x
+ * and y coordinate.  For tiled regions, caller must ensure that x and y are
+ * multiples of the tile size.
+d279 16
+a294 20
+uint32_t
+intel_region_get_aligned_offset(struct intel_region *region, uint32_t x,
+                                uint32_t y, bool map_stencil_as_y_tiled)
+{
+   int cpp = region->cpp;
+   uint32_t pitch = region->pitch;
+   uint32_t tiling = region->tiling;
+
+   if (map_stencil_as_y_tiled) {
+      tiling = I915_TILING_Y;
+
+      /* When mapping a W-tiled stencil buffer as Y-tiled, each 64-high W-tile
+       * gets transformed into a 32-high Y-tile.  Accordingly, the pitch of
+       * the resulting region is twice the pitch of the original region, since
+       * each row in the Y-tiled view corresponds to two rows in the actual
+       * W-tiled surface.  So we need to correct the pitch before computing
+       * the offsets.
+       */
+      pitch *= 2;
+   }
+a295 15
+   switch (tiling) {
+   default:
+      assert(false);
+   case I915_TILING_NONE:
+      return y * pitch + x * cpp;
+   case I915_TILING_X:
+      assert((x % (512 / cpp)) == 0);
+      assert((y % 8) == 0);
+      return y * pitch + x / (512 / cpp) * 4096;
+   case I915_TILING_Y:
+      assert((x % (128 / cpp)) == 0);
+      assert((y % 32) == 0);
+      return y * pitch + x / (128 / cpp) * 4096;
+   }
+}
+@
+
+

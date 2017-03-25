@@ -1,0 +1,569 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_5_6:1.5.0.4
+	OPENBSD_5_6_BASE:1.5
+	OPENBSD_5_5:1.4.0.10
+	OPENBSD_5_5_BASE:1.4
+	OPENBSD_5_4:1.4.0.6
+	OPENBSD_5_4_BASE:1.4
+	OPENBSD_5_3:1.4.0.4
+	OPENBSD_5_3_BASE:1.4
+	OPENBSD_5_2:1.4.0.2
+	OPENBSD_5_2_BASE:1.4
+	NGINX_1_0_14:1.1.1.2
+	NGINX:1.1.1
+	OPENBSD_5_1_BASE:1.1.1.1
+	OPENBSD_5_1:1.1.1.1.0.2
+	nginx_1_0_6:1.1.1.1
+	nginx:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2014.08.26.19.35.34;	author robert;	state dead;
+branches;
+next	1.5;
+commitid	sO1mMs3aGJWmnMM1;
+
+1.5
+date	2014.06.12.15.27.09;	author robert;	state Exp;
+branches;
+next	1.4;
+commitid	diSa3BSte1X8Lp04;
+
+1.4
+date	2012.05.13.09.14.58;	author robert;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.03.06.15.57.14;	author robert;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.02.18.11.20.22;	author robert;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2011.09.22.23.32.23;	author robert;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2011.09.22.23.32.23;	author robert;	state Exp;
+branches;
+next	1.1.1.2;
+
+1.1.1.2
+date	2012.03.15.16.48.19;	author sthen;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@remove nginx from the base system in favor of OpenBSD's own httpd(8)
+@
+text
+@
+/*
+ * Copyright (C) Igor Sysoev
+ * Copyright (C) Nginx, Inc.
+ */
+
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+
+
+/*
+ * It seems that Darwin 9.4 (Mac OS X 1.5) sendfile() has the same
+ * old bug as early FreeBSD sendfile() syscall:
+ * http://www.freebsd.org/cgi/query-pr.cgi?pr=33771
+ *
+ * Besides sendfile() has another bug: if one calls sendfile()
+ * with both a header and a trailer, then sendfile() ignores a file part
+ * at all and sends only the header and the trailer together.
+ * For this reason we send a trailer only if there is no a header.
+ *
+ * Although sendfile() allows to pass a header or a trailer,
+ * it may send the header or the trailer and a part of the file
+ * in different packets.  And FreeBSD workaround (TCP_NOPUSH option)
+ * does not help.
+ */
+
+
+#if (IOV_MAX > 64)
+#define NGX_HEADERS   64
+#define NGX_TRAILERS  64
+#else
+#define NGX_HEADERS   IOV_MAX
+#define NGX_TRAILERS  IOV_MAX
+#endif
+
+
+ngx_chain_t *
+ngx_darwin_sendfile_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
+{
+    int              rc;
+    u_char          *prev;
+    off_t            size, send, prev_send, aligned, sent, fprev;
+    off_t            header_size, file_size;
+    ngx_uint_t       eintr, complete;
+    ngx_err_t        err;
+    ngx_buf_t       *file;
+    ngx_array_t      header, trailer;
+    ngx_event_t     *wev;
+    ngx_chain_t     *cl;
+    struct sf_hdtr   hdtr;
+    struct iovec    *iov, headers[NGX_HEADERS], trailers[NGX_TRAILERS];
+
+    wev = c->write;
+
+    if (!wev->ready) {
+        return in;
+    }
+
+#if (NGX_HAVE_KQUEUE)
+
+    if ((ngx_event_flags & NGX_USE_KQUEUE_EVENT) && wev->pending_eof) {
+        (void) ngx_connection_error(c, wev->kq_errno,
+                               "kevent() reported about an closed connection");
+        wev->error = 1;
+        return NGX_CHAIN_ERROR;
+    }
+
+#endif
+
+    /* the maximum limit size is the maximum size_t value - the page size */
+
+    if (limit == 0 || limit > (off_t) (NGX_MAX_SIZE_T_VALUE - ngx_pagesize)) {
+        limit = NGX_MAX_SIZE_T_VALUE - ngx_pagesize;
+    }
+
+    send = 0;
+
+    header.elts = headers;
+    header.size = sizeof(struct iovec);
+    header.nalloc = NGX_HEADERS;
+    header.pool = c->pool;
+
+    trailer.elts = trailers;
+    trailer.size = sizeof(struct iovec);
+    trailer.nalloc = NGX_TRAILERS;
+    trailer.pool = c->pool;
+
+    for ( ;; ) {
+        file = NULL;
+        file_size = 0;
+        header_size = 0;
+        eintr = 0;
+        complete = 0;
+        prev_send = send;
+
+        header.nelts = 0;
+        trailer.nelts = 0;
+
+        /* create the header iovec and coalesce the neighbouring bufs */
+
+        prev = NULL;
+        iov = NULL;
+
+        for (cl = in; cl && send < limit; cl = cl->next) {
+
+            if (ngx_buf_special(cl->buf)) {
+                continue;
+            }
+
+            if (!ngx_buf_in_memory_only(cl->buf)) {
+                break;
+            }
+
+            size = cl->buf->last - cl->buf->pos;
+
+            if (send + size > limit) {
+                size = limit - send;
+            }
+
+            if (prev == cl->buf->pos) {
+                iov->iov_len += (size_t) size;
+
+            } else {
+                if (header.nelts >= IOV_MAX) {
+                    break;
+                }
+
+                iov = ngx_array_push(&header);
+                if (iov == NULL) {
+                    return NGX_CHAIN_ERROR;
+                }
+
+                iov->iov_base = (void *) cl->buf->pos;
+                iov->iov_len = (size_t) size;
+            }
+
+            prev = cl->buf->pos + (size_t) size;
+            header_size += size;
+            send += size;
+        }
+
+
+        if (cl && cl->buf->in_file && send < limit) {
+            file = cl->buf;
+
+            /* coalesce the neighbouring file bufs */
+
+            do {
+                size = cl->buf->file_last - cl->buf->file_pos;
+
+                if (send + size > limit) {
+                    size = limit - send;
+
+                    aligned = (cl->buf->file_pos + size + ngx_pagesize - 1)
+                               & ~((off_t) ngx_pagesize - 1);
+
+                    if (aligned <= cl->buf->file_last) {
+                        size = aligned - cl->buf->file_pos;
+                    }
+                }
+
+                file_size += size;
+                send += size;
+                fprev = cl->buf->file_pos + size;
+                cl = cl->next;
+
+            } while (cl
+                     && cl->buf->in_file
+                     && send < limit
+                     && file->file->fd == cl->buf->file->fd
+                     && fprev == cl->buf->file_pos);
+        }
+
+        if (file && header.nelts == 0) {
+
+            /* create the trailer iovec and coalesce the neighbouring bufs */
+
+            prev = NULL;
+            iov = NULL;
+
+            while (cl && send < limit) {
+
+                if (ngx_buf_special(cl->buf)) {
+                    cl = cl->next;
+                    continue;
+                }
+
+                if (!ngx_buf_in_memory_only(cl->buf)) {
+                    break;
+                }
+
+                size = cl->buf->last - cl->buf->pos;
+
+                if (send + size > limit) {
+                    size = limit - send;
+                }
+
+                if (prev == cl->buf->pos) {
+                    iov->iov_len += (size_t) size;
+
+                } else {
+                    if (trailer.nelts >= IOV_MAX) {
+                        break;
+                    }
+
+                    iov = ngx_array_push(&trailer);
+                    if (iov == NULL) {
+                        return NGX_CHAIN_ERROR;
+                    }
+
+                    iov->iov_base = (void *) cl->buf->pos;
+                    iov->iov_len = (size_t) size;
+                }
+
+                prev = cl->buf->pos + (size_t) size;
+                send += size;
+                cl = cl->next;
+            }
+        }
+
+        if (file) {
+
+            /*
+             * sendfile() returns EINVAL if sf_hdtr's count is 0,
+             * but corresponding pointer is not NULL
+             */
+
+            hdtr.headers = header.nelts ? (struct iovec *) header.elts: NULL;
+            hdtr.hdr_cnt = header.nelts;
+            hdtr.trailers = trailer.nelts ? (struct iovec *) trailer.elts: NULL;
+            hdtr.trl_cnt = trailer.nelts;
+
+            sent = header_size + file_size;
+
+            ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "sendfile: @@%O %O h:%O",
+                           file->file_pos, sent, header_size);
+
+            rc = sendfile(file->file->fd, c->fd, file->file_pos,
+                          &sent, &hdtr, 0);
+
+            if (rc == -1) {
+                err = ngx_errno;
+
+                switch (err) {
+                case NGX_EAGAIN:
+                    break;
+
+                case NGX_EINTR:
+                    eintr = 1;
+                    break;
+
+                default:
+                    wev->error = 1;
+                    (void) ngx_connection_error(c, err, "sendfile() failed");
+                    return NGX_CHAIN_ERROR;
+                }
+
+                ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, err,
+                               "sendfile() sent only %O bytes", sent);
+            }
+
+            if (rc == 0 && sent == 0) {
+
+                /*
+                 * if rc and sent equal to zero, then someone
+                 * has truncated the file, so the offset became beyond
+                 * the end of the file
+                 */
+
+                ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                              "sendfile() reported that \"%s\" was truncated",
+                              file->file->name.data);
+
+                return NGX_CHAIN_ERROR;
+            }
+
+            ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "sendfile: %d, @@%O %O:%O",
+                           rc, file->file_pos, sent, file_size + header_size);
+
+        } else {
+            rc = writev(c->fd, header.elts, header.nelts);
+
+            ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "writev: %d of %uz", rc, send);
+
+            if (rc == -1) {
+                err = ngx_errno;
+
+                switch (err) {
+                case NGX_EAGAIN:
+                    break;
+
+                case NGX_EINTR:
+                    eintr = 1;
+                    break;
+
+                default:
+                    wev->error = 1;
+                    ngx_connection_error(c, err, "writev() failed");
+                    return NGX_CHAIN_ERROR;
+                }
+
+                ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, err,
+                               "writev() not ready");
+            }
+
+            sent = rc > 0 ? rc : 0;
+        }
+
+        if (send - prev_send == sent) {
+            complete = 1;
+        }
+
+        c->sent += sent;
+
+        for ( /* void */ ; in; in = in->next) {
+
+            if (ngx_buf_special(in->buf)) {
+                continue;
+            }
+
+            if (sent == 0) {
+                break;
+            }
+
+            size = ngx_buf_size(in->buf);
+
+            if (sent >= size) {
+                sent -= size;
+
+                if (ngx_buf_in_memory(in->buf)) {
+                    in->buf->pos = in->buf->last;
+                }
+
+                if (in->buf->in_file) {
+                    in->buf->file_pos = in->buf->file_last;
+                }
+
+                continue;
+            }
+
+            if (ngx_buf_in_memory(in->buf)) {
+                in->buf->pos += (size_t) sent;
+            }
+
+            if (in->buf->in_file) {
+                in->buf->file_pos += sent;
+            }
+
+            break;
+        }
+
+        if (eintr) {
+            continue;
+        }
+
+        if (!complete) {
+            wev->ready = 0;
+            return in;
+        }
+
+        if (send >= limit || in == NULL) {
+            return in;
+        }
+    }
+}
+@
+
+
+1.5
+log
+@update to 1.6.0 with official syslog support backported from the 1.7 branch
+
+tested by several, ok sthen@@
+@
+text
+@@
+
+
+1.4
+log
+@update to nginx-1.2.0
+@
+text
+@d320 1
+a320 1
+        for (cl = in; cl; cl = cl->next) {
+d322 1
+a322 1
+            if (ngx_buf_special(cl->buf)) {
+d330 1
+a330 1
+            size = ngx_buf_size(cl->buf);
+d335 2
+a336 2
+                if (ngx_buf_in_memory(cl->buf)) {
+                    cl->buf->pos = cl->buf->last;
+d339 2
+a340 2
+                if (cl->buf->in_file) {
+                    cl->buf->file_pos = cl->buf->file_last;
+d346 2
+a347 2
+            if (ngx_buf_in_memory(cl->buf)) {
+                cl->buf->pos += (size_t) sent;
+d350 2
+a351 2
+            if (cl->buf->in_file) {
+                cl->buf->file_pos += sent;
+d363 1
+a363 1
+            return cl;
+d366 2
+a367 2
+        if (send >= limit || cl == NULL) {
+            return cl;
+a368 2
+
+        in = cl;
+@
+
+
+1.3
+log
+@update to 1.0.13
+@
+text
+@d106 2
+a107 4
+        for (cl = in;
+             cl && header.nelts < IOV_MAX && send < limit;
+             cl = cl->next)
+        {
+d126 4
+d183 1
+a183 1
+            while (cl && header.nelts < IOV_MAX && send < limit) {
+d204 4
+@
+
+
+1.2
+log
+@update to 1.0.12
+@
+text
+@d176 1
+a176 1
+            /* create the tailer iovec and coalesce the neighbouring bufs */
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d4 1
+@
+
+
+1.1.1.1
+log
+@import of nginx 1.0.6 with a bundled libpcre needed for pcre to work
+properly.
+this is not yet linked to the build but we would like to work on it
+in tree to provide an apache replacement for base
+@
+text
+@@
+
+
+1.1.1.2
+log
+@update to nginx 1.0.14
+
+SECURITY fix: contents of previously freed memory might be sent
+to a client if backend returned specially crafted response.
+
+ok robert@@
+@
+text
+@a3 1
+ * Copyright (C) Nginx, Inc.
+d175 1
+a175 1
+            /* create the trailer iovec and coalesce the neighbouring bufs */
+@
+

@@ -1,0 +1,512 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.04;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.26;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===--- HexagonGenMux.cpp ------------------------------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+
+// During instruction selection, MUX instructions are generated for
+// conditional assignments. Since such assignments often present an
+// opportunity to predicate instructions, HexagonExpandCondsets
+// expands MUXes into pairs of conditional transfers, and then proceeds
+// with predication of the producers/consumers of the registers involved.
+// This happens after exiting from the SSA form, but before the machine
+// instruction scheduler. After the scheduler and after the register
+// allocation there can be cases of pairs of conditional transfers
+// resulting from a MUX where neither of them was further predicated. If
+// these transfers are now placed far enough from the instruction defining
+// the predicate register, they cannot use the .new form. In such cases it
+// is better to collapse them back to a single MUX instruction.
+
+#define DEBUG_TYPE "hexmux"
+
+#include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "HexagonTargetMachine.h"
+
+using namespace llvm;
+
+namespace llvm {
+  FunctionPass *createHexagonGenMux();
+  void initializeHexagonGenMuxPass(PassRegistry& Registry);
+}
+
+namespace {
+  class HexagonGenMux : public MachineFunctionPass {
+  public:
+    static char ID;
+    HexagonGenMux() : MachineFunctionPass(ID), HII(0), HRI(0) {
+      initializeHexagonGenMuxPass(*PassRegistry::getPassRegistry());
+    }
+    const char *getPassName() const override {
+      return "Hexagon generate mux instructions";
+    }
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+      MachineFunctionPass::getAnalysisUsage(AU);
+    }
+    bool runOnMachineFunction(MachineFunction &MF) override;
+
+  private:
+    const HexagonInstrInfo *HII;
+    const HexagonRegisterInfo *HRI;
+
+    struct CondsetInfo {
+      unsigned PredR;
+      unsigned TrueX, FalseX;
+      CondsetInfo() : PredR(0), TrueX(UINT_MAX), FalseX(UINT_MAX) {}
+    };
+    struct DefUseInfo {
+      BitVector Defs, Uses;
+      DefUseInfo() : Defs(), Uses() {}
+      DefUseInfo(const BitVector &D, const BitVector &U) : Defs(D), Uses(U) {}
+    };
+    struct MuxInfo {
+      MachineBasicBlock::iterator At;
+      unsigned DefR, PredR;
+      MachineOperand *SrcT, *SrcF;
+      MachineInstr *Def1, *Def2;
+      MuxInfo(MachineBasicBlock::iterator It, unsigned DR, unsigned PR,
+            MachineOperand *TOp, MachineOperand *FOp,
+            MachineInstr *D1, MachineInstr *D2)
+        : At(It), DefR(DR), PredR(PR), SrcT(TOp), SrcF(FOp), Def1(D1),
+          Def2(D2) {}
+    };
+    typedef DenseMap<MachineInstr*,unsigned> InstrIndexMap;
+    typedef DenseMap<unsigned,DefUseInfo> DefUseInfoMap;
+    typedef SmallVector<MuxInfo,4> MuxInfoList;
+
+    bool isRegPair(unsigned Reg) const {
+      return Hexagon::DoubleRegsRegClass.contains(Reg);
+    }
+    void getSubRegs(unsigned Reg, BitVector &SRs) const;
+    void expandReg(unsigned Reg, BitVector &Set) const;
+    void getDefsUses(const MachineInstr *MI, BitVector &Defs,
+          BitVector &Uses) const;
+    void buildMaps(MachineBasicBlock &B, InstrIndexMap &I2X,
+          DefUseInfoMap &DUM);
+    bool isCondTransfer(unsigned Opc) const;
+    unsigned getMuxOpcode(const MachineOperand &Src1,
+          const MachineOperand &Src2) const;
+    bool genMuxInBlock(MachineBasicBlock &B);
+  };
+
+  char HexagonGenMux::ID = 0;
+}
+
+INITIALIZE_PASS(HexagonGenMux, "hexagon-mux",
+  "Hexagon generate mux instructions", false, false)
+
+
+void HexagonGenMux::getSubRegs(unsigned Reg, BitVector &SRs) const {
+  for (MCSubRegIterator I(Reg, HRI); I.isValid(); ++I)
+    SRs[*I] = true;
+}
+
+
+void HexagonGenMux::expandReg(unsigned Reg, BitVector &Set) const {
+  if (isRegPair(Reg))
+    getSubRegs(Reg, Set);
+  else
+    Set[Reg] = true;
+}
+
+
+void HexagonGenMux::getDefsUses(const MachineInstr *MI, BitVector &Defs,
+      BitVector &Uses) const {
+  // First, get the implicit defs and uses for this instruction.
+  unsigned Opc = MI->getOpcode();
+  const MCInstrDesc &D = HII->get(Opc);
+  if (const MCPhysReg *R = D.ImplicitDefs)
+    while (*R)
+      expandReg(*R++, Defs);
+  if (const MCPhysReg *R = D.ImplicitUses)
+    while (*R)
+      expandReg(*R++, Uses);
+
+  // Look over all operands, and collect explicit defs and uses.
+  for (ConstMIOperands Mo(MI); Mo.isValid(); ++Mo) {
+    if (!Mo->isReg() || Mo->isImplicit())
+      continue;
+    unsigned R = Mo->getReg();
+    BitVector &Set = Mo->isDef() ? Defs : Uses;
+    expandReg(R, Set);
+  }
+}
+
+
+void HexagonGenMux::buildMaps(MachineBasicBlock &B, InstrIndexMap &I2X,
+      DefUseInfoMap &DUM) {
+  unsigned Index = 0;
+  unsigned NR = HRI->getNumRegs();
+  BitVector Defs(NR), Uses(NR);
+
+  for (MachineBasicBlock::iterator I = B.begin(), E = B.end(); I != E; ++I) {
+    MachineInstr *MI = &*I;
+    I2X.insert(std::make_pair(MI, Index));
+    Defs.reset();
+    Uses.reset();
+    getDefsUses(MI, Defs, Uses);
+    DUM.insert(std::make_pair(Index, DefUseInfo(Defs, Uses)));
+    Index++;
+  }
+}
+
+
+bool HexagonGenMux::isCondTransfer(unsigned Opc) const {
+  switch (Opc) {
+    case Hexagon::A2_tfrt:
+    case Hexagon::A2_tfrf:
+    case Hexagon::C2_cmoveit:
+    case Hexagon::C2_cmoveif:
+      return true;
+  }
+  return false;
+}
+
+
+unsigned HexagonGenMux::getMuxOpcode(const MachineOperand &Src1,
+      const MachineOperand &Src2) const {
+  bool IsReg1 = Src1.isReg(), IsReg2 = Src2.isReg();
+  if (IsReg1)
+    return IsReg2 ? Hexagon::C2_mux : Hexagon::C2_muxir;
+  if (IsReg2)
+    return Hexagon::C2_muxri;
+
+  // Neither is a register. The first source is extendable, but the second
+  // is not (s8).
+  if (Src2.isImm() && isInt<8>(Src2.getImm()))
+    return Hexagon::C2_muxii;
+
+  return 0;
+}
+
+
+bool HexagonGenMux::genMuxInBlock(MachineBasicBlock &B) {
+  bool Changed = false;
+  InstrIndexMap I2X;
+  DefUseInfoMap DUM;
+  buildMaps(B, I2X, DUM);
+
+  typedef DenseMap<unsigned,CondsetInfo> CondsetMap;
+  CondsetMap CM;
+  MuxInfoList ML;
+
+  MachineBasicBlock::iterator NextI, End = B.end();
+  for (MachineBasicBlock::iterator I = B.begin(); I != End; I = NextI) {
+    MachineInstr *MI = &*I;
+    NextI = std::next(I);
+    unsigned Opc = MI->getOpcode();
+    if (!isCondTransfer(Opc))
+      continue;
+    unsigned DR = MI->getOperand(0).getReg();
+    if (isRegPair(DR))
+      continue;
+
+    unsigned PR = MI->getOperand(1).getReg();
+    unsigned Idx = I2X.lookup(MI);
+    CondsetMap::iterator F = CM.find(DR);
+    bool IfTrue = HII->isPredicatedTrue(Opc);
+
+    // If there is no record of a conditional transfer for this register,
+    // or the predicate register differs, create a new record for it.
+    if (F != CM.end() && F->second.PredR != PR) {
+      CM.erase(F);
+      F = CM.end();
+    }
+    if (F == CM.end()) {
+      auto It = CM.insert(std::make_pair(DR, CondsetInfo()));
+      F = It.first;
+      F->second.PredR = PR;
+    }
+    CondsetInfo &CI = F->second;
+    if (IfTrue)
+      CI.TrueX = Idx;
+    else
+      CI.FalseX = Idx;
+    if (CI.TrueX == UINT_MAX || CI.FalseX == UINT_MAX)
+      continue;
+
+    // There is now a complete definition of DR, i.e. we have the predicate
+    // register, the definition if-true, and definition if-false.
+
+    // First, check if both definitions are far enough from the definition
+    // of the predicate register.
+    unsigned MinX = std::min(CI.TrueX, CI.FalseX);
+    unsigned MaxX = std::max(CI.TrueX, CI.FalseX);
+    unsigned SearchX = (MaxX > 4) ? MaxX-4 : 0;
+    bool NearDef = false;
+    for (unsigned X = SearchX; X < MaxX; ++X) {
+      const DefUseInfo &DU = DUM.lookup(X);
+      if (!DU.Defs[PR])
+        continue;
+      NearDef = true;
+      break;
+    }
+    if (NearDef)
+      continue;
+
+    // The predicate register is not defined in the last few instructions.
+    // Check if the conversion to MUX is possible (either "up", i.e. at the
+    // place of the earlier partial definition, or "down", where the later
+    // definition is located). Examine all defs and uses between these two
+    // definitions.
+    // SR1, SR2 - source registers from the first and the second definition.
+    MachineBasicBlock::iterator It1 = B.begin(), It2 = B.begin();
+    std::advance(It1, MinX);
+    std::advance(It2, MaxX);
+    MachineInstr *Def1 = It1, *Def2 = It2;
+    MachineOperand *Src1 = &Def1->getOperand(2), *Src2 = &Def2->getOperand(2);
+    unsigned SR1 = Src1->isReg() ? Src1->getReg() : 0;
+    unsigned SR2 = Src2->isReg() ? Src2->getReg() : 0;
+    bool Failure = false, CanUp = true, CanDown = true;
+    for (unsigned X = MinX+1; X < MaxX; X++) {
+      const DefUseInfo &DU = DUM.lookup(X);
+      if (DU.Defs[PR] || DU.Defs[DR] || DU.Uses[DR]) {
+        Failure = true;
+        break;
+      }
+      if (CanDown && DU.Defs[SR1])
+        CanDown = false;
+      if (CanUp && DU.Defs[SR2])
+        CanUp = false;
+    }
+    if (Failure || (!CanUp && !CanDown))
+      continue;
+
+    MachineOperand *SrcT = (MinX == CI.TrueX) ? Src1 : Src2;
+    MachineOperand *SrcF = (MinX == CI.FalseX) ? Src1 : Src2;
+    // Prefer "down", since this will move the MUX farther away from the
+    // predicate definition.
+    MachineBasicBlock::iterator At = CanDown ? Def2 : Def1;
+    ML.push_back(MuxInfo(At, DR, PR, SrcT, SrcF, Def1, Def2));
+  }
+
+  for (unsigned I = 0, N = ML.size(); I < N; ++I) {
+    MuxInfo &MX = ML[I];
+    MachineBasicBlock &B = *MX.At->getParent();
+    DebugLoc DL = MX.At->getDebugLoc();
+    unsigned MxOpc = getMuxOpcode(*MX.SrcT, *MX.SrcF);
+    if (!MxOpc)
+      continue;
+    BuildMI(B, MX.At, DL, HII->get(MxOpc), MX.DefR)
+      .addReg(MX.PredR)
+      .addOperand(*MX.SrcT)
+      .addOperand(*MX.SrcF);
+    B.erase(MX.Def1);
+    B.erase(MX.Def2);
+    Changed = true;
+  }
+
+  return Changed;
+}
+
+bool HexagonGenMux::runOnMachineFunction(MachineFunction &MF) {
+  HII = MF.getSubtarget<HexagonSubtarget>().getInstrInfo();
+  HRI = MF.getSubtarget<HexagonSubtarget>().getRegisterInfo();
+  bool Changed = false;
+  for (auto &I : MF)
+    Changed |= genMuxInBlock(I);
+  return Changed;
+}
+
+FunctionPass *llvm::createHexagonGenMux() {
+  return new HexagonGenMux();
+}
+
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@a51 4
+    MachineFunctionProperties getRequiredProperties() const override {
+      return MachineFunctionProperties().set(
+          MachineFunctionProperties::Property::AllVRegsAllocated);
+    }
+d73 4
+a76 4
+              MachineOperand *TOp, MachineOperand *FOp, MachineInstr &D1,
+              MachineInstr &D2)
+          : At(It), DefR(DR), PredR(PR), SrcT(TOp), SrcF(FOp), Def1(&D1),
+            Def2(&D2) {}
+d131 1
+a131 1
+  for (ConstMIOperands Mo(*MI); Mo.isValid(); ++Mo) {
+d261 2
+a262 2
+    MachineInstr &Def1 = *It1, &Def2 = *It2;
+    MachineOperand *Src1 = &Def1.getOperand(2), *Src2 = &Def2.getOperand(2);
+a307 2
+  if (skipFunction(*MF.getFunction()))
+    return false;
+d319 1
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d25 1
+a25 8
+#include "HexagonInstrInfo.h"
+#include "HexagonRegisterInfo.h"
+#include "HexagonSubtarget.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineFunction.h"
+a26 1
+#include "llvm/CodeGen/MachineInstr.h"
+d28 2
+a29 10
+#include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/MC/MCInstrDesc.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/MathExtras.h"
+#include <algorithm>
+#include <limits>
+#include <iterator>
+#include <utility>
+a33 1
+
+d36 1
+a36 2
+
+} // end namespace llvm
+a38 1
+
+d42 1
+a42 2
+
+    HexagonGenMux() : MachineFunctionPass(ID), HII(nullptr), HRI(nullptr) {
+d45 1
+a45 2
+
+    StringRef getPassName() const override {
+a47 1
+
+a50 1
+
+a51 1
+
+d54 1
+a54 1
+          MachineFunctionProperties::Property::NoVRegs);
+d62 3
+a64 5
+      unsigned PredR = 0;
+      unsigned TrueX = std::numeric_limits<unsigned>::max();
+      unsigned FalseX = std::numeric_limits<unsigned>::max();
+
+      CondsetInfo() = default;
+a65 1
+
+d68 1
+a68 2
+
+      DefUseInfo() = default;
+a70 1
+
+a75 1
+
+a81 1
+
+a88 1
+
+d102 1
+a102 2
+
+} // end anonymous namespace
+d107 1
+d113 1
+d121 1
+d135 2
+a136 2
+  for (const MachineOperand &MO : MI->operands()) {
+    if (!MO.isReg() || MO.isImplicit())
+d138 2
+a139 2
+    unsigned R = MO.getReg();
+    BitVector &Set = MO.isDef() ? Defs : Uses;
+d144 1
+d162 1
+d174 1
+d191 1
+d234 1
+a234 2
+    if (CI.TrueX == std::numeric_limits<unsigned>::max() ||
+        CI.FalseX == std::numeric_limits<unsigned>::max())
+@
+
+

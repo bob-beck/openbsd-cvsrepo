@@ -1,0 +1,322 @@
+head	1.1;
+branch	1.1.1;
+access;
+symbols
+	LLVM_4_0_0:1.1.1.2
+	LLVM_4_0_0_RC1:1.1.1.2
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.1
+date	2016.09.03.22.46.59;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.46.59;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.00;	author patrick;	state Exp;
+branches;
+next	;
+commitid	qMUxATnKgqN83Oct;
+
+
+desc
+@@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@//===-- ExpandPostRAPseudos.cpp - Pseudo instruction expansion pass -------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// This file defines a pass that expands COPY and SUBREG_TO_REG pseudo
+// instructions after register allocation.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetInstrInfo.h"
+#include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/Target/TargetSubtargetInfo.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "postrapseudos"
+
+namespace {
+struct ExpandPostRA : public MachineFunctionPass {
+private:
+  const TargetRegisterInfo *TRI;
+  const TargetInstrInfo *TII;
+
+public:
+  static char ID; // Pass identification, replacement for typeid
+  ExpandPostRA() : MachineFunctionPass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    AU.addPreservedID(MachineLoopInfoID);
+    AU.addPreservedID(MachineDominatorsID);
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
+  /// runOnMachineFunction - pass entry point
+  bool runOnMachineFunction(MachineFunction&) override;
+
+private:
+  bool LowerSubregToReg(MachineInstr *MI);
+  bool LowerCopy(MachineInstr *MI);
+
+  void TransferImplicitDefs(MachineInstr *MI);
+};
+} // end anonymous namespace
+
+char ExpandPostRA::ID = 0;
+char &llvm::ExpandPostRAPseudosID = ExpandPostRA::ID;
+
+INITIALIZE_PASS(ExpandPostRA, "postrapseudos",
+                "Post-RA pseudo instruction expansion pass", false, false)
+
+/// TransferImplicitDefs - MI is a pseudo-instruction, and the lowered
+/// replacement instructions immediately precede it.  Copy any implicit-def
+/// operands from MI to the replacement instruction.
+void
+ExpandPostRA::TransferImplicitDefs(MachineInstr *MI) {
+  MachineBasicBlock::iterator CopyMI = MI;
+  --CopyMI;
+
+  for (unsigned i = 0, e = MI->getNumOperands(); i != e; ++i) {
+    MachineOperand &MO = MI->getOperand(i);
+    if (!MO.isReg() || !MO.isImplicit() || MO.isUse())
+      continue;
+    CopyMI->addOperand(MachineOperand::CreateReg(MO.getReg(), true, true));
+  }
+}
+
+bool ExpandPostRA::LowerSubregToReg(MachineInstr *MI) {
+  MachineBasicBlock *MBB = MI->getParent();
+  assert((MI->getOperand(0).isReg() && MI->getOperand(0).isDef()) &&
+         MI->getOperand(1).isImm() &&
+         (MI->getOperand(2).isReg() && MI->getOperand(2).isUse()) &&
+          MI->getOperand(3).isImm() && "Invalid subreg_to_reg");
+
+  unsigned DstReg  = MI->getOperand(0).getReg();
+  unsigned InsReg  = MI->getOperand(2).getReg();
+  assert(!MI->getOperand(2).getSubReg() && "SubIdx on physreg?");
+  unsigned SubIdx  = MI->getOperand(3).getImm();
+
+  assert(SubIdx != 0 && "Invalid index for insert_subreg");
+  unsigned DstSubReg = TRI->getSubReg(DstReg, SubIdx);
+
+  assert(TargetRegisterInfo::isPhysicalRegister(DstReg) &&
+         "Insert destination must be in a physical register");
+  assert(TargetRegisterInfo::isPhysicalRegister(InsReg) &&
+         "Inserted value must be in a physical register");
+
+  DEBUG(dbgs() << "subreg: CONVERTING: " << *MI);
+
+  if (MI->allDefsAreDead()) {
+    MI->setDesc(TII->get(TargetOpcode::KILL));
+    DEBUG(dbgs() << "subreg: replaced by: " << *MI);
+    return true;
+  }
+
+  if (DstSubReg == InsReg) {
+    // No need to insert an identity copy instruction.
+    // Watch out for case like this:
+    // %RAX<def> = SUBREG_TO_REG 0, %EAX<kill>, 3
+    // We must leave %RAX live.
+    if (DstReg != InsReg) {
+      MI->setDesc(TII->get(TargetOpcode::KILL));
+      MI->RemoveOperand(3);     // SubIdx
+      MI->RemoveOperand(1);     // Imm
+      DEBUG(dbgs() << "subreg: replace by: " << *MI);
+      return true;
+    }
+    DEBUG(dbgs() << "subreg: eliminated!");
+  } else {
+    TII->copyPhysReg(*MBB, MI, MI->getDebugLoc(), DstSubReg, InsReg,
+                     MI->getOperand(2).isKill());
+
+    // Implicitly define DstReg for subsequent uses.
+    MachineBasicBlock::iterator CopyMI = MI;
+    --CopyMI;
+    CopyMI->addRegisterDefined(DstReg);
+    DEBUG(dbgs() << "subreg: " << *CopyMI);
+  }
+
+  DEBUG(dbgs() << '\n');
+  MBB->erase(MI);
+  return true;
+}
+
+bool ExpandPostRA::LowerCopy(MachineInstr *MI) {
+
+  if (MI->allDefsAreDead()) {
+    DEBUG(dbgs() << "dead copy: " << *MI);
+    MI->setDesc(TII->get(TargetOpcode::KILL));
+    DEBUG(dbgs() << "replaced by: " << *MI);
+    return true;
+  }
+
+  MachineOperand &DstMO = MI->getOperand(0);
+  MachineOperand &SrcMO = MI->getOperand(1);
+
+  if (SrcMO.getReg() == DstMO.getReg()) {
+    DEBUG(dbgs() << "identity copy: " << *MI);
+    // No need to insert an identity copy instruction, but replace with a KILL
+    // if liveness is changed.
+    if (SrcMO.isUndef() || MI->getNumOperands() > 2) {
+      // We must make sure the super-register gets killed. Replace the
+      // instruction with KILL.
+      MI->setDesc(TII->get(TargetOpcode::KILL));
+      DEBUG(dbgs() << "replaced by:   " << *MI);
+      return true;
+    }
+    // Vanilla identity copy.
+    MI->eraseFromParent();
+    return true;
+  }
+
+  DEBUG(dbgs() << "real copy:   " << *MI);
+  TII->copyPhysReg(*MI->getParent(), MI, MI->getDebugLoc(),
+                   DstMO.getReg(), SrcMO.getReg(), SrcMO.isKill());
+
+  if (MI->getNumOperands() > 2)
+    TransferImplicitDefs(MI);
+  DEBUG({
+    MachineBasicBlock::iterator dMI = MI;
+    dbgs() << "replaced by: " << *(--dMI);
+  });
+  MI->eraseFromParent();
+  return true;
+}
+
+/// runOnMachineFunction - Reduce subregister inserts and extracts to register
+/// copies.
+///
+bool ExpandPostRA::runOnMachineFunction(MachineFunction &MF) {
+  DEBUG(dbgs() << "Machine Function\n"
+               << "********** EXPANDING POST-RA PSEUDO INSTRS **********\n"
+               << "********** Function: " << MF.getName() << '\n');
+  TRI = MF.getSubtarget().getRegisterInfo();
+  TII = MF.getSubtarget().getInstrInfo();
+
+  bool MadeChange = false;
+
+  for (MachineFunction::iterator mbbi = MF.begin(), mbbe = MF.end();
+       mbbi != mbbe; ++mbbi) {
+    for (MachineBasicBlock::iterator mi = mbbi->begin(), me = mbbi->end();
+         mi != me;) {
+      MachineInstr *MI = mi;
+      // Advance iterator here because MI may be erased.
+      ++mi;
+
+      // Only expand pseudos.
+      if (!MI->isPseudo())
+        continue;
+
+      // Give targets a chance to expand even standard pseudos.
+      if (TII->expandPostRAPseudo(MI)) {
+        MadeChange = true;
+        continue;
+      }
+
+      // Expand standard pseudos.
+      switch (MI->getOpcode()) {
+      case TargetOpcode::SUBREG_TO_REG:
+        MadeChange |= LowerSubregToReg(MI);
+        break;
+      case TargetOpcode::COPY:
+        MadeChange |= LowerCopy(MI);
+        break;
+      case TargetOpcode::DBG_VALUE:
+        continue;
+      case TargetOpcode::INSERT_SUBREG:
+      case TargetOpcode::EXTRACT_SUBREG:
+        llvm_unreachable("Sub-register pseudos should have been eliminated.");
+      }
+    }
+  }
+
+  return MadeChange;
+}
+@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@d54 1
+a54 1
+  void TransferImplicitOperands(MachineInstr *MI);
+d64 2
+a65 2
+/// TransferImplicitOperands - MI is a pseudo-instruction, and the lowered
+/// replacement instructions immediately precede it.  Copy any implicit
+d67 2
+a68 1
+void ExpandPostRA::TransferImplicitOperands(MachineInstr *MI) {
+d72 6
+a77 3
+  for (const MachineOperand &MO : MI->implicit_operands())
+    if (MO.isReg())
+      CopyMI->addOperand(MO);
+d170 1
+a170 1
+    TransferImplicitOperands(MI);
+d195 1
+a195 1
+      MachineInstr &MI = *mi;
+d200 1
+a200 1
+      if (!MI.isPseudo())
+d210 1
+a210 1
+      switch (MI.getOpcode()) {
+d212 1
+a212 1
+        MadeChange |= LowerSubregToReg(&MI);
+d215 1
+a215 1
+        MadeChange |= LowerCopy(&MI);
+@
+

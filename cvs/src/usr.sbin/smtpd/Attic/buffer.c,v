@@ -1,0 +1,655 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_4_7:1.6.0.2
+	OPENBSD_4_7_BASE:1.6
+	OPENBSD_4_6:1.4.0.4
+	OPENBSD_4_6_BASE:1.4
+	OPENBSD_4_5:1.1.0.2
+	OPENBSD_4_5_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2010.05.26.16.44.32;	author nicm;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	2010.05.26.13.56.08;	author nicm;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2009.09.15.10.54.59;	author jacekm;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2009.07.23.18.58.43;	author eric;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2009.06.06.08.55.41;	author pyr;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2009.06.05.21.15.07;	author pyr;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.06.05.20.43.57;	author pyr;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2008.11.01.21.35.28;	author gilles;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@Move imsg into libutil and add a man page.
+
+Minor bump for libutil.
+
+Previous versions of this diff and man page looked at by various people.
+
+"you should just commit" deraadt
+@
+text
+@/*	$OpenBSD: buffer.c,v 1.7 2010/05/26 13:56:08 nicm Exp $	*/
+
+/*
+ * Copyright (c) 2003, 2004 Henning Brauer <henning@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "imsg.h"
+
+int	ibuf_realloc(struct ibuf *, size_t);
+void	ibuf_enqueue(struct msgbuf *, struct ibuf *);
+void	ibuf_dequeue(struct msgbuf *, struct ibuf *);
+
+struct ibuf *
+ibuf_open(size_t len)
+{
+	struct ibuf	*buf;
+
+	if ((buf = calloc(1, sizeof(struct ibuf))) == NULL)
+		return (NULL);
+	if ((buf->buf = malloc(len)) == NULL) {
+		free(buf);
+		return (NULL);
+	}
+	buf->size = buf->max = len;
+	buf->fd = -1;
+
+	return (buf);
+}
+
+struct ibuf *
+ibuf_dynamic(size_t len, size_t max)
+{
+	struct ibuf	*buf;
+
+	if (max < len)
+		return (NULL);
+
+	if ((buf = ibuf_open(len)) == NULL)
+		return (NULL);
+
+	if (max > 0)
+		buf->max = max;
+
+	return (buf);
+}
+
+int
+ibuf_realloc(struct ibuf *buf, size_t len)
+{
+	u_char	*b;
+
+	/* on static buffers max is eq size and so the following fails */
+	if (buf->wpos + len > buf->max) {
+		errno = ENOMEM;
+		return (-1);
+	}
+
+	b = realloc(buf->buf, buf->wpos + len);
+	if (b == NULL)
+		return (-1);
+	buf->buf = b;
+	buf->size = buf->wpos + len;
+
+	return (0);
+}
+
+int
+ibuf_add(struct ibuf *buf, const void *data, size_t len)
+{
+	if (buf->wpos + len > buf->size)
+		if (ibuf_realloc(buf, len) == -1)
+			return (-1);
+
+	memcpy(buf->buf + buf->wpos, data, len);
+	buf->wpos += len;
+	return (0);
+}
+
+void *
+ibuf_reserve(struct ibuf *buf, size_t len)
+{
+	void	*b;
+
+	if (buf->wpos + len > buf->size)
+		if (ibuf_realloc(buf, len) == -1)
+			return (NULL);
+
+	b = buf->buf + buf->wpos;
+	buf->wpos += len;
+	return (b);
+}
+
+void *
+ibuf_seek(struct ibuf *buf, size_t pos, size_t len)
+{
+	/* only allowed to seek in already written parts */
+	if (pos + len > buf->wpos)
+		return (NULL);
+
+	return (buf->buf + pos);
+}
+
+size_t
+ibuf_size(struct ibuf *buf)
+{
+	return (buf->wpos);
+}
+
+size_t
+ibuf_left(struct ibuf *buf)
+{
+	return (buf->max - buf->wpos);
+}
+
+void
+ibuf_close(struct msgbuf *msgbuf, struct ibuf *buf)
+{
+	ibuf_enqueue(msgbuf, buf);
+}
+
+int
+ibuf_write(struct msgbuf *msgbuf)
+{
+	struct iovec	 iov[IOV_MAX];
+	struct ibuf	*buf;
+	unsigned int	 i = 0;
+	ssize_t	n;
+
+	bzero(&iov, sizeof(iov));
+	TAILQ_FOREACH(buf, &msgbuf->bufs, entry) {
+		if (i >= IOV_MAX)
+			break;
+		iov[i].iov_base = buf->buf + buf->rpos;
+		iov[i].iov_len = buf->wpos - buf->rpos;
+		i++;
+	}
+
+	if ((n = writev(msgbuf->fd, iov, i)) == -1) {
+		if (errno == EAGAIN || errno == ENOBUFS ||
+		    errno == EINTR)	/* try later */
+			return (0);
+		else
+			return (-1);
+	}
+
+	if (n == 0) {			/* connection closed */
+		errno = 0;
+		return (-2);
+	}
+
+	msgbuf_drain(msgbuf, n);
+
+	return (0);
+}
+
+void
+ibuf_free(struct ibuf *buf)
+{
+	free(buf->buf);
+	free(buf);
+}
+
+void
+msgbuf_init(struct msgbuf *msgbuf)
+{
+	msgbuf->queued = 0;
+	msgbuf->fd = -1;
+	TAILQ_INIT(&msgbuf->bufs);
+}
+
+void
+msgbuf_drain(struct msgbuf *msgbuf, size_t n)
+{
+	struct ibuf	*buf, *next;
+
+	for (buf = TAILQ_FIRST(&msgbuf->bufs); buf != NULL && n > 0;
+	    buf = next) {
+		next = TAILQ_NEXT(buf, entry);
+		if (buf->rpos + n >= buf->wpos) {
+			n -= buf->wpos - buf->rpos;
+			ibuf_dequeue(msgbuf, buf);
+		} else {
+			buf->rpos += n;
+			n = 0;
+		}
+	}
+}
+
+void
+msgbuf_clear(struct msgbuf *msgbuf)
+{
+	struct ibuf	*buf;
+
+	while ((buf = TAILQ_FIRST(&msgbuf->bufs)) != NULL)
+		ibuf_dequeue(msgbuf, buf);
+}
+
+int
+msgbuf_write(struct msgbuf *msgbuf)
+{
+	struct iovec	 iov[IOV_MAX];
+	struct ibuf	*buf;
+	unsigned int	 i = 0;
+	ssize_t		 n;
+	struct msghdr	 msg;
+	struct cmsghdr	*cmsg;
+	union {
+		struct cmsghdr	hdr;
+		char		buf[CMSG_SPACE(sizeof(int))];
+	} cmsgbuf;
+
+	bzero(&iov, sizeof(iov));
+	bzero(&msg, sizeof(msg));
+	TAILQ_FOREACH(buf, &msgbuf->bufs, entry) {
+		if (i >= IOV_MAX)
+			break;
+		iov[i].iov_base = buf->buf + buf->rpos;
+		iov[i].iov_len = buf->wpos - buf->rpos;
+		i++;
+		if (buf->fd != -1)
+			break;
+	}
+
+	msg.msg_iov = iov;
+	msg.msg_iovlen = i;
+
+	if (buf != NULL && buf->fd != -1) {
+		msg.msg_control = (caddr_t)&cmsgbuf.buf;
+		msg.msg_controllen = sizeof(cmsgbuf.buf);
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		*(int *)CMSG_DATA(cmsg) = buf->fd;
+	}
+
+	if ((n = sendmsg(msgbuf->fd, &msg, 0)) == -1) {
+		if (errno == EAGAIN || errno == ENOBUFS ||
+		    errno == EINTR)	/* try later */
+			return (0);
+		else
+			return (-1);
+	}
+
+	if (n == 0) {			/* connection closed */
+		errno = 0;
+		return (-2);
+	}
+
+	/*
+	 * assumption: fd got sent if sendmsg sent anything
+	 * this works because fds are passed one at a time
+	 */
+	if (buf != NULL && buf->fd != -1) {
+		close(buf->fd);
+		buf->fd = -1;
+	}
+
+	msgbuf_drain(msgbuf, n);
+
+	return (0);
+}
+
+void
+ibuf_enqueue(struct msgbuf *msgbuf, struct ibuf *buf)
+{
+	TAILQ_INSERT_TAIL(&msgbuf->bufs, buf, entry);
+	msgbuf->queued++;
+}
+
+void
+ibuf_dequeue(struct msgbuf *msgbuf, struct ibuf *buf)
+{
+	TAILQ_REMOVE(&msgbuf->bufs, buf, entry);
+
+	if (buf->fd != -1)
+		close(buf->fd);
+
+	msgbuf->queued--;
+	ibuf_free(buf);
+}
+@
+
+
+1.7
+log
+@Rename some imsg bits to make namespace collisions less likely buf to
+ibuf, buf_read to ibuf_read, READ_BUF_SIZE to IBUF_READ_SIZE.
+
+ok henning gilles claudio jacekm deraadt
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.12 2009/09/15 10:54:59 jacekm Exp $	*/
+@
+
+
+1.6
+log
+@Enclose repeated buffer draining code in a new msgbuf_drain()
+function, which is additionally exported for use by others.
+
+It will be needed by smtpd's SSL module when the SMTP client code
+is changed to replace libevent's evbuffers with our msgbuf_* API.
+
+ok gilles@@ henning@@ guenther@@ eric@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.44 2009/07/23 18:58:42 eric Exp $	*/
+d31 3
+a33 3
+int	buf_realloc(struct buf *, size_t);
+void	buf_enqueue(struct msgbuf *, struct buf *);
+void	buf_dequeue(struct msgbuf *, struct buf *);
+d35 2
+a36 2
+struct buf *
+buf_open(size_t len)
+d38 1
+a38 1
+	struct buf	*buf;
+d40 1
+a40 1
+	if ((buf = calloc(1, sizeof(struct buf))) == NULL)
+d52 2
+a53 2
+struct buf *
+buf_dynamic(size_t len, size_t max)
+d55 1
+a55 1
+	struct buf	*buf;
+d60 1
+a60 1
+	if ((buf = buf_open(len)) == NULL)
+d70 1
+a70 1
+buf_realloc(struct buf *buf, size_t len)
+d90 1
+a90 1
+buf_add(struct buf *buf, const void *data, size_t len)
+d93 1
+a93 1
+		if (buf_realloc(buf, len) == -1)
+d102 1
+a102 1
+buf_reserve(struct buf *buf, size_t len)
+d107 1
+a107 1
+		if (buf_realloc(buf, len) == -1)
+d116 1
+a116 1
+buf_seek(struct buf *buf, size_t pos, size_t len)
+d126 1
+a126 1
+buf_size(struct buf *buf)
+d132 1
+a132 1
+buf_left(struct buf *buf)
+d138 1
+a138 1
+buf_close(struct msgbuf *msgbuf, struct buf *buf)
+d140 1
+a140 1
+	buf_enqueue(msgbuf, buf);
+d144 1
+a144 1
+buf_write(struct msgbuf *msgbuf)
+d147 1
+a147 1
+	struct buf	*buf;
+d179 1
+a179 1
+buf_free(struct buf *buf)
+d196 1
+a196 1
+	struct buf	*buf, *next;
+d203 1
+a203 1
+			buf_dequeue(msgbuf, buf);
+d214 1
+a214 1
+	struct buf	*buf;
+d217 1
+a217 1
+		buf_dequeue(msgbuf, buf);
+d224 1
+a224 1
+	struct buf	*buf;
+d287 1
+a287 1
+buf_enqueue(struct msgbuf *msgbuf, struct buf *buf)
+d294 1
+a294 1
+buf_dequeue(struct msgbuf *msgbuf, struct buf *buf)
+d302 1
+a302 1
+	buf_free(buf);
+@
+
+
+1.5
+log
+@make buf_write() behave like msgbuf_write(): send out only the
+bytes that were filled, not the whole buffer.
+
+ok pyr@@ gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.20 2009/06/05 21:15:47 pyr Exp $	*/
+d147 1
+a147 1
+	struct buf	*buf, *next;
+d173 1
+a173 11
+	for (buf = TAILQ_FIRST(&msgbuf->bufs); buf != NULL && n > 0;
+	    buf = next) {
+		next = TAILQ_NEXT(buf, entry);
+		if (buf->rpos + n >= buf->wpos) {
+			n -= buf->wpos - buf->rpos;
+			buf_dequeue(msgbuf, buf);
+		} else {
+			buf->rpos += n;
+			n = 0;
+		}
+	}
+d194 18
+d224 1
+a224 1
+	struct buf	*buf, *next;
+d281 1
+a281 11
+	for (buf = TAILQ_FIRST(&msgbuf->bufs); buf != NULL && n > 0;
+	    buf = next) {
+		next = TAILQ_NEXT(buf, entry);
+		if (buf->rpos + n >= buf->wpos) {
+			n -= buf->wpos - buf->rpos;
+			buf_dequeue(msgbuf, buf);
+		} else {
+			buf->rpos += n;
+			n = 0;
+		}
+	}
+@
+
+
+1.4
+log
+@shuffle code around to achieve 0 length diff nirvana between all the
+currently synced daemons' imsg.c, imsg.h and buffer.c
+@
+text
+@d156 1
+a156 1
+		iov[i].iov_len = buf->size - buf->rpos;
+d176 2
+a177 2
+		if (buf->rpos + n >= buf->size) {
+			n -= buf->size - buf->rpos;
+@
+
+
+1.3
+log
+@bring buf_write which is going to be needed for bgpd.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.2 2009/06/05 20:43:57 pyr Exp $	*/
+d137 6
+a185 6
+}
+
+void
+buf_close(struct msgbuf *msgbuf, struct buf *buf)
+{
+	buf_enqueue(msgbuf, buf);
+@
+
+
+1.2
+log
+@make smtpd's imsg lib ready, just like relayd and ospfd.
+ok gilles@@, jacekm@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.19 2009/06/05 07:14:31 pyr Exp $	*/
+d135 45
+@
+
+
+1.1
+log
+@smtpd is a smtp server implementation for OpenBSD. It is a work in progress
+which still lacks many features. bringing it in tree will help working on it
+more easily.
+
+"at this stage it should go in" henning@@, "move ahead" deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.9 2007/12/07 17:17:00 reyk Exp $	*/
+d19 1
+a19 1
+#include <sys/types.h>
+a20 2
+#include <sys/tree.h>
+#include <sys/param.h>
+a22 1
+#include <sys/time.h>
+a24 4
+#include <event.h>
+#include <limits.h>
+#include <pwd.h>
+#include <stdio.h>
+d29 1
+a29 1
+#include "smtpd.h"
+d90 1
+a90 1
+buf_add(struct buf *buf, void *data, size_t len)
+d115 23
+a137 1
+int
+a140 1
+	return (1);
+d170 6
+a175 6
+	struct iovec		 iov[IOV_MAX];
+	struct buf		*buf, *next, *save = NULL;
+	int			 i = 0;
+	ssize_t			 n;
+	struct msghdr		 msg;
+	struct cmsghdr		*cmsg;
+d177 3
+a179 3
+		struct cmsghdr	 hdr;
+		char		 buf[CMSG_SPACE(sizeof(int))];
+	}			 cmsgbuf;
+a185 4
+		if (buf->fd != -1 && i != 0) {
+			buf = save;
+			break;
+		}
+d187 1
+a187 1
+		iov[i].iov_len = buf->size - buf->rpos;
+a190 1
+		save = buf;
+d219 4
+d231 2
+a232 2
+		if (buf->rpos + n >= buf->size) {
+			n -= buf->size - buf->rpos;
+@
+

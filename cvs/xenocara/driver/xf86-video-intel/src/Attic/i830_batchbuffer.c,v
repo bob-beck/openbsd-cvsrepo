@@ -1,0 +1,716 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_0:1.3.0.6
+	OPENBSD_5_0_BASE:1.3
+	OPENBSD_4_9:1.3.0.2
+	OPENBSD_4_9_BASE:1.3
+	OPENBSD_4_8:1.3.0.4
+	OPENBSD_4_8_BASE:1.3
+	OPENBSD_4_7:1.1.0.4
+	OPENBSD_4_7_BASE:1.1
+	OPENBSD_4_6:1.1.0.2
+	OPENBSD_4_6_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2011.11.29.12.39.02;	author oga;	state dead;
+branches;
+next	1.3;
+
+1.3
+date	2010.07.18.14.47.47;	author oga;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2010.05.10.22.32.29;	author oga;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.06.25.20.16.43;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Update the intel driver to a more recent version based on more recent
+upsteam code.
+
+Backporting keeping UMS changes by me, some bugfixes from kettenis@@.
+
+Has been in snapshots for a while, committed on request so we can be
+sure what people are running. This is a prerequesite for sandybridge
+support but has those chipsets disabled for now until the correct code
+has been added.
+@
+text
+@/* -*- c-basic-offset: 4 -*- */
+/*
+ * Copyright © 2006 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * Authors:
+ *    Eric Anholt <eric@@anholt.net>
+ *
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <assert.h>
+#include <stdlib.h>
+
+#include "xf86.h"
+#include "i830.h"
+#include "i830_ring.h"
+#include "i915_drm.h"
+
+#define DUMP_BATCHBUFFERS NULL /* "/tmp/i915-batchbuffers.dump" */
+
+static void intel_end_vertex(intel_screen_private *intel)
+{
+	if (intel->vertex_bo) {
+		if (intel->vertex_used)
+			dri_bo_subdata(intel->vertex_bo, 0, intel->vertex_used*4, intel->vertex_ptr);
+
+		dri_bo_unreference(intel->vertex_bo);
+		intel->vertex_bo = NULL;
+	}
+}
+
+void intel_next_vertex(intel_screen_private *intel)
+{
+	intel_end_vertex(intel);
+
+	intel->vertex_bo =
+		dri_bo_alloc(intel->bufmgr, "vertex", sizeof (intel->vertex_ptr), 4096);
+	intel->vertex_used = 0;
+}
+
+static void intel_next_batch(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+
+	/* The 865 has issues with larger-than-page-sized batch buffers. */
+	if (IS_I865G(intel))
+		intel->batch_bo =
+		    dri_bo_alloc(intel->bufmgr, "batch", 4096, 4096);
+	else
+		intel->batch_bo =
+		    dri_bo_alloc(intel->bufmgr, "batch", 4096 * 4, 4096);
+
+	intel->batch_used = 0;
+
+	/* We don't know when another client has executed, so we have
+	 * to reinitialize our 3D state per batch.
+	 */
+	intel->last_3d = LAST_3D_OTHER;
+}
+
+void intel_batch_init(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+
+	intel->batch_emit_start = 0;
+	intel->batch_emitting = 0;
+
+	intel_next_batch(scrn);
+}
+
+void intel_batch_teardown(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+
+	if (intel->batch_bo != NULL) {
+		dri_bo_unreference(intel->batch_bo);
+		intel->batch_bo = NULL;
+	}
+
+	if (intel->last_batch_bo != NULL) {
+		dri_bo_unreference(intel->last_batch_bo);
+		intel->last_batch_bo = NULL;
+	}
+
+	if (intel->vertex_bo) {
+		dri_bo_unreference(intel->vertex_bo);
+		intel->vertex_bo = NULL;
+	}
+
+	while (!list_is_empty(&intel->batch_pixmaps))
+		list_del(intel->batch_pixmaps.next);
+
+	while (!list_is_empty(&intel->flush_pixmaps))
+		list_del(intel->flush_pixmaps.next);
+
+	while (!list_is_empty(&intel->in_flight)) {
+		struct intel_pixmap *entry;
+
+		entry = list_first_entry(&intel->in_flight,
+					 struct intel_pixmap,
+					 in_flight);
+
+		dri_bo_unreference(entry->bo);
+		list_del(&entry->in_flight);
+		free(entry);
+	}
+}
+
+void intel_batch_do_flush(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+
+	while (!list_is_empty(&intel->flush_pixmaps))
+		list_del(intel->flush_pixmaps.next);
+
+	intel->need_mi_flush = FALSE;
+}
+
+void intel_batch_emit_flush(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+	int flags;
+
+	assert (!intel->in_batch_atomic);
+
+	/* Big hammer, look to the pipelined flushes in future. */
+	flags = MI_WRITE_DIRTY_STATE | MI_INVALIDATE_MAP_CACHE;
+	if (IS_I965G(intel))
+		flags = 0;
+
+	BEGIN_BATCH(1);
+	OUT_BATCH(MI_FLUSH | flags);
+	ADVANCE_BATCH();
+
+	intel_batch_do_flush(scrn);
+}
+
+void intel_batch_submit(ScrnInfoPtr scrn, int flush)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+	int ret;
+
+	assert (!intel->in_batch_atomic);
+
+	if (intel->vertex_flush)
+		intel->vertex_flush(intel);
+	intel_end_vertex(intel);
+
+	if (flush)
+		intel_batch_emit_flush(scrn);
+
+	if (intel->batch_used == 0)
+		return;
+
+	/* Mark the end of the batchbuffer. */
+	OUT_BATCH(MI_BATCH_BUFFER_END);
+	/* Emit a padding dword if we aren't going to be quad-word aligned. */
+	if (intel->batch_used & 1)
+		OUT_BATCH(MI_NOOP);
+
+	if (DUMP_BATCHBUFFERS) {
+	    FILE *file = fopen(DUMP_BATCHBUFFERS, "a");
+	    if (file) {
+		fwrite (intel->batch_ptr, intel->batch_used*4, 1, file);
+		fclose(file);
+	    }
+	}
+
+	ret = dri_bo_subdata(intel->batch_bo, 0, intel->batch_used*4, intel->batch_ptr);
+	if (ret == 0)
+		ret = dri_bo_exec(intel->batch_bo, intel->batch_used*4,
+				  NULL, 0, 0xffffffff);
+	if (ret != 0) {
+		static int once;
+
+		if (!once) {
+			xf86DrvMsg(scrn->scrnIndex, X_ERROR,
+				   "Failed to submit batch buffer, expect rendering corruption "
+				   "or even a frozen display: %s.\n",
+				   strerror(-ret));
+			once = 1;
+		}
+	}
+
+	while (!list_is_empty(&intel->batch_pixmaps)) {
+		struct intel_pixmap *entry;
+
+		entry = list_first_entry(&intel->batch_pixmaps,
+					 struct intel_pixmap,
+					 batch);
+
+		entry->busy = -1;
+		entry->batch_write = 0;
+		list_del(&entry->batch);
+	}
+
+	intel->need_mi_flush |= !list_is_empty(&intel->flush_pixmaps);
+	while (!list_is_empty(&intel->flush_pixmaps))
+		list_del(intel->flush_pixmaps.next);
+
+	while (!list_is_empty(&intel->in_flight)) {
+		struct intel_pixmap *entry;
+
+		entry = list_first_entry(&intel->in_flight,
+					 struct intel_pixmap,
+					 in_flight);
+
+		dri_bo_unreference(entry->bo);
+		list_del(&entry->in_flight);
+		free(entry);
+	}
+
+	/* Save a ref to the last batch emitted, which we use for syncing
+	 * in debug code.
+	 */
+	dri_bo_unreference(intel->last_batch_bo);
+	intel->last_batch_bo = intel->batch_bo;
+	intel->batch_bo = NULL;
+
+	intel_next_batch(scrn);
+
+	if (intel->debug_flush & DEBUG_FLUSH_WAIT)
+		intel_batch_wait_last(scrn);
+
+	if (intel->batch_flush_notify)
+		intel->batch_flush_notify(scrn);
+}
+
+/** Waits on the last emitted batchbuffer to be completed. */
+void intel_batch_wait_last(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+
+	/* Map it CPU write, which guarantees it's done.  This is a completely
+	 * non performance path, so we don't need anything better.
+	 */
+	drm_intel_gem_bo_map_gtt(intel->last_batch_bo);
+	drm_intel_gem_bo_unmap_gtt(intel->last_batch_bo);
+}
+
+void intel_sync(ScrnInfoPtr scrn)
+{
+	intel_screen_private *intel = intel_get_screen_private(scrn);
+
+	if (I810_DEBUG & (DEBUG_VERBOSE_ACCEL | DEBUG_VERBOSE_SYNC))
+		ErrorF("I830Sync\n");
+
+	if (!scrn->vtSema || !intel->batch_bo || !intel->batch_ptr)
+		return;
+
+	intel_batch_submit(scrn, TRUE);
+	intel_batch_wait_last(scrn);
+}
+@
+
+
+1.3
+log
+@Update the intel driver to (mostly) a backport of 2.12.
+
+It is missing a few commits that I have yet to verify (ones that try and
+continue if we lock the gpu rendering engine and can't reset it, for
+example) taht will be verified and sent out for extra testing soon.
+
+Should contain a bunch of speedups and some correctness improvements
+(though rendercheck still gives some errors that I am looking into).
+
+This has been in snaps since the first day of c2k10, any known issues
+with just this driver have (to my knowledge) been fixed since. A problem
+with macbooks pointed out by otto happens with both this and the in-tree
+driver and thus doesn't stop this moving forward.
+
+As well as the 2.12 improvements, this driver also has a backport
+(partially aided by the backports in RHEL 5 kindly provided by Dave
+Airlie) from the kms code of modesetting support for ironlake (arrandale
+and clarkdale: the IGDs build into intel nehalem cpu dies) which has
+been tested on a number of chipsets. Note that Display port and eDP
+displays have not yet been worked on (and probably won't until I can
+find a displayport monitor), but VGA and lvds at least are known to
+work, sure beats vesa.
+
+"no objection on my side" matthieu@@, prodding (as always) from princess
+marco.
+@
+text
+@@
+
+
+1.2
+log
+@Update the intel driver to 2.9.1 plus backports.
+
+2.9.1 is the last version of the intel DDX that supports UMS (User
+modesetting), with 2.10 onwards being purely KMS only. As such, this
+driver contains backports of almost every correctness or performance
+related fix to the rendering layer in later intel drivers. This driver
+*REQUIRES* a GEM enabled kernel. it claims to support non-gem mode but
+this is essentially unmaintained and due to the way the abstraciton
+works is slow, if it works at all (it often does not). You have been
+warned.
+
+tested by many many people on tech over the last few weeks.
+@
+text
+@d43 1
+a43 2
+static int
+intel_nondrm_exec(dri_bo *bo, unsigned int used, void *priv)
+d45 3
+a47 2
+    ScrnInfoPtr scrn = priv;
+    intel_screen_private *intel = intel_get_screen_private(scrn);
+d49 3
+a51 41
+    BEGIN_LP_RING(4);
+    OUT_RING(MI_BATCH_BUFFER_START | (2 << 6));
+    OUT_RING(bo->offset);
+    OUT_RING(MI_NOOP);
+    OUT_RING(MI_NOOP);
+    ADVANCE_LP_RING();
+
+    return 0;
+}
+
+static int
+intel_nondrm_exec_i830(dri_bo *bo, unsigned int used, void *priv)
+{
+    ScrnInfoPtr scrn = priv;
+    intel_screen_private *intel = intel_get_screen_private(scrn);
+
+    BEGIN_LP_RING(4);
+    OUT_RING(MI_BATCH_BUFFER);
+    OUT_RING(bo->offset);
+    OUT_RING(bo->offset + intel->batch_used - 4);
+    OUT_RING(MI_NOOP);
+    ADVANCE_LP_RING();
+
+    return 0;
+}
+
+/**
+ * Creates a fence value representing a request to be passed.
+ *
+ * Stub implementation that should be avoided when DRM functions are available.
+ */
+static unsigned int
+intel_nondrm_emit(void *priv)
+{
+    static unsigned int fence = 0;
+
+    /* Match DRM in not using half the range. The fake bufmgr relies on this. */
+    if (++fence >= 0x8000000)
+	fence = 1;
+
+    return fence;
+d54 1
+a54 7
+/**
+ * Waits on a fence representing a request to be passed.
+ *
+ * Stub implementation that should be avoided when DRM functions are available.
+ */
+static void
+intel_nondrm_wait(unsigned int fence, void *priv)
+d56 1
+a56 1
+    ScrnInfoPtr scrn = priv;
+d58 3
+a60 1
+    i830_wait_ring_idle(scrn);
+a65 1
+	int ret;
+a74 4
+	ret = dri_bo_map(intel->batch_bo, 1);
+	if (ret != 0)
+		FatalError("Failed to map batchbuffer: %s\n", strerror(-ret));
+
+a75 1
+	intel->batch_ptr = intel->batch_bo->virtual;
+a90 12
+
+	if (!intel->have_gem) {
+		if (IS_I830(intel) || IS_845G(intel)) {
+			intel_bufmgr_fake_set_exec_callback(intel->bufmgr,
+			    intel_nondrm_exec_i830, scrn);
+		} else {
+			intel_bufmgr_fake_set_exec_callback(intel->bufmgr,
+			    intel_nondrm_exec, scrn);
+		}
+		intel_bufmgr_fake_set_fence_callback(intel->bufmgr,
+		    intel_nondrm_emit, intel_nondrm_wait, scrn);
+	}
+d97 1
+a97 4
+	if (intel->batch_ptr != NULL) {
+		dri_bo_unmap(intel->batch_bo);
+		intel->batch_ptr = NULL;
+
+d100 1
+d102 1
+d106 33
+d157 1
+a157 12
+	while (!list_is_empty(&intel->flush_pixmaps)) {
+		struct intel_pixmap *entry;
+
+		entry = list_first_entry(&intel->flush_pixmaps,
+					 struct intel_pixmap,
+					 flush);
+
+		entry->flush_read_domains = entry->flush_write_domain = 0;
+		list_del(&entry->flush);
+	}
+
+	intel->need_mi_flush = FALSE;
+d160 1
+a160 1
+void intel_batch_submit(ScrnInfoPtr scrn)
+d167 7
+d177 2
+d180 2
+a181 9
+	if ((intel->batch_used & 4) == 0) {
+		*(uint32_t *) (intel->batch_ptr + intel->batch_used) = MI_NOOP;
+		intel->batch_used += 4;
+	}
+
+	/* Mark the end of the batchbuffer. */
+	*(uint32_t *) (intel->batch_ptr + intel->batch_used) =
+	    MI_BATCH_BUFFER_END;
+	intel->batch_used += 4;
+d186 1
+a186 1
+		fwrite (intel->batch_ptr, intel->batch_used, 1, file);
+d191 4
+a194 6
+	dri_bo_unmap(intel->batch_bo);
+	intel->batch_ptr = NULL;
+
+	ret =
+	    dri_bo_exec(intel->batch_bo, intel->batch_used, NULL, 0,
+			0xffffffff);
+d214 2
+a215 1
+		entry->batch_read_domains = entry->batch_write_domain = 0;
+d219 3
+a221 15
+	/* Mark that we need to flush whatever potential rendering we've done in the
+	 * blockhandler.  We could set this less often, but it's probably not worth
+	 * the work.
+	 */
+	intel->need_mi_flush = !list_is_empty(&intel->flush_pixmaps);
+	while (!list_is_empty(&intel->flush_pixmaps)) {
+		struct intel_pixmap *entry;
+
+		entry = list_first_entry(&intel->flush_pixmaps,
+					 struct intel_pixmap,
+					 flush);
+
+		entry->flush_read_domains = entry->flush_write_domain = 0;
+		list_del(&entry->flush);
+	}
+d232 1
+a232 1
+		xfree(entry);
+d259 2
+a260 2
+	drm_intel_bo_map(intel->last_batch_bo, TRUE);
+	drm_intel_bo_unmap(intel->last_batch_bo);
+d273 1
+a273 2
+	intel_batch_emit_flush(scrn);
+	intel_batch_submit(scrn);
+@
+
+
+1.1
+log
+@update to xf86-video-intel 2.7.1. Tested by many.
+@
+text
+@a34 1
+#include <errno.h>
+d41 2
+d46 2
+a47 2
+    ScrnInfoPtr pScrn = priv;
+    I830Ptr pI830 = I830PTR(pScrn);
+d62 2
+a63 2
+    ScrnInfoPtr pScrn = priv;
+    I830Ptr pI830 = I830PTR(pScrn);
+d68 1
+a68 1
+    OUT_RING(bo->offset + pI830->batch_used - 4);
+d100 1
+a100 1
+    ScrnInfoPtr pScrn = priv;
+d102 1
+a102 1
+    i830_wait_ring_idle(pScrn);
+d105 1
+a105 2
+static void
+intel_next_batch(ScrnInfoPtr pScrn)
+d107 2
+a108 1
+    I830Ptr pI830 = I830PTR(pScrn);
+d110 24
+a133 5
+    /* The 865 has issues with larger-than-page-sized batch buffers. */
+    if (IS_I865G(pI830))
+	pI830->batch_bo = dri_bo_alloc(pI830->bufmgr, "batch", 4096, 4096);
+    else
+	pI830->batch_bo = dri_bo_alloc(pI830->bufmgr, "batch", 4096 * 4, 4096);
+d135 2
+a136 2
+    if (dri_bo_map(pI830->batch_bo, 1) != 0)
+	FatalError("Failed to map batchbuffer: %s\n", strerror(errno));
+d138 1
+a138 2
+    pI830->batch_used = 0;
+    pI830->batch_ptr = pI830->batch_bo->virtual;
+d140 11
+a150 5
+    /* If we are using DRI2, we don't know when another client has executed,
+     * so we have to reinitialize our 3D state per batch.
+     */
+    if (pI830->directRenderingType == DRI_DRI2)
+	pI830->last_3d = LAST_3D_OTHER;
+d153 1
+a153 2
+void
+intel_batch_init(ScrnInfoPtr pScrn)
+d155 1
+a155 1
+    I830Ptr pI830 = I830PTR(pScrn);
+d157 3
+a159 2
+    pI830->batch_emit_start = 0;
+    pI830->batch_emitting = 0;
+d161 2
+a162 1
+    intel_next_batch(pScrn);
+d164 2
+a165 9
+    if (pI830->directRenderingType <= DRI_NONE) {
+	if (IS_I830(pI830) || IS_845G(pI830)) {
+	    intel_bufmgr_fake_set_exec_callback(pI830->bufmgr,
+						intel_nondrm_exec_i830,
+						pScrn);
+	} else {
+	    intel_bufmgr_fake_set_exec_callback(pI830->bufmgr,
+						intel_nondrm_exec,
+						pScrn);
+a166 5
+	intel_bufmgr_fake_set_fence_callback(pI830->bufmgr,
+					     intel_nondrm_emit,
+					     intel_nondrm_wait,
+					     pScrn);
+    }
+d169 1
+a169 2
+void
+intel_batch_teardown(ScrnInfoPtr pScrn)
+d171 13
+a183 1
+    I830Ptr pI830 = I830PTR(pScrn);
+d185 12
+a196 5
+    if (pI830->batch_ptr != NULL) {
+	dri_bo_unmap(pI830->batch_bo);
+	dri_bo_unreference(pI830->batch_bo);
+	pI830->batch_ptr = NULL;
+    }
+d199 1
+a199 2
+void
+intel_batch_flush(ScrnInfoPtr pScrn, Bool flushed)
+d201 67
+a267 2
+    I830Ptr pI830 = I830PTR(pScrn);
+    int ret;
+d269 3
+a271 2
+    if (pI830->batch_used == 0)
+	return;
+d273 2
+a274 3
+    /* If we're not using GEM, then emit a flush after each batch buffer */
+    if (pI830->memory_manager == NULL && !flushed) {
+	int flags = MI_WRITE_DIRTY_STATE | MI_INVALIDATE_MAP_CACHE;
+d276 8
+a283 2
+	if (IS_I965G(pI830))
+	    flags = 0;
+d285 6
+a290 9
+	*(uint32_t *)(pI830->batch_ptr + pI830->batch_used) = MI_FLUSH | flags;
+	pI830->batch_used += 4;
+    }
+	
+    /* Emit a padding dword if we aren't going to be quad-word aligned. */
+    if ((pI830->batch_used & 4) == 0) {
+	*(uint32_t *)(pI830->batch_ptr + pI830->batch_used) = MI_NOOP;
+	pI830->batch_used += 4;
+    }
+d292 1
+a292 3
+    /* Mark the end of the batchbuffer. */
+    *(uint32_t *)(pI830->batch_ptr + pI830->batch_used) = MI_BATCH_BUFFER_END;
+    pI830->batch_used += 4;
+d294 2
+a295 2
+    dri_bo_unmap(pI830->batch_bo);
+    pI830->batch_ptr = NULL;
+d297 19
+a315 3
+    ret = dri_bo_exec(pI830->batch_bo, pI830->batch_used, NULL, 0, 0xffffffff);
+    if (ret != 0)
+	FatalError("Failed to submit batchbuffer: %s\n", strerror(-ret));
+d317 2
+a318 2
+    dri_bo_unreference(pI830->batch_bo);
+    intel_next_batch(pScrn);
+d320 2
+a321 6
+    /* Mark that we need to flush whatever potential rendering we've done in the
+     * blockhandler.  We could set this less often, but it's probably not worth
+     * the work.
+     */
+    if (pI830->memory_manager != NULL)
+	pI830->need_mi_flush = TRUE;
+d323 3
+a325 2
+    if (pI830->batch_flush_notify)
+	pI830->batch_flush_notify (pScrn);
+@
+

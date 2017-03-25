@@ -1,0 +1,713 @@
+head	1.10;
+access;
+symbols
+	OPENBSD_5_4:1.9.0.2
+	OPENBSD_5_4_BASE:1.9
+	OPENBSD_5_3:1.8.0.2
+	OPENBSD_5_3_BASE:1.8
+	OPENBSD_5_2:1.7.0.4
+	OPENBSD_5_2_BASE:1.7
+	OPENBSD_5_1_BASE:1.7
+	OPENBSD_5_1:1.7.0.2
+	OPENBSD_5_0:1.6.0.4
+	OPENBSD_5_0_BASE:1.6
+	OPENBSD_4_9:1.6.0.2
+	OPENBSD_4_9_BASE:1.6
+	OPENBSD_4_8:1.4.0.2
+	OPENBSD_4_8_BASE:1.4
+	OPENBSD_4_7:1.2.0.2
+	OPENBSD_4_7_BASE:1.2;
+locks; strict;
+comment	@ * @;
+
+
+1.10
+date	2014.01.10.21.52.29;	author brad;	state dead;
+branches;
+next	1.9;
+
+1.9
+date	2013.04.17.23.03.23;	author ratchov;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2012.08.25.15.05.51;	author ratchov;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2012.01.26.20.21.31;	author ratchov;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2010.11.08.21.25.44;	author edd;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2010.08.24.14.55.30;	author naddy;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2010.06.30.07.59.53;	author jakemsr;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2010.05.26.21.29.56;	author jakemsr;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2009.12.26.19.23.12;	author naddy;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.10.11.13.36.23;	author edd;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.10
+log
+@Update to MPlayer 20140106 snapshot.
+
+ok edd@@
+@
+text
+@/*
+ * Copyright (c) 2008 Alexandre Ratchov <alex@@caoua.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/types.h>
+#include <poll.h>
+#include <errno.h>
+#include <sndio.h>
+
+#include "config.h"
+#include "mp_msg.h"
+#include "mixer.h"
+#include "help_mp.h"
+
+#include "libaf/af_format.h"
+
+#include "audio_out.h"
+#include "audio_out_internal.h"
+
+static ao_info_t info = {
+	"sndio audio output",
+	"sndio",
+	"Alexandre Ratchov <alex@@caoua.org>",
+	""
+};
+
+LIBAO_EXTERN(sndio)
+
+static struct sio_hdl *hdl = NULL;
+struct pollfd *pfds;
+static struct sio_par par;
+static int delay, vol, havevol;
+#define SILENCE_NMAX 0x1000
+static char silence[SILENCE_NMAX];
+
+/*
+ * misc parameters (volume, etc...)
+ */
+static int control(int cmd, void *arg)
+{
+	ao_control_vol_t *ctl = arg;
+
+	switch (cmd) {
+	case AOCONTROL_GET_VOLUME:
+		if (!havevol)
+			return CONTROL_FALSE;
+		ctl->left = ctl->right = vol * 100 / SIO_MAXVOL;
+		break;
+	case AOCONTROL_SET_VOLUME:
+		if (!havevol)
+			return CONTROL_FALSE;
+		sio_setvol(hdl, ctl->left * SIO_MAXVOL / 100);
+		break;
+	default:
+		return CONTROL_UNKNOWN;
+	}
+	return CONTROL_OK;
+}
+
+/*
+ * call-back invoked to notify of the hardware position
+ */
+static void movecb(void *addr, int delta)
+{
+	delay -= delta * (int)(par.bps * par.pchan);
+}
+
+/*
+ * call-back invoked to notify about volume changes
+ */
+static void volcb(void *addr, unsigned newvol)
+{
+	vol = newvol;
+}
+
+/*
+ * open device and setup parameters
+ * return: 1 = success, 0 = failure
+ */
+static int init(int rate, int channels, int format, int flags)
+{
+	struct af_to_par {
+		int format, bits, sig, le;
+	} af_to_par[] = {
+		{AF_FORMAT_U8,	    8, 0, 0},
+		{AF_FORMAT_S8,      8, 1, 0},
+		{AF_FORMAT_U16_LE, 16, 0, 1},
+		{AF_FORMAT_U16_BE, 16, 0, 0},
+		{AF_FORMAT_S16_LE, 16, 1, 1},
+		{AF_FORMAT_S16_BE, 16, 1, 0},
+		{AF_FORMAT_U24_LE, 16, 0, 1},
+		{AF_FORMAT_U24_BE, 24, 0, 0},
+		{AF_FORMAT_S24_LE, 24, 1, 1},
+		{AF_FORMAT_S24_BE, 24, 1, 0},
+		{AF_FORMAT_U32_LE, 32, 0, 1},
+		{AF_FORMAT_U32_BE, 32, 0, 0},
+		{AF_FORMAT_S32_LE, 32, 1, 1},
+		{AF_FORMAT_S32_BE, 32, 1, 0}
+	}, *p;
+	int i, bpf, ac3 = 0;
+	
+	hdl = sio_open(NULL, SIO_PLAY, 0);
+	if (hdl == NULL) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: can't open sndio\n");
+		return 0;
+	}
+	sio_initpar(&par);
+	for (i = 0, p = af_to_par;; i++, p++) {
+		if (i == sizeof(af_to_par) / sizeof(struct af_to_par)) {
+			if (format == AF_FORMAT_AC3_BE ||
+			    format == AF_FORMAT_AC3_LE)
+				ac3 = 1;
+			mp_msg(MSGT_AO, MSGL_V, "ao2: unsupported format\n");
+			par.bits = 16;
+			par.sig = 1;
+			par.le = SIO_LE_NATIVE;
+			break;
+		}
+		if (p->format == format) {
+			par.bits = p->bits;
+			par.sig = p->sig;
+			if (p->bits > 8)
+				par.le = p->le;
+			if (p->bits != SIO_BPS(p->bits))
+				par.bps = p->bits / 8;
+			break;
+		}
+	}
+	par.rate = rate;
+	par.pchan = channels;
+	par.appbufsz = par.rate * 250 / 1000;	/* 250ms buffer */
+	par.round = par.rate * 10 / 1000;	/*  10ms block size */
+	if (!sio_setpar(hdl, &par)) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: couldn't set params\n");
+		goto bad_close;
+	}
+	if (!sio_getpar(hdl, &par)) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: couldn't get params\n");
+		goto bad_close;
+	}
+	if (par.bits == 8 && par.bps == 1) {
+		format = par.sig ? AF_FORMAT_S8 : AF_FORMAT_U8;	
+	} else if (par.bits == 16 && par.bps == 2) {
+		format = par.sig ? 
+		    (par.le ? AF_FORMAT_S16_LE : AF_FORMAT_S16_BE) :
+		    (par.le ? AF_FORMAT_U16_LE : AF_FORMAT_U16_BE);
+	} else if ((par.bits == 24 || par.msb) && par.bps == 3) {
+		format = par.sig ? 
+		    (par.le ? AF_FORMAT_S24_LE : AF_FORMAT_S24_BE) :
+		    (par.le ? AF_FORMAT_U24_LE : AF_FORMAT_U24_BE);
+	} else if ((par.bits == 32 || par.msb) && par.bps == 4) {
+		format = par.sig ? 
+		    (par.le ? AF_FORMAT_S32_LE : AF_FORMAT_S32_BE) :
+		    (par.le ? AF_FORMAT_U32_LE : AF_FORMAT_U32_BE);
+	} else {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: couldn't set format\n");
+		goto bad_close;
+	}
+	pfds = malloc(sizeof(struct pollfd) * sio_nfds(hdl));
+	if (pfds == NULL) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: couldn't allocate poll fds\n");
+		goto bad_close;
+	}
+	bpf = par.bps * par.pchan;
+	ao_data.channels = par.pchan;
+	ao_data.format = ac3 ? AF_FORMAT_AC3_NE : format;
+	ao_data.bps = bpf * par.rate;
+	ao_data.buffersize = par.bufsz * bpf;
+	ao_data.outburst = par.round * bpf;
+	ao_data.samplerate = rate;
+	havevol = sio_onvol(hdl, volcb, NULL);
+	sio_onmove(hdl, movecb, NULL);
+	delay = 0;
+	if (!sio_start(hdl)) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: init: couldn't start\n");
+		goto bad_free;
+	}
+	return 1;
+bad_free:
+	free(pfds);
+bad_close:
+	sio_close(hdl);
+	hdl = 0;
+	return 0;
+}
+
+/*
+ * close device
+ */
+static void uninit(int immed)
+{
+	if (hdl)
+		sio_close(hdl);
+}
+
+/*
+ * stop playing and empty buffers (for seeking/pause)
+ */
+static void reset(void)
+{
+	if (!sio_stop(hdl)) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: reset: couldn't stop\n");
+	}
+	delay = 0;
+	if (!sio_start(hdl)) {
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: reset: couldn't start\n");
+	}
+}
+
+/*
+ * how many bytes can be played without blocking
+ */
+static int get_space(void)
+{
+	int bufused, revents, n;
+
+	/*
+	 * call poll() and sio_revents(), so the
+	 * delay counter is updated
+	 */
+	n = sio_pollfd(hdl, pfds, POLLOUT);
+	while (poll(pfds, n, 0) < 0 && errno == EINTR)
+		; /* nothing */
+	revents = sio_revents(hdl, pfds);
+	return par.bufsz * par.pchan * par.bps - delay;
+}
+
+/*
+ * play given number of bytes until sio_write() blocks
+ */
+static int play(void *data, int len, int flags)
+{
+	int n;
+
+	n = sio_write(hdl, data, len);
+	delay += n;
+	if (flags & AOPLAY_FINAL_CHUNK)
+		reset();
+	return n;
+}
+
+/*
+ * return: delay in seconds between first and last sample in buffer
+ */
+static float get_delay(void)
+{
+	return (float)delay / (par.bps * par.pchan * par.rate);
+}
+
+/*
+ * stop playing, keep buffers (for pause)
+ */
+static void audio_pause(void)
+{
+	reset();
+}
+
+/*
+ * resume playing, after audio_pause()
+ */
+static void audio_resume(void)
+{
+	int n, count, todo;
+
+	/*
+	 * we want to start with buffers full, because mplayer uses
+	 * get_space() pointer as clock, which would cause video to
+	 * accelerate while buffers are filled.
+	 */
+	todo = par.bufsz * par.pchan * par.bps;
+	while (todo > 0) {
+		count = todo;
+		if (count > SILENCE_NMAX)
+			count = SILENCE_NMAX;
+		n = sio_write(hdl, silence, count);
+		if (n == 0)
+			break;
+		todo -= n;
+		delay += n;
+	}
+}
+@
+
+
+1.9
+log
+@allocate the right number of pollfd structures
+ok naddy
+@
+text
+@@
+
+
+1.8
+log
+@Use a lookup table for supported audio parameters, remove
+hacks from first sndio days that aren't necessary any longer.
+Suggested by Reimar Doeffinger. Tweaks from Tim van der Molen
+and naddy@@. Tested by many, ok dcoppa
+@
+text
+@d42 1
+d147 1
+a147 1
+		return 0;
+d151 1
+a151 1
+		return 0;
+d169 6
+a174 1
+		return 0;
+a175 1
+
+d188 1
+d191 6
+a226 1
+	struct pollfd pfd;
+d233 2
+a234 2
+	n = sio_pollfd(hdl, &pfd, POLLOUT);
+	while (poll(&pfd, n, 0) < 0 && errno == EINTR)
+d236 1
+a236 1
+	revents = sio_revents(hdl, &pfd);
+@
+
+
+1.7
+log
+@Use sndio volume knob if available (consumes less CPU), rather than
+chaining two soft volume knobs. Stop audio during pause to consume
+less CPU. Honour AOPLAY_FINAL_CHUNK flag which fixes playback of very
+short files.
+
+ok & tweaks stsp@@, ok sthen@@, dcoppa@@, go ahead edd@@ (maintainer)
+@
+text
+@a53 2
+	if (!havevol)
+		return CONTROL_FALSE;
+d56 2
+d61 2
+d93 20
+a112 3
+	int bpf;
+	int ac3 = 0;
+
+d119 20
+a138 85
+	switch (format) {
+	case AF_FORMAT_U8:
+		par.bits = 8;
+		par.sig = 0;
+		break;
+	case AF_FORMAT_S8:
+		par.bits = 8;
+		par.sig = 1;
+		break;
+	case AF_FORMAT_U16_LE:
+		par.bits = 16;
+		par.sig = 0;
+		par.le = 1;
+		break;
+	case AF_FORMAT_S16_LE:
+		par.bits = 16;
+		par.sig = 1;
+		par.le = 1;
+		break;
+	case AF_FORMAT_U16_BE:
+		par.bits = 16;
+		par.sig = 0;
+		par.le = 0;
+		break;
+	case AF_FORMAT_S16_BE:
+		par.bits = 16;
+		par.sig = 1;
+		par.le = 0;
+		break;
+	case AF_FORMAT_U24_LE:
+		par.bits = 24;
+		par.bps = 3;
+		par.sig = 0;
+		par.le = 1;
+		break;
+	case AF_FORMAT_S24_LE:
+		par.bits = 24;
+		par.bps = 3;
+		par.sig = 1;
+		par.le = 1;
+		break;
+	case AF_FORMAT_U24_BE:
+		par.bits = 24;
+		par.bps = 3;
+		par.sig = 0;
+		par.le = 0;
+		break;
+	case AF_FORMAT_S24_BE:
+		par.bits = 24;
+		par.bps = 3;
+		par.sig = 1;
+		par.le = 0;
+		break;
+	case AF_FORMAT_U32_LE:
+		par.bits = 32;
+		par.sig = 0;
+		par.le = 1;
+		break;
+	case AF_FORMAT_U32_BE:
+		par.bits = 32;
+		par.sig = 0;
+		par.le = 0;
+		break;
+	case AF_FORMAT_S32_LE:
+		par.bits = 32;
+		par.sig = 1;
+		par.le = 1;
+		break;
+	case AF_FORMAT_S32_BE:
+		par.bits = 32;
+		par.sig = 1;
+		par.le = 0;
+		break;
+	case AF_FORMAT_AC3_BE:
+	case AF_FORMAT_AC3_LE:
+		par.bits = 16;
+		par.sig = 1;
+		par.le = SIO_LE_NATIVE;
+		ac3 = 1;
+		break;
+	default:
+		mp_msg(MSGT_AO, MSGL_V, "ao2: unsupported format\n");
+		par.bits = 16;
+		par.sig = 1;
+		par.le = SIO_LE_NATIVE;
+d175 1
+a175 1
+	ao_data.buffersize = par.appbufsz * bpf;
+d177 1
+a177 5
+	/* avoid resampling for close rates */
+	if ((par.rate >= rate * 0.97) && (par.rate <= rate * 1.03))
+		ao_data.samplerate = rate;
+	else
+		ao_data.samplerate = par.rate;
+a183 10
+	if (ao_data.samplerate != rate) {
+		/* apparently mplayer rounds a little when resampling.
+		 * anyway, it doesn't write quite a full buffer on the first
+		 * write, which means libsndio never actually starts up
+		 * because it's trying to fill the buffer.  this is
+		 * enough for everything I have come across.
+		 */
+		sio_write(hdl, silence, 8 * bpf);
+		delay += 8 * bpf;
+	}
+d269 1
+a269 2
+	 * accelerate while buffers are filled. Remove this when not
+	 * necessary anymore.
+@
+
+
+1.6
+log
+@Update to mplayer-20101024. Noteworthy improvements include vpx
+(webm) support and alpha support. This work is a joint effort from
+myself, naddy@@ and jakemsr@@. Cheers.
+
+OK jakemsr@@
+@
+text
+@d43 1
+a43 1
+static long long realpos = 0, playpos = 0;
+d52 15
+a66 1
+	return CONTROL_FALSE;
+d74 9
+a82 1
+	realpos += delta * (int)(par.bps * par.pchan);
+a98 1
+
+a217 1
+	ao_data.samplerate = par.rate;
+d223 6
+d230 1
+a230 1
+	realpos = playpos = 0;
+a233 7
+
+	/* avoid resampling for close rates */
+	if ((ao_data.samplerate >= rate * 0.97) &&
+	    (ao_data.samplerate <= rate * 1.03)) {
+		ao_data.samplerate = rate;
+	}
+
+d242 1
+a243 1
+
+d259 2
+a260 1
+static void reset(void) {
+d264 1
+a264 1
+	realpos = playpos = 0;
+d276 1
+a276 1
+	int bufused, space, revents, n;
+d280 1
+a280 1
+	 * playpos and realpos counters are updated
+d286 1
+a286 3
+	bufused = (realpos < 0) ? playpos : playpos - realpos;
+	space = par.bufsz * par.pchan * par.bps - bufused;
+	return space;
+d297 3
+a299 1
+	playpos += n;
+d308 1
+a308 3
+	int bufused;
+	bufused = (realpos < 0) ? playpos : playpos - realpos;
+	return (float)bufused / (par.bps * par.pchan * par.rate);
+d316 1
+a316 1
+	/* libsndio stops automatically if no data is available */
+a325 2
+	todo = par.appbufsz * par.pchan * par.bps;
+
+d327 4
+a330 3
+	 * libsndio starts automatically if enough data is available;
+	 * however we want to start with buffers full, because video
+	 * would accelerate during buffers are filled
+d332 1
+d341 1
+a341 1
+		realpos -= n;
+@
+
+
+1.5
+log
+@restore AC3/DTS pass-through over S/PDIF; ok edd@@ jakemsr@@
+@
+text
+@d160 4
+a163 2
+		mp_msg(MSGT_AO, MSGL_ERR, "ao2: unsupported format\n");
+		return 0;
+@
+
+
+1.4
+log
+@support 24-bit audio formats
+ok ratchov
+@
+text
+@d152 2
+a153 1
+	case AF_FORMAT_AC3:
+d197 1
+a197 1
+	ao_data.format = ac3 ? AF_FORMAT_AC3 : format;
+@
+
+
+1.3
+log
+@update to mplayer-export-snapshot-20100308
+
+locally:
+* fix audio when using bsdbt848 video driver (problems noted by simon@@)
+* allow 24-bit audio output formats in the sndio backend (from ratchov@@)
+
+mostly from edd@@ (MAINTAINER)
+@
+text
+@d108 24
+d180 4
+@
+
+
+1.2
+log
+@* add support for 32-bit audio; from jakemsr@@
+* enable AC3/DTS pass-through over S/PDIF
+@
+text
+@d156 1
+a156 1
+	} else if (par.bits == 32 && par.bps == 4) {
+@
+
+
+1.1
+log
+@New version of mplayer based upon a snapshot (20090708).
+  * fixes some flv playback
+  * removed ggi output - broken i386/sparc64.
+  * removed gui (deprecated) - use gnome-mplayer instead.
+  * removed win32 codecs - opensource codecs are good quality.
+
+OK, naddy@@, sthen@@
+@
+text
+@d70 1
+d108 26
+d156 4
+d168 1
+a168 1
+	ao_data.format = format;
+@
+

@@ -1,0 +1,559 @@
+head	1.6;
+access;
+symbols;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2015.10.09.06.44.14;	author semarie;	state dead;
+branches;
+next	1.5;
+commitid	OMHrQoEqoUBdOfmt;
+
+1.5
+date	2015.10.08.10.09.09;	author semarie;	state Exp;
+branches;
+next	1.4;
+commitid	55TxT6B1v1Z4n8yx;
+
+1.4
+date	2015.09.24.06.52.22;	author semarie;	state Exp;
+branches;
+next	1.3;
+commitid	TUvbBaBL9IIGZInz;
+
+1.3
+date	2015.09.24.06.25.54;	author semarie;	state Exp;
+branches;
+next	1.2;
+commitid	zJVLAfTNVIOkVoSl;
+
+1.2
+date	2015.09.10.11.18.10;	author semarie;	state Exp;
+branches;
+next	1.1;
+commitid	wGhTUOQVKI9rH3bX;
+
+1.1
+date	2015.08.24.09.21.10;	author semarie;	state Exp;
+branches;
+next	;
+commitid	PMLVZe5EVtqaJvpn;
+
+
+desc
+@@
+
+
+1.6
+log
+@follow tame->pledge in regress
+@
+text
+@/*	$OpenBSD: manager.c,v 1.5 2015/10/08 10:09:09 semarie Exp $ */
+/*
+ * Copyright (c) 2015 Sebastien Marie <semarie@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/syslimits.h>
+#include <sys/wait.h>
+
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+extern char *__progname;
+
+static const char *
+coredump_name()
+{
+	static char coredump[PATH_MAX] = "";
+
+	if (*coredump)
+		return (coredump);
+
+	if (strlcpy(coredump, __progname, sizeof(coredump)) >= sizeof(coredump))
+		errx(1, "coredump: strlcpy");
+
+	if (strlcat(coredump, ".core", sizeof(coredump)) >= sizeof(coredump))
+		errx(1, "coredump: strlcat");
+
+	return (coredump);
+}
+
+
+static int
+check_coredump()
+{
+	const char *coredump = coredump_name();
+	int fd;
+
+	if ((fd = open(coredump, O_RDONLY)) == -1) {
+		if (errno == ENOENT)
+			return (1); /* coredump not found */
+		else
+			return (-1); /* error */
+	}
+
+	(void)close(fd);
+	return (0); /* coredump found */
+}
+
+
+static int
+clear_coredump(int *ret, const char *test_name)
+{
+	int saved_errno = errno;
+	int u;
+
+	if (((u = unlink(coredump_name())) != 0) && (errno != ENOENT)) {
+		warn("test(%s): clear_coredump", test_name);
+		*ret = EXIT_FAILURE;
+		return (-1);
+	}
+	errno = saved_errno;
+
+	return (0);
+}
+
+
+static int
+grab_syscall(pid_t pid)
+{
+	int	 ret = -1;
+	char	*search = NULL;
+	int	 searchlen;
+	FILE	*fd;
+	char	 line[1024];
+	char	*end;
+
+	/* build searched string */
+	if ((searchlen = asprintf(&search, "%s(%d): syscall ", __progname, pid))
+	    <= 0)
+		goto out;
+
+	/* call dmesg */
+	if ((fd = popen("/sbin/dmesg", "r")) == NULL)
+		goto out;
+
+	/* search the string */
+	while (1) {
+		/* read a line */
+		fgets(line, sizeof(line), fd);
+
+		/* error checking */
+		if (ferror(fd)) {
+			ret = -1;
+			goto out;
+		}
+
+		/* quit */
+		if (feof(fd))
+			break;
+
+		/* strip trailing '\n' */
+		end = strchr(line, '\n');
+		if (*end == '\n')
+			*end = '\0';
+
+		/* check if found */
+		if (strncmp(search, line, searchlen) == 0) {
+			const char *errstr = NULL;
+			/* found */
+			ret = strtonum(line + searchlen, 0, 255, &errstr);
+			if (errstr) {
+				warn("strtonum: line=%s err=%s", line, errstr);
+				return (-1);
+			}
+		}
+	}
+
+	/* cleanup */
+	if (pclose(fd) == -1)
+		goto out;
+
+	/* not found */
+	if (ret == -1)
+		ret = 0;
+
+out:
+	free(search);
+	return (ret);
+}
+
+/* mainly stolen from src/bin/cat/cat.c */
+static int
+drainfd(int rfd, int wfd)
+{
+	char buf[1024];
+	ssize_t nr, nw, off;
+
+	while ((nr = read(rfd, buf, sizeof(buf))) != -1 && nr != 0)
+		for (off = 0; nr; nr -= nw, off += nw)
+			if ((nw = write(wfd, buf + off, (size_t)nr)) == 0 ||
+			    nw == -1)
+				return (-1);
+	if (nr < 0)
+		return (-1);
+
+	return (0);
+}
+
+void
+_start_test(int *ret, const char *test_name, const char *request,
+    const char *paths[], void (*test_func)(void))
+{
+	int fildes[2];
+	pid_t pid;
+	int status;
+	int i;
+
+	/* early print testname */
+	printf("test(%s): tame=", test_name);
+	if (request) {
+		printf("(\"%s\",", request);
+		if (paths) {
+			printf("{");
+			for (i = 0; paths[i] != NULL; i++)
+				printf("\"%s\",", paths[i]);
+			printf("NULL})");
+		} else
+			printf("NULL)");
+	} else
+		printf("not-called");
+	
+	/* unlink previous coredump (if exists) */
+	if (clear_coredump(ret, test_name) == -1)
+		return;
+
+	/* flush outputs (for STDOUT_FILENO manipulation) */
+	if (fflush(NULL) != 0) {
+		warn("test(%s) fflush", test_name);
+		*ret = EXIT_FAILURE;
+		return;
+	}
+
+	/* make pipe to grab output */
+	if (pipe(fildes) != 0) {
+		warn("test(%s) pipe", test_name);
+		*ret = EXIT_FAILURE;
+		return;
+	}
+
+	/* fork and launch the test */
+	switch (pid = fork()) {
+	case -1:
+		(void)close(fildes[0]);
+		(void)close(fildes[1]);
+
+		warn("test(%s) fork", test_name);
+		*ret = EXIT_FAILURE;
+		return;
+
+	case 0:
+		/* output to pipe */
+		(void)close(fildes[0]);
+		while (dup2(fildes[1], STDOUT_FILENO) == -1)
+			if (errno != EINTR)
+				err(errno, "dup2");
+
+		/* create a new session (for kill) */
+		setsid();
+
+		/* set tame policy */
+		if (request && tame(request, paths) != 0)
+			err(errno, "tame");
+
+		/* reset errno and launch test */
+		errno = 0;
+		test_func();
+
+		if (errno != 0)
+			_exit(errno);
+
+		_exit(EXIT_SUCCESS);
+		/* NOTREACHED */
+	}
+
+	/* copy pipe to output */
+	(void)close(fildes[1]);
+	if (drainfd(fildes[0], STDOUT_FILENO) != 0) {
+		warn("test(%s): drainfd", test_name);
+		*ret = EXIT_FAILURE;
+		return;
+	}
+	if (close(fildes[0]) != 0) {
+		warn("test(%s): close", test_name);
+		*ret = EXIT_FAILURE;
+		return;
+	}
+
+	/* wait for test to terminate */
+	while (waitpid(pid, &status, 0) < 0) {
+		if (errno == EAGAIN)
+			continue;
+		warn("test(%s): waitpid", test_name);
+		*ret = EXIT_FAILURE;
+		return;
+	}
+
+	/* show status and details */
+	printf(" status=%d", status);
+
+	if (WIFCONTINUED(status))
+		printf(" continued");
+
+	if (WIFEXITED(status)) {
+		int e = WEXITSTATUS(status);
+		printf(" exit=%d", e);
+		if (e > 0 && e <= ELAST)
+			printf(" (errno: \"%s\")", strerror(e));
+	}
+
+	if (WIFSIGNALED(status)) {
+		int signal = WTERMSIG(status);
+		printf(" signal=%d", signal);
+
+		/* check if core file is really here ? */
+		if (WCOREDUMP(status)) {
+			int coredump = check_coredump();
+
+			switch(coredump) {
+			case -1: /* error */
+				warn("test(%s): check_coredump", test_name);
+				*ret = EXIT_FAILURE;
+				return;
+
+			case 0: /* found */
+				printf(" coredump=present");
+				break;
+
+			case 1:	/* not found */
+				printf(" coredump=absent");
+				break;
+
+			default:
+				warnx("test(%s): unknown coredump code %d",
+				    test_name, coredump);
+				*ret = EXIT_FAILURE;
+				return;
+			}
+
+		}
+
+		/* grab tamed syscall from dmesg */
+		if ((signal == SIGKILL) || (signal = SIGABRT)) {
+			int syscall = grab_syscall(pid);
+			switch (syscall) {
+			case -1:	/* error */
+				warn("test(%s): grab_syscall pid=%d", test_name,
+				    pid);
+				*ret = EXIT_FAILURE;
+				return;
+
+			case 0:		/* not found */
+				printf(" tamed_syscall=not_found");
+				break;
+
+			default:
+				printf(" tamed_syscall=%d", syscall);
+			}
+		}
+	}
+
+	if (WIFSTOPPED(status))
+		printf(" stop=%d", WSTOPSIG(status));
+
+	printf("\n");
+}
+@
+
+
+1.5
+log
+@allow a test to manage itself the tame(2) call.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: manager.c,v 1.4 2015/09/24 06:52:22 semarie Exp $ */
+@
+
+
+1.4
+log
+@tame("xxx", NULL) and tame("xxx", {NULL}) are not the same
+- change output of regress to reflect that
+- add test
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: manager.c,v 1.3 2015/09/24 06:25:54 semarie Exp $ */
+d178 10
+a187 6
+	printf("test(%s): tame=(\"%s\",", test_name, request);
+	if (paths) {
+		printf("{");
+		for (i = 0; paths[i] != NULL; i++)
+			printf("\"%s\",", paths[i]);
+		printf("NULL})");
+d189 2
+a190 2
+		printf("NULL)");
+
+d230 1
+a230 1
+		if (tame(request, paths) != 0)
+@
+
+
+1.3
+log
+@refactor a bit regress tame
+- unit tests are functions in main.c
+- use test name in output
+- add grabbing stdout output of tests
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: manager.c,v 1.2 2015/09/10 11:18:10 semarie Exp $ */
+d178 8
+a185 4
+	printf("test(%s): tame=(\"%s\",{", test_name, request);
+	for (i = 0; paths && paths[i] != NULL; i++)
+		printf("\"%s\",", paths[i]);
+	printf("NULL})");
+@
+
+
+1.2
+log
+@convert tame(2) regress to new API
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: manager.c,v 1.1 2015/08/24 09:21:10 semarie Exp $ */
+a30 2
+#include "actions.h"
+
+a32 2
+int	execute_action(action_t, va_list);
+
+d70 1
+a70 1
+clear_coredump(int *ret, int ntest)
+d76 1
+a76 1
+		warn("test(%d): clear_coredump", ntest);
+d150 17
+d169 2
+a170 1
+start_test(int *ret, int ntest, const char *request, const char *paths[], ...)
+d172 1
+a172 1
+	static int ntest_check = 0;
+a174 2
+	va_list ap;
+	action_t action;
+d177 5
+a181 7
+#ifndef DEBUG
+	/* check ntest (useful for dev) */
+	if (ntest != ++ntest_check)
+		errx(EXIT_FAILURE,
+		    "invalid test number: should be %d but is %d",
+		    ntest_check, ntest);
+#endif /* DEBUG */
+d184 1
+a184 1
+	if (clear_coredump(ret, ntest) == -1)
+d186 15
+a200 1
+	
+d204 4
+a207 1
+		warn("test(%d) fork", ntest);
+d212 7
+a218 1
+		/* create a new session (for AC_KILL) */
+d221 1
+a221 1
+		/* XXX redirect output to /dev/null ? */
+d224 7
+a230 8
+		
+		va_start(ap, paths);
+		while ((action = va_arg(ap, action_t)) != AC_EXIT) {
+			execute_action(action, ap);
+			if (errno != 0)
+				_exit(errno);
+		}
+		va_end(ap);
+d236 13
+d253 1
+a253 1
+		warn("test(%d): waitpid", ntest);
+d259 1
+a259 4
+	printf("test(%d): tame=(\"%s\",{", ntest, request);
+	for (i = 0; paths && paths[i] != NULL; i++)
+		printf("\"%s\",", paths[i]);
+	printf("NULL}) status=%d", status);
+d281 1
+a281 1
+				warn("test(%d): check_coredump", ntest);
+d294 2
+a295 2
+				warnx("test(%d): unknown coredump code %d",
+				    ntest, coredump);
+d307 1
+a307 1
+				warn("test(%d): grab_syscall pid=%d", ntest,
+@
+
+
+1.1
+log
+@add new (extensible) testsuite for tame(2)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$ */
+a18 1
+#include <sys/tame.h>
+a34 1
+int	parse_flags(char *);
+d156 1
+a156 1
+start_test(int *ret, int ntest, int flags, char *paths[], ...)
+d189 1
+a189 1
+		if (tame(flags, paths) != 0)
+d214 1
+a214 1
+	printf("test(%d): tame=(0x%x,{", ntest, flags);
+@
+

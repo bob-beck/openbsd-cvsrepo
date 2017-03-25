@@ -1,0 +1,464 @@
+head	1.9;
+access;
+symbols
+	OPENBSD_4_2:1.7.0.2
+	OPENBSD_4_2_BASE:1.7
+	OPENBSD_4_1:1.6.0.2
+	OPENBSD_4_1_BASE:1.6;
+locks; strict;
+comment	@ * @;
+
+
+1.9
+date	2007.12.07.17.27.07;	author deraadt;	state dead;
+branches;
+next	1.8;
+
+1.8
+date	2007.11.24.17.07.28;	author reyk;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2007.06.12.15.16.10;	author msf;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2007.02.07.13.39.58;	author reyk;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2007.01.29.14.23.31;	author pyr;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2007.01.09.00.45.32;	author deraadt;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2007.01.08.20.46.18;	author reyk;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2007.01.08.13.37.26;	author reyk;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2006.12.16.11.45.07;	author reyk;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.9
+log
+@hoststated/hoststatectl get repository copied (and de-tagged) into
+relayd/relayctl.  This is a more suitable place for a daemon that has
+grown out of it's initial roots of "monitoring and redirecting services
+at various layers", into one that is "a full featured proxy, which
+happens to know what is up/down"
+@
+text
+@/*	$OpenBSD: buffer.c,v 1.8 2007/11/24 17:07:28 reyk Exp $	*/
+
+/*
+ * Copyright (c) 2003, 2004 Henning Brauer <henning@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+
+#include <net/if.h>
+
+#include <errno.h>
+#include <event.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <openssl/ssl.h>
+
+#include "hoststated.h"
+
+int	buf_realloc(struct buf *, size_t);
+void	buf_enqueue(struct msgbuf *, struct buf *);
+void	buf_dequeue(struct msgbuf *, struct buf *);
+
+struct buf *
+buf_open(size_t len)
+{
+	struct buf	*buf;
+
+	if ((buf = calloc(1, sizeof(struct buf))) == NULL)
+		return (NULL);
+	if ((buf->buf = malloc(len)) == NULL) {
+		free(buf);
+		return (NULL);
+	}
+	buf->size = buf->max = len;
+	buf->fd = -1;
+
+	return (buf);
+}
+
+struct buf *
+buf_dynamic(size_t len, size_t max)
+{
+	struct buf	*buf;
+
+	if (max < len)
+		return (NULL);
+
+	if ((buf = buf_open(len)) == NULL)
+		return (NULL);
+
+	if (max > 0)
+		buf->max = max;
+
+	return (buf);
+}
+
+int
+buf_realloc(struct buf *buf, size_t len)
+{
+	u_char	*b;
+
+	/* on static buffers max is eq size and so the following fails */
+	if (buf->wpos + len > buf->max) {
+		errno = ENOMEM;
+		return (-1);
+	}
+
+	b = realloc(buf->buf, buf->wpos + len);
+	if (b == NULL)
+		return (-1);
+	buf->buf = b;
+	buf->size = buf->wpos + len;
+
+	return (0);
+}
+
+int
+buf_add(struct buf *buf, void *data, size_t len)
+{
+	if (buf->wpos + len > buf->size)
+		if (buf_realloc(buf, len) == -1)
+			return (-1);
+
+	memcpy(buf->buf + buf->wpos, data, len);
+	buf->wpos += len;
+	return (0);
+}
+
+void *
+buf_reserve(struct buf *buf, size_t len)
+{
+	void	*b;
+
+	if (buf->wpos + len > buf->size)
+		if (buf_realloc(buf, len) == -1)
+			return (NULL);
+
+	b = buf->buf + buf->wpos;
+	buf->wpos += len;
+	return (b);
+}
+
+int
+buf_close(struct msgbuf *msgbuf, struct buf *buf)
+{
+	buf_enqueue(msgbuf, buf);
+	return (1);
+}
+
+void
+buf_free(struct buf *buf)
+{
+	free(buf->buf);
+	free(buf);
+}
+
+void
+msgbuf_init(struct msgbuf *msgbuf)
+{
+	msgbuf->queued = 0;
+	msgbuf->fd = -1;
+	TAILQ_INIT(&msgbuf->bufs);
+}
+
+void
+msgbuf_clear(struct msgbuf *msgbuf)
+{
+	struct buf	*buf;
+
+	while ((buf = TAILQ_FIRST(&msgbuf->bufs)) != NULL)
+		buf_dequeue(msgbuf, buf);
+}
+
+int
+msgbuf_write(struct msgbuf *msgbuf)
+{
+	struct iovec	 iov[IOV_MAX];
+	struct buf	*buf, *next;
+	int		 i = 0;
+	ssize_t		 n;
+	struct msghdr	 msg;
+	struct cmsghdr	*cmsg;
+	char		 cmsgbuf[CMSG_SPACE(sizeof(int))];
+
+	bzero(&iov, sizeof(iov));
+	bzero(&msg, sizeof(msg));
+	TAILQ_FOREACH(buf, &msgbuf->bufs, entry) {
+		if (i >= IOV_MAX)
+			break;
+		iov[i].iov_base = buf->buf + buf->rpos;
+		iov[i].iov_len = buf->size - buf->rpos;
+		i++;
+		if (buf->fd != -1)
+			break;
+	}
+
+	msg.msg_iov = iov;
+	msg.msg_iovlen = i;
+
+	if (buf != NULL && buf->fd != -1) {
+		msg.msg_control = (caddr_t)cmsgbuf;
+		msg.msg_controllen = CMSG_LEN(sizeof(int));
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		*(int *)CMSG_DATA(cmsg) = buf->fd;
+	}
+
+	if ((n = sendmsg(msgbuf->fd, &msg, 0)) == -1) {
+		if (errno == EAGAIN || errno == ENOBUFS ||
+		    errno == EINTR)	/* try later */
+			return (0);
+		else
+			return (-1);
+	}
+
+	if (n == 0) {			/* connection closed */
+		errno = 0;
+		return (-2);
+	}
+
+	if (buf != NULL && buf->fd != -1) {
+		msg.msg_control = (caddr_t)cmsgbuf;
+		msg.msg_controllen = CMSG_LEN(sizeof(int));
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		*(int *)CMSG_DATA(cmsg) = buf->fd;
+	}
+
+	for (buf = TAILQ_FIRST(&msgbuf->bufs); buf != NULL && n > 0;
+	    buf = next) {
+		next = TAILQ_NEXT(buf, entry);
+		if (buf->rpos + n >= buf->size) {
+			n -= buf->size - buf->rpos;
+			buf_dequeue(msgbuf, buf);
+		} else {
+			buf->rpos += n;
+			n = 0;
+		}
+	}
+
+	return (0);
+}
+
+void
+buf_enqueue(struct msgbuf *msgbuf, struct buf *buf)
+{
+	TAILQ_INSERT_TAIL(&msgbuf->bufs, buf, entry);
+	msgbuf->queued++;
+}
+
+void
+buf_dequeue(struct msgbuf *msgbuf, struct buf *buf)
+{
+	TAILQ_REMOVE(&msgbuf->bufs, buf, entry);
+
+	if (buf->fd != -1)
+		close(buf->fd);
+
+	msgbuf->queued--;
+	buf_free(buf);
+}
+@
+
+
+1.8
+log
+@sort includes, adjust to style(9)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.7 2007/06/12 15:16:10 msf Exp $	*/
+@
+
+
+1.7
+log
+@put the fd passing from bgpd back in to hoststated's version of imsg,
+needed for layer 7 reload support.
+
+ok pyr@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.6 2007/02/07 13:39:58 reyk Exp $	*/
+d19 1
+a19 1
+#include <sys/types.h>
+d23 1
+a23 1
+#include <sys/param.h>
+d25 1
+@
+
+
+1.6
+log
+@remove unused functions and variables which have been copied from
+ospfd(8) (can be re-imported later if required).
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.5 2007/01/29 14:23:31 pyr Exp $	*/
+d53 1
+d160 2
+d171 2
+d178 10
+d201 10
+d237 4
+@
+
+
+1.5
+log
+@Add SSL support to hoststated.
+with help and OK reyk@@
+with help and advice by claudio@@ and Srebrenko Sehic
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.4 2007/01/09 00:45:32 deraadt Exp $	*/
+a117 10
+}
+
+void *
+buf_seek(struct buf *buf, size_t pos, size_t len)
+{
+	/* only allowed to seek in already written parts */
+	if (pos + len > buf->wpos)
+		return (NULL);
+
+	return (buf->buf + pos);
+@
+
+
+1.4
+log
+@adapt to rename
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.3 2007/01/08 20:46:18 reyk Exp $	*/
+d32 2
+@
+
+
+1.3
+log
+@do NOT use the regexp interface. it is way to complicated, error-prone
+and we don't know about all the possible security problems.
+
+change the check send/expect code to use the fnmatch(3) interface
+using shell globbing rules instead. this allows simple patterns like
+"220 * ESMTP*" or "SSH-[12].??-*".
+
+suggested by deraadt@@ and otto@@
+ok Pierre-Yves Ritschard (pyr at spootnik dot org)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.2 2007/01/08 13:37:26 reyk Exp $	*/
+d33 1
+a33 1
+#include "hostated.h"
+@
+
+
+1.2
+log
+@add a generic send/expect check using regular expression (see
+regex(3)).  this allows to define additional checks for other TCP
+protocols.
+
+From Pierre-Yves Ritschard (pyr at spootnik dot org)
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: buffer.c,v 1.1 2006/12/16 11:45:07 reyk Exp $	*/
+a31 1
+#include <regex.h>
+@
+
+
+1.1
+log
+@Import hostated, the host status daemon.  This daemon will monitor
+remote hosts and dynamically alter pf(4) tables and redirection rules
+for active server load balancing.  The daemon has been written by
+Pierre-Yves Ritschard (pyr at spootnik.org) and was formerly known as
+"slbd".
+
+The daemon is fully functional but it still needs some work and
+cleanup so we don't link it to the build yet.  Some TODOs are a
+partial rewrite of the check_* routines (use libevent whenever we
+can), improvement of the manpages, and general knf and cleanup.
+
+ok deraadt@@ claudio@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d32 1
+@
+

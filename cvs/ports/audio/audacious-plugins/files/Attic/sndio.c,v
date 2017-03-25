@@ -1,0 +1,1060 @@
+head	1.6;
+access;
+symbols
+	OPENBSD_5_2:1.5.0.2
+	OPENBSD_5_2_BASE:1.5
+	OPENBSD_5_1_BASE:1.2
+	OPENBSD_5_1:1.2.0.6
+	OPENBSD_5_0:1.2.0.4
+	OPENBSD_5_0_BASE:1.2
+	OPENBSD_4_9:1.2.0.2
+	OPENBSD_4_9_BASE:1.2
+	OPENBSD_4_8:1.1.0.8
+	OPENBSD_4_8_BASE:1.1
+	OPENBSD_4_7:1.1.0.6
+	OPENBSD_4_7_BASE:1.1
+	OPENBSD_4_6:1.1.0.4
+	OPENBSD_4_6_BASE:1.1
+	OPENBSD_4_5:1.1.0.2
+	OPENBSD_4_5_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2012.08.25.11.30.19;	author dcoppa;	state dead;
+branches;
+next	1.5;
+
+1.5
+date	2012.05.10.22.42.24;	author ratchov;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2012.05.09.20.53.35;	author ratchov;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.03.20.19.10.56;	author stsp;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2010.12.19.18.19.56;	author shadchin;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2009.01.25.02.07.06;	author fgsch;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@Update to audacious / audacious-plugins 3.3.1
+
+With suggestions from Brad and stsp@@
+OK stsp@@
+@
+text
+@/*
+ * Copyright (c) 2008, 2009 Thomas Pfaff <tpfaff@@tp76.info>
+ * Copyright (c) 2012 Alexandre Ratchov <alex@@caoua.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <errno.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sndio.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <gtk/gtk.h>
+#include <audacious/plugin.h>
+#include <audacious/misc.h>
+#include <audacious/i18n.h>
+#include <audacious/plugin.h>
+#include <libaudgui/libaudgui.h>
+#include <libaudgui/libaudgui-gtk.h>
+
+#include "config.h"
+
+/*
+ * minimum output buffer size in milliseconds
+ */
+#define BUFFER_SIZE_MIN	250
+
+bool_t	sndio_init(void);
+void	sndio_cleanup(void);
+void	sndio_about(void);
+int	sndio_take_message(const char *, const void *, int);
+void	sndio_configure(void);
+void	sndio_get_volume(int *, int *);
+void	sndio_set_volume(int, int);
+bool_t	sndio_open(int, int, int);
+void	sndio_close(void);
+int	sndio_buffer_free(void);
+void    sndio_period_wait(void);
+void	sndio_write(void *, int);
+void	sndio_pause(bool_t);
+void	sndio_flush(int);
+int	sndio_output_time(void);
+int	sndio_written_time(void);
+void	sndio_drain(void);
+void	sndio_set_written_time(int);
+
+void	onmove_cb(void *, int);
+void	onvol_cb(void *, unsigned);
+
+void	configure_win_ok_cb(GtkWidget *, gpointer);
+
+static struct sio_par par;
+static struct sio_hdl *hdl;
+static long long rdpos;
+static long long wrpos;
+static int paused, restarted, volume;
+static int pause_pending, flush_pending, volume_pending;
+static int bytes_per_sec;
+static pthread_mutex_t mtx;
+
+static GtkWidget *configure_win;
+static GtkWidget *adevice_entry;
+static gchar *audiodev;
+
+AUD_OUTPUT_PLUGIN
+(
+	.name = "sndio",
+	.init = sndio_init,
+	.cleanup = sndio_cleanup,
+	.about = sndio_about,
+	.configure = sndio_configure,
+	.probe_priority = 2,
+	.get_volume = sndio_get_volume,
+	.set_volume = sndio_set_volume,
+	.open_audio = sndio_open,
+	.write_audio = sndio_write,
+	.close_audio = sndio_close,
+	.buffer_free = sndio_buffer_free,
+	.period_wait = sndio_period_wait,
+	.flush = sndio_flush,
+	.pause = sndio_pause,
+	.output_time = sndio_output_time,
+	.written_time = sndio_written_time,
+	.set_written_time = sndio_set_written_time,
+	.drain = sndio_drain
+)
+
+static struct fmt_to_par {
+	int fmt, bits, sig, le;
+} fmt_to_par[] = {
+	{FMT_S8,      8, 1, 0}, {FMT_U8,      8, 1, 0},
+	{FMT_S16_LE, 16, 1, 1}, {FMT_S16_BE, 16, 1, 0},
+	{FMT_U16_LE, 16, 0, 1},	{FMT_U16_BE, 16, 0, 0},
+	{FMT_S24_LE, 24, 1, 1},	{FMT_S24_BE, 24, 1, 0},
+	{FMT_U24_LE, 24, 0, 1},	{FMT_U24_BE, 24, 0, 0},
+	{FMT_S32_LE, 32, 1, 1},	{FMT_S32_BE, 32, 1, 0},
+	{FMT_U32_LE, 32, 0, 1},	{FMT_U32_BE, 32, 0, 0}
+};
+
+static const gchar * const sndio_defaults[] = {
+	"volume", "100",
+	"audiodev", "",
+	NULL,
+};
+
+static void
+reset(void)
+{
+	if (!restarted) {
+		restarted = 1;
+		sio_stop(hdl);
+		sio_start(hdl);
+		rdpos = wrpos;
+	}
+}
+
+static void
+wait_ready(void)
+{
+	int n;
+	struct pollfd pfds[16];
+
+	if (volume_pending) {
+		sio_setvol(hdl, volume * SIO_MAXVOL / 100);
+		volume_pending = 0;
+	}
+	if (flush_pending) {
+		reset();
+		flush_pending = 0;
+	}
+	if (pause_pending) {
+		if (paused)
+			reset();
+		pause_pending = 0;
+	}
+	if (paused) {
+		pthread_mutex_unlock(&mtx);
+		usleep(20000);
+		pthread_mutex_lock(&mtx);
+		return;
+	}
+	n = sio_pollfd(hdl, pfds, POLLOUT);
+	if (n != 0) {
+		pthread_mutex_unlock(&mtx);
+		while (poll(pfds, n, -1) < 0) {
+			if (errno != EINTR) {
+				perror("poll");
+				exit(1);
+			}
+		}
+		pthread_mutex_lock(&mtx);
+	}
+	(void)sio_revents(hdl, pfds);
+}
+
+bool_t
+sndio_init(void)
+{
+	pthread_mutex_init(&mtx, NULL);
+
+	aud_config_set_defaults("sndio", sndio_defaults);
+	volume = aud_get_int("sndio", "volume");
+	audiodev = aud_get_string("sndio", "audiodev");
+
+	return (1);
+}
+
+void
+sndio_cleanup(void)
+{
+	aud_set_int("sndio", "volume", volume);
+	aud_set_string("sndio", "audiodev", audiodev);
+	pthread_mutex_destroy(&mtx);
+}
+
+void
+sndio_about(void)
+{
+	static GtkWidget *about = NULL;
+
+	audgui_simple_message(&about, GTK_MESSAGE_INFO,
+	    _("About Sndio Output Plugin"),
+	    _("Sndio Output Plugin\n\n"
+	    "Written by Thomas Pfaff <tpfaff@@tp76.info>\n"));
+}
+
+void
+sndio_get_volume(int *l, int *r)
+{
+	pthread_mutex_lock(&mtx);
+	*l = *r = volume;
+	pthread_mutex_unlock(&mtx);
+}
+
+void
+sndio_set_volume(int l, int r)
+{
+	/* Ignore balance control, so use unattenuated channel. */
+	pthread_mutex_lock(&mtx);
+	volume = l > r ? l : r;
+	volume_pending = 1;
+	pthread_mutex_unlock(&mtx);
+}
+
+bool_t
+sndio_open(int fmt, int rate, int nch)
+{
+	int i;
+	struct sio_par askpar;
+	GtkWidget *dialog = NULL;
+	unsigned buffer_size;
+
+	hdl = sio_open(strlen(audiodev) > 0 ? audiodev : NULL, SIO_PLAY, 1);
+	if (!hdl) {
+		g_warning("failed to open audio device %s", audiodev);
+		return (0);
+	}
+	sio_initpar(&askpar);
+	for (i = 0; ; i++) {
+		if (i == sizeof(fmt_to_par) / sizeof(struct fmt_to_par)) {
+			g_warning("unknown format %d requested", fmt);
+			sndio_close();
+			return 0;
+		}
+		if (fmt_to_par[i].fmt == fmt)
+			break;
+	}
+	askpar.bits = fmt_to_par[i].bits;
+	askpar.bps = SIO_BPS(askpar.bits);
+	askpar.sig = fmt_to_par[i].sig;
+	if (askpar.bits > 8)
+		askpar.le = fmt_to_par[i].le;
+	askpar.pchan = nch;
+	askpar.rate = rate;
+	buffer_size = aud_get_int(NULL, "output_buffer_size");
+	if (buffer_size < BUFFER_SIZE_MIN)
+		buffer_size = BUFFER_SIZE_MIN;
+	askpar.appbufsz = buffer_size * rate / 1000;
+	if (!sio_setpar(hdl, &askpar) || !sio_getpar(hdl, &par)) {
+		g_warning("failed to set parameters");
+		sndio_close();
+		return (0);
+	}
+	if ((par.bps > 1 && par.le != askpar.le) ||
+	    (par.bits < par.bps * 8 && !par.msb) ||
+	    par.bps != askpar.bps ||
+	    par.sig != askpar.sig ||
+	    par.pchan != askpar.pchan ||
+            par.rate != askpar.rate) {
+		g_warning("parameters not supported by the audio device");
+		audgui_simple_message(&dialog, GTK_MESSAGE_INFO,
+		    _("Unsupported format"),
+		    _("A format not supported by the audio device "
+		    "was requested.\n\n"
+		    "Please try again with the sndiod(1) server running."));
+		sndio_close();
+		return (0);
+	}
+	rdpos = 0;
+	wrpos = 0;
+	sio_onmove(hdl, onmove_cb, NULL);
+	sio_onvol(hdl, onvol_cb, NULL);
+	sio_setvol(hdl, volume * SIO_MAXVOL / 100);
+	if (!sio_start(hdl)) {
+		g_warning("failed to start audio device");
+		sndio_close();
+		return (0);
+	}
+	pause_pending = flush_pending = volume_pending = 0;
+	bytes_per_sec = par.bps * par.pchan * par.rate;
+	restarted = 1;
+	paused = 0;
+	return (1);
+}
+
+void
+sndio_write(void *ptr, int length)
+{
+	unsigned n;
+
+	pthread_mutex_lock(&mtx);
+	for (;;) {
+		if (paused)
+			break;
+		restarted = 0;
+		n = sio_write(hdl, ptr, length);
+		if (n == 0 && sio_eof(hdl))
+			return;
+		wrpos += n;
+		length -= n;
+		ptr = (char *)ptr + n;
+		if (length == 0)
+			break;
+		wait_ready();
+	}
+	pthread_mutex_unlock(&mtx);
+}
+
+void
+sndio_close(void)
+{
+	if (!hdl)
+		return;
+	sio_close(hdl);
+	hdl = NULL;
+}
+
+int
+sndio_buffer_free(void)
+{
+	return paused ? 0 : par.round * par.pchan * par.bps;
+}
+
+void
+sndio_period_wait(void)
+{
+	pthread_mutex_lock(&mtx);
+	wait_ready();
+	pthread_mutex_unlock(&mtx);
+}
+
+void
+sndio_flush(int time)
+{
+	pthread_mutex_lock(&mtx);
+	rdpos = wrpos = (long long)time * bytes_per_sec / 1000;
+	flush_pending = 1;
+	pthread_mutex_unlock(&mtx);
+}
+
+void
+sndio_pause(bool_t flag)
+{	
+	pthread_mutex_lock(&mtx);
+	paused = flag;
+	pause_pending = 1;
+	pthread_mutex_unlock(&mtx);
+}
+
+void
+sndio_drain(void)
+{
+	/* sndio always drains */
+}
+
+int
+sndio_output_time(void)
+{
+	int time;
+
+	pthread_mutex_lock(&mtx);
+	time = rdpos * 1000 / bytes_per_sec;
+	pthread_mutex_unlock(&mtx);
+	return time;
+}
+
+int
+sndio_written_time(void)
+{
+	int time;
+
+	pthread_mutex_lock(&mtx);
+	time = wrpos * 1000 / bytes_per_sec;
+	pthread_mutex_unlock(&mtx);
+	return time;
+}
+
+void
+sndio_set_written_time(int time)
+{
+	int used;
+
+	pthread_mutex_lock(&mtx);
+	wrpos = time * bytes_per_sec / 1000;
+	used = wrpos - rdpos;
+	rdpos = time * bytes_per_sec / 1000;
+	wrpos = rdpos + used;
+	pthread_mutex_unlock(&mtx);
+}
+
+void
+onmove_cb(void *addr, int delta)
+{
+	rdpos += delta * (int)(par.bps * par.pchan);
+}
+
+void
+onvol_cb(void *addr, unsigned ctl)
+{
+	/* Update volume only if it actually changed */
+	if (ctl != volume * SIO_MAXVOL / 100)
+		volume = ctl * 100 / SIO_MAXVOL;
+}
+
+void
+configure_win_ok_cb(GtkWidget *w, gpointer data)
+{
+	strlcpy(audiodev, gtk_entry_get_text(GTK_ENTRY(adevice_entry)),
+	    PATH_MAX);
+	aud_set_string("sndio", "audiodev", audiodev);
+	gtk_widget_destroy(configure_win);
+}
+
+void
+sndio_configure(void)
+{
+	GtkWidget *vbox;
+	GtkWidget *adevice_frame, *adevice_text, *adevice_vbox;
+	GtkWidget *bbox, *ok, *cancel;
+
+	if (configure_win) {
+		gtk_window_present(GTK_WINDOW(configure_win));
+		return;
+	}
+
+	configure_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+	g_signal_connect(configure_win, "destroy",
+	    G_CALLBACK(gtk_widget_destroyed), &configure_win);
+
+	gtk_window_set_title(GTK_WINDOW(configure_win), _("sndio device"));
+	gtk_window_set_resizable(GTK_WINDOW(configure_win), FALSE);
+	gtk_window_set_position(GTK_WINDOW(configure_win), GTK_WIN_POS_MOUSE);
+	gtk_container_set_border_width(GTK_CONTAINER(configure_win), 10);
+
+	vbox = gtk_vbox_new(FALSE, 5);
+	gtk_container_add(GTK_CONTAINER(configure_win), vbox);
+	gtk_container_set_border_width(GTK_CONTAINER(vbox), 5);
+
+	adevice_frame = gtk_frame_new(_("Audio device:"));
+	gtk_box_pack_start(GTK_BOX(vbox), adevice_frame, FALSE, FALSE, 0);
+
+	adevice_vbox = gtk_vbox_new(FALSE, 5);
+	gtk_container_set_border_width(GTK_CONTAINER(adevice_vbox), 5);
+	gtk_container_add(GTK_CONTAINER(adevice_frame), adevice_vbox);
+
+	adevice_text = gtk_label_new(_("(empty means default)"));
+	gtk_box_pack_start(GTK_BOX(adevice_vbox), adevice_text, TRUE, TRUE, 0);
+
+	adevice_entry = gtk_entry_new();
+	gtk_entry_set_text(GTK_ENTRY(adevice_entry), audiodev);
+	gtk_box_pack_start(GTK_BOX(adevice_vbox), adevice_entry, TRUE, TRUE, 0);
+
+	bbox = gtk_hbutton_box_new();
+	gtk_button_box_set_layout(GTK_BUTTON_BOX(bbox), GTK_BUTTONBOX_END);
+	gtk_box_set_spacing(GTK_BOX(bbox), 5);
+	gtk_box_pack_start(GTK_BOX(vbox), bbox, FALSE, FALSE, 0);
+
+	ok = gtk_button_new_with_label(_("OK"));
+	g_signal_connect(ok, "clicked",
+	    G_CALLBACK(configure_win_ok_cb), NULL);
+
+	gtk_widget_set_can_default(ok, TRUE);
+	gtk_box_pack_start(GTK_BOX(bbox), ok, TRUE, TRUE, 0);
+	gtk_widget_grab_default(ok);
+
+	cancel = gtk_button_new_with_label(_("Cancel"));
+	g_signal_connect(cancel, "clicked",
+	    G_CALLBACK(gtk_widget_destroy), &configure_win);
+
+	gtk_widget_set_can_default(cancel, TRUE);
+	gtk_box_pack_start(GTK_BOX(bbox), cancel, TRUE, TRUE, 0);
+
+	gtk_widget_show_all(configure_win);
+}
+@
+
+
+1.5
+log
+@use milliseconds for the buffer size, in the sndio backend
+
+ok stsp, dcoppa
+@
+text
+@@
+
+
+1.4
+log
+@Update the plug-in to the newer 3.x plug-in semantics. Fixes audacious
+unpausing by itself as various other bugs caused by using the version
+2.x plug-in.
+
+ok stsp, dcoppa
+@
+text
+@d35 5
+d223 1
+d247 4
+a250 1
+	askpar.appbufsz = aud_get_int(NULL, "output_buffer_size");
+@
+
+
+1.3
+log
+@Update to audacious-plugins-3.2.
+With sndio plugin updates by ratchov and myself.
+ok ratchov ajacoutot
+@
+text
+@d18 3
+a24 1
+#include <pthread.h>
+d44 2
+d63 2
+a64 3
+static int paused, flushed, volume;
+static int flush_time, pause_flag, volume_target;
+static int writing, pause_pending, flush_pending, volume_pending;
+a66 1
+static pthread_t sndio_thread;
+d85 2
+d107 6
+d114 1
+a114 1
+volume_do(int v)
+d116 5
+a120 7
+	if (writing) {
+		volume_target = v;
+		volume_pending = 1;
+	} else {
+		if (hdl)
+			sio_setvol(hdl, v * SIO_MAXVOL / 100);
+		volume_pending = 0;
+d125 1
+a125 1
+pause_do(int flag)
+d127 14
+a140 10
+	if (writing) {
+		pause_flag = flag;
+		pause_pending = 1;
+	} else {
+		if (flag && !paused && !flushed) {
+			sio_stop(hdl);
+			sio_start(hdl);
+			rdpos = wrpos;
+		}
+		paused = flag;
+d143 14
+a156 12
+}
+
+static void
+flush_do(int time)
+{
+	if (writing) {
+		flush_time = time;
+		flush_pending = 1;
+	} else {
+		if (!paused && !flushed) {
+			sio_stop(hdl);
+			sio_start(hdl);
+d158 1
+a158 3
+		rdpos = wrpos = (long long)time * bytes_per_sec / 1000;
+		flush_pending = 0;
+		flushed = 1;
+d160 1
+a162 17
+void
+sndio_about(void)
+{
+	static GtkWidget *about = NULL;
+
+	audgui_simple_message(&about, GTK_MESSAGE_INFO,
+	    _("About Sndio Output Plugin"),
+	    _("Sndio Output Plugin\n\n"
+	    "Written by Thomas Pfaff <tpfaff@@tp76.info>\n"));
+}
+
+static const gchar * const sndio_defaults[] = {
+ "volume", "100",
+ "audiodev", "",
+ NULL,
+};
+
+d184 11
+d208 1
+a208 1
+	volume_do(volume);
+d219 1
+a219 1
+	hdl = sio_open(strlen(audiodev) > 0 ? audiodev : NULL, SIO_PLAY, 0);
+d266 1
+a266 1
+	volume_do(volume);
+d274 1
+a274 1
+	flushed = 1;
+d285 4
+a288 4
+	flushed = 0;
+	if (!paused) {	
+		writing = 1;
+		pthread_mutex_unlock(&mtx);
+d290 2
+a291 2
+		pthread_mutex_lock(&mtx);
+		writing = 0;
+d293 5
+a297 11
+	}
+	if (volume_pending)
+		volume_do(volume);
+	if (flush_pending)
+		flush_do(flush_time);
+	if (pause_pending)
+		pause_do(pause_flag);
+	if (paused) {
+		pthread_mutex_unlock(&mtx);
+		usleep(10000);
+		pthread_mutex_lock(&mtx);
+d311 14
+d329 2
+a330 1
+	flush_do(time);
+d338 2
+a339 1
+	pause_do(flag);
+a386 1
+	pthread_mutex_lock(&mtx);
+a387 1
+	pthread_mutex_unlock(&mtx);
+a393 1
+	pthread_mutex_lock(&mtx);
+a395 1
+	pthread_mutex_unlock(&mtx);
+@
+
+
+1.2
+log
+@Update to 2.4.2.
+ok jasper@@
+@
+text
+@d2 2
+a3 1
+ * Copyright (c) 2008,2009 Thomas Pfaff <tpfaff@@tp76.info>
+d18 1
+d22 1
+a22 1
+
+d24 2
+a25 3
+#include <libmcs/mcs.h>
+#include <sndio.h>
+#include <audacious/configdb.h>
+d33 2
+a34 1
+OutputPluginInitStatus	sndio_init(void);
+d36 1
+d38 3
+a40 4
+void	sndio_get_volume(gint *, gint *);
+void	sndio_set_volume(gint, gint);
+gint	sndio_open(gint, gint, gint);
+void	sndio_write(gpointer, gint);
+d42 7
+a48 6
+void	sndio_flush(gint);
+void	sndio_pause(gshort);
+gint	sndio_free(void);
+gint	sndio_playing(void);
+gint	sndio_output_time(void);
+gint	sndio_written_time(void);
+d51 1
+d59 6
+a64 3
+static int paused;
+static int volume;
+static long bytes_per_sec;
+d70 3
+a72 2
+OutputPlugin sndio_op = {
+	.description = "Sndio Output Plugin",
+d74 1
+a74 1
+	.cleanup = NULL,
+d77 1
+a84 2
+	.buffer_free = sndio_free,
+	.buffer_playing = sndio_playing,
+d86 15
+a100 1
+	.written_time = sndio_written_time
+d103 29
+a131 1
+OutputPlugin *sndio_oplist[] = { &sndio_op, NULL };
+d133 16
+a148 1
+SIMPLE_OUTPUT_PLUGIN(sndio, sndio_oplist);
+d161 7
+a167 1
+OutputPluginInitStatus
+d170 1
+a170 1
+	mcs_handle_t *cfgfile;
+d172 3
+a174 4
+	cfgfile = aud_cfg_db_open();
+	aud_cfg_db_get_int(cfgfile, "sndio", "volume", &volume);
+	aud_cfg_db_get_string(cfgfile, "sndio", "audiodev", &audiodev);
+	aud_cfg_db_close(cfgfile);
+d176 2
+a177 4
+	if (!volume)
+		volume = 100;
+	if (!audiodev)
+		audiodev = g_strdup("");
+d179 6
+a184 1
+	return (OUTPUT_PLUGIN_INIT_FOUND_DEVICES);
+d188 1
+a188 1
+sndio_get_volume(gint *l, gint *r)
+d190 1
+d192 1
+d196 1
+a196 1
+sndio_set_volume(gint l, gint r)
+d199 1
+d201 2
+a202 2
+	if (hdl)
+		sio_setvol(hdl, volume * SIO_MAXVOL / 100);
+d205 2
+a206 2
+gint
+sndio_open(gint fmt, gint rate, gint nch)
+d208 1
+d210 1
+d217 9
+a225 34
+
+	sio_initpar(&par);
+	switch (fmt) {
+	case FMT_U8:
+		par.bits = 8;
+		par.sig = 0;
+		break;
+	case FMT_S8:
+		par.bits = 8;
+		par.sig = 1;
+		break;
+	case FMT_U16_LE:
+		par.bits = 16;
+		par.sig = 0;
+		par.le = 1;
+		break;
+	case FMT_U16_BE:
+		par.bits = 16;
+		par.sig = 0;
+		par.le = 0;
+		break;
+	case FMT_S16_LE:
+		par.bits = 16;
+		par.sig = 1;
+		par.le = 1;
+		break;
+	case FMT_S16_BE:
+		par.bits = 16;
+		par.sig = 1;
+		par.le = 0;
+	default:
+		g_warning("unknown format %d requested", fmt);
+		sndio_close();
+		return (0);
+d227 9
+a235 8
+	par.pchan = nch;
+	par.rate = rate;
+
+	/* 250 ms buffer */
+	par.appbufsz = par.rate / 4;
+
+	askpar = par;
+	if (!sio_setpar(hdl, &par) || !sio_getpar(hdl, &par)) {
+d240 3
+a242 3
+
+	if ((par.bits == 16 && par.le != askpar.le) ||
+	    par.bits != askpar.bits ||
+d246 1
+a246 2
+		GtkWidget *dialog = NULL;
+		g_warning("parameters not supported");
+d251 1
+a251 1
+		    "Please try again with the aucat(1) server running."));
+a254 1
+
+d258 2
+a259 2
+
+	paused = 0;
+d265 1
+a265 1
+
+d267 2
+a268 2
+
+	sndio_set_volume(volume, volume);
+d273 1
+a273 1
+sndio_write(gpointer ptr, gint length)
+d275 24
+a298 2
+	if (!paused)
+		wrpos += sio_write(hdl, ptr, length);
+a303 2
+	mcs_handle_t *cfgfile;
+
+a305 5
+
+	cfgfile = aud_cfg_db_open();
+	aud_cfg_db_set_int(cfgfile, "sndio", "volume", volume);
+	aud_cfg_db_close(cfgfile);
+
+d311 1
+a311 1
+sndio_flush(gint time)
+d313 3
+a315 3
+	int bufused = (rdpos < 0) ? wrpos : wrpos - rdpos;
+	rdpos = time / 1000 * bytes_per_sec;
+	wrpos = rdpos + bufused;
+d319 9
+a327 1
+sndio_pause(gshort flag)
+d329 1
+a329 1
+	paused = flag;
+d332 2
+a333 2
+gint
+sndio_free(void)
+d335 6
+a340 1
+	return (paused ? 0 : 1000000);
+d343 2
+a344 2
+gint
+sndio_playing(void)
+d346 6
+a351 1
+	return (paused ? TRUE : FALSE);
+d354 2
+a355 2
+gint
+sndio_output_time(void)
+d357 8
+a364 1
+	return (hdl ? rdpos * 1000 / bytes_per_sec : 0);
+d367 2
+a368 2
+gint
+sndio_written_time(void)
+d370 3
+a372 1
+	return (hdl ? wrpos * 1000 / bytes_per_sec : 0);
+d376 1
+a376 1
+onmove_cb(void *addr, int delta)
+d378 5
+a382 1
+	rdpos += delta *(int)(par.bps * par.pchan);
+a387 2
+	mcs_handle_t *cfgfile;
+
+d390 1
+a390 5
+
+	cfgfile = aud_cfg_db_open();
+	aud_cfg_db_set_string(cfgfile, "sndio", "audiodev", audiodev);
+	aud_cfg_db_close(cfgfile);
+
+d407 2
+a408 2
+	gtk_signal_connect(GTK_OBJECT(configure_win), "destroy",
+	    GTK_SIGNAL_FUNC(gtk_widget_destroyed), &configure_win);
+d411 1
+a411 1
+	gtk_window_set_policy(GTK_WINDOW(configure_win), FALSE, FALSE, FALSE);
+d413 1
+a413 1
+	gtk_container_border_width(GTK_CONTAINER(configure_win), 10);
+d427 1
+a427 1
+	gtk_box_pack_start_defaults(GTK_BOX(adevice_vbox), adevice_text);
+d431 1
+a431 1
+	gtk_box_pack_start_defaults(GTK_BOX(adevice_vbox), adevice_entry);
+d435 1
+a435 1
+	gtk_button_box_set_spacing(GTK_BUTTON_BOX(bbox), 5);
+d439 2
+a440 2
+	gtk_signal_connect(GTK_OBJECT(ok), "clicked",
+	    GTK_SIGNAL_FUNC(configure_win_ok_cb), NULL);
+d442 1
+a442 1
+	GTK_WIDGET_SET_FLAGS(ok, GTK_CAN_DEFAULT);
+d447 2
+a448 3
+	gtk_signal_connect_object(GTK_OBJECT(cancel), "clicked",
+	    GTK_SIGNAL_FUNC(gtk_widget_destroy),
+	    GTK_OBJECT(configure_win));
+d450 1
+a450 1
+	GTK_WIDGET_SET_FLAGS(cancel, GTK_CAN_DEFAULT);
+@
+
+
+1.1
+log
+@- update to 1.5.1
+- remove arts, esd and oss (from brad)
+- add jack pseudo flavor (from brad)
+- add wavpack
+- add sndio, based on xmms' sndio support from Thomas Pfaff
+
+input, some testing and ok sthen@@.
+@
+text
+@d22 1
+d24 1
+d27 2
+d32 1
+a32 1
+void	sndio_init(void);
+d37 1
+a37 1
+gint	sndio_open(AFormat, gint, gint);
+d89 1
+a89 1
+	static GtkWidget *about;
+d91 1
+a91 4
+	if (about != NULL)
+		return;
+
+	about = audacious_info_dialog(
+d94 1
+a94 5
+	    "Written by Thomas Pfaff <tpfaff@@tp76.info>\n"),
+	    _("Ok"), FALSE, NULL, NULL);
+
+	gtk_signal_connect(GTK_OBJECT(about), "destroy",
+		GTK_SIGNAL_FUNC(gtk_widget_destroyed), &about);
+d97 1
+a97 1
+void
+d111 2
+d131 1
+a131 1
+sndio_open(AFormat fmt, gint rate, gint nch)
+a160 5
+	case FMT_U16_NE:
+		par.bits = 16;
+		par.sig = 0;
+		par.le = SIO_LE_NATIVE;
+		break;
+a169 5
+	case FMT_S16_NE:
+		par.bits = 16;
+		par.sig = 1;
+		par.le = SIO_LE_NATIVE;
+		break;
+d193 1
+d195 2
+a196 1
+		audacious_info_dialog(_("Unsupported format"),
+d199 1
+a199 2
+		    "Please try again with the aucat(1) server running."),
+		    _("OK"), FALSE, NULL, NULL);
+@
+

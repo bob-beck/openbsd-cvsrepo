@@ -1,0 +1,1207 @@
+head	1.15;
+access;
+symbols
+	OPENBSD_6_0:1.15.0.4
+	OPENBSD_6_0_BASE:1.15
+	OPENBSD_5_9:1.15.0.2
+	OPENBSD_5_9_BASE:1.15
+	OPENBSD_5_8:1.14.0.8
+	OPENBSD_5_8_BASE:1.14
+	OPENBSD_5_7:1.14.0.2
+	OPENBSD_5_7_BASE:1.14
+	OPENBSD_5_6:1.14.0.4
+	OPENBSD_5_6_BASE:1.14
+	OPENBSD_5_5:1.11.0.8
+	OPENBSD_5_5_BASE:1.11
+	OPENBSD_5_4:1.11.0.4
+	OPENBSD_5_4_BASE:1.11
+	OPENBSD_5_3:1.11.0.2
+	OPENBSD_5_3_BASE:1.11
+	OPENBSD_5_2:1.7.0.2
+	OPENBSD_5_2_BASE:1.7;
+locks; strict;
+comment	@ * @;
+
+
+1.15
+date	2016.01.05.05.27.54;	author visa;	state Exp;
+branches;
+next	1.14;
+commitid	916i76I5mjNtTg33;
+
+1.14
+date	2014.03.31.20.21.19;	author miod;	state Exp;
+branches;
+next	1.13;
+
+1.13
+date	2014.03.29.18.09.30;	author guenther;	state Exp;
+branches;
+next	1.12;
+
+1.12
+date	2014.03.09.10.12.17;	author miod;	state Exp;
+branches;
+next	1.11;
+
+1.11
+date	2012.10.03.11.18.23;	author miod;	state Exp;
+branches;
+next	1.10;
+
+1.10
+date	2012.09.29.19.24.31;	author miod;	state Exp;
+branches;
+next	1.9;
+
+1.9
+date	2012.09.29.19.13.15;	author miod;	state Exp;
+branches;
+next	1.8;
+
+1.8
+date	2012.09.29.18.54.38;	author miod;	state Exp;
+branches;
+next	1.7;
+
+1.7
+date	2012.06.24.20.25.58;	author miod;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	2012.06.24.16.26.04;	author miod;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2012.05.27.19.13.04;	author miod;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2012.05.17.19.34.04;	author miod;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2012.04.21.12.20.30;	author miod;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.04.06.20.11.18;	author miod;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2012.03.28.20.44.23;	author miod;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.15
+log
+@Some implementations of HitSyncDCache() call pmap_extract() for va->pa
+conversion. Because pmap_extract() acquires the PTE mutex, a "locking
+against myself" panic is triggered if the cache routine gets called in
+a context where the mutex is already held.
+
+In the pmap, all calls to HitSyncDCache() are for a whole page. Add a
+new cache routine, HitSyncDCachePage(), which gets both the va and the
+pa of a page. This removes the need of the va->pa conversion. The new
+routine has the same signature as SyncDCachePage(), allowing reuse of
+the same routine for cache implementations that do not need differences
+between "Hit" and non-"Hit" routines.
+
+With the diff, POWER Indigo2 R8000 boots multiuser again. Tested on sgi
+GENERIC-IP27.MP and octeon GENERIC.MP, too.
+
+Diff from miod@@, ok kettenis@@
+@
+text
+@/*	$OpenBSD: cache_r4k.c,v 1.14 2014/03/31 20:21:19 miod Exp $	*/
+
+/*
+ * Copyright (c) 2012 Miodrag Vallat.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+
+#include <mips64/cache.h>
+#include <machine/cpu.h>
+#include <mips64/mips_cpu.h>
+
+#include <uvm/uvm_extern.h>
+
+#define	IndexInvalidate_I	0x00
+#define	IndexWBInvalidate_D	0x01
+#define	IndexWBInvalidate_S	0x03
+
+#define	HitInvalidate_D		0x11
+#define	HitInvalidate_S		0x13
+
+#define	HitWBInvalidate_D	0x15
+#define	HitWBInvalidate_S	0x17
+
+#define	cache(op,addr) \
+    __asm__ volatile ("cache %0, 0(%1)" :: "i"(op), "r"(addr) : "memory")
+
+static __inline__ void	mips4k_hitinv_primary(vaddr_t, vsize_t, vsize_t);
+static __inline__ void	mips4k_hitinv_secondary(vaddr_t, vsize_t, vsize_t);
+static __inline__ void	mips4k_hitwbinv_primary(vaddr_t, vsize_t, vsize_t);
+static __inline__ void	mips4k_hitwbinv_secondary(vaddr_t, vsize_t, vsize_t);
+
+/*
+ * Invoke a simple routine from uncached space (either CKSEG1 or uncached
+ * XKPHYS).
+ */
+
+static void
+run_uncached(void (*fn)(register_t), register_t arg)
+{
+	vaddr_t va;
+	paddr_t pa;
+
+	va = (vaddr_t)fn;
+	if (IS_XKPHYS(va)) {
+		pa = XKPHYS_TO_PHYS(va);
+		va = PHYS_TO_XKPHYS(pa, CCA_NC);
+	} else {
+		pa = CKSEG0_TO_PHYS(va);
+		va = PHYS_TO_CKSEG1(pa);
+	}
+	fn = (void (*)(register_t))va;
+
+	(*fn)(arg);
+}
+
+
+void
+Mips4k_ConfigCache(struct cpu_info *ci)
+{
+	register_t cfg, ncfg;
+
+	cfg = cp0_get_config();
+
+	ci->ci_l1inst.size = (1 << 12) << ((cfg >> 9) & 0x07); /* IC */
+	if (cfg & (1 << 5))	/* IB */
+		ci->ci_l1inst.linesize = 32;
+	else
+		ci->ci_l1inst.linesize = 16;
+
+	ci->ci_l1data.size = (1 << 12) << ((cfg >> 6) & 0x07); /* DC */
+	if (cfg & (1 << 4))	/* DB */
+		ci->ci_l1data.linesize = 32;
+	else
+		ci->ci_l1data.linesize = 16;
+
+	/* R4000 and R4400 L1 caches are direct */
+	ci->ci_l1inst.setsize = ci->ci_l1inst.size;
+	ci->ci_l1inst.sets = 1;
+	ci->ci_l1data.setsize = ci->ci_l1data.size;
+	ci->ci_l1data.sets = 1;
+
+	cache_valias_mask =
+	    (max(ci->ci_l1inst.size, ci->ci_l1data.size) - 1) &
+	    ~PAGE_MASK;
+
+	if ((cfg & (1 << 17)) == 0) {	/* SC */
+		/*
+		 * We expect the setup code to have set up ci->ci_l2 for us.
+		 * Unfortunately we aren't allowed to panic() there if it
+		 * didn't, because the console is not available.
+		 */
+
+		/* fixed 32KB aliasing to avoid VCE */
+		pmap_prefer_mask = ((1 << 15) - 1);
+	} else {
+		memset(&ci->ci_l2, 0, sizeof(struct cache_info));
+	}
+	memset(&ci->ci_l3, 0, sizeof(struct cache_info));
+
+	if (cache_valias_mask != 0) {
+		cache_valias_mask |= PAGE_MASK;
+		pmap_prefer_mask |= cache_valias_mask;
+	}
+
+	ci->ci_SyncCache = Mips4k_SyncCache;
+	ci->ci_InvalidateICache = Mips4k_InvalidateICache;
+	ci->ci_InvalidateICachePage = Mips4k_InvalidateICachePage;
+	ci->ci_SyncICache = Mips4k_SyncICache;
+	ci->ci_SyncDCachePage = Mips4k_SyncDCachePage;
+	ci->ci_HitSyncDCachePage = Mips4k_HitSyncDCachePage;
+	ci->ci_HitSyncDCache = Mips4k_HitSyncDCache;
+	ci->ci_HitInvalidateDCache = Mips4k_HitInvalidateDCache;
+	ci->ci_IOSyncDCache = Mips4k_IOSyncDCache;
+
+	ncfg = (cfg & ~CFGR_CCA_MASK) | CCA_CACHED;
+	ncfg &= ~CFGR_CU;
+	if (cfg != ncfg)
+		run_uncached(cp0_set_config, ncfg);
+}
+
+/*
+ * Writeback and invalidate all caches.
+ */
+void
+Mips4k_SyncCache(struct cpu_info *ci)
+{
+	vaddr_t sva, eva;
+	vsize_t line;
+
+	sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+	eva = sva + ci->ci_l1inst.size;
+	line = ci->ci_l1inst.linesize;
+	while (sva != eva) {
+		cache(IndexInvalidate_I, sva);
+		sva += line;
+	}
+
+	sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+	eva = sva + ci->ci_l1data.size;
+	line = ci->ci_l1data.linesize;
+	while (sva != eva) {
+		cache(IndexWBInvalidate_D, sva);
+		sva += line;
+	}
+
+	if (ci->ci_l2.size != 0) {
+		sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+		eva = sva + ci->ci_l2.size;
+		line = ci->ci_l2.linesize;
+		while (sva != eva) {
+			cache(IndexWBInvalidate_S, sva);
+			sva += line;
+		}
+	}
+
+	mips_sync();
+}
+
+/*
+ * Invalidate I$ for the given range.
+ */
+void
+Mips4k_InvalidateICache(struct cpu_info *ci, vaddr_t _va, size_t _sz)
+{
+	vaddr_t va, sva, eva;
+	vsize_t sz;
+	vsize_t line;
+
+	line = ci->ci_l1inst.linesize;
+	/* extend the range to integral cache lines */
+	if (line == 16) {
+		va = _va & ~(16UL - 1);
+		sz = ((_va + _sz + 16 - 1) & ~(16UL - 1)) - va;
+	} else {
+		va = _va & ~(32UL - 1);
+		sz = ((_va + _sz + 32 - 1) & ~(32UL - 1)) - va;
+	}
+
+	sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+	/* keep only the index bits */
+	sva += va & ((1UL << 15) - 1);
+	if (sz > ci->ci_l1inst.size)
+		sz = ci->ci_l1inst.size;
+	eva = sva + sz;
+	while (sva != eva) {
+		cache(IndexInvalidate_I, sva);
+		sva += line;
+	}
+
+	mips_sync();
+}
+
+/*
+ * Register a given page for I$ invalidation.
+ */
+void
+Mips4k_InvalidateICachePage(struct cpu_info *ci, vaddr_t va)
+{
+	/*
+	 * Mark the particular page index bits as needing to be flushed.
+	 */
+	ci->ci_cachepending_l1i |=
+	    1ULL << ((va & ((1UL << 15) - 1)) >> PAGE_SHIFT);
+}
+
+/*
+ * Perform postponed I$ invalidation.
+ */
+void
+Mips4k_SyncICache(struct cpu_info *ci)
+{
+	vaddr_t sva, eva;
+	vsize_t line;
+	uint64_t idx;
+
+	if (ci->ci_cachepending_l1i != 0) {
+		line = ci->ci_l1inst.linesize;
+
+		if (ci->ci_l1inst.size <= PAGE_SIZE) {
+			ci->ci_cachepending_l1i = 0;
+			sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+			eva = sva + ci->ci_l1inst.size;
+			while (sva != eva) {
+				cache(IndexInvalidate_I, sva);
+				sva += line;
+			}
+			return;
+		}
+
+		/*
+		 * Iterate on all pending page index bits.
+		 */
+		for (idx = 0; ci->ci_cachepending_l1i != 0; idx++) {
+			if ((ci->ci_cachepending_l1i & (1ULL << idx)) == 0)
+				continue;
+
+			sva = PHYS_TO_XKPHYS(idx << PAGE_SHIFT, CCA_CACHED);
+			eva = sva + PAGE_SIZE;
+			while (sva != eva) {
+				cache(IndexInvalidate_I, sva);
+				sva += line;
+			}
+
+			ci->ci_cachepending_l1i &= ~(1ULL << idx);
+		}
+	}
+}
+
+/*
+ * Writeback D$ for the given page.
+ */
+void
+Mips4k_SyncDCachePage(struct cpu_info *ci, vaddr_t va, paddr_t pa)
+{
+	vaddr_t sva, eva;
+	vsize_t line;
+
+	line = ci->ci_l1data.linesize;
+	sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+	/* keep only the index bits */
+	sva += va & ((1UL << 15) - 1);
+	if (PAGE_SIZE > ci->ci_l1data.size)
+		eva = sva + ci->ci_l1data.size;
+	else
+		eva = sva + PAGE_SIZE;
+	while (sva != eva) {
+		cache(IndexWBInvalidate_D, sva);
+		sva += line;
+	}
+
+	if (ci->ci_l2.size != 0) {
+		line = ci->ci_l2.linesize;
+		sva = PHYS_TO_XKPHYS(pa, CCA_CACHED);
+		eva = sva + PAGE_SIZE;
+		while (sva != eva) {
+			cache(IndexWBInvalidate_S, sva);
+			sva += line;
+		}
+	}
+
+	mips_sync();
+}
+
+static __inline__ void
+mips4k_hitwbinv_primary(vaddr_t va, vsize_t sz, vsize_t line)
+{
+	vaddr_t eva;
+
+	eva = va + sz;
+	while (va != eva) {
+		cache(HitWBInvalidate_D, va);
+		va += line;
+	}
+}
+
+static __inline__ void
+mips4k_hitwbinv_secondary(vaddr_t va, vsize_t sz, vsize_t line)
+{
+	vaddr_t eva;
+
+	eva = va + sz;
+	while (va != eva) {
+		cache(HitWBInvalidate_S, va);
+		va += line;
+	}
+}
+
+/*
+ * Writeback D$ for the given page, which is expected to be currently
+ * mapped, allowing the use of `Hit' operations. This is less aggressive
+ * than using `Index' operations.
+ */
+
+void
+Mips4k_HitSyncDCachePage(struct cpu_info *ci, vaddr_t va, paddr_t pa)
+{
+	mips4k_hitwbinv_primary(va, PAGE_SIZE, ci->ci_l1data.linesize);
+	if (ci->ci_l2.size != 0)
+		mips4k_hitwbinv_secondary(va, PAGE_SIZE, ci->ci_l2.linesize);
+
+	mips_sync();
+}
+
+/*
+ * Writeback D$ for the given range. Range is expected to be currently
+ * mapped, allowing the use of `Hit' operations. This is less aggressive
+ * than using `Index' operations.
+ */
+
+void
+Mips4k_HitSyncDCache(struct cpu_info *ci, vaddr_t _va, size_t _sz)
+{
+	vaddr_t va;
+	vsize_t sz;
+	vsize_t line;
+
+	line = ci->ci_l1data.linesize;
+	/* extend the range to integral cache lines */
+	if (line == 16) {
+		va = _va & ~(16UL - 1);
+		sz = ((_va + _sz + 16 - 1) & ~(16UL - 1)) - va;
+	} else {
+		va = _va & ~(32UL - 1);
+		sz = ((_va + _sz + 32 - 1) & ~(32UL - 1)) - va;
+	}
+	mips4k_hitwbinv_primary(va, sz, line);
+
+	if (ci->ci_l2.size != 0) {
+		line = ci->ci_l2.linesize;
+		/* extend the range to integral cache lines */
+		va = _va & ~(line - 1);
+		sz = ((_va + _sz + line - 1) & ~(line - 1)) - va;
+		mips4k_hitwbinv_secondary(va, sz, line);
+	}
+
+	mips_sync();
+}
+
+/*
+ * Invalidate D$ for the given range. Range is expected to be currently
+ * mapped, allowing the use of `Hit' operations. This is less aggressive
+ * than using `Index' operations.
+ */
+
+static __inline__ void
+mips4k_hitinv_primary(vaddr_t va, vsize_t sz, vsize_t line)
+{
+	vaddr_t eva;
+
+	eva = va + sz;
+	while (va != eva) {
+		cache(HitInvalidate_D, va);
+		va += line;
+	}
+}
+
+static __inline__ void
+mips4k_hitinv_secondary(vaddr_t va, vsize_t sz, vsize_t line)
+{
+	vaddr_t eva;
+
+	eva = va + sz;
+	while (va != eva) {
+		cache(HitInvalidate_S, va);
+		va += line;
+	}
+}
+
+void
+Mips4k_HitInvalidateDCache(struct cpu_info *ci, vaddr_t _va, size_t _sz)
+{
+	vaddr_t va;
+	vsize_t sz;
+	vsize_t line;
+
+	line = ci->ci_l1data.linesize;
+	/* extend the range to integral cache lines */
+	if (line == 16) {
+		va = _va & ~(16UL - 1);
+		sz = ((_va + _sz + 16 - 1) & ~(16UL - 1)) - va;
+	} else {
+		va = _va & ~(32UL - 1);
+		sz = ((_va + _sz + 32 - 1) & ~(32UL - 1)) - va;
+	}
+	mips4k_hitinv_primary(va, sz, line);
+
+	if (ci->ci_l2.size != 0) {
+		line = ci->ci_l2.linesize;
+		/* extend the range to integral cache lines */
+		va = _va & ~(line - 1);
+		sz = ((_va + _sz + line - 1) & ~(line - 1)) - va;
+		mips4k_hitinv_secondary(va, sz, line);
+	}
+
+	mips_sync();
+}
+
+/*
+ * Backend for bus_dmamap_sync(). Enforce coherency of the given range
+ * by performing the necessary cache writeback and/or invalidate
+ * operations.
+ */
+void
+Mips4k_IOSyncDCache(struct cpu_info *ci, vaddr_t _va, size_t _sz, int how)
+{
+	vaddr_t va;
+	vsize_t sz;
+	vsize_t line;
+	int partial_start, partial_end;
+
+	/*
+	 * L1
+	 */
+
+	line = ci->ci_l1data.linesize;
+	/* extend the range to integral cache lines */
+	if (line == 16) {
+		va = _va & ~(16UL - 1);
+		sz = ((_va + _sz + 16 - 1) & ~(16UL - 1)) - va;
+	} else {
+		va = _va & ~(32UL - 1);
+		sz = ((_va + _sz + 32 - 1) & ~(32UL - 1)) - va;
+	}
+
+	switch (how) {
+	case CACHE_SYNC_R:
+		/* writeback partial cachelines */
+		if (((_va | _sz) & (line - 1)) != 0) {
+			partial_start = va != _va;
+			partial_end = va + sz != _va + _sz;
+		} else {
+			partial_start = partial_end = 0;
+		}
+		if (partial_start) {
+			cache(HitWBInvalidate_D, va);
+			va += line;
+			sz -= line;
+		}
+		if (sz != 0 && partial_end) {
+			sz -= line;
+			cache(HitWBInvalidate_D, va + sz);
+		}
+		if (sz != 0)
+			mips4k_hitinv_primary(va, sz, line);
+		break;
+	case CACHE_SYNC_X:
+	case CACHE_SYNC_W:
+		mips4k_hitwbinv_primary(va, sz, line);
+		break;
+	}
+
+	/*
+	 * L2
+	 */
+
+	if (ci->ci_l2.size != 0) {
+		line = ci->ci_l2.linesize;
+		/* extend the range to integral cache lines */
+		va = _va & ~(line - 1);
+		sz = ((_va + _sz + line - 1) & ~(line - 1)) - va;
+
+		switch (how) {
+		case CACHE_SYNC_R:
+			/* writeback partial cachelines */
+			if (((_va | _sz) & (line - 1)) != 0) {
+				partial_start = va != _va;
+				partial_end = va + sz != _va + _sz;
+			} else {
+				partial_start = partial_end = 0;
+			}
+			if (partial_start) {
+				cache(HitWBInvalidate_S, va);
+				va += line;
+				sz -= line;
+			}
+			if (sz != 0 && partial_end) {
+				sz -= line;
+				cache(HitWBInvalidate_S, va + sz);
+			}
+			if (sz != 0)
+				mips4k_hitinv_secondary(va, sz, line);
+			break;
+		case CACHE_SYNC_X:
+		case CACHE_SYNC_W:
+			mips4k_hitwbinv_secondary(va, sz, line);
+			break;
+		}
+	}
+}
+@
+
+
+1.14
+log
+@Due the virtually indexed nature of the L1 instruction cache on most mips
+processors, every time a new text page is mapped in a pmap, the L1 I$ is
+flushed for the va spanned by this page.
+
+Since we map pages of our binaries upon demand, as they get faulted in, but
+uvm_fault() tries to map the few neighbour pages, this can end up in a
+bunch of pmap_enter() calls in a row, for executable mappings. If the L1
+I$ is small enough, this can cause the whole L1 I$ cache to be flushed
+several times.
+
+Change pmap_enter() to postpone these flushes by only registering the
+pending flushes, and have pmap_update() perform them. The cpu-specific
+cache code can then optimize this to avoid unnecessary operations.
+
+Tested on R4000SC, R4600SC, R5000SC, RM7000, R10000 with 4KB and 16KB
+page sizes (coherent and non-coherent designs), and Loongson 2F by mikeb@@ and
+me. Should not affect anything on Octeon since there is no way to flush a
+subset of I$ anyway.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.13 2014/03/29 18:09:30 guenther Exp $	*/
+d124 1
+a297 6
+/*
+ * Writeback D$ for the given range. Range is expected to be currently
+ * mapped, allowing the use of `Hit' operations. This is less aggressive
+ * than using `Index' operations.
+ */
+
+d321 22
+@
+
+
+1.13
+log
+@It's been a quarter century: we can assume volatile is present with that name.
+
+ok dlg@@ mpi@@ deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.12 2014/03/09 10:12:17 miod Exp $	*/
+d121 2
+d204 56
+@
+
+
+1.12
+log
+@Rework the per-cpu cache information. Use a common struct to store the line
+size, the number of sets, and the total size (and the set size, for convenience)
+per cache (I$, D$, L2, L3).
+This allows cpu.c to print the number of ways (sets) of L2 and L3 caches from
+the cache information, rather than hardcoding this from the processor type.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.11 2012/10/03 11:18:23 miod Exp $	*/
+d39 1
+a39 1
+    __asm__ __volatile__ ("cache %0, 0(%1)" :: "i"(op), "r"(addr) : "memory")
+@
+
+
+1.11
+log
+@Split ever-growing mips <machine/cpu.h> into what 99% of the kernel needs,
+which will remain in <machine/cpu.h>, and a new mips_cpu.h containing only the
+goriest md details, which are only of interest to a handful set of files; this
+is similar in spirit to what alpha does, but here <machine/cpu.h> does not
+include the new file.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.10 2012/09/29 19:24:31 miod Exp $	*/
+d78 1
+d80 1
+a80 1
+		ci->ci_l1instcacheline = 32;
+d82 1
+a82 2
+		ci->ci_l1instcacheline = 16;
+	ci->ci_l1instcachesize = (1 << 12) << ((cfg >> 9) & 0x07); /* IC */
+d84 1
+d86 1
+a86 1
+		ci->ci_l1datacacheline = 32;
+d88 1
+a88 2
+		ci->ci_l1datacacheline = 16;
+	ci->ci_l1datacachesize = (1 << 12) << ((cfg >> 6) & 0x07); /* DC */
+d91 4
+a94 3
+	ci->ci_cacheways = 1;
+	ci->ci_l1instcacheset = ci->ci_l1instcachesize;
+	ci->ci_l1datacacheset = ci->ci_l1datacachesize;
+d97 1
+a97 1
+	    (max(ci->ci_l1instcachesize, ci->ci_l1datacachesize) - 1) &
+d102 3
+a104 4
+		 * We expect the setup code to have set up ci->ci_l2size and
+		 * ci->ci_l2line for us. Unfortunately we aren't allowed to
+		 * panic() there if it didn't, because the console is not
+		 * available.
+d110 1
+a110 2
+		ci->ci_l2line = 0;
+		ci->ci_l2size = 0;
+d112 1
+a112 1
+	ci->ci_l3size = 0;
+d142 2
+a143 2
+	eva = sva + ci->ci_l1instcachesize;
+	line = ci->ci_l1instcacheline;
+d150 2
+a151 2
+	eva = sva + ci->ci_l1datacachesize;
+	line = ci->ci_l1datacacheline;
+d157 1
+a157 1
+	if (ci->ci_l2size != 0) {
+d159 2
+a160 2
+		eva = sva + ci->ci_l2size;
+		line = ci->ci_l2line;
+d180 1
+a180 1
+	line = ci->ci_l1instcacheline;
+d193 2
+d213 1
+a213 1
+	line = ci->ci_l1datacacheline;
+d217 4
+a220 1
+	eva = sva + PAGE_SIZE;
+d226 2
+a227 2
+	if (ci->ci_l2size != 0) {
+		line = ci->ci_l2line;
+d276 1
+a276 1
+	line = ci->ci_l1datacacheline;
+d287 2
+a288 2
+	if (ci->ci_l2size != 0) {
+		line = ci->ci_l2line;
+d335 1
+a335 1
+	line = ci->ci_l1datacacheline;
+d346 2
+a347 2
+	if (ci->ci_l2size != 0) {
+		line = ci->ci_l2line;
+d374 1
+a374 1
+	line = ci->ci_l1datacacheline;
+d415 2
+a416 2
+	if (ci->ci_l2size != 0) {
+		line = ci->ci_l2line;
+@
+
+
+1.10
+log
+@Handle the coprocessor 0 cause and status registers as a 64 bit value now,
+as some odd mips designs need moro than 32 bits in there. This causes a lot
+of mechanical changes everywhere getsr() is used.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.9 2012/09/29 19:13:15 miod Exp $	*/
+d24 1
+@
+
+
+1.9
+log
+@Add a few more coprocessor 0 cause and config registers defines.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.8 2012/09/29 18:54:38 miod Exp $	*/
+d45 25
+d73 1
+a73 1
+	uint32_t cfg, ncfg;
+d128 2
+a129 17
+	if (cfg != ncfg) {
+		void (*fn)(uint32_t);
+		vaddr_t va;
+		paddr_t pa;
+
+		va = (vaddr_t)&cp0_set_config;
+		if (IS_XKPHYS(va)) {
+			pa = XKPHYS_TO_PHYS(va);
+			va = PHYS_TO_XKPHYS(pa, CCA_NC);
+		} else {
+			pa = CKSEG0_TO_PHYS(va);
+			va = PHYS_TO_CKSEG1(pa);
+		}
+		fn = (void (*)(uint32_t))va;
+
+		(*fn)(ncfg);
+	}
+@
+
+
+1.8
+log
+@Proide a mips_sync() macro to wrap asm("sync"), and replace gazillions of
+such statements with it.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.7 2012/06/24 20:25:58 miod Exp $	*/
+d101 2
+a102 2
+	ncfg = (cfg & ~7) | CCA_CACHED;
+	ncfg &= ~(1 << 4);
+@
+
+
+1.7
+log
+@Bring in line with current cache_r{5,10}k.c style, and optimize slightly the
+handling of a partial last line in IOSyncDCache. No functional change.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.6 2012/06/24 16:26:04 miod Exp $	*/
+a38 2
+#define	sync() \
+    __asm__ __volatile__ ("sync" ::: "memory")
+d157 1
+a157 1
+	sync();
+d189 1
+a189 1
+	sync();
+d221 1
+a221 1
+	sync();
+d280 1
+a280 1
+	sync();
+d339 1
+a339 1
+	sync();
+@
+
+
+1.6
+log
+@Add cache operation functions pointers to struct cpu_info; the various
+cache lines and sizes are already there, after all.
+
+The ConfigCache cache routine is responsible for filling these function
+pointers; cache routine invocation macros are updated to use the cpu_info
+fields, but may still be overriden in <machine/cpu.h> on platforms where
+only one set of cache routines is used.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.5 2012/05/27 19:13:04 miod Exp $	*/
+d40 1
+a40 1
+    __asm__ __volatile__ ("sync" ::: "memory");
+d77 4
+a80 3
+		 * We expect the setup code to have set up ci->ci_l2size for
+		 * us. Unfortunately we aren't allowed to panic() there,
+		 * because the console is not available.
+a385 1
+			cache(HitWBInvalidate_D, va + sz - line);
+d387 1
+d389 2
+a390 1
+		mips4k_hitinv_primary(va, sz, line);
+a422 1
+				cache(HitWBInvalidate_S, va + sz - line);
+d424 1
+d426 2
+a427 1
+			mips4k_hitinv_secondary(va, sz, line);
+@
+
+
+1.5
+log
+@Add a `L2 cache line size' member to struct cpu_info. This allows R4k code to
+stop abusing another field, and will be used by more routines RSN.
+
+No functional change.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.4 2012/05/17 19:34:04 miod Exp $	*/
+d94 7
+@
+
+
+1.4
+log
+@Correct virtual aliasing mask computation.
+Note that this would only affect 4KB page size IP22 kernels, which is not the
+default IP22 configuration, and which noone not out of his or her mind would do.
+
+In other words: this is a correctness fix with no impact on Real Life (c)(R)TM
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.3 2012/04/21 12:20:30 miod Exp $	*/
+d85 1
+a85 1
+		ci->ci_cacheconfiguration = 0;
+d144 1
+a144 1
+		line = ci->ci_cacheconfiguration;	/* L2 line size */
+d206 1
+a206 1
+		line = ci->ci_cacheconfiguration;	/* L2 line size */
+d267 1
+a267 1
+		line = ci->ci_cacheconfiguration;	/* L2 line size */
+d326 1
+a326 1
+		line = ci->ci_cacheconfiguration;	/* L2 line size */
+d394 1
+a394 1
+		line = ci->ci_cacheconfiguration;	/* L2 line size */
+@
+
+
+1.3
+log
+@Rework the signature of the cache handling routines again. It makes more sense
+to pass both the virtual and physical addresses of the page to clean to
+SyncDCachePage, which is the only routine using `Index' operations on the data
+cache, which might be virtually indexed at some levels but physically indexed
+at others. On the other hand, it does not make any sense to pass a physical
+address to routines using `Hit' operations (and they were discarding them
+anyway).
+
+In addition to making things cleaner, this fixes sporadic userland misbehaviour
+(read: SIGSGEV) on RM7000 O2 systems.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.2 2012/04/06 20:11:18 miod Exp $	*/
+d71 2
+a72 1
+	cache_valias_mask = (ci->ci_l1instcachesize | ci->ci_l1datacachesize) &
+@
+
+
+1.2
+log
+@Make the logic for PMAP_PREFER() and the logic, inside pmap, to do the
+necessary cache coherency work wrt similar virtual indexes of different
+physical pages, depending upon two distinct global variables, instead of
+a shared one. R4000/R4400 VCE requires a 32KB mask for PMAP_PREFER, which
+is otherwise not necessary for pmap coherency (especially since, on these
+processors, only L1 uses virtual indexes, and the L1 size is not greater
+than the page size, as we are using 16KB pages).
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: cache_r4k.c,v 1.1 2012/03/28 20:44:23 miod Exp $	*/
+d50 1
+a50 1
+	uint32_t cfg;
+d94 3
+a96 1
+	if ((cfg & 7) != CCA_CACHED) {
+d111 1
+a111 2
+		cfg = (cfg & ~7) | CCA_CACHED;
+		(*fn)(cfg);
+d157 1
+a157 1
+Mips4k_InvalidateICache(struct cpu_info *ci, uint64_t _va, size_t _sz)
+d167 1
+a167 1
+		sz = ((_va + _sz + 16 - 1) & ~(16UL - 1)) - _va;
+d170 1
+a170 1
+		sz = ((_va + _sz + 32 - 1) & ~(32UL - 1)) - _va;
+d189 1
+a189 1
+Mips4k_SyncDCachePage(struct cpu_info *ci, uint64_t va)
+d206 1
+a206 3
+		sva = PHYS_TO_XKPHYS(0, CCA_CACHED);
+		/* keep only the index bits */
+		sva += va & ((1UL << 22) - 1);	/* largest L2 is 4MB */
+d248 1
+a248 1
+Mips4k_HitSyncDCache(struct cpu_info *ci, uint64_t _va, size_t _sz)
+d307 1
+a307 1
+Mips4k_HitInvalidateDCache(struct cpu_info *ci, uint64_t _va, size_t _sz)
+d317 1
+a317 1
+		sz = ((_va + _sz + 16 - 1) & ~(16UL - 1)) - _va;
+d320 1
+a320 1
+		sz = ((_va + _sz + 32 - 1) & ~(32UL - 1)) - _va;
+d341 1
+a341 1
+Mips4k_IOSyncDCache(struct cpu_info *ci, uint64_t _va, size_t _sz, int how)
+@
+
+
+1.1
+log
+@Work in progress support for the SGI Indigo, Indigo 2 and Indy systems
+(IP20, IP22, IP24) in 64-bit mode, adapated from NetBSD. Currently limited
+to headless operation, input and video drivers will get ported soon.
+
+Should work on all R4000, R4440 and R5000 based systems. L2 cache on R5000SC
+Indy not supported yet (coming soon), R4600 not supported yet either (coming
+soon as well).
+
+Tested to boot multiuser on: Indigo2 R4000SC, Indy R4000PC, Indy R4000SC,
+Indy R5000SC, Indigo2 R4400SC. There are still glitches in the Ethernet driver
+which are being looked at.
+
+Expansion support is limited to the GIO E++ board; GIO boards with PCI-GIO
+bridges not ported yet due to the lack of hardware, and this kind of driver
+does not port blindly.
+
+Most of this work comes from NetBSD, polishing and integration work, as well
+as putting as many ``R4x00 in 64-bit mode'' erratas as necessary, by yours
+truly.
+
+More work is coming, as well as trying to get some easy way to boot install
+kernels (as older PROM can only boot ECOFF binaries, which won't do for the
+kernel).
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d25 2
+d42 5
+d71 1
+a71 1
+	CpuCacheAliasMask = (ci->ci_l1instcachesize | ci->ci_l1datacachesize) &
+d82 1
+a82 1
+		CpuCacheAliasMask |= ((1 << 15) - 1) & ~PAGE_MASK;
+d89 4
+a92 2
+	if (CpuCacheAliasMask != 0)
+		CpuCacheAliasMask |= PAGE_MASK;
+d121 1
+a121 1
+	uint64_t line;
+d160 1
+a160 1
+	uint64_t line;
+d191 1
+a191 1
+	uint64_t line;
+d223 25
+d251 1
+a251 1
+	vaddr_t va, sva, eva;
+d253 1
+a253 1
+	uint64_t line;
+d264 1
+a264 7
+
+	sva = va;
+	eva = sva + sz;
+	while (sva != eva) {
+		cache(HitWBInvalidate_D, sva);
+		sva += line;
+	}
+d271 1
+a271 7
+
+		sva = va;
+		eva = sva + sz;
+		while (sva != eva) {
+			cache(HitWBInvalidate_S, sva);
+			sva += line;
+		}
+d282 25
+d310 1
+a310 1
+	vaddr_t va, sva, eva;
+d312 1
+a312 1
+	uint64_t line;
+d323 1
+a323 7
+
+	sva = va;
+	eva = sva + sz;
+	while (sva != eva) {
+		cache(HitInvalidate_D, sva);
+		sva += line;
+	}
+d330 1
+a330 7
+
+		sva = va;
+		eva = sva + sz;
+		while (sva != eva) {
+			cache(HitInvalidate_S, sva);
+			sva += line;
+		}
+d342 1
+a342 1
+Mips4k_IOSyncDCache(struct cpu_info *ci, uint64_t va, size_t sz, int how)
+d344 19
+d365 15
+a379 3
+		if (((va | sz) & (ci->ci_l1datacacheline - 1)) == 0) {
+			Mips4k_HitInvalidateDCache(ci, va, sz);
+			break;
+d381 2
+a382 1
+		/* FALLTHROUGH */
+a383 2
+		Mips4k_HitSyncDCache(ci, va, sz);
+		break;
+d385 1
+a385 1
+		Mips4k_HitSyncDCache(ci, va, sz);
+d387 37
+@
+

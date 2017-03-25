@@ -1,0 +1,618 @@
+head	1.8;
+access;
+symbols;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	2017.01.24.12.53.52;	author deraadt;	state Exp;
+branches;
+next	1.7;
+commitid	QYSA2DhKNoKjBuQG;
+
+1.7
+date	2016.09.13.17.13.37;	author deraadt;	state Exp;
+branches;
+next	1.6;
+commitid	nxoiZiJPhAAVKQhE;
+
+1.6
+date	2016.09.13.16.49.28;	author deraadt;	state Exp;
+branches;
+next	1.5;
+commitid	Kh60oAaRyMBwMrcR;
+
+1.5
+date	2016.09.13.16.01.37;	author deraadt;	state Exp;
+branches;
+next	1.4;
+commitid	GnjSXU1CfTTXviB4;
+
+1.4
+date	2016.09.01.00.35.22;	author florian;	state Exp;
+branches;
+next	1.3;
+commitid	BIKpBY4sC6SiXDhj;
+
+1.3
+date	2016.09.01.00.21.36;	author deraadt;	state Exp;
+branches;
+next	1.2;
+commitid	P9IiJlKSbxnKzQyC;
+
+1.2
+date	2016.08.31.23.25.10;	author benno;	state Exp;
+branches;
+next	1.1;
+commitid	41Z3wsAayvdFMoI5;
+
+1.1
+date	2016.08.31.22.01.42;	author florian;	state Exp;
+branches;
+next	;
+commitid	1Bh2CBIwvUy50FSg;
+
+
+desc
+@@
+
+
+1.8
+log
+@
+Complete jsing's coccinelle cleanup... by hand
+ok jsing
+@
+text
+@/*	$Id: keyproc.c,v 1.7 2016/09/13 17:13:37 deraadt Exp $ */
+/*
+ * Copyright (c) 2016 Kristaps Dzonsons <kristaps@@bsd.lv>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/stat.h>
+
+#include <err.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <openssl/pem.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+
+#include "extern.h"
+#include "rsa.h"
+
+/*
+ * This was lifted more or less directly from demos/x509/mkreq.c of the
+ * OpenSSL source code.
+ */
+static int
+add_ext(STACK_OF(X509_EXTENSION) *sk, int nid, const char *value)
+{
+	X509_EXTENSION	*ex;
+	char		*cp;
+
+	/*
+	 * XXX: I don't like this at all.
+	 * There's no documentation for X509V3_EXT_conf_nid, so I'm not
+	 * sure if the "value" parameter is ever written to, touched,
+	 * etc.
+	 * The 'official' examples suggest not (they use a string
+	 * literal as the input), but to be safe, I'm doing an
+	 * allocation here and just letting it go.
+	 * This leaks memory, but bounded to the number of SANs.
+	 */
+
+	if ((cp = strdup(value)) == NULL) {
+		warn("strdup");
+		return (0);
+	}
+	ex = X509V3_EXT_conf_nid(NULL, NULL, nid, cp);
+	if (ex == NULL) {
+		warnx("X509V3_EXT_conf_nid");
+		free(cp);
+		return (0);
+	}
+	sk_X509_EXTENSION_push(sk, ex);
+	return (1);
+}
+
+/*
+ * Create an X509 certificate from the private key we have on file.
+ * To do this, we first open the key file, then jail ourselves.
+ * We then use the crypto library to create the certificate within the
+ * jail and, on success, ship it to "netsock" as an X509 request.
+ */
+int
+keyproc(int netsock, const char *keyfile,
+    const char **alts, size_t altsz, int newkey)
+{
+	char		*der64 = NULL, *der = NULL, *dercp;
+	char		*sans = NULL, *san = NULL;
+	FILE		*f;
+	size_t		 i, sansz;
+	void		*pp;
+	EVP_PKEY	*pkey = NULL;
+	X509_REQ	*x = NULL;
+	X509_NAME	*name = NULL;
+	int		 len, rc = 0, cc, nid;
+	mode_t		 prev;
+	STACK_OF(X509_EXTENSION) *exts = NULL;
+
+	/*
+	 * First, open our private key file read-only or write-only if
+	 * we're creating from scratch.
+	 * Set our umask to be maximally restrictive.
+	 */
+
+	prev = umask((S_IWUSR | S_IXUSR) | S_IRWXG | S_IRWXO);
+	f = fopen(keyfile, newkey ? "wx" : "r");
+	umask(prev);
+
+	if (f == NULL) {
+		warn("%s", keyfile);
+		goto out;
+	}
+
+	/* File-system, user, and sandbox jail. */
+
+	ERR_load_crypto_strings();
+
+	if (pledge("stdio", NULL) == -1) {
+		warn("pledge");
+		goto out;
+	}
+
+	if (newkey) {
+		if ((pkey = rsa_key_create(f, keyfile)) == NULL)
+			goto out;
+		dodbg("%s: generated RSA domain key", keyfile);
+	} else {
+		if ((pkey = rsa_key_load(f, keyfile)) == NULL)
+			goto out;
+		doddbg("%s: loaded RSA domain key", keyfile);
+	}
+
+	fclose(f);
+	f = NULL;
+
+	/*
+	 * Generate our certificate from the EVP public key.
+	 * Then set it as the X509 requester's key.
+	 */
+
+	if ((x = X509_REQ_new()) == NULL) {
+		warnx("X509_new");
+		goto out;
+	} else if (!X509_REQ_set_pubkey(x, pkey)) {
+		warnx("X509_set_pubkey");
+		goto out;
+	}
+
+	/* Now specify the common name that we'll request. */
+
+	if ((name = X509_NAME_new()) == NULL) {
+		warnx("X509_NAME_new");
+		goto out;
+	} else if (!X509_NAME_add_entry_by_txt(name, "CN",
+		MBSTRING_ASC, (u_char *)alts[0], -1, -1, 0)) {
+		warnx("X509_NAME_add_entry_by_txt: CN=%s", alts[0]);
+		goto out;
+	} else if (!X509_REQ_set_subject_name(x, name)) {
+		warnx("X509_req_set_issuer_name");
+		goto out;
+	}
+
+	/*
+	 * Now add the SAN extensions.
+	 * This was lifted more or less directly from demos/x509/mkreq.c
+	 * of the OpenSSL source code.
+	 * (The zeroth altname is the domain name.)
+	 * TODO: is this the best way of doing this?
+	 */
+
+	if (altsz > 1) {
+		nid = NID_subject_alt_name;
+		if ((exts = sk_X509_EXTENSION_new_null()) == NULL) {
+			warnx("sk_X509_EXTENSION_new_null");
+			goto out;
+		}
+		/* Initialise to empty string. */
+		if ((sans = strdup("")) == NULL) {
+			warn("strdup");
+			goto out;
+		}
+		sansz = strlen(sans) + 1;
+
+		/*
+		 * For each SAN entry, append it to the string.
+		 * We need a single SAN entry for all of the SAN
+		 * domains: NOT an entry per domain!
+		 */
+
+		for (i = 1; i < altsz; i++) {
+			cc = asprintf(&san, "%sDNS:%s",
+			    i > 1 ? "," : "", alts[i]);
+			if (cc == -1) {
+				warn("asprintf");
+				goto out;
+			}
+			pp = realloc(sans, sansz + strlen(san));
+			if (pp == NULL) {
+				warn("realloc");
+				goto out;
+			}
+			sans = pp;
+			sansz += strlen(san);
+			strlcat(sans, san, sansz);
+			free(san);
+			san = NULL;
+		}
+
+		if (!add_ext(exts, nid, sans)) {
+			warnx("add_ext");
+			goto out;
+		} else if (!X509_REQ_add_extensions(x, exts)) {
+			warnx("X509_REQ_add_extensions");
+			goto out;
+		}
+		sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+	}
+
+	/* Sign the X509 request using SHA256. */
+
+	if (!X509_REQ_sign(x, pkey, EVP_sha256())) {
+		warnx("X509_sign");
+		goto out;
+	}
+
+	/* Now, serialise to DER, then base64. */
+
+	if ((len = i2d_X509_REQ(x, NULL)) < 0) {
+		warnx("i2d_X509");
+		goto out;
+	} else if ((der = dercp = malloc(len)) == NULL) {
+		warn("malloc");
+		goto out;
+	} else if (len != i2d_X509_REQ(x, (u_char **)&dercp)) {
+		warnx("i2d_X509");
+		goto out;
+	} else if ((der64 = base64buf_url(der, len)) == NULL) {
+		warnx("base64buf_url");
+		goto out;
+	}
+
+	/*
+	 * Write that we're ready, then write.
+	 * We ignore reader-closed failure, as we're just going to roll
+	 * into the exit case anyway.
+	 */
+
+	if (writeop(netsock, COMM_KEY_STAT, KEY_READY) < 0)
+		goto out;
+	if (writestr(netsock, COMM_CERT, der64) < 0)
+		goto out;
+
+	rc = 1;
+out:
+	close(netsock);
+	if (f != NULL)
+		fclose(f);
+	free(der);
+	free(der64);
+	free(sans);
+	free(san);
+	if (x != NULL)
+		X509_REQ_free(x);
+	if (name != NULL)
+		X509_NAME_free(name);
+	if (pkey != NULL)
+		EVP_PKEY_free(pkey);
+	ERR_print_errors_fp(stderr);
+	ERR_free_strings();
+	return (rc);
+}
+@
+
+
+1.7
+log
+@A small amount more KNF to make this easier on our eyes.  Not going further
+than this.
+ok florian
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.6 2016/09/13 16:49:28 deraadt Exp $ */
+d56 1
+a56 1
+	if (NULL == (cp = strdup(value))) {
+d61 1
+a61 1
+	if (NULL == ex) {
+d102 1
+a102 1
+	if (NULL == f) {
+d117 1
+a117 1
+		if (NULL == (pkey = rsa_key_create(f, keyfile)))
+d121 1
+a121 1
+		if (NULL == (pkey = rsa_key_load(f, keyfile)))
+d134 1
+a134 1
+	if (NULL == (x = X509_REQ_new())) {
+d144 1
+a144 1
+	if (NULL == (name = X509_NAME_new())) {
+d166 1
+a166 1
+		if (NULL == (exts = sk_X509_EXTENSION_new_null())) {
+d171 1
+a171 1
+		if (NULL == (sans = strdup(""))) {
+d186 1
+a186 1
+			if (-1 == cc) {
+d191 1
+a191 1
+			if (NULL == pp) {
+d224 1
+a224 1
+	} else if (NULL == (der = dercp = malloc(len))) {
+d230 1
+a230 1
+	} else if (NULL == (der64 = base64buf_url(der, len))) {
+d249 1
+a249 1
+	if (NULL != f)
+d255 1
+a255 1
+	if (NULL != x)
+d257 1
+a257 1
+	if (NULL != name)
+d259 1
+a259 1
+	if (NULL != pkey)
+@
+
+
+1.6
+log
+@hoist local variable initialization directly into the definitions,
+rather than doing it right afterwards.
+ok florian
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.5 2016/09/13 16:01:37 deraadt Exp $ */
+d78 1
+a78 1
+	const char **alts, size_t altsz, int newkey)
+d137 1
+a137 1
+	} else if ( ! X509_REQ_set_pubkey(x, pkey)) {
+d147 1
+a147 1
+	} else if ( ! X509_NAME_add_entry_by_txt(name, "CN",
+d151 1
+a151 1
+	} else if ( ! X509_REQ_set_subject_name(x, name)) {
+d185 1
+a185 1
+				i > 1 ? "," : "", alts[i]);
+d202 1
+a202 1
+		if ( ! add_ext(exts, nid, sans)) {
+d205 1
+a205 1
+		} else if ( ! X509_REQ_add_extensions(x, exts)) {
+d209 1
+a209 2
+		sk_X509_EXTENSION_pop_free
+			(exts, X509_EXTENSION_free);
+d214 1
+a214 1
+	if ( ! X509_REQ_sign(x, pkey, EVP_sha256())) {
+@
+
+
+1.5
+log
+@RAND_status() and RAND_seed() are not needed, this is 2016.
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.4 2016/09/01 00:35:22 florian Exp $ */
+d80 2
+a81 1
+	char		*der64, *der, *dercp, *sans, *san;
+d85 4
+a88 4
+	EVP_PKEY	*pkey;
+	X509_REQ	*x;
+	X509_NAME	*name;
+	int		 len, rc, cc, nid;
+d90 1
+a90 8
+	STACK_OF(X509_EXTENSION) *exts;
+
+	x = NULL;
+	pkey = NULL;
+	name = NULL;
+	der = der64 = sans = san = NULL;
+	rc = 0;
+	exts = NULL;
+@
+
+
+1.4
+log
+@we don't have config.h
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.3 2016/09/01 00:21:36 deraadt Exp $ */
+a86 1
+	unsigned char	 rbuf[64];
+a119 12
+	}
+
+	/*
+	 * Seed our PRNG with data from arc4random().
+	 * Do this until we're told it's ok and use increments of 64
+	 * bytes (arbitrarily).
+	 * TODO: is this sufficient as a RAND source?
+	 */
+
+	while (0 == RAND_status()) {
+		arc4random_buf(rbuf, sizeof(rbuf));
+		RAND_seed(rbuf, sizeof(rbuf));
+@
+
+
+1.3
+log
+@Collapse krazy abstractions for other sandbox models, using chroot and
+pledge directly as needed.
+ok florian
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.2 2016/08/31 23:25:10 benno Exp $ */
+a16 3
+#ifdef HAVE_CONFIG_H
+# include "config.h"
+#endif
+@
+
+
+1.2
+log
+@whitespace
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.1 2016/08/31 22:01:42 florian Exp $ */
+a118 3
+	if ( ! sandbox_before())
+		goto out;
+
+d121 2
+a122 5
+	if ( ! dropfs(PATH_VAR_EMPTY))
+		goto out;
+	else if ( ! dropprivs())
+		goto out;
+	else if ( ! sandbox_after())
+d124 1
+@
+
+
+1.1
+log
+@Import Kristaps' letskencrypt and call it acme-client in tree.
+OK to get it in deraadt@@ (and probably beck@@)
+
+At least deraadt@@, beck@@ and otto@@ are fine with the name and the
+disagreements stopped.
+@
+text
+@d1 1
+a1 1
+/*	$Id: keyproc.c,v 1.38 2016/07/16 10:59:34 kristaps Exp $ */
+d42 1
+a42 1
+static int 
+d45 1
+a45 1
+	X509_EXTENSION 	*ex;
+d61 1
+a61 1
+		return(0);
+d67 1
+a67 1
+		return(0);
+d70 1
+a70 1
+	return(1);
+d80 1
+a80 1
+keyproc(int netsock, const char *keyfile, 
+d89 1
+a89 1
+	X509_NAME 	*name;
+d102 1
+a102 1
+	/* 
+d118 1
+a118 1
+	
+d131 1
+a131 1
+	/* 
+d156 1
+a156 1
+	/* 
+d174 2
+a175 2
+	} else if ( ! X509_NAME_add_entry_by_txt(name, "CN", 
+	           MBSTRING_ASC, (u_char *)alts[0], -1, -1, 0)) {
+d183 2
+a184 2
+	/* 
+	 * Now add the SAN extensions. 
+d188 1
+a188 1
+ 	 * TODO: is this the best way of doing this?
+d204 1
+a204 1
+		/* 
+d211 1
+a211 1
+			cc = asprintf(&san, "%sDNS:%s", 
+d245 1
+a245 1
+	} 
+d263 2
+a264 2
+	/* 
+	 * Write that we're ready, then write. 
+d268 2
+a269 2
+       
+	if (writeop(netsock, COMM_KEY_STAT, KEY_READY) < 0) 
+d271 1
+a271 1
+	if (writestr(netsock, COMM_CERT, der64) < 0) 
+d291 1
+a291 1
+	return(rc);
+a292 1
+
+@
+

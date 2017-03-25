@@ -1,0 +1,482 @@
+head	1.2;
+access;
+symbols
+	OPENBSD_5_8:1.1.1.3.0.4
+	OPENBSD_5_8_BASE:1.1.1.3
+	OPENBSD_5_7:1.1.1.3.0.2
+	OPENBSD_5_7_BASE:1.1.1.3
+	v10_2_9:1.1.1.3
+	v10_4_3:1.1.1.2
+	v10_2_7:1.1.1.1
+	OPENBSD_5_6:1.1.1.1.0.2
+	OPENBSD_5_6_BASE:1.1.1.1
+	v10_2_3:1.1.1.1
+	mesa:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.2
+date	2015.12.23.05.17.49;	author jsg;	state dead;
+branches;
+next	1.1;
+commitid	TnlogFl9nOv2eaRf;
+
+1.1
+date	2014.07.09.20.34.50;	author jsg;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	3JhLfwcuBALP0ZR7;
+
+1.1.1.1
+date	2014.07.09.20.34.50;	author jsg;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	3JhLfwcuBALP0ZR7;
+
+1.1.1.2
+date	2015.01.25.14.11.39;	author jsg;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	ce2W5rH5aF7VS9gi;
+
+1.1.1.3
+date	2015.02.20.22.48.45;	author jsg;	state Exp;
+branches;
+next	;
+commitid	F54a1i0WXHMxq7kE;
+
+
+desc
+@@
+
+
+1.2
+log
+@remove the now unused Mesa 10.2.9 code
+@
+text
+@/*
+ * Copyright © 2013 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+#include "brw_fs.h"
+#include "brw_cfg.h"
+
+/** @@file brw_fs_sel_peephole.cpp
+ *
+ * This file contains the opt_peephole_sel() optimization pass that replaces
+ * MOV instructions to the same destination in the "then" and "else" bodies of
+ * an if statement with SEL instructions.
+ */
+
+/* Four MOVs seems to be pretty typical, so I picked the next power of two in
+ * the hopes that it would handle almost anything possible in a single
+ * pass.
+ */
+#define MAX_MOVS 8 /**< The maximum number of MOVs to attempt to match. */
+
+/**
+ * Scans forwards from an IF counting consecutive MOV instructions in the
+ * "then" and "else" blocks of the if statement.
+ *
+ * A pointer to the fs_inst* for IF is passed as the <if_inst> argument. The
+ * function stores pointers to the MOV instructions in the <then_mov> and
+ * <else_mov> arrays.
+ *
+ * \return the minimum number of MOVs found in the two branches or zero if
+ *         an error occurred.
+ *
+ * E.g.:
+ *                  IF ...
+ *    then_mov[0] = MOV g4, ...
+ *    then_mov[1] = MOV g5, ...
+ *    then_mov[2] = MOV g6, ...
+ *                  ELSE ...
+ *    else_mov[0] = MOV g4, ...
+ *    else_mov[1] = MOV g5, ...
+ *    else_mov[2] = MOV g7, ...
+ *                  ENDIF
+ *    returns 3.
+ */
+static int
+count_movs_from_if(fs_inst *then_mov[MAX_MOVS], fs_inst *else_mov[MAX_MOVS],
+                   fs_inst *if_inst, fs_inst *else_inst)
+{
+   fs_inst *m = if_inst;
+
+   assert(m->opcode == BRW_OPCODE_IF);
+   m = (fs_inst *) m->next;
+
+   int then_movs = 0;
+   while (then_movs < MAX_MOVS && m->opcode == BRW_OPCODE_MOV) {
+      then_mov[then_movs] = m;
+      m = (fs_inst *) m->next;
+      then_movs++;
+   }
+
+   m = (fs_inst *) else_inst->next;
+
+   int else_movs = 0;
+   while (else_movs < MAX_MOVS && m->opcode == BRW_OPCODE_MOV) {
+      else_mov[else_movs] = m;
+      m = (fs_inst *) m->next;
+      else_movs++;
+   }
+
+   return MIN2(then_movs, else_movs);
+}
+
+/**
+ * Try to replace IF/MOV+/ELSE/MOV+/ENDIF with SEL.
+ *
+ * Many GLSL shaders contain the following pattern:
+ *
+ *    x = condition ? foo : bar
+ *
+ * or
+ *
+ *    if (...) a.xyzw = foo.xyzw;
+ *    else     a.xyzw = bar.xyzw;
+ *
+ * The compiler emits an ir_if tree for this, since each subexpression might be
+ * a complex tree that could have side-effects or short-circuit logic.
+ *
+ * However, the common case is to simply select one of two constants or
+ * variable values---which is exactly what SEL is for.  In this case, the
+ * assembly looks like:
+ *
+ *    (+f0) IF
+ *    MOV dst src0
+ *    ...
+ *    ELSE
+ *    MOV dst src1
+ *    ...
+ *    ENDIF
+ *
+ * where each pair of MOVs to a common destination and can be easily translated
+ * into
+ *
+ *    (+f0) SEL dst src0 src1
+ *
+ * If src0 is an immediate value, we promote it to a temporary GRF.
+ */
+bool
+fs_visitor::opt_peephole_sel()
+{
+   bool progress = false;
+
+   cfg_t cfg(&instructions);
+
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+
+      /* IF instructions, by definition, can only be found at the ends of
+       * basic blocks.
+       */
+      fs_inst *if_inst = (fs_inst *) block->end;
+      if (if_inst->opcode != BRW_OPCODE_IF)
+         continue;
+
+      if (!block->else_inst)
+         continue;
+
+      fs_inst *else_inst = (fs_inst *) block->else_inst;
+      assert(else_inst->opcode == BRW_OPCODE_ELSE);
+
+      fs_inst *else_mov[MAX_MOVS] = { NULL };
+      fs_inst *then_mov[MAX_MOVS] = { NULL };
+
+      int movs = count_movs_from_if(then_mov, else_mov, if_inst, else_inst);
+
+      if (movs == 0)
+         continue;
+
+      fs_inst *sel_inst[MAX_MOVS] = { NULL };
+      fs_inst *mov_imm_inst[MAX_MOVS] = { NULL };
+
+      /* Generate SEL instructions for pairs of MOVs to a common destination. */
+      for (int i = 0; i < movs; i++) {
+         if (!then_mov[i] || !else_mov[i])
+            break;
+
+         /* Check that the MOVs are the right form. */
+         if (!then_mov[i]->dst.equals(else_mov[i]->dst) ||
+             then_mov[i]->is_partial_write() ||
+             else_mov[i]->is_partial_write()) {
+            movs = i;
+            break;
+         }
+
+         /* Check that source types for mov operations match. */
+         if (then_mov[i]->src[0].type != else_mov[i]->src[0].type) {
+            movs = i;
+            break;
+         }
+
+         if (!then_mov[i]->src[0].equals(else_mov[i]->src[0])) {
+            /* Only the last source register can be a constant, so if the MOV
+             * in the "then" clause uses a constant, we need to put it in a
+             * temporary.
+             */
+            fs_reg src0(then_mov[i]->src[0]);
+            if (src0.file == IMM) {
+               src0 = fs_reg(this, glsl_type::float_type);
+               src0.type = then_mov[i]->src[0].type;
+               mov_imm_inst[i] = MOV(src0, then_mov[i]->src[0]);
+            }
+
+            sel_inst[i] = SEL(then_mov[i]->dst, src0, else_mov[i]->src[0]);
+
+            if (brw->gen == 6 && if_inst->conditional_mod) {
+               /* For Sandybridge with IF with embedded comparison */
+               sel_inst[i]->predicate = BRW_PREDICATE_NORMAL;
+            } else {
+               /* Separate CMP and IF instructions */
+               sel_inst[i]->predicate = if_inst->predicate;
+               sel_inst[i]->predicate_inverse = if_inst->predicate_inverse;
+            }
+         } else {
+            sel_inst[i] = MOV(then_mov[i]->dst, then_mov[i]->src[0]);
+         }
+      }
+
+      if (movs == 0)
+         continue;
+
+      /* Emit a CMP if our IF used the embedded comparison */
+      if (brw->gen == 6 && if_inst->conditional_mod) {
+         fs_inst *cmp_inst = CMP(reg_null_d, if_inst->src[0], if_inst->src[1],
+                                 if_inst->conditional_mod);
+         if_inst->insert_before(cmp_inst);
+      }
+
+      for (int i = 0; i < movs; i++) {
+         if (mov_imm_inst[i])
+            if_inst->insert_before(mov_imm_inst[i]);
+         if_inst->insert_before(sel_inst[i]);
+
+         then_mov[i]->remove();
+         else_mov[i]->remove();
+      }
+
+      progress = true;
+   }
+
+   if (progress)
+      invalidate_live_intervals();
+
+   return progress;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Import Mesa 10.2.3
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import Mesa 10.4.3
+@
+text
+@d44 3
+a46 3
+ * A pointer to the bblock_t following the IF is passed as the <then_block>
+ * argument. The function stores pointers to the MOV instructions in the
+ * <then_mov> and <else_mov> arrays.
+d65 1
+a65 1
+                   bblock_t *then_block, bblock_t *else_block)
+d67 5
+d73 3
+a75 5
+   foreach_inst_in_block(fs_inst, inst, then_block) {
+      if (then_movs == MAX_MOVS || inst->opcode != BRW_OPCODE_MOV)
+         break;
+
+      then_mov[then_movs] = inst;
+d79 2
+d82 3
+a84 5
+   foreach_inst_in_block(fs_inst, inst, else_block) {
+      if (else_movs == MAX_MOVS || inst->opcode != BRW_OPCODE_MOV)
+         break;
+
+      else_mov[else_movs] = inst;
+d130 5
+a134 1
+   foreach_block (block, cfg) {
+d138 1
+a138 1
+      fs_inst *if_inst = (fs_inst *)block->end();
+d142 6
+d151 1
+a151 14
+      bblock_t *then_block = block->next();
+      bblock_t *else_block = NULL;
+      foreach_list_typed(bblock_link, child, link, &block->children) {
+         if (child->block != then_block) {
+            if (child->block->prev()->end()->opcode == BRW_OPCODE_ELSE) {
+               else_block = child->block;
+            }
+            break;
+         }
+      }
+      if (else_block == NULL)
+         continue;
+
+      int movs = count_movs_from_if(then_mov, else_mov, then_block, else_block);
+a158 12
+      enum brw_predicate predicate;
+      bool predicate_inverse;
+      if (brw->gen == 6 && if_inst->conditional_mod) {
+         /* For Sandybridge with IF with embedded comparison */
+         predicate = BRW_PREDICATE_NORMAL;
+         predicate_inverse = false;
+      } else {
+         /* Separate CMP and IF instructions */
+         predicate = if_inst->predicate;
+         predicate_inverse = if_inst->predicate_inverse;
+      }
+
+d178 1
+a178 3
+         if (then_mov[i]->src[0].equals(else_mov[i]->src[0])) {
+            sel_inst[i] = MOV(then_mov[i]->dst, then_mov[i]->src[0]);
+         } else {
+d191 11
+a201 2
+            sel_inst[i]->predicate = predicate;
+            sel_inst[i]->predicate_inverse = predicate_inverse;
+d212 1
+a212 1
+         if_inst->insert_before(block, cmp_inst);
+d217 2
+a218 2
+            if_inst->insert_before(block, mov_imm_inst[i]);
+         if_inst->insert_before(block, sel_inst[i]);
+d220 2
+a221 2
+         then_mov[i]->remove(then_block);
+         else_mov[i]->remove(else_block);
+@
+
+
+1.1.1.3
+log
+@Import Mesa 10.2.9
+@
+text
+@d44 3
+a46 3
+ * A pointer to the fs_inst* for IF is passed as the <if_inst> argument. The
+ * function stores pointers to the MOV instructions in the <then_mov> and
+ * <else_mov> arrays.
+d65 1
+a65 1
+                   fs_inst *if_inst, fs_inst *else_inst)
+d67 4
+a70 4
+   fs_inst *m = if_inst;
+
+   assert(m->opcode == BRW_OPCODE_IF);
+   m = (fs_inst *) m->next;
+d72 1
+a72 4
+   int then_movs = 0;
+   while (then_movs < MAX_MOVS && m->opcode == BRW_OPCODE_MOV) {
+      then_mov[then_movs] = m;
+      m = (fs_inst *) m->next;
+d76 4
+a79 1
+   m = (fs_inst *) else_inst->next;
+d81 1
+a81 4
+   int else_movs = 0;
+   while (else_movs < MAX_MOVS && m->opcode == BRW_OPCODE_MOV) {
+      else_mov[else_movs] = m;
+      m = (fs_inst *) m->next;
+d127 1
+a127 5
+   cfg_t cfg(&instructions);
+
+   for (int b = 0; b < cfg.num_blocks; b++) {
+      bblock_t *block = cfg.blocks[b];
+
+d131 1
+a131 1
+      fs_inst *if_inst = (fs_inst *) block->end;
+a134 6
+      if (!block->else_inst)
+         continue;
+
+      fs_inst *else_inst = (fs_inst *) block->else_inst;
+      assert(else_inst->opcode == BRW_OPCODE_ELSE);
+
+d138 14
+a151 1
+      int movs = count_movs_from_if(then_mov, else_mov, if_inst, else_inst);
+d159 12
+d190 3
+a192 1
+         if (!then_mov[i]->src[0].equals(else_mov[i]->src[0])) {
+d205 2
+a206 11
+
+            if (brw->gen == 6 && if_inst->conditional_mod) {
+               /* For Sandybridge with IF with embedded comparison */
+               sel_inst[i]->predicate = BRW_PREDICATE_NORMAL;
+            } else {
+               /* Separate CMP and IF instructions */
+               sel_inst[i]->predicate = if_inst->predicate;
+               sel_inst[i]->predicate_inverse = if_inst->predicate_inverse;
+            }
+         } else {
+            sel_inst[i] = MOV(then_mov[i]->dst, then_mov[i]->src[0]);
+d217 1
+a217 1
+         if_inst->insert_before(cmp_inst);
+d222 2
+a223 2
+            if_inst->insert_before(mov_imm_inst[i]);
+         if_inst->insert_before(sel_inst[i]);
+d225 2
+a226 2
+         then_mov[i]->remove();
+         else_mov[i]->remove();
+@
+
+

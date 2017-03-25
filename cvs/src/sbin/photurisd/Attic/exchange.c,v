@@ -1,0 +1,917 @@
+head	1.7;
+access;
+symbols
+	OPENBSD_3_2:1.6.0.2
+	OPENBSD_3_2_BASE:1.6
+	OPENBSD_3_1:1.5.0.6
+	OPENBSD_3_1_BASE:1.5
+	OPENBSD_3_0:1.5.0.4
+	OPENBSD_3_0_BASE:1.5
+	OPENBSD_2_9:1.5.0.2
+	OPENBSD_2_9_BASE:1.5
+	OPENBSD_2_8:1.1.0.8
+	OPENBSD_2_8_BASE:1.1
+	OPENBSD_2_7:1.1.0.6
+	OPENBSD_2_7_BASE:1.1
+	OPENBSD_2_6:1.1.0.4
+	OPENBSD_2_6_BASE:1.1
+	OPENBSD_2_5:1.1.0.2
+	OPENBSD_2_5_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.7
+date	2003.03.13.00.33.46;	author deraadt;	state dead;
+branches;
+next	1.6;
+
+1.6
+date	2002.06.09.08.13.08;	author todd;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	2001.01.28.22.45.07;	author niklas;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2000.12.15.01.58.27;	author provos;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2000.12.11.21.21.17;	author provos;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2000.12.11.02.16.50;	author provos;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	98.11.14.23.37.23;	author deraadt;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.7
+log
+@thought we had already deleted this
+@
+text
+@/*	$OpenBSD: exchange.c,v 1.6 2002/06/09 08:13:08 todd Exp $	*/
+
+/*
+ * Copyright 1997-2000 Niels Provos <provos@@citi.umich.edu>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *      This product includes software developed by Niels Provos.
+ * 4. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+/*
+ * exchange.c:
+ *
+ */
+
+#ifndef lint
+static char rcsid[] = "$OpenBSD: exchange.c,v 1.6 2002/06/09 08:13:08 todd Exp $";
+#endif
+
+#define _EXCHANGE_C_
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ssl/bn.h>
+
+#include "config.h"
+#include "state.h"
+#include "exchange.h"
+#include "modulus.h"
+#include "attributes.h"
+#include "buffer.h"
+#include "cookie.h"
+#include "schedule.h"
+#include "scheme.h"
+#include "log.h"
+
+/*
+ * Get the number of bits from a variable precision number
+ * according to draft-simpson-photuris-11
+ */
+
+u_int8_t *
+varpre_get_number_bits(size_t *nbits, u_int8_t *varpre)
+{
+     int blocks;
+     size_t bits;
+
+     if (varpre == NULL)
+	  return (NULL);
+
+     /* We don't support numbers, that long */
+     if (*varpre == 255 && *(varpre+1) == 255)
+	     return (NULL);
+
+     bits = 0;
+     if (*varpre == 255) {
+	  blocks = 3;
+	  bits = 65280;
+          varpre++;
+     } else
+	  blocks = 2;
+
+     while (blocks-- > 0) {
+	     bits = (bits << 8) + *varpre;
+	     varpre++;
+     }
+
+     *nbits = bits;
+
+     return (varpre);
+}
+
+/*
+ * Convert a variable precision number to a bignum
+ */
+
+u_int8_t *
+BN_varpre2bn(u_int8_t *varpre, size_t size, BIGNUM *a)
+{
+     u_int8_t *p;
+     size_t bytes;
+
+     BN_zero(a);
+     p = varpre_get_number_bits(&bytes, varpre);
+     if (p == NULL)
+	     return (NULL);
+
+     bytes = (bytes + 7) / 8;
+
+     if (p + bytes != varpre + size)
+	     return (NULL);
+
+     while (bytes > 0) {
+	  BN_lshift(a, a, 8);
+	  BN_add_word(a, *p);
+
+	  bytes--;
+	  p++;
+     }
+
+     return (p);
+}
+
+int
+BN_bn2varpre(BIGNUM *p, u_int8_t *value, size_t *size)
+{
+	size_t bits, bytes;
+	int header;
+	BIGNUM *a;
+
+	bits = BN_num_bits(p);
+	bytes = (bits + 7) / 8;
+
+	/* We only support 4 octets */
+	if (bits > 65279) {
+		bits -= 65280;
+		value[0] = 255;
+		value[1] = (bits >> 16) & 0xFF;
+		value[2] = (bits >>  8) & 0xFF;
+		value[3] =  bits        & 0xFF;
+		header = 4;
+	} else {
+		value[0] = (bits >> 8) & 0xFF;
+		value[1] =  bits       & 0xFF;
+		header = 2;
+	}
+
+	/* Check if the buffer is big enough */
+	if (bytes + header > (*size - header))
+		return (-1);
+
+	a = BN_new();
+	BN_copy(a, p);
+
+	*size = bytes + header;
+
+	while (bytes > 0) {
+		bytes--;
+		value[bytes + header] = BN_mod_word(a, 256);
+		BN_rshift(a, a, 8);
+	}
+	BN_clear_free(a);
+
+	return (0);
+}
+
+
+int
+exchange_check_value(BIGNUM *exchange, BIGNUM *gen, BIGNUM *mod)
+{
+     size_t bits;
+     BIGNUM *test;
+
+     bits = BN_num_bits(mod);
+     if (BN_num_bits(exchange) < bits/2)
+	  return (0);
+
+     test = BN_new();
+     BN_copy(test, mod);
+     BN_sub_word(test, 1);
+     if (!BN_cmp(exchange, test)) {
+	  BN_free(test);
+	  return (0);
+     }
+
+     /* XXX - more tests need to go here */
+
+     BN_free(test);
+     return (1);
+}
+
+/*
+ * Finds to a given modulus and generator cached information
+ * which is used to create the private value and exchange value
+ */
+
+int
+exchange_make_values(struct stateob *st, BIGNUM *modulus, BIGNUM *generator)
+{
+     struct moduli_cache *p, *tmp;
+     u_int8_t *mod;
+     time_t tm;
+
+     tm = time(NULL);
+
+     /* See if we have this cached already */
+     if ((p = mod_find_modgen(modulus,generator)) == NULL) {
+	  /* Create a new modulus, generator pair */
+	  if((p = mod_new_modgen(modulus,generator)) == NULL) {
+	       BN_clear_free(generator);
+	       BN_clear_free(modulus);
+	       log_error("Not enough memory in exchange_make_values()");
+	       return (-1);
+	  }
+	  mod_insert(p);
+     }
+     /* If we don't have a private value calculate a new one */
+     if (p->lifetime < tm || BN_is_zero(p->private_value)) {
+	  if (p->exchangevalue != NULL)
+	       free(p->exchangevalue);
+
+	  /* See if we can find a cached private value */
+	  if ((tmp = mod_find_modulus(modulus)) != NULL &&
+	      tmp->lifetime > tm && !BN_is_zero(tmp->private_value)) {
+	       BN_copy(p->private_value, tmp->private_value);
+
+	       /* Keep exchange value on same (gen,mod) pair */
+	       if (!BN_cmp(p->generator, tmp->generator)) {
+		    p->exchangevalue = calloc(tmp->exchangesize,sizeof(u_int8_t));
+		    if (p->exchangevalue == NULL) {
+			 log_error("calloc() in exchange_make_values()");
+			 return (-1);
+		    }
+		    bcopy(tmp->exchangevalue, p->exchangevalue,
+			  tmp->exchangesize);
+		    p->exchangesize = tmp->exchangesize;
+	       } else
+		    p->exchangevalue = NULL;
+		
+	       p->iterations = tmp->iterations;
+	       p->status = tmp->status;
+	       p->lifetime = tmp->lifetime;
+	  } else {
+		  size_t bits;
+
+	       /*
+		* Make a new private value and change responder secrets
+		* as required by draft.
+		*/
+
+	       schedule_remove(REKEY, NULL);
+	       schedule_insert(REKEY, REKEY_TIMEOUT, NULL, 0);
+	       reset_secret();
+
+	       p->lifetime = tm + MOD_TIMEOUT;
+	       p->exchangevalue = NULL;
+
+	       /* Find pointer to the VPN containing the modulus */
+	       mod = scheme_get_mod(st->scheme);
+	       varpre_get_number_bits(&bits, mod);
+	       BN_rand(p->private_value, bits, 0, 0);
+	  }
+	  /* Do we need to generate a new exchange value */
+	  if (p->exchangevalue == NULL) {
+	       BIGNUM *tmp;
+	       BN_CTX *ctx;
+	       size_t bits;
+
+	       mod = scheme_get_mod(st->scheme);
+	       varpre_get_number_bits(&bits, mod);
+
+	       tmp = BN_new();
+	       ctx = BN_CTX_new();
+	       BN_mod_exp(tmp, p->generator, p->private_value, p->modulus,
+			  ctx);
+
+	       /*
+		* If our exchange value is defective we need to make a new one
+		* to avoid subgroup confinement.
+		*/
+	       while (!exchange_check_value(tmp, p->generator, p->modulus)) {
+		    BN_rand(p->private_value, bits, 0, 0);
+		    BN_mod_exp(tmp, p->generator, p->private_value, p->modulus,
+			       ctx);
+	       }
+
+	       BN_CTX_free(ctx);
+
+	       p->exchangesize = BUFFER_SIZE;
+	       BN_bn2varpre(tmp, buffer, &(p->exchangesize));
+
+	       p->exchangevalue = calloc(p->exchangesize, sizeof(u_int8_t));
+	       if (p->exchangevalue == NULL) {
+		    log_error("calloc() in exchange_make_value()");
+		    BN_clear_free(tmp);
+		    return (-1);
+	       }
+	       bcopy(buffer, p->exchangevalue, p->exchangesize);
+
+	       BN_clear_free(tmp);
+	  }
+     }
+
+     if (st->exchangevalue != NULL)
+	  free(st->exchangevalue);
+
+     st->exchangevalue = calloc(p->exchangesize, sizeof(u_int8_t));
+     if (st->exchangevalue == NULL) {
+	  log_error("calloc() in exchange_make_values()");
+	  return (-1);
+     }
+     bcopy(p->exchangevalue, st->exchangevalue, p->exchangesize);
+
+     st->exchangesize = p->exchangesize;
+     BN_copy(st->modulus, p->modulus);
+     BN_copy(st->generator, p->generator);
+
+     return (0);
+}
+
+int
+exchange_set_generator(BIGNUM *generator, u_int8_t *scheme, u_int8_t *gen)
+{
+	switch (ntohs(*((u_int16_t *)scheme))) {
+	case DH_G_2_MD5:                    /* DH: Generator of 2 */
+	case DH_G_2_DES_MD5:                /* DH: Generator of 2 + privacy */
+	case DH_G_2_3DES_SHA1:
+	     BN_set_word(generator,2);
+	     break;
+	case DH_G_3_MD5:
+	case DH_G_3_DES_MD5:
+	case DH_G_3_3DES_SHA1:
+	     BN_set_word(generator,3);
+	     break;
+	case DH_G_5_MD5:
+	case DH_G_5_DES_MD5:
+	case DH_G_5_3DES_SHA1:
+             BN_set_word(generator,5);
+	     break;
+	default:
+	     log_print("Unsupported exchange scheme %d",
+		       *((u_int16_t *)scheme));
+	     return (-1);
+	}
+	return (0);
+}
+
+/*
+ * Generates the exchange values needed for the value_request
+ * and value_response packets.
+ */
+
+int
+exchange_value_generate(struct stateob *st, u_int8_t *value, u_int16_t *size)
+{
+        BIGNUM *modulus, *generator;
+	struct moduli_cache *p;
+	u_int8_t *varpre;
+
+	if ((varpre = scheme_get_mod(st->scheme)) == NULL)
+	     return (-1);
+
+	generator = BN_new();
+	if (exchange_set_generator(generator, st->scheme,
+				   scheme_get_gen(st->scheme)) == -1) {
+	     BN_clear_free(generator);
+	     return (-1);
+	}
+
+	modulus = BN_new();
+	BN_varpre2bn(varpre, varpre2octets(varpre), modulus);
+
+	if(exchange_make_values(st, modulus, generator) == -1) {
+	     BN_clear_free(modulus);
+	     BN_clear_free(generator);
+	     return (-1);
+	}
+
+	p = mod_find_modgen(modulus,generator);
+	if (*size < p->exchangesize)
+	     return (-1);
+
+	bcopy(p->exchangevalue, value, p->exchangesize);
+	BN_clear_free(modulus);
+	BN_clear_free(generator);
+	
+	*size = p->exchangesize;
+	return (1);
+}
+@
+
+
+1.6
+log
+@rm trailing whitespace
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: exchange.c,v 1.5 2001/01/28 22:45:07 niklas Exp $	*/
+d38 1
+a38 1
+static char rcsid[] = "$OpenBSD: exchange.c,v 1.5 2001/01/28 22:45:07 niklas Exp $";
+@
+
+
+1.5
+log
+@$OpenBSD$
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d38 1
+a38 1
+static char rcsid[] = "$OpenBSD: exchange.c,v 1.4 2000/12/15 01:58:27 provos Exp $";
+d47 3
+a49 3
+#include <sys/socket.h> 
+#include <netinet/in.h> 
+#include <arpa/inet.h> 
+d67 1
+a67 1
+ 
+d70 1
+a70 1
+{    
+d76 1
+a76 1
+     
+d82 1
+a82 1
+     if (*varpre == 255) { 
+d85 2
+a86 2
+          varpre++; 
+     } else 
+d126 1
+a126 1
+     
+d166 1
+a166 1
+		BN_rshift(a, a, 8); 
+d179 1
+a179 1
+     
+d198 1
+a198 1
+/* 
+d240 1
+a240 1
+		    bcopy(tmp->exchangevalue, p->exchangevalue, 
+d245 1
+a245 1
+		   
+d252 1
+a252 1
+	       /* 
+d283 1
+a283 1
+	       /* 
+d344 1
+a344 1
+             BN_set_word(generator,5); 
+d348 1
+a348 1
+		       *((u_int16_t *)scheme)); 
+d354 1
+a354 1
+/* 
+@
+
+
+1.4
+log
+@more cleanup. remove last vestiges of gmp.
+@
+text
+@d1 2
+d38 1
+a38 1
+static char rcsid[] = "$Id: exchange.c,v 1.3 2000/12/11 21:21:17 provos Exp $";
+@
+
+
+1.3
+log
+@proper logging.
+@
+text
+@d2 1
+a2 1
+ * Copyright 1997 Niels Provos <provos@@physnet.uni-hamburg.de>
+d36 1
+a36 1
+static char rcsid[] = "$Id: exchange.c,v 1.2 2000/12/11 02:16:50 provos Exp $";
+d48 2
+a51 1
+#include "gmp.h"
+@
+
+
+1.2
+log
+@make it use bignum.
+@
+text
+@d36 1
+a36 1
+static char rcsid[] = "$Id: exchange.c,v 1.1 1998/11/14 23:37:23 deraadt Exp $";
+d58 1
+a58 1
+#include "errlog.h"
+d215 1
+a215 1
+	       log_error(1, "Not enough memory in exchange_make_values()");
+d234 1
+a234 1
+			 log_error(1, "calloc() in exchange_make_values()");
+d297 1
+a297 1
+		    log_error(1, "calloc() in exchange_make_value()");
+d312 1
+a312 1
+	  log_error(1, "calloc() in exchange_make_values()");
+d344 1
+a344 1
+	     log_error(0, "Unsupported exchange scheme %d",
+@
+
+
+1.1
+log
+@move ipsec tools into .
+@
+text
+@d36 1
+a36 1
+static char rcsid[] = "$Id: exchange.c,v 1.3 1998/10/02 16:52:56 niklas Exp $";
+a59 20
+void
+make_random_mpz(mpz_t a, mpz_t bits)
+{
+     mpz_t d;
+
+     mpz_init_set_str(d, "0x100000000", 0);
+
+     /* XXX - we generate too many bits */
+
+     mpz_set_ui(a, 0);
+     mpz_cdiv_q_ui(bits,bits,32);               /* We work in 2^32 chucks */
+
+     while(mpz_cmp_ui(bits,0)>0) {
+	  mpz_mul(a, a, d);                   /* c = a * 0x100000000 */
+	  mpz_add_ui(a, a, arc4random());     /* d = random */
+	  mpz_sub_ui(bits, bits, 1);
+     }
+     mpz_clear(d);
+}
+
+d66 1
+a66 1
+varpre_get_number_bits(mpz_t bits, u_int8_t *varpre)
+d68 2
+a69 4
+     u_int8_t blocks;
+     mpz_t a;
+
+     mpz_init_set_ui(a,0);
+a70 1
+     mpz_set_ui(bits, 0);
+d72 5
+a76 1
+	  return NULL;
+d78 2
+a79 5
+     if(*varpre == 255 && *(varpre+1) == 255) {
+	  blocks = 6;
+	  varpre += 2;
+	  mpz_set_ui(bits, 16776960);
+     } else if(*varpre == 255) { 
+d81 1
+a81 1
+	  mpz_set_ui(bits, 65280);
+d86 3
+a88 4
+     while(blocks-->0) {
+	  mpz_mul_ui(a,a,256);
+	  mpz_add_ui(a,a,*varpre);
+	  varpre++;
+d90 4
+a93 3
+     mpz_add(bits,a,bits);                    /* Add the above bits */
+     mpz_clear(a);
+     return varpre;
+d97 1
+a97 1
+ * Convert a variable precision number to a mpz number
+d101 1
+a101 1
+mpz_set_varpre(mpz_t a, u_int8_t *varpre)
+d104 8
+a111 1
+     mpz_t bytes;
+d113 8
+a120 8
+     mpz_init(bytes);
+     mpz_set_ui(a, 0);
+     p = varpre_get_number_bits(bytes, varpre);
+     mpz_cdiv_q_ui(bytes,bytes,8);                     /* Number of bytes */
+     while(mpz_cmp_ui(bytes,0)) {
+	  mpz_mul_ui(a, a, 256);
+	  mpz_sub_ui(bytes, bytes, 1);
+	  mpz_add_ui(a, a, *p);
+a122 16
+     mpz_clear(bytes);
+     
+     return p;
+}
+
+u_int8_t *
+mpz_init_set_varpre(mpz_t a, u_int8_t *varpre)
+{
+     mpz_init(a);
+     return mpz_set_varpre(a,varpre);
+}
+
+void
+mpz_get_number_bits(mpz_t rop, mpz_t p)
+{
+     size_t bits;
+d124 1
+a124 2
+     bits = mpz_sizeinbase(p, 2);
+     mpz_set_ui(rop, bits); 
+d128 1
+a128 1
+mpz_to_varpre(u_int8_t *value, u_int16_t *size, mpz_t p, mpz_t gbits)
+d130 20
+a149 25
+     u_int16_t header;
+     mpz_t a, tmp, bits, bytes;
+     u_int32_t count;
+
+     mpz_init(bytes);
+     mpz_init(tmp);
+     mpz_init_set(bits, gbits);
+
+     mpz_cdiv_q_ui(bytes, bits, 8);
+
+     count = mpz_get_ui(bytes);
+
+     /* XXX - only support 4 octets at the moment */
+     if(mpz_cmp_ui(bits, 65279) > 0) {
+	  mpz_sub_ui(bits,bits,65280);
+	  value[0] = 255;
+	  value[3] = mpz_fdiv_qr_ui(bits,tmp,bits,256) & 0xFF;
+	  value[2] = mpz_fdiv_qr_ui(bits,tmp,bits,256) & 0xFF;
+	  value[1] = mpz_fdiv_qr_ui(bits,tmp,bits,256) & 0xFF;
+	  header = 4;
+     } else {
+	  value[1] = mpz_fdiv_qr_ui(bits,tmp,bits,256) & 0xFF;
+	  value[0] = mpz_fdiv_qr_ui(bits,tmp,bits,256) & 0xFF;
+	  header = 2;
+     }
+d151 15
+a165 4
+     if(mpz_cmp_ui(bytes, *size-header)>0)
+	  return -1;       /* Not enough buffer */
+
+     mpz_init_set(a, p);
+d167 1
+a167 13
+     /* XXX - int16 vs. int32 */
+     *size = count+header;
+
+     while(count>0) {
+	  count--;
+	  value[count+header]=mpz_fdiv_qr_ui(a, tmp, a, 256);
+     }
+     mpz_clear(a);
+     mpz_clear(tmp);
+     mpz_clear(bits);
+     mpz_clear(bytes);
+
+     return 0;
+d172 1
+a172 1
+exchange_check_value(mpz_t exchange, mpz_t gen, mpz_t mod)
+d175 1
+a175 1
+     mpz_t test;
+d177 10
+a186 14
+     bits = mpz_sizeinbase(mod, 2);
+     if (mpz_sizeinbase(exchange, 2) < bits/2)
+	  return 0;
+
+     mpz_init(test);
+     mpz_sub_ui(test, mod, 1);
+     if (!mpz_cmp(exchange,test)) {
+	  mpz_clear(test);
+	  return 0;
+     }
+     mpz_set_ui(test, 1);
+     if (!mpz_cmp(exchange,test)) {
+	  mpz_clear(test);
+	  return 0;
+d191 2
+a192 2
+     mpz_clear(test);
+     return 1;
+d201 1
+a201 1
+exchange_make_values(struct stateob *st, mpz_t modulus, mpz_t generator)
+d210 1
+a210 1
+     if((p = mod_find_modgen(modulus,generator)) == NULL) {
+d213 2
+a214 2
+	       mpz_clear(generator);
+	       mpz_clear(modulus);
+d216 1
+a216 1
+	       return -1;
+d221 1
+a221 1
+     if(p->lifetime < tm || !mpz_cmp_ui(p->private_value,0)) {
+d226 3
+a228 4
+	  if((tmp = mod_find_modulus(modulus)) != NULL &&
+	     tmp->lifetime > tm && mpz_cmp_ui(tmp->private_value,0)) {
+	       mpz_set(p->private_value, tmp->private_value);
+
+d231 1
+a231 1
+	       if (!mpz_cmp(p->generator, tmp->generator)) {
+d235 1
+a235 1
+			 return -1;
+d247 1
+a247 1
+	       mpz_t bits;
+a257 2
+	       mpz_init(bits);
+	       
+d263 2
+a264 3
+	       varpre_get_number_bits(bits, mod);
+	       make_random_mpz(p->private_value, bits);
+	       mpz_clear(bits);
+d268 3
+a270 1
+	       mpz_t tmp, bits;
+a271 1
+	       mpz_init(bits);
+d273 1
+a273 1
+	       varpre_get_number_bits(bits, mod);
+d275 4
+a278 3
+	       mpz_init(tmp);
+
+	       mpz_powm(tmp, p->generator, p->private_value, p->modulus);
+d285 3
+a287 2
+		    make_random_mpz(p->private_value, bits);
+		    mpz_powm(tmp, p->generator, p->private_value, p->modulus);
+d290 1
+d293 1
+a293 1
+	       mpz_to_varpre(buffer, &(p->exchangesize), tmp, bits);
+d298 2
+a299 2
+		    mpz_clear(bits); mpz_clear(tmp);
+		    return -1;
+d303 1
+a303 2
+	       mpz_clear(bits);
+	       mpz_clear(tmp);
+d306 1
+d309 1
+d313 1
+a313 1
+	  return -1;
+d316 1
+d318 4
+a321 3
+     mpz_set(st->modulus, p->modulus);
+     mpz_set(st->generator, p->generator);
+     return 0;
+d325 1
+a325 1
+exchange_set_generator(mpz_t generator, u_int8_t *scheme, u_int8_t *gen)
+d331 1
+a331 1
+	     mpz_set_ui(generator,2);
+d336 1
+a336 1
+	     mpz_set_ui(generator,3);
+d341 1
+a341 1
+             mpz_set_ui(generator,5); 
+d346 1
+a346 1
+	     return -1;
+d348 1
+a348 1
+	return 0;
+d359 1
+a359 1
+        mpz_t modulus,generator;
+d364 1
+a364 1
+	     return -1;
+d366 1
+a366 1
+	mpz_init(generator);
+d369 2
+a370 2
+	     mpz_clear(generator);
+	     return -1;
+d373 2
+a374 1
+	mpz_init_set_varpre(modulus, varpre);
+d377 3
+a379 3
+	     mpz_clear(modulus);
+	     mpz_clear(generator);
+	     return -1;
+d384 1
+a384 1
+	     return -1;
+d387 2
+a388 2
+	mpz_clear(modulus);
+	mpz_clear(generator);
+d391 1
+a391 1
+	return 1;
+@
+

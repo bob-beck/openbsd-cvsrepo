@@ -1,0 +1,569 @@
+head	1.4;
+access;
+symbols
+	OPENBSD_5_5:1.3.0.2
+	OPENBSD_5_5_BASE:1.3
+	v9_2_5:1.1.1.1
+	v9_2_3:1.1.1.1
+	v9_2_2:1.1.1.1
+	v9_2_1:1.1.1.1
+	v9_2_0:1.1.1.1
+	mesa:1.1.1
+	OPENBSD_5_0:1.1.0.6
+	OPENBSD_5_0_BASE:1.1
+	OPENBSD_4_9:1.1.0.2
+	OPENBSD_4_9_BASE:1.1
+	OPENBSD_4_8:1.1.0.4
+	OPENBSD_4_8_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.4
+date	2014.07.09.21.08.53;	author jsg;	state dead;
+branches;
+next	1.3;
+commitid	WPD6rgPryPkvXOr9;
+
+1.3
+date	2013.09.05.14.00.39;	author jsg;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2011.10.23.13.37.33;	author matthieu;	state dead;
+branches;
+next	1.1;
+
+1.1
+date	2010.05.22.20.06.06;	author matthieu;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	2013.09.05.13.11.35;	author jsg;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.4
+log
+@Merge Mesa 10.2.3
+tested by matthieu@@ kettenis@@ mpi@@ brett@@ and myself across a
+diverse range of hardware
+@
+text
+@/*
+ * Copyright 2012 Red Hat Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: Ben Skeggs
+ *
+ */
+
+#include "pipe/p_defines.h"
+#include "util/u_pack_color.h"
+
+#include "nouveau/nouveau_gldefs.h"
+#include "nouveau/nv_object.xml.h"
+#include "nv30-40_3d.xml.h"
+#include "nv30_context.h"
+#include "nv30_format.h"
+
+static INLINE uint32_t
+pack_rgba(enum pipe_format format, const float *rgba)
+{
+   union util_color uc;
+   util_pack_color(rgba, format, &uc);
+   return uc.ui;
+}
+
+static INLINE uint32_t
+pack_zeta(enum pipe_format format, double depth, unsigned stencil)
+{
+   uint32_t zuint = (uint32_t)(depth * 4294967295.0);
+   if (format != PIPE_FORMAT_Z16_UNORM)
+      return (zuint & 0xffffff00) | (stencil & 0xff);
+   return zuint >> 16;
+}
+
+static void
+nv30_clear(struct pipe_context *pipe, unsigned buffers,
+           const union pipe_color_union *color, double depth, unsigned stencil)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+   struct pipe_framebuffer_state *fb = &nv30->framebuffer;
+   uint32_t colr = 0, zeta = 0, mode = 0;
+
+   if (!nv30_state_validate(nv30, TRUE))
+      return;
+
+   if (buffers & PIPE_CLEAR_COLOR && fb->nr_cbufs) {
+      colr  = pack_rgba(fb->cbufs[0]->format, color->f);
+      mode |= NV30_3D_CLEAR_BUFFERS_COLOR_R |
+              NV30_3D_CLEAR_BUFFERS_COLOR_G |
+              NV30_3D_CLEAR_BUFFERS_COLOR_B |
+              NV30_3D_CLEAR_BUFFERS_COLOR_A;
+   }
+
+   if (fb->zsbuf) {
+      zeta = pack_zeta(fb->zsbuf->format, depth, stencil);
+      if (buffers & PIPE_CLEAR_DEPTH)
+         mode |= NV30_3D_CLEAR_BUFFERS_DEPTH;
+      if (buffers & PIPE_CLEAR_STENCIL)
+         mode |= NV30_3D_CLEAR_BUFFERS_STENCIL;
+   }
+
+   /*XXX: wtf? fixes clears sometimes not clearing on nv3x... */
+   if (nv30->screen->eng3d->oclass < NV40_3D_CLASS) {
+      BEGIN_NV04(push, NV30_3D(CLEAR_DEPTH_VALUE), 3);
+      PUSH_DATA (push, zeta);
+      PUSH_DATA (push, colr);
+      PUSH_DATA (push, mode);
+   }
+
+   BEGIN_NV04(push, NV30_3D(CLEAR_DEPTH_VALUE), 3);
+   PUSH_DATA (push, zeta);
+   PUSH_DATA (push, colr);
+   PUSH_DATA (push, mode);
+
+   nv30_state_release(nv30);
+}
+
+static void
+nv30_clear_render_target(struct pipe_context *pipe, struct pipe_surface *ps,
+                         const union pipe_color_union *color,
+                         unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nv30_surface *sf = nv30_surface(ps);
+   struct nv30_miptree *mt = nv30_miptree(ps->texture);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+   struct nouveau_object *eng3d = nv30->screen->eng3d;
+   struct nouveau_pushbuf_refn refn;
+   uint32_t rt_format;
+
+   rt_format = nv30_format(pipe->screen, ps->format)->hw;
+   if (util_format_get_blocksize(ps->format) == 4)
+      rt_format |= NV30_3D_RT_FORMAT_ZETA_Z24S8;
+   else
+      rt_format |= NV30_3D_RT_FORMAT_ZETA_Z16;
+
+   if (nv30_miptree(ps->texture)->swizzled) {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_SWIZZLED;
+      rt_format |= util_logbase2(sf->width) << 16;
+      rt_format |= util_logbase2(sf->height) << 24;
+   } else {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_LINEAR;
+   }
+
+   refn.bo = mt->base.bo;
+   refn.flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_WR;
+   if (nouveau_pushbuf_space(push, 16, 1, 0) ||
+       nouveau_pushbuf_refn (push, &refn, 1))
+      return;
+
+   BEGIN_NV04(push, NV30_3D(RT_ENABLE), 1);
+   PUSH_DATA (push, NV30_3D_RT_ENABLE_COLOR0);
+   BEGIN_NV04(push, NV30_3D(RT_HORIZ), 3);
+   PUSH_DATA (push, sf->width << 16);
+   PUSH_DATA (push, sf->height << 16);
+   PUSH_DATA (push, rt_format);
+   BEGIN_NV04(push, NV30_3D(COLOR0_PITCH), 2);
+   if (eng3d->oclass < NV40_3D_CLASS)
+      PUSH_DATA (push, (sf->pitch << 16) | sf->pitch);
+   else
+      PUSH_DATA (push, sf->pitch);
+   PUSH_RELOC(push, mt->base.bo, sf->offset, NOUVEAU_BO_LOW, 0, 0);
+   BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+   PUSH_DATA (push, (w << 16) | x);
+   PUSH_DATA (push, (h << 16) | y);
+
+   BEGIN_NV04(push, NV30_3D(CLEAR_COLOR_VALUE), 2);
+   PUSH_DATA (push, pack_rgba(ps->format, color->f));
+   PUSH_DATA (push, NV30_3D_CLEAR_BUFFERS_COLOR_R |
+                    NV30_3D_CLEAR_BUFFERS_COLOR_G |
+                    NV30_3D_CLEAR_BUFFERS_COLOR_B |
+                    NV30_3D_CLEAR_BUFFERS_COLOR_A);
+
+   nv30->dirty |= NV30_NEW_FRAMEBUFFER | NV30_NEW_SCISSOR;
+}
+
+static void
+nv30_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *ps,
+                         unsigned buffers, double depth, unsigned stencil,
+                         unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nv30_surface *sf = nv30_surface(ps);
+   struct nv30_miptree *mt = nv30_miptree(ps->texture);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+   struct nouveau_object *eng3d = nv30->screen->eng3d;
+   struct nouveau_pushbuf_refn refn;
+   uint32_t rt_format, mode = 0;
+
+   rt_format = nv30_format(pipe->screen, ps->format)->hw;
+   if (util_format_get_blocksize(ps->format) == 4)
+      rt_format |= NV30_3D_RT_FORMAT_COLOR_A8R8G8B8;
+   else
+      rt_format |= NV30_3D_RT_FORMAT_COLOR_R5G6B5;
+
+   if (nv30_miptree(ps->texture)->swizzled) {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_SWIZZLED;
+      rt_format |= util_logbase2(sf->width) << 16;
+      rt_format |= util_logbase2(sf->height) << 24;
+   } else {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_LINEAR;
+   }
+
+   if (buffers & PIPE_CLEAR_DEPTH)
+      mode |= NV30_3D_CLEAR_BUFFERS_DEPTH;
+   if (buffers & PIPE_CLEAR_STENCIL)
+      mode |= NV30_3D_CLEAR_BUFFERS_STENCIL;
+
+   refn.bo = mt->base.bo;
+   refn.flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_WR;
+   if (nouveau_pushbuf_space(push, 32, 1, 0) ||
+       nouveau_pushbuf_refn (push, &refn, 1))
+      return;
+
+   BEGIN_NV04(push, NV30_3D(RT_ENABLE), 1);
+   PUSH_DATA (push, 0);
+   BEGIN_NV04(push, NV30_3D(RT_HORIZ), 3);
+   PUSH_DATA (push, sf->width << 16);
+   PUSH_DATA (push, sf->height << 16);
+   PUSH_DATA (push, rt_format);
+   if (eng3d->oclass < NV40_3D_CLASS) {
+      BEGIN_NV04(push, NV30_3D(COLOR0_PITCH), 1);
+      PUSH_DATA (push, (sf->pitch << 16) | sf->pitch);
+   } else {
+      BEGIN_NV04(push, NV40_3D(ZETA_PITCH), 1);
+      PUSH_DATA (push, sf->pitch);
+   }
+   BEGIN_NV04(push, NV30_3D(ZETA_OFFSET), 1);
+   PUSH_RELOC(push, mt->base.bo, sf->offset, NOUVEAU_BO_LOW, 0, 0);
+   BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+   PUSH_DATA (push, (w << 16) | x);
+   PUSH_DATA (push, (h << 16) | y);
+
+   BEGIN_NV04(push, NV30_3D(CLEAR_DEPTH_VALUE), 1);
+   PUSH_DATA (push, pack_zeta(ps->format, depth, stencil));
+   BEGIN_NV04(push, NV30_3D(CLEAR_BUFFERS), 1);
+   PUSH_DATA (push, mode);
+
+   nv30->dirty |= NV30_NEW_FRAMEBUFFER | NV30_NEW_SCISSOR;
+}
+
+void
+nv30_clear_init(struct pipe_context *pipe)
+{
+   pipe->clear = nv30_clear;
+   pipe->clear_render_target = nv30_clear_render_target;
+   pipe->clear_depth_stencil = nv30_clear_depth_stencil;
+}
+@
+
+
+1.3
+log
+@Merge Mesa 9.2.0
+@
+text
+@@
+
+
+1.2
+log
+@Merge Mesa 7.10.3
+@
+text
+@d1 25
+a25 1
+#include "pipe/p_context.h"
+d27 1
+a27 2
+#include "pipe/p_state.h"
+#include "util/u_clear.h"
+d29 3
+d33 186
+d221 1
+a221 2
+nv30_clear(struct pipe_context *pipe, unsigned buffers,
+           const float *rgba, double depth, unsigned stencil)
+d223 3
+a225 2
+	util_clear(pipe, &nv30_context(pipe)->framebuffer, buffers, rgba, depth,
+		   stencil);
+@
+
+
+1.1
+log
+@Update to Mesa 7.8.1. Tested on a bulk ports build by naddy@@, ok oga@@.
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Import Mesa 9.2.0
+@
+text
+@d1 1
+a1 25
+/*
+ * Copyright 2012 Red Hat Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: Ben Skeggs
+ *
+ */
+
+d3 2
+a4 1
+#include "util/u_pack_color.h"
+a5 3
+#include "nouveau/nouveau_gldefs.h"
+#include "nouveau/nv_object.xml.h"
+#include "nv30-40_3d.xml.h"
+a6 1
+#include "nv30_format.h"
+d8 1
+a8 18
+static INLINE uint32_t
+pack_rgba(enum pipe_format format, const float *rgba)
+{
+   union util_color uc;
+   util_pack_color(rgba, format, &uc);
+   return uc.ui;
+}
+
+static INLINE uint32_t
+pack_zeta(enum pipe_format format, double depth, unsigned stencil)
+{
+   uint32_t zuint = (uint32_t)(depth * 4294967295.0);
+   if (format != PIPE_FORMAT_Z16_UNORM)
+      return (zuint & 0xffffff00) | (stencil & 0xff);
+   return zuint >> 16;
+}
+
+static void
+d10 1
+a10 168
+           const union pipe_color_union *color, double depth, unsigned stencil)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+   struct pipe_framebuffer_state *fb = &nv30->framebuffer;
+   uint32_t colr = 0, zeta = 0, mode = 0;
+
+   if (!nv30_state_validate(nv30, TRUE))
+      return;
+
+   if (buffers & PIPE_CLEAR_COLOR && fb->nr_cbufs) {
+      colr  = pack_rgba(fb->cbufs[0]->format, color->f);
+      mode |= NV30_3D_CLEAR_BUFFERS_COLOR_R |
+              NV30_3D_CLEAR_BUFFERS_COLOR_G |
+              NV30_3D_CLEAR_BUFFERS_COLOR_B |
+              NV30_3D_CLEAR_BUFFERS_COLOR_A;
+   }
+
+   if (fb->zsbuf) {
+      zeta = pack_zeta(fb->zsbuf->format, depth, stencil);
+      if (buffers & PIPE_CLEAR_DEPTH)
+         mode |= NV30_3D_CLEAR_BUFFERS_DEPTH;
+      if (buffers & PIPE_CLEAR_STENCIL)
+         mode |= NV30_3D_CLEAR_BUFFERS_STENCIL;
+   }
+
+   /*XXX: wtf? fixes clears sometimes not clearing on nv3x... */
+   if (nv30->screen->eng3d->oclass < NV40_3D_CLASS) {
+      BEGIN_NV04(push, NV30_3D(CLEAR_DEPTH_VALUE), 3);
+      PUSH_DATA (push, zeta);
+      PUSH_DATA (push, colr);
+      PUSH_DATA (push, mode);
+   }
+
+   BEGIN_NV04(push, NV30_3D(CLEAR_DEPTH_VALUE), 3);
+   PUSH_DATA (push, zeta);
+   PUSH_DATA (push, colr);
+   PUSH_DATA (push, mode);
+
+   nv30_state_release(nv30);
+}
+
+static void
+nv30_clear_render_target(struct pipe_context *pipe, struct pipe_surface *ps,
+                         const union pipe_color_union *color,
+                         unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nv30_surface *sf = nv30_surface(ps);
+   struct nv30_miptree *mt = nv30_miptree(ps->texture);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+   struct nouveau_object *eng3d = nv30->screen->eng3d;
+   struct nouveau_pushbuf_refn refn;
+   uint32_t rt_format;
+
+   rt_format = nv30_format(pipe->screen, ps->format)->hw;
+   if (util_format_get_blocksize(ps->format) == 4)
+      rt_format |= NV30_3D_RT_FORMAT_ZETA_Z24S8;
+   else
+      rt_format |= NV30_3D_RT_FORMAT_ZETA_Z16;
+
+   if (nv30_miptree(ps->texture)->swizzled) {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_SWIZZLED;
+      rt_format |= util_logbase2(sf->width) << 16;
+      rt_format |= util_logbase2(sf->height) << 24;
+   } else {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_LINEAR;
+   }
+
+   refn.bo = mt->base.bo;
+   refn.flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_WR;
+   if (nouveau_pushbuf_space(push, 16, 1, 0) ||
+       nouveau_pushbuf_refn (push, &refn, 1))
+      return;
+
+   BEGIN_NV04(push, NV30_3D(RT_ENABLE), 1);
+   PUSH_DATA (push, NV30_3D_RT_ENABLE_COLOR0);
+   BEGIN_NV04(push, NV30_3D(RT_HORIZ), 3);
+   PUSH_DATA (push, sf->width << 16);
+   PUSH_DATA (push, sf->height << 16);
+   PUSH_DATA (push, rt_format);
+   BEGIN_NV04(push, NV30_3D(COLOR0_PITCH), 2);
+   if (eng3d->oclass < NV40_3D_CLASS)
+      PUSH_DATA (push, (sf->pitch << 16) | sf->pitch);
+   else
+      PUSH_DATA (push, sf->pitch);
+   PUSH_RELOC(push, mt->base.bo, sf->offset, NOUVEAU_BO_LOW, 0, 0);
+   BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+   PUSH_DATA (push, (w << 16) | x);
+   PUSH_DATA (push, (h << 16) | y);
+
+   BEGIN_NV04(push, NV30_3D(CLEAR_COLOR_VALUE), 2);
+   PUSH_DATA (push, pack_rgba(ps->format, color->f));
+   PUSH_DATA (push, NV30_3D_CLEAR_BUFFERS_COLOR_R |
+                    NV30_3D_CLEAR_BUFFERS_COLOR_G |
+                    NV30_3D_CLEAR_BUFFERS_COLOR_B |
+                    NV30_3D_CLEAR_BUFFERS_COLOR_A);
+
+   nv30->dirty |= NV30_NEW_FRAMEBUFFER | NV30_NEW_SCISSOR;
+}
+
+static void
+nv30_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *ps,
+                         unsigned buffers, double depth, unsigned stencil,
+                         unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   struct nv30_context *nv30 = nv30_context(pipe);
+   struct nv30_surface *sf = nv30_surface(ps);
+   struct nv30_miptree *mt = nv30_miptree(ps->texture);
+   struct nouveau_pushbuf *push = nv30->base.pushbuf;
+   struct nouveau_object *eng3d = nv30->screen->eng3d;
+   struct nouveau_pushbuf_refn refn;
+   uint32_t rt_format, mode = 0;
+
+   rt_format = nv30_format(pipe->screen, ps->format)->hw;
+   if (util_format_get_blocksize(ps->format) == 4)
+      rt_format |= NV30_3D_RT_FORMAT_COLOR_A8R8G8B8;
+   else
+      rt_format |= NV30_3D_RT_FORMAT_COLOR_R5G6B5;
+
+   if (nv30_miptree(ps->texture)->swizzled) {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_SWIZZLED;
+      rt_format |= util_logbase2(sf->width) << 16;
+      rt_format |= util_logbase2(sf->height) << 24;
+   } else {
+      rt_format |= NV30_3D_RT_FORMAT_TYPE_LINEAR;
+   }
+
+   if (buffers & PIPE_CLEAR_DEPTH)
+      mode |= NV30_3D_CLEAR_BUFFERS_DEPTH;
+   if (buffers & PIPE_CLEAR_STENCIL)
+      mode |= NV30_3D_CLEAR_BUFFERS_STENCIL;
+
+   refn.bo = mt->base.bo;
+   refn.flags = NOUVEAU_BO_VRAM | NOUVEAU_BO_WR;
+   if (nouveau_pushbuf_space(push, 32, 1, 0) ||
+       nouveau_pushbuf_refn (push, &refn, 1))
+      return;
+
+   BEGIN_NV04(push, NV30_3D(RT_ENABLE), 1);
+   PUSH_DATA (push, 0);
+   BEGIN_NV04(push, NV30_3D(RT_HORIZ), 3);
+   PUSH_DATA (push, sf->width << 16);
+   PUSH_DATA (push, sf->height << 16);
+   PUSH_DATA (push, rt_format);
+   if (eng3d->oclass < NV40_3D_CLASS) {
+      BEGIN_NV04(push, NV30_3D(COLOR0_PITCH), 1);
+      PUSH_DATA (push, (sf->pitch << 16) | sf->pitch);
+   } else {
+      BEGIN_NV04(push, NV40_3D(ZETA_PITCH), 1);
+      PUSH_DATA (push, sf->pitch);
+   }
+   BEGIN_NV04(push, NV30_3D(ZETA_OFFSET), 1);
+   PUSH_RELOC(push, mt->base.bo, sf->offset, NOUVEAU_BO_LOW, 0, 0);
+   BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+   PUSH_DATA (push, (w << 16) | x);
+   PUSH_DATA (push, (h << 16) | y);
+
+   BEGIN_NV04(push, NV30_3D(CLEAR_DEPTH_VALUE), 1);
+   PUSH_DATA (push, pack_zeta(ps->format, depth, stencil));
+   BEGIN_NV04(push, NV30_3D(CLEAR_BUFFERS), 1);
+   PUSH_DATA (push, mode);
+
+   nv30->dirty |= NV30_NEW_FRAMEBUFFER | NV30_NEW_SCISSOR;
+}
+
+void
+nv30_clear_init(struct pipe_context *pipe)
+d12 2
+a13 3
+   pipe->clear = nv30_clear;
+   pipe->clear_render_target = nv30_clear_render_target;
+   pipe->clear_depth_stencil = nv30_clear_depth_stencil;
+@
+
+

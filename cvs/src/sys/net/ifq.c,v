@@ -1,0 +1,1037 @@
+head	1.9;
+access;
+symbols
+	OPENBSD_6_0:1.4.0.6
+	OPENBSD_6_0_BASE:1.4
+	OPENBSD_5_9:1.4.0.2
+	OPENBSD_5_9_BASE:1.4;
+locks; strict;
+comment	@ * @;
+
+
+1.9
+date	2017.03.07.15.42.02;	author mikeb;	state Exp;
+branches;
+next	1.8;
+commitid	9QEfcQWoNmJfXKm9;
+
+1.8
+date	2017.03.07.15.16.01;	author mikeb;	state Exp;
+branches;
+next	1.7;
+commitid	IAxebLLQN4lEbJ6g;
+
+1.7
+date	2017.03.07.01.29.53;	author dlg;	state Exp;
+branches;
+next	1.6;
+commitid	So70CRieBADFeXD4;
+
+1.6
+date	2017.01.24.03.57.35;	author dlg;	state Exp;
+branches;
+next	1.5;
+commitid	PERtGPXCvlLRRBr8;
+
+1.5
+date	2017.01.20.03.48.03;	author dlg;	state Exp;
+branches;
+next	1.4;
+commitid	GEDLRXNPd1XbyAED;
+
+1.4
+date	2015.12.29.12.35.43;	author dlg;	state Exp;
+branches;
+next	1.3;
+commitid	jmjQ2HY9jy7XMY4d;
+
+1.3
+date	2015.12.09.12.07.42;	author dlg;	state Exp;
+branches;
+next	1.2;
+commitid	KX6sfSDH2c6WR5Pg;
+
+1.2
+date	2015.12.09.03.22.39;	author dlg;	state Exp;
+branches;
+next	1.1;
+commitid	ORE7f8VM8QK0ujAk;
+
+1.1
+date	2015.12.08.10.06.12;	author dlg;	state Exp;
+branches;
+next	;
+commitid	VAQjlQNQBXJ725Km;
+
+
+desc
+@@
+
+
+1.9
+log
+@Change priq enqueue policy to drop lower priority packets
+
+The new priority queueing enqueue policy is such that when the
+aggregate queue depth of an outgoing queue is exceeded we attempt
+to find a non-empty queue of packets with lower priority than the
+priority of a packet we're trying to enqueue and if there's such
+queue, we drop the first packet from it.
+
+This ensures that high priority traffic will almost always find
+the place on the queue and low priority bulk traffic gets a better
+chance at regulating its throughput.  There's no change in the
+behavior if altered priorities are not used (e.g. via "set prio"
+Pf directive, VLAN priorities and so on).
+
+With a correction from dlg@@, additional tests by dhill@@
+OK bluhm, mpi
+@
+text
+@/*	$OpenBSD: ifq.c,v 1.8 2017/03/07 15:16:01 mikeb Exp $ */
+
+/*
+ * Copyright (c) 2015 David Gwynne <dlg@@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/socket.h>
+#include <sys/mbuf.h>
+#include <sys/proc.h>
+
+#include <net/if.h>
+#include <net/if_var.h>
+
+/*
+ * priq glue
+ */
+unsigned int	 priq_idx(unsigned int, const struct mbuf *);
+struct mbuf	*priq_enq(struct ifqueue *, struct mbuf *);
+struct mbuf	*priq_deq_begin(struct ifqueue *, void **);
+void		 priq_deq_commit(struct ifqueue *, struct mbuf *, void *);
+void		 priq_purge(struct ifqueue *, struct mbuf_list *);
+
+void		*priq_alloc(unsigned int, void *);
+void		 priq_free(unsigned int, void *);
+
+const struct ifq_ops priq_ops = {
+	priq_idx,
+	priq_enq,
+	priq_deq_begin,
+	priq_deq_commit,
+	priq_purge,
+	priq_alloc,
+	priq_free,
+};
+
+const struct ifq_ops * const ifq_priq_ops = &priq_ops;
+
+/*
+ * priq internal structures
+ */
+
+struct priq {
+	struct mbuf_list	 pq_lists[IFQ_NQUEUES];
+};
+
+/*
+ * ifqueue serialiser
+ */
+
+void	ifq_start_task(void *);
+void	ifq_restart_task(void *);
+void	ifq_barrier_task(void *);
+
+#define TASK_ONQUEUE 0x1
+
+void
+ifq_serialize(struct ifqueue *ifq, struct task *t)
+{
+	struct task work;
+
+	if (ISSET(t->t_flags, TASK_ONQUEUE))
+		return;
+
+	mtx_enter(&ifq->ifq_task_mtx);
+	if (!ISSET(t->t_flags, TASK_ONQUEUE)) {
+		SET(t->t_flags, TASK_ONQUEUE);
+		TAILQ_INSERT_TAIL(&ifq->ifq_task_list, t, t_entry);
+	}
+
+	if (ifq->ifq_serializer == NULL) {
+		ifq->ifq_serializer = curcpu();
+
+		while ((t = TAILQ_FIRST(&ifq->ifq_task_list)) != NULL) {
+			TAILQ_REMOVE(&ifq->ifq_task_list, t, t_entry);
+			CLR(t->t_flags, TASK_ONQUEUE);
+			work = *t; /* copy to caller to avoid races */
+
+			mtx_leave(&ifq->ifq_task_mtx);
+
+			(*work.t_func)(work.t_arg);
+
+			mtx_enter(&ifq->ifq_task_mtx);
+		}
+
+		ifq->ifq_serializer = NULL;
+	}
+	mtx_leave(&ifq->ifq_task_mtx);
+}
+
+int
+ifq_is_serialized(struct ifqueue *ifq)
+{
+	return (ifq->ifq_serializer == curcpu());
+}
+
+void
+ifq_start_task(void *p)
+{
+	struct ifqueue *ifq = p;
+	struct ifnet *ifp = ifq->ifq_if;
+
+	if (!ISSET(ifp->if_flags, IFF_RUNNING) ||
+	    ifq_empty(ifq) || ifq_is_oactive(ifq))
+		return;
+
+	ifp->if_qstart(ifq);
+}
+
+void
+ifq_restart_task(void *p)
+{
+	struct ifqueue *ifq = p;
+	struct ifnet *ifp = ifq->ifq_if;
+
+	ifq_clr_oactive(ifq);
+	ifp->if_qstart(ifq);
+}
+
+void
+ifq_barrier(struct ifqueue *ifq)
+{
+	struct sleep_state sls;
+	unsigned int notdone = 1;
+	struct task t = TASK_INITIALIZER(ifq_barrier_task, &notdone);
+
+	/* this should only be called from converted drivers */
+	KASSERT(ISSET(ifq->ifq_if->if_xflags, IFXF_MPSAFE));
+
+	if (ifq->ifq_serializer == NULL)
+		return;
+
+	ifq_serialize(ifq, &t);
+
+	while (notdone) {
+		sleep_setup(&sls, &notdone, PWAIT, "ifqbar");
+		sleep_finish(&sls, notdone);
+	}
+}
+
+void
+ifq_barrier_task(void *p)
+{
+	unsigned int *notdone = p;
+
+	*notdone = 0;
+	wakeup_one(notdone);
+}
+
+/*
+ * ifqueue mbuf queue API
+ */
+
+void
+ifq_init(struct ifqueue *ifq, struct ifnet *ifp, unsigned int idx)
+{
+	ifq->ifq_if = ifp;
+	ifq->ifq_softc = NULL;
+
+	mtx_init(&ifq->ifq_mtx, IPL_NET);
+	ifq->ifq_qdrops = 0;
+
+	/* default to priq */
+	ifq->ifq_ops = &priq_ops;
+	ifq->ifq_q = priq_ops.ifqop_alloc(idx, NULL);
+
+	ifq->ifq_len = 0;
+
+	ifq->ifq_packets = 0;
+	ifq->ifq_bytes = 0;
+	ifq->ifq_qdrops = 0;
+	ifq->ifq_errors = 0;
+	ifq->ifq_mcasts = 0;
+
+	mtx_init(&ifq->ifq_task_mtx, IPL_NET);
+	TAILQ_INIT(&ifq->ifq_task_list);
+	ifq->ifq_serializer = NULL;
+
+	task_set(&ifq->ifq_start, ifq_start_task, ifq);
+	task_set(&ifq->ifq_restart, ifq_restart_task, ifq);
+
+	if (ifq->ifq_maxlen == 0)
+		ifq_set_maxlen(ifq, IFQ_MAXLEN);
+
+	ifq->ifq_idx = idx;
+}
+
+void
+ifq_attach(struct ifqueue *ifq, const struct ifq_ops *newops, void *opsarg)
+{
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+	struct mbuf_list free_ml = MBUF_LIST_INITIALIZER();
+	struct mbuf *m;
+	const struct ifq_ops *oldops;
+	void *newq, *oldq;
+
+	newq = newops->ifqop_alloc(ifq->ifq_idx, opsarg);
+
+	mtx_enter(&ifq->ifq_mtx);
+	ifq->ifq_ops->ifqop_purge(ifq, &ml);
+	ifq->ifq_len = 0;
+
+	oldops = ifq->ifq_ops;
+	oldq = ifq->ifq_q;
+
+	ifq->ifq_ops = newops;
+	ifq->ifq_q = newq;
+
+	while ((m = ml_dequeue(&ml)) != NULL) {
+		m = ifq->ifq_ops->ifqop_enq(ifq, m);
+		if (m != NULL) {
+			ifq->ifq_qdrops++;
+			ml_enqueue(&free_ml, m);
+		} else
+			ifq->ifq_len++;
+	}
+	mtx_leave(&ifq->ifq_mtx);
+
+	oldops->ifqop_free(ifq->ifq_idx, oldq);
+
+	ml_purge(&free_ml);
+}
+
+void
+ifq_destroy(struct ifqueue *ifq)
+{
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+
+	/* don't need to lock because this is the last use of the ifq */
+
+	ifq->ifq_ops->ifqop_purge(ifq, &ml);
+	ifq->ifq_ops->ifqop_free(ifq->ifq_idx, ifq->ifq_q);
+
+	ml_purge(&ml);
+}
+
+int
+ifq_enqueue(struct ifqueue *ifq, struct mbuf *m)
+{
+	struct mbuf *dm;
+
+	mtx_enter(&ifq->ifq_mtx);
+	dm = ifq->ifq_ops->ifqop_enq(ifq, m);
+	if (dm != m) {
+		ifq->ifq_packets++;
+		ifq->ifq_bytes += m->m_pkthdr.len;
+		if (ISSET(m->m_flags, M_MCAST))
+			ifq->ifq_mcasts++;
+	}
+
+	if (dm == NULL)
+		ifq->ifq_len++;
+	else
+		ifq->ifq_qdrops++;
+	mtx_leave(&ifq->ifq_mtx);
+
+	if (dm != NULL)
+		m_freem(dm);
+
+	return (dm == m ? ENOBUFS : 0);
+}
+
+struct mbuf *
+ifq_deq_begin(struct ifqueue *ifq)
+{
+	struct mbuf *m = NULL;
+	void *cookie;
+
+	mtx_enter(&ifq->ifq_mtx);
+	if (ifq->ifq_len == 0 ||
+	    (m = ifq->ifq_ops->ifqop_deq_begin(ifq, &cookie)) == NULL) {
+		mtx_leave(&ifq->ifq_mtx);
+		return (NULL);
+	}
+
+	m->m_pkthdr.ph_cookie = cookie;
+
+	return (m);
+}
+
+void
+ifq_deq_commit(struct ifqueue *ifq, struct mbuf *m)
+{
+	void *cookie;
+
+	KASSERT(m != NULL);
+	cookie = m->m_pkthdr.ph_cookie;
+
+	ifq->ifq_ops->ifqop_deq_commit(ifq, m, cookie);
+	ifq->ifq_len--;
+	mtx_leave(&ifq->ifq_mtx);
+}
+
+void
+ifq_deq_rollback(struct ifqueue *ifq, struct mbuf *m)
+{
+	KASSERT(m != NULL);
+
+	mtx_leave(&ifq->ifq_mtx);
+}
+
+struct mbuf *
+ifq_dequeue(struct ifqueue *ifq)
+{
+	struct mbuf *m;
+
+	m = ifq_deq_begin(ifq);
+	if (m == NULL)
+		return (NULL);
+
+	ifq_deq_commit(ifq, m);
+
+	return (m);
+}
+
+unsigned int
+ifq_purge(struct ifqueue *ifq)
+{
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+	unsigned int rv;
+
+	mtx_enter(&ifq->ifq_mtx);
+	ifq->ifq_ops->ifqop_purge(ifq, &ml);
+	rv = ifq->ifq_len;
+	ifq->ifq_len = 0;
+	ifq->ifq_qdrops += rv;
+	mtx_leave(&ifq->ifq_mtx);
+
+	KASSERT(rv == ml_len(&ml));
+
+	ml_purge(&ml);
+
+	return (rv);
+}
+
+void *
+ifq_q_enter(struct ifqueue *ifq, const struct ifq_ops *ops)
+{
+	mtx_enter(&ifq->ifq_mtx);
+	if (ifq->ifq_ops == ops)
+		return (ifq->ifq_q);
+
+	mtx_leave(&ifq->ifq_mtx);
+
+	return (NULL);
+}
+
+void
+ifq_q_leave(struct ifqueue *ifq, void *q)
+{
+	KASSERT(q == ifq->ifq_q);
+	mtx_leave(&ifq->ifq_mtx);
+}
+
+/*
+ * priq implementation
+ */
+
+unsigned int
+priq_idx(unsigned int nqueues, const struct mbuf *m)
+{
+	unsigned int flow = 0;
+
+	if (ISSET(m->m_pkthdr.ph_flowid, M_FLOWID_VALID))
+		flow = m->m_pkthdr.ph_flowid & M_FLOWID_MASK;
+
+	return (flow % nqueues);
+}
+
+void *
+priq_alloc(unsigned int idx, void *null)
+{
+	struct priq *pq;
+	int i;
+
+	pq = malloc(sizeof(struct priq), M_DEVBUF, M_WAITOK);
+	for (i = 0; i < IFQ_NQUEUES; i++)
+		ml_init(&pq->pq_lists[i]);
+	return (pq);
+}
+
+void
+priq_free(unsigned int idx, void *pq)
+{
+	free(pq, M_DEVBUF, sizeof(struct priq));
+}
+
+struct mbuf *
+priq_enq(struct ifqueue *ifq, struct mbuf *m)
+{
+	struct priq *pq;
+	struct mbuf_list *pl;
+	struct mbuf *n = NULL;
+	unsigned int prio;
+
+	pq = ifq->ifq_q;
+	KASSERT(m->m_pkthdr.pf.prio <= IFQ_MAXPRIO);
+
+	/* Find a lower priority queue to drop from */
+	if (ifq_len(ifq) >= ifq->ifq_maxlen) {
+		for (prio = 0; prio < m->m_pkthdr.pf.prio; prio++) {
+			pl = &pq->pq_lists[prio];
+			if (ml_len(pl) > 0) {
+				n = ml_dequeue(pl);
+				goto enqueue;
+			}
+		}
+		/*
+		 * There's no lower priority queue that we can
+		 * drop from so don't enqueue this one.
+		 */
+		return (m);
+	}
+
+ enqueue:
+	pl = &pq->pq_lists[m->m_pkthdr.pf.prio];
+	ml_enqueue(pl, m);
+
+	return (n);
+}
+
+struct mbuf *
+priq_deq_begin(struct ifqueue *ifq, void **cookiep)
+{
+	struct priq *pq = ifq->ifq_q;
+	struct mbuf_list *pl;
+	unsigned int prio = nitems(pq->pq_lists);
+	struct mbuf *m;
+
+	do {
+		pl = &pq->pq_lists[--prio];
+		m = MBUF_LIST_FIRST(pl);
+		if (m != NULL) {
+			*cookiep = pl;
+			return (m);
+		}
+	} while (prio > 0);
+
+	return (NULL);
+}
+
+void
+priq_deq_commit(struct ifqueue *ifq, struct mbuf *m, void *cookie)
+{
+	struct mbuf_list *pl = cookie;
+
+	KASSERT(MBUF_LIST_FIRST(pl) == m);
+
+	ml_dequeue(pl);
+}
+
+void
+priq_purge(struct ifqueue *ifq, struct mbuf_list *ml)
+{
+	struct priq *pq = ifq->ifq_q;
+	struct mbuf_list *pl;
+	unsigned int prio = nitems(pq->pq_lists);
+
+	do {
+		pl = &pq->pq_lists[--prio];
+		ml_enlist(ml, pl);
+	} while (prio > 0);
+}
+@
+
+
+1.8
+log
+@Convert priority queue lists to mbuf_lists
+
+This simplifies the code quite a bit making it easier to reason about.
+dlg@@ has begrudgingly submitted to populism, OK bluhm, mpi
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.7 2017/03/07 01:29:53 dlg Exp $ */
+d406 2
+d409 16
+a424 1
+	if (ifq_len(ifq) >= ifq->ifq_maxlen)
+d426 1
+d428 1
+a428 2
+	pq = ifq->ifq_q;
+	KASSERT(m->m_pkthdr.pf.prio <= IFQ_MAXPRIO);
+a429 1
+
+d432 1
+a432 1
+	return (NULL);
+@
+
+
+1.7
+log
+@deprecate ifq_enqueue_try, and let backends drop arbitrary mbufs.
+
+mikeb@@ wants priq to be able to drop lower priority packets if the
+current one is high. because ifq avoids freeing an mbuf while an
+ifq mutex is held, he needs a way for a backend to return an arbitrary
+mbuf to drop rather than signal that the current one needs to be
+dropped.
+
+this lets the backends return the mbuf to be dropped, which may or
+may not be the current one.
+
+to support this ifq_enqueue_try has to be dropped because it can
+only signal about the current mbuf. nothing uses it (except
+ifq_enqueue), so we can get rid of it. it wasnt even documented.
+
+this diff includes some tweaks by mikeb@@ around the statistics
+gathered in ifq_enqueue when an mbuf is dropped.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.6 2017/01/24 03:57:35 dlg Exp $ */
+a55 5
+struct priq_list {
+	struct mbuf		*head;
+	struct mbuf		*tail;
+};
+
+d57 1
+a57 1
+	struct priq_list	 pq_lists[IFQ_NQUEUES];
+d386 7
+a392 1
+	return (malloc(sizeof(struct priq), M_DEVBUF, M_WAITOK | M_ZERO));
+d405 1
+a405 1
+	struct priq_list *pl;
+d414 1
+a414 6
+	m->m_nextpkt = NULL;
+	if (pl->tail == NULL)
+		pl->head = m;
+	else
+		pl->tail->m_nextpkt = m;
+	pl->tail = m;
+d423 1
+a423 1
+	struct priq_list *pl;
+d429 1
+a429 1
+		m = pl->head;
+d442 1
+a442 1
+	struct priq_list *pl = cookie;
+d444 1
+a444 1
+	KASSERT(pl->head == m);
+d446 1
+a446 5
+	pl->head = m->m_nextpkt;
+	m->m_nextpkt = NULL;
+
+	if (pl->head == NULL)
+		pl->tail = NULL;
+d453 1
+a453 1
+	struct priq_list *pl;
+a454 1
+	struct mbuf *m, *n;
+d458 1
+a458 7
+
+		for (m = pl->head; m != NULL; m = n) {
+			n = m->m_nextpkt;
+			ml_enqueue(ml, m);
+		}
+
+		pl->head = pl->tail = NULL;
+@
+
+
+1.6
+log
+@add support for multiple transmit ifqueues per network interface.
+
+an ifq to transmit a packet is picked by the current traffic
+conditioner (ie, priq or hfsc) by providing an index into an array
+of ifqs. by default interfaces get a single ifq but can ask for
+more using if_attach_queues().
+
+the vast majority of our drivers still think there's a 1:1 mapping
+between interfaces and transmit queues, so their if_start routines
+take an ifnet pointer instead of a pointer to the ifqueue struct.
+instead of changing all the drivers in the tree, drivers can opt
+into using an if_qstart routine and setting the IFXF_MPSAFE flag.
+the stack provides a compatability wrapper from the new if_qstart
+handler to the previous if_start handlers if IFXF_MPSAFE isnt set.
+
+enabling hfsc on an interface configures it to transmit everything
+through the first ifq. any other ifqs are left configured as priq,
+but unused, when hfsc is enabled.
+
+getting this in now so everyone can kick the tyres.
+
+ok mpi@@ visa@@ (who provided some tweaks for cnmac).
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.5 2017/01/20 03:48:03 dlg Exp $ */
+d32 1
+a32 1
+int		 priq_enq(struct ifqueue *, struct mbuf *);
+d228 2
+a229 1
+		if (ifq->ifq_ops->ifqop_enq(ifq, m) != 0) {
+d256 1
+a256 1
+ifq_enqueue_try(struct ifqueue *ifq, struct mbuf *m)
+d258 1
+a258 1
+	int rv;
+d261 2
+a262 4
+	rv = ifq->ifq_ops->ifqop_enq(ifq, m);
+	if (rv == 0) {
+		ifq->ifq_len++;
+
+d267 5
+a271 1
+	} else
+d275 2
+a276 2
+	return (rv);
+}
+d278 1
+a278 10
+int
+ifq_enqueue(struct ifqueue *ifq, struct mbuf *m)
+{
+	int err;
+
+	err = ifq_enqueue_try(ifq, m);
+	if (err != 0)
+		m_freem(m);
+
+	return (err);
+d400 1
+a400 1
+int
+d407 1
+a407 1
+		return (ENOBUFS);
+d420 1
+a420 1
+	return (0);
+@
+
+
+1.5
+log
+@keep output packet counters on the ifq structure.
+
+these copy what is counted on the output path on the ifnet struct,
+except ifq counts both packets and bytes when a packet is queued
+instead of just the bytes.
+
+all the counters are protected by the ifq mutex except for ifq_errors,
+which can be updated safely from inside a start routine because the
+ifq machinery serialises them.
+
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.4 2015/12/29 12:35:43 dlg Exp $ */
+d31 1
+a31 2
+void		*priq_alloc(void *);
+void		 priq_free(void *);
+d37 3
+d41 1
+a41 2
+	priq_alloc,
+	priq_free,
+d46 2
+d125 1
+a125 1
+	ifp->if_start(ifp);
+d135 1
+a135 1
+	ifp->if_start(ifp);
+d173 1
+a173 1
+ifq_init(struct ifqueue *ifq, struct ifnet *ifp)
+d176 1
+d183 1
+a183 1
+	ifq->ifq_q = priq_ops.ifqop_alloc(NULL);
+d187 6
+d202 2
+d215 1
+a215 1
+	newq = newops->ifqop_alloc(opsarg);
+d236 1
+a236 1
+	oldops->ifqop_free(oldq);
+d249 1
+a249 1
+	ifq->ifq_ops->ifqop_free(ifq->ifq_q);
+d383 11
+d395 1
+a395 1
+priq_alloc(void *null)
+d401 1
+a401 1
+priq_free(void *pq)
+@
+
+
+1.4
+log
+@store curcpu() in ifq_serializer so we can check it.
+
+this in turn gives us ifq_is_serialized() and an IFQ_ASSERT_SERIALIZED()
+macro.
+
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.3 2015/12/09 12:07:42 dlg Exp $ */
+d175 1
+a175 1
+	ifq->ifq_drops = 0;
+d217 1
+a217 1
+			ifq->ifq_drops++;
+d249 1
+a249 1
+	if (rv == 0)
+d251 7
+a257 2
+	else
+		ifq->ifq_drops++;
+d338 1
+a338 1
+	ifq->ifq_drops += rv;
+@
+
+
+1.3
+log
+@rework ifq_serialise to avoid some atomic ops.
+
+now both the list of work and the flag saying if something is
+running the list are protected by a single mutex. it cuts the
+number of interlocked ops for an uncontended run of the queue from
+5 down to 2.
+
+jmatthew likes it.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.2 2015/12/09 03:22:39 dlg Exp $ */
+d86 2
+a87 2
+	if (ifq->ifq_serializer == 0) {
+		ifq->ifq_serializer = 1;
+d101 1
+a101 1
+		ifq->ifq_serializer = 0;
+d106 6
+d145 1
+a145 1
+	if (ifq->ifq_serializer == 0)
+d185 1
+a185 1
+	ifq->ifq_serializer = 0;
+@
+
+
+1.2
+log
+@rework the if_start mpsafe serialisation so it can serialise arbitrary work
+
+work is represented by struct task.
+
+the start routine is now wrapped by a task which is serialised by the
+infrastructure. if_start_barrier has been renamed to ifq_barrier and
+is now implemented as a task that gets serialised with the start
+routine.
+
+this also adds an ifq_restart() function. it serialises a call to
+ifq_clr_oactive and calls the start routine again. it exists to
+avoid a race that kettenis@@ identified in between when a start
+routine discovers theres no space left on a ring, and when it calls
+ifq_set_oactive. if the txeof side of the driver empties the ring
+and calls ifq_clr_oactive in between the above calls in start, the
+queue will be marked oactive and the stack will never call the start
+routine again.
+
+by serialising the ifq_set_oactive call in the start routine and
+ifq_clr_oactive calls we avoid that race.
+
+tested on various nics
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$ */
+a23 1
+#include <sys/atomic.h>
+a71 35
+static inline unsigned int
+ifq_enter(struct ifqueue *ifq)
+{
+	return (atomic_inc_int_nv(&ifq->ifq_serializer) == 1);
+}
+
+static inline unsigned int
+ifq_leave(struct ifqueue *ifq)
+{
+	return (atomic_cas_uint(&ifq->ifq_serializer, 1, 0) == 1);
+}
+
+static inline int
+ifq_next_task(struct ifqueue *ifq, struct task *work)
+{
+	struct task *t;
+	int rv = 0;
+
+	ifq->ifq_serializer = 1;
+
+	mtx_enter(&ifq->ifq_task_mtx);
+	t = TAILQ_FIRST(&ifq->ifq_task_list);
+	if (t != NULL) {
+		TAILQ_REMOVE(&ifq->ifq_task_list, t, t_entry);
+		CLR(t->t_flags, TASK_ONQUEUE);
+
+		*work = *t; /* copy to caller to avoid races */
+
+		rv = 1;
+	}
+	mtx_leave(&ifq->ifq_task_mtx);
+
+	return (rv);
+}
+
+a84 1
+	mtx_leave(&ifq->ifq_task_mtx);
+d86 9
+a94 2
+	if (!ifq_enter(ifq))
+		return;
+a95 2
+	do {
+		while (ifq_next_task(ifq, &work))
+d98 6
+a103 1
+	} while (!ifq_leave(ifq));
+@
+
+
+1.1
+log
+@split the interface send queue (struct ifqueue) implementation out.
+
+the intention is to make it more clear what belongs to a transmit
+queue and what belongs to an interface.
+
+suggested by and ok mpi@@
+@
+text
+@d67 6
+d82 8
+a89 2
+	if (atomic_cas_uint(&ifq->ifq_serializer, 1, 0) == 1)
+		return (1);
+d93 13
+a105 1
+	return (0);
+d109 1
+a109 1
+if_start_mpsafe(struct ifnet *ifp)
+d111 11
+a121 1
+	struct ifqueue *ifq = &ifp->if_snd;
+d127 15
+a141 5
+		if (__predict_false(!ISSET(ifp->if_flags, IFF_RUNNING))) {
+			ifq->ifq_serializer = 0;
+			wakeup_one(&ifq->ifq_serializer);
+			return;
+		}
+d143 2
+a144 2
+		if (ifq_empty(ifq) || ifq_is_oactive(ifq))
+			continue;
+d146 5
+a150 1
+		ifp->if_start(ifp);
+d152 2
+a153 1
+	} while (!ifq_leave(ifq));
+d157 1
+a157 1
+if_start_barrier(struct ifnet *ifp)
+d160 2
+a161 1
+	struct ifqueue *ifq = &ifp->if_snd;
+d164 1
+a164 4
+	KASSERT(ISSET(ifp->if_xflags, IFXF_MPSAFE));
+
+	/* drivers should only call this on the way down */
+	KASSERT(!ISSET(ifp->if_flags, IFF_RUNNING));
+d169 15
+a183 5
+	if_start_mpsafe(ifp); /* spin the wheel to guarantee a wakeup */
+	do {
+		sleep_setup(&sls, &ifq->ifq_serializer, PWAIT, "ifbar");
+		sleep_finish(&sls, ifq->ifq_serializer != 0);
+	} while (ifq->ifq_serializer != 0);
+d191 1
+a191 1
+ifq_init(struct ifqueue *ifq)
+d193 2
+d202 4
+d207 3
+a209 1
+	ifq->ifq_len = 0;
+@
+

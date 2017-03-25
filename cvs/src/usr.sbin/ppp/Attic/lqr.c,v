@@ -1,0 +1,575 @@
+head	1.8;
+access;
+symbols
+	OPENBSD_2_3:1.5.0.2
+	OPENBSD_2_3_BASE:1.5
+	PPP1_5:1.1.1.1
+	BRIAN:1.1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.8
+date	98.08.31.00.21.07;	author brian;	state dead;
+branches;
+next	1.7;
+
+1.7
+date	98.06.28.09.41.41;	author brian;	state Exp;
+branches;
+next	1.6;
+
+1.6
+date	98.06.26.19.07.14;	author brian;	state Exp;
+branches;
+next	1.5;
+
+1.5
+date	98.03.13.00.56.24;	author brian;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	98.03.12.02.40.42;	author brian;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	98.01.21.02.13.35;	author brian;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	98.01.11.17.54.47;	author brian;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	97.11.23.20.27.34;	author brian;	state Exp;
+branches
+	1.1.1.1;
+next	;
+
+1.1.1.1
+date	97.11.23.20.27.34;	author brian;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.8
+log
+@Upgrade ppp to version 2.0
+
+This adds a number of features including:
+o Multilink
+o Callback (including CBCP)
+o DNS negotiation (client & server)
+o Easy to configure masquerading/packet aliasing
+o Any number of diagnostic socket connections (limits DOS attacks)
+o Sticky routes (ppp updates the routing table when the IP number is changed)
+
+See the file README.changes for things that effect current
+configurations.
+@
+text
+@/*
+ *	      PPP Line Quality Monitoring (LQM) Module
+ *
+ *	    Written by Toshiharu OHNO (tony-o@@iij.ad.jp)
+ *
+ *   Copyright (C) 1993, Internet Initiative Japan, Inc. All rights reserverd.
+ *
+ * Redistribution and use in source and binary forms are permitted
+ * provided that the above copyright notice and this paragraph are
+ * duplicated in all such forms and that any documentation,
+ * advertising materials, and other materials related to such
+ * distribution and use acknowledge that the software was developed
+ * by the Internet Initiative Japan, Inc.  The name of the
+ * IIJ may not be used to endorse or promote products derived
+ * from this software without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * $Id: lqr.c,v 1.7 1998/06/28 09:41:41 brian Exp $
+ *
+ *	o LQR based on RFC1333
+ *
+ * TODO:
+ *	o LQM policy
+ *	o Allow user to configure LQM method and interval.
+ */
+#include <sys/param.h>
+#include <netinet/in.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include "command.h"
+#include "mbuf.h"
+#include "log.h"
+#include "defs.h"
+#include "timer.h"
+#include "fsm.h"
+#include "lcpproto.h"
+#include "lqr.h"
+#include "hdlc.h"
+#include "lcp.h"
+#include "loadalias.h"
+#include "vars.h"
+
+struct lqrdata MyLqrData, HisLqrData;
+struct lqrsave HisLqrSave;
+
+static struct pppTimer LqrTimer;
+
+static u_int32_t lastpeerin = (u_int32_t) - 1;
+
+static int lqmmethod;
+static u_int32_t echoseq;
+static u_int32_t gotseq;
+static int lqrsendcnt;
+
+struct echolqr {
+  u_int32_t magic;
+  u_int32_t signature;
+  u_int32_t sequence;
+};
+
+#define	SIGNATURE  0x594e4f54
+
+static void
+SendEchoReq(void)
+{
+  struct fsm *fp = &LcpFsm;
+  struct echolqr *lqr, lqrdata;
+
+  if (fp->state == ST_OPENED) {
+    lqr = &lqrdata;
+    lqr->magic = htonl(LcpInfo.want_magic);
+    lqr->signature = htonl(SIGNATURE);
+    LogPrintf(LogLQM, "Send echo LQR [%d]\n", echoseq);
+    lqr->sequence = htonl(echoseq++);
+    FsmOutput(fp, CODE_ECHOREQ, fp->reqid++,
+	      (u_char *) lqr, sizeof(struct echolqr));
+  }
+}
+
+void
+RecvEchoLqr(struct mbuf * bp)
+{
+  struct echolqr *lqr;
+  u_int32_t seq;
+
+  if (plength(bp) == sizeof(struct echolqr)) {
+    lqr = (struct echolqr *) MBUF_CTOP(bp);
+    if (htonl(lqr->signature) == SIGNATURE) {
+      seq = ntohl(lqr->sequence);
+      LogPrintf(LogLQM, "Got echo LQR [%d]\n", ntohl(lqr->sequence));
+      /* careful not to update gotseq with older values */
+      if ((gotseq > (u_int32_t)0 - 5 && seq < 5) ||
+          (gotseq <= (u_int32_t)0 - 5 && seq > gotseq))
+        gotseq = seq;
+    }
+  }
+}
+
+void
+LqrChangeOrder(struct lqrdata * src, struct lqrdata * dst)
+{
+  u_int32_t *sp, *dp;
+  int n;
+
+  sp = (u_int32_t *) src;
+  dp = (u_int32_t *) dst;
+  for (n = 0; n < sizeof(struct lqrdata) / sizeof(u_int32_t); n++)
+    *dp++ = ntohl(*sp++);
+}
+
+static void
+SendLqrReport(void *v)
+{
+  struct mbuf *bp;
+
+  StopTimer(&LqrTimer);
+
+  if (lqmmethod & LQM_LQR) {
+    if (lqrsendcnt > 5) {
+      /*
+       * XXX: Should implement LQM strategy
+       */
+      LogPrintf(LogPHASE, "** Too many LQR packets lost **\n");
+      LogPrintf(LogLQM, "LqrOutput: Too many LQR packets lost\n");
+      lqmmethod = 0;		/* Prevent recursion via LcpClose() */
+      reconnect(RECON_TRUE);
+      LcpClose();
+    } else {
+      bp = mballoc(sizeof(struct lqrdata), MB_LQR);
+      HdlcOutput(PRI_LINK, PROTO_LQR, bp);
+      lqrsendcnt++;
+    }
+  } else if (lqmmethod & LQM_ECHO) {
+    if ((echoseq > 5 && echoseq - 5 > gotseq) ||
+        (echoseq <= 5 && echoseq > gotseq + 5)) {
+      LogPrintf(LogPHASE, "** Too many ECHO LQR packets lost **\n");
+      LogPrintf(LogLQM, "LqrOutput: Too many ECHO LQR packets lost\n");
+      lqmmethod = 0;		/* Prevent recursion via LcpClose() */
+      reconnect(RECON_TRUE);
+      LcpClose();
+    } else
+      SendEchoReq();
+  }
+  if (lqmmethod && LqrTimer.load)
+    StartTimer(&LqrTimer);
+}
+
+void
+LqrInput(struct mbuf * bp)
+{
+  int len;
+  u_char *cp;
+  struct lqrdata *lqr;
+
+  len = plength(bp);
+  if (len != sizeof(struct lqrdata)) {
+    pfree(bp);
+    return;
+  }
+  if (!Acceptable(ConfLqr)) {
+    bp->offset -= 2;
+    bp->cnt += 2;
+
+    cp = MBUF_CTOP(bp);
+    LcpSendProtoRej(cp, bp->cnt);
+  } else {
+    cp = MBUF_CTOP(bp);
+    lqr = (struct lqrdata *) cp;
+    if (ntohl(lqr->MagicNumber) != LcpInfo.his_magic) {
+      LogPrintf(LogERROR, "LqrInput: magic %x != expecting %x\n",
+		ntohl(lqr->MagicNumber), LcpInfo.his_magic);
+      pfree(bp);
+      return;
+    }
+
+    /*
+     * Convert byte order and save into our strage
+     */
+    LqrChangeOrder(lqr, &HisLqrData);
+    LqrDump("LqrInput", &HisLqrData);
+    lqrsendcnt = 0;		/* we have received LQR from peer */
+
+    /*
+     * Generate an LQR response to peer we're not running LQR timer OR
+     * two successive LQR's PeerInLQRs are same OR we're not going to
+     * send our next one before the peers max timeout.
+     */
+    if (LqrTimer.load == 0 || lastpeerin == HisLqrData.PeerInLQRs ||
+        (LqrTimer.arg &&
+         LqrTimer.rest * 100 / SECTICKS > (u_long)LqrTimer.arg)) {
+      lqmmethod |= LQM_LQR;
+      SendLqrReport(LqrTimer.arg);
+    }
+    lastpeerin = HisLqrData.PeerInLQRs;
+  }
+  pfree(bp);
+}
+
+/*
+ *  When LCP is reached to opened state, We'll start LQM activity.
+ */
+void
+StartLqm()
+{
+  struct lcpstate *lcp = &LcpInfo;
+
+  lqrsendcnt = 0;		/* start waiting all over for ECHOs */
+  echoseq = 0;
+  gotseq = 0;
+  memset(&HisLqrData, '\0', sizeof HisLqrData);
+
+  lqmmethod = LQM_ECHO;
+  if (Enabled(ConfLqr) && !REJECTED(lcp, TY_QUALPROTO))
+    lqmmethod |= LQM_LQR;
+  StopTimer(&LqrTimer);
+
+  if (lcp->his_lqrperiod)
+    LogPrintf(LogLQM, "Expecting LQR every %d.%02d secs\n",
+	      lcp->his_lqrperiod / 100, lcp->his_lqrperiod % 100);
+
+  if (lcp->want_lqrperiod) {
+    LogPrintf(LogLQM, "Will send %s every %d.%02d secs\n",
+              lqmmethod & LQM_LQR ? "LQR" : "ECHO LQR",
+	      lcp->want_lqrperiod / 100, lcp->want_lqrperiod % 100);
+    LqrTimer.state = TIMER_STOPPED;
+    LqrTimer.load = lcp->want_lqrperiod * SECTICKS / 100;
+    LqrTimer.func = SendLqrReport;
+    LqrTimer.arg = (void *)(u_long)lcp->his_lqrperiod;
+    SendLqrReport(LqrTimer.arg);
+  } else {
+    LqrTimer.load = 0;
+    if (!lcp->his_lqrperiod)
+      LogPrintf(LogLQM, "LQR/ECHO LQR not negotiated\n");
+  }
+}
+
+void
+StopLqrTimer()
+{
+  StopTimer(&LqrTimer);
+}
+
+void
+StopLqr(int method)
+{
+  LogPrintf(LogLQM, "StopLqr method = %x\n", method);
+
+  if (method == LQM_LQR)
+    LogPrintf(LogLQM, "Stop sending LQR, Use LCP ECHO instead.\n");
+  if (method == LQM_ECHO)
+    LogPrintf(LogLQM, "Stop sending LCP ECHO.\n");
+  lqmmethod &= ~method;
+  if (lqmmethod)
+    SendLqrReport(LqrTimer.arg);
+  else
+    StopTimer(&LqrTimer);
+}
+
+void
+LqrDump(const char *message, const struct lqrdata * lqr)
+{
+  if (LogIsKept(LogLQM)) {
+    LogPrintf(LogLQM, "%s:\n", message);
+    LogPrintf(LogLQM, "  Magic:          %08x   LastOutLQRs:    %08x\n",
+	      lqr->MagicNumber, lqr->LastOutLQRs);
+    LogPrintf(LogLQM, "  LastOutPackets: %08x   LastOutOctets:  %08x\n",
+	      lqr->LastOutPackets, lqr->LastOutOctets);
+    LogPrintf(LogLQM, "  PeerInLQRs:     %08x   PeerInPackets:  %08x\n",
+	      lqr->PeerInLQRs, lqr->PeerInPackets);
+    LogPrintf(LogLQM, "  PeerInDiscards: %08x   PeerInErrors:   %08x\n",
+	      lqr->PeerInDiscards, lqr->PeerInErrors);
+    LogPrintf(LogLQM, "  PeerInOctets:   %08x   PeerOutLQRs:    %08x\n",
+	      lqr->PeerInOctets, lqr->PeerOutLQRs);
+    LogPrintf(LogLQM, "  PeerOutPackets: %08x   PeerOutOctets:  %08x\n",
+	      lqr->PeerOutPackets, lqr->PeerOutOctets);
+  }
+}
+@
+
+
+1.7
+log
+@Don't assume sizeof(long) == 4
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.6 1998/06/26 19:07:14 brian Exp $
+@
+
+
+1.6
+log
+@Don't depend on sizeof(u_long) == 4.
+Pointed out by: Theo
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.5 1998/03/13 00:56:24 brian Exp $
+d194 1
+a194 1
+         LqrTimer.rest * 100 / SECTICKS > (u_int32_t)LqrTimer.arg)) {
+d232 1
+a232 1
+    LqrTimer.arg = (void *)lcp->his_lqrperiod;
+@
+
+
+1.5
+log
+@Don't send LQRs when the peer has LCP REJ'd them.  Send
+ECHO LQRs instead.
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.4 1998/03/12 02:40:42 brian Exp $
+d52 1
+a52 1
+static u_long lastpeerin = (u_long) - 1;
+d106 1
+a106 1
+  u_long *sp, *dp;
+d109 2
+a110 2
+  sp = (u_long *) src;
+  dp = (u_long *) dst;
+@
+
+
+1.4
+log
+@o Fix a few comment typos.
+o Fix ``set timeout'' usage message and documentation.
+o Change ifOutPackets, ifOutOctets and ifOutLQRs to `u_int32_t's
+  so that they wrap correctly.
+o Put the LQR in network byte order using the correct struct size
+  (sizeof u_int32_t, not sizeof u_long).
+o Wrap LQR ECHO counters correctly.
+o Don't increment OutLQR count if the last LQR hasn't been replied
+  to.
+o Initialise HisLqrData (last received LQR) in StartLqm.
+o Don't start the LQR timer if we're `disabled' and `accepted'.
+o Generate LQR responses when both sides are using a timer and
+  we're not going to send our next LQR before the peers max timeout.
+
+LQR should now be fully functional.
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.3 1998/01/21 02:13:35 brian Exp $
+d217 1
+a217 1
+  if (Enabled(ConfLqr))
+@
+
+
+1.3
+log
+@Remove unused #includes.
+Make various bits static.
+Remove unused variables.
+Submitted by: eivind
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.2 1998/01/11 17:54:47 brian Exp $
+d32 1
+d95 4
+a98 1
+      gotseq = seq;
+d111 1
+a111 1
+  for (n = 0; n < sizeof(struct lqrdata) / sizeof(u_long); n++)
+a123 1
+
+d127 3
+a129 2
+      LogPrintf(LogPHASE, "** 1 Too many ECHO packets are lost. **\n");
+      lqmmethod = 0;		/* Prevent rcursion via LcpClose() */
+d138 5
+a142 3
+    if (echoseq - gotseq > 5) {
+      LogPrintf(LogPHASE, "** 2 Too many ECHO packets are lost. **\n");
+      lqmmethod = 0;		/* Prevent rcursion via LcpClose() */
+d148 1
+a148 1
+  if (lqmmethod && Enabled(ConfLqr))
+d188 3
+a190 2
+     * Generate LQR responce to peer, if i) We are not running LQR timer. ii)
+     * Two successive LQR's PeerInLQRs are same.
+d192 3
+a194 1
+    if (LqrTimer.load == 0 || lastpeerin == HisLqrData.PeerInLQRs) {
+d196 1
+a196 1
+      SendLqrReport(0);
+a209 1
+  int period;
+d214 1
+a219 3
+  LogPrintf(LogLQM, "LQM method = %d\n", lqmmethod);
+
+  if (lcp->his_lqrperiod || lcp->want_lqrperiod) {
+d221 8
+a228 5
+    /*
+     * We need to run timer. Let's figure out period.
+     */
+    period = lcp->his_lqrperiod ? lcp->his_lqrperiod : lcp->want_lqrperiod;
+    StopTimer(&LqrTimer);
+d230 1
+a230 1
+    LqrTimer.load = period * SECTICKS / 100;
+d232 2
+a233 4
+    SendLqrReport(0);
+    StartTimer(&LqrTimer);
+    LogPrintf(LogLQM, "Will send LQR every %d.%d secs\n",
+	      period / 100, period % 100);
+d235 3
+a237 1
+    LogPrintf(LogLQM, "LQR is not activated.\n");
+d258 1
+a258 1
+    SendLqrReport(0);
+@
+
+
+1.2
+log
+@Make things work when sizeof(long) != 32 (hopefully)
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.1.1.1 1997/11/23 20:27:34 brian Exp $
+a44 1
+#include "main.h"
+d46 4
+a49 1
+struct pppTimer LqrTimer;
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d20 1
+a20 1
+ * $Id: lqr.c,v 1.20 1997/11/22 03:37:37 brian Exp $
+d52 2
+a53 2
+static int echoseq;
+static int gotseq;
+d57 3
+a59 3
+  u_long magic;
+  u_long signature;
+  u_long sequence;
+d85 1
+a85 1
+  u_long seq;
+@
+
+
+1.1.1.1
+log
+@Import version 1.5 of ppp.
+
+<sales>
+This is a user-level ppp implementation that uses the
+tun driver.  It was originally created by a Japanese
+ISP.  It's now piled with features.  Check the man pages
+for details.
+</sales>
+
+The sources are identical to the ones in FreeBSD, except
+for the Makefile.
+
+IP aliasing (NAT) is disabled, and can be enabled by simply
+doing a ``make install'' of libalias, then rebuilding
+ppp.  I'll create libalias as a port soon.
+@
+text
+@@
+

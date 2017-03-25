@@ -1,0 +1,223 @@
+head	1.3;
+access;
+symbols
+	OPENBSD_6_0:1.3.0.16
+	OPENBSD_6_0_BASE:1.3
+	OPENBSD_5_9:1.3.0.12
+	OPENBSD_5_9_BASE:1.3
+	OPENBSD_5_8:1.3.0.14
+	OPENBSD_5_8_BASE:1.3
+	OPENBSD_5_7:1.3.0.6
+	OPENBSD_5_7_BASE:1.3
+	OPENBSD_5_6:1.3.0.10
+	OPENBSD_5_6_BASE:1.3
+	OPENBSD_5_5:1.3.0.8
+	OPENBSD_5_5_BASE:1.3
+	OPENBSD_5_4:1.3.0.4
+	OPENBSD_5_4_BASE:1.3
+	OPENBSD_5_3:1.3.0.2
+	OPENBSD_5_3_BASE:1.3
+	OPENBSD_5_2:1.1.0.10
+	OPENBSD_5_2_BASE:1.1
+	OPENBSD_5_1_BASE:1.1
+	OPENBSD_5_1:1.1.0.8
+	OPENBSD_5_0:1.1.0.6
+	OPENBSD_5_0_BASE:1.1
+	OPENBSD_4_9:1.1.0.4
+	OPENBSD_4_9_BASE:1.1
+	OPENBSD_4_8:1.1.0.2
+	OPENBSD_4_8_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.3
+date	2012.09.29.19.24.31;	author miod;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2012.09.29.18.54.38;	author miod;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2010.05.08.21.59.56;	author miod;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.3
+log
+@Handle the coprocessor 0 cause and status registers as a 64 bit value now,
+as some odd mips designs need moro than 32 bits in there. This causes a lot
+of mechanical changes everywhere getsr() is used.
+@
+text
+@/*	$OpenBSD: isa_machdep.c,v 1.2 2012/09/29 18:54:38 miod Exp $	*/
+
+/*
+ * Copyright (c) 2009, 2010 Miodrag Vallat.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * Legacy device support.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/device.h>
+
+#include <machine/autoconf.h>
+#include <machine/cpu.h>
+#include <machine/intr.h>
+
+#include <dev/ic/i8259reg.h>
+
+#include <dev/pci/pcivar.h>
+
+#include <dev/isa/isareg.h>
+#include <dev/isa/isavar.h>
+
+#include <loongson/dev/bonitoreg.h>
+#include <loongson/dev/bonitovar.h>
+#include <loongson/dev/bonito_irq.h>
+
+void	 loongson_set_isa_imr(uint);
+void	 loongson_isa_splx(int);
+void	 loongson_isa_setintrmask(int);
+
+uint	loongson_isaimr;
+
+void
+loongson_set_isa_imr(uint newimr)
+{
+	uint imr1, imr2;
+
+	imr1 = 0xff & ~newimr;
+	imr1 &= ~(1 << 2);	/* enable cascade */
+	imr2 = 0xff & ~(newimr >> 8);
+
+	/*
+	 * For some reason, trying to write the same value to the PIC
+	 * registers causes an immediate system freeze (at least on the
+	 * 2F and CS5536 based Lemote Yeeloong), so we only do this if
+	 * the value changes.
+	 * Note that interrupts have been disabled by the caller.
+	 */
+	if ((newimr ^ loongson_isaimr) & 0xff00)
+		REGVAL8(BONITO_PCIIO_BASE + IO_ICU2 + 1) = imr2;
+	if ((newimr ^ loongson_isaimr) & 0x00ff)
+		REGVAL8(BONITO_PCIIO_BASE + IO_ICU1 + 1) = imr1;
+	loongson_isaimr = newimr;
+}
+
+void
+loongson_isa_specific_eoi(int bit)
+{
+	if (bit & 8) {
+		REGVAL8(BONITO_PCIIO_BASE + IO_ICU2 + PIC_OCW2) =
+		    OCW2_SELECT | OCW2_EOI | OCW2_SL | OCW2_ILS(bit & 7);
+		bit = 2;
+	}
+	REGVAL8(BONITO_PCIIO_BASE + IO_ICU1 + PIC_OCW2) =
+	    OCW2_SELECT | OCW2_EOI | OCW2_SL | OCW2_ILS(bit);
+}
+
+void
+loongson_isa_splx(int newipl)
+{
+	struct cpu_info *ci = curcpu();
+
+	/* Update masks to new ipl. Order highly important! */
+	__asm__ (".set noreorder\n");
+	ci->ci_ipl = newipl;
+	mips_sync();
+	__asm__ (".set reorder\n");
+	loongson_isa_setintrmask(newipl);
+	/* If we still have softints pending trigger processing. */
+	if (ci->ci_softpending != 0 && newipl < IPL_SOFTINT)
+		setsoftintr0();
+}
+
+void
+loongson_isa_setintrmask(int level)
+{
+	uint64_t active;
+	register_t sr;
+
+	active = bonito_intem & ~bonito_imask[level];
+
+	sr = disableintr();
+	bonito_setintrmask(level);
+	loongson_set_isa_imr(BONITO_ISA_MASK(active));
+	setsr(sr);
+}
+
+void
+loongson_generic_isa_attach_hook(struct device *parent, struct device *self,
+    struct isabus_attach_args *iba)
+{
+	loongson_isaimr = 0;
+	/* overrides bonito callback */
+	register_splx_handler(loongson_isa_splx);
+}
+@
+
+
+1.2
+log
+@Proide a mips_sync() macro to wrap asm("sync"), and replace gazillions of
+such statements with it.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: isa_machdep.c,v 1.1 2010/05/08 21:59:56 miod Exp $	*/
+d103 1
+a103 1
+	uint32_t sr;
+@
+
+
+1.1
+log
+@Huge work-in-progress commit to support Loongson 2E-based evaluation boards
+with a VIA 686 southbridge.
+
+Features:
+- 686 setup code (no thanks to PMON for not initializing the beast).
+- work in progress ISA interrupt handling code.
+- support for vga(4) compatible devices as console, in PC-compatible text mode.
+- move legacy (ISA) support code out of bonito(4) to make things clearer.
+- support more than 256MB on 2E-based systems.
+
+Tested on a generic 2E-based evaluation board by someone who wishes to remain
+anonymous; you know who you are, thank you very much for testing.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d28 1
+d91 2
+a92 1
+	__asm__ ("sync\n\t.set reorder\n");
+@
+

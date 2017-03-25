@@ -1,0 +1,846 @@
+head	1.3;
+access;
+symbols
+	OPENBSD_6_0:1.3.0.6
+	OPENBSD_6_0_BASE:1.3
+	OPENBSD_5_9:1.3.0.4
+	OPENBSD_5_9_BASE:1.3
+	OPENBSD_5_8:1.3.0.2
+	OPENBSD_5_8_BASE:1.3
+	OPENBSD_5_7:1.2.0.6
+	OPENBSD_5_7_BASE:1.2
+	OPENBSD_5_6:1.2.0.4
+	OPENBSD_5_6_BASE:1.2
+	OPENBSD_5_5:1.2.0.2
+	OPENBSD_5_5_BASE:1.2
+	OPENBSD_5_4:1.1.0.2
+	OPENBSD_5_4_BASE:1.1;
+locks; strict;
+comment	@ * @;
+
+
+1.3
+date	2015.04.12.19.42.06;	author matthieu;	state Exp;
+branches;
+next	1.2;
+commitid	DK857Z2Au1JEohAk;
+
+1.2
+date	2014.02.03.15.54.52;	author matthieu;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2013.03.18.18.38.21;	author matthieu;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.3
+log
+@Update to xf86-video-intel 2.99.916
+Fixes a display bug seenby ajacoutot@@, ok jsg@@ and kettenis@@.
+newer X.Org (2.99.917 or master) version cause corruption on older
+machines (X40, i965), probably caused by a bug in our kernel,
+under investigation by kettenis@@.
+@
+text
+@/***************************************************************************
+
+ Copyright 2000-2011 Intel Corporation.  All Rights Reserved.
+
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and associated documentation files (the
+ "Software"), to deal in the Software without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sub license, and/or sell copies of the Software, and to
+ permit persons to whom the Software is furnished to do so, subject to
+ the following conditions:
+
+ The above copyright notice and this permission notice (including the
+ next paragraph) shall be included in all copies or substantial portions
+ of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ IN NO EVENT SHALL INTEL, AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
+ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+ **************************************************************************/
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "sna.h"
+#include "sna_video.h"
+
+#include <xf86xv.h>
+#include <X11/extensions/Xv.h>
+
+#define MAKE_ATOM(a) MakeAtom(a, sizeof(a) - 1, true)
+
+static Atom xvBrightness, xvContrast, xvSyncToVblank;
+
+static XvFormatRec Formats[] = {
+	{15}, {16}, {24}
+};
+
+static const XvAttributeRec Attributes[] = {
+	{XvSettable | XvGettable, -1, 1, (char *)"XV_SYNC_TO_VBLANK"},
+	//{XvSettable | XvGettable, -128, 127, (char *)"XV_BRIGHTNESS"},
+	//{XvSettable | XvGettable, 0, 255, (char *)"XV_CONTRAST"},
+};
+
+static const XvImageRec Images[] = {
+	XVIMAGE_YUY2,
+	XVIMAGE_YV12,
+	XVIMAGE_I420,
+	XVIMAGE_UYVY,
+	XVMC_YUV,
+};
+
+static int sna_video_textured_stop(ddStopVideo_ARGS)
+{
+	struct sna_video *video = port->devPriv.ptr;
+
+	DBG(("%s()\n", __FUNCTION__));
+
+	RegionUninit(&video->clip);
+	sna_video_free_buffers(video);
+
+	return Success;
+}
+
+static int
+sna_video_textured_set_attribute(ddSetPortAttribute_ARGS)
+{
+	struct sna_video *video = port->devPriv.ptr;
+
+	if (attribute == xvBrightness) {
+		if (value < -128 || value > 127)
+			return BadValue;
+
+		video->brightness = value;
+	} else if (attribute == xvContrast) {
+		if (value < 0 || value > 255)
+			return BadValue;
+
+		video->contrast = value;
+	} else if (attribute == xvSyncToVblank) {
+		if (value < -1 || value > 1)
+			return BadValue;
+
+		video->SyncToVblank = value;
+	} else
+		return BadMatch;
+
+	return Success;
+}
+
+static int
+sna_video_textured_get_attribute(ddGetPortAttribute_ARGS)
+{
+	struct sna_video *video = port->devPriv.ptr;
+
+	if (attribute == xvBrightness)
+		*value = video->brightness;
+	else if (attribute == xvContrast)
+		*value = video->contrast;
+	else if (attribute == xvSyncToVblank)
+		*value = video->SyncToVblank;
+	else
+		return BadMatch;
+
+	return Success;
+}
+
+static int
+sna_video_textured_best_size(ddQueryBestSize_ARGS)
+{
+	if (vid_w > (drw_w << 1))
+		drw_w = vid_w >> 1;
+	if (vid_h > (drw_h << 1))
+		drw_h = vid_h >> 1;
+
+	*p_w = drw_w;
+	*p_h = drw_h;
+
+	return Success;
+}
+
+/*
+ * The source rectangle of the video is defined by (src_x, src_y, src_w, src_h).
+ * The dest rectangle of the video is defined by (drw_x, drw_y, drw_w, drw_h).
+ * id is a fourcc code for the format of the video.
+ * buf is the pointer to the source data in system memory.
+ * width and height are the w/h of the source data.
+ * If "sync" is true, then we must be finished with *buf at the point of return
+ * (which we always are).
+ * clip is the clipping region in screen space.
+ * data is a pointer to our port private.
+ * drawable is some Drawable, which might not be the screen in the case of
+ * compositing.  It's a new argument to the function in the 1.1 server.
+ */
+static int
+sna_video_textured_put_image(ddPutImage_ARGS)
+{
+	struct sna_video *video = port->devPriv.ptr;
+	struct sna *sna = video->sna;
+	struct sna_video_frame frame;
+	PixmapPtr pixmap = get_drawable_pixmap(draw);
+	unsigned int flags;
+	BoxRec dstBox;
+	RegionRec clip;
+	xf86CrtcPtr crtc;
+	bool flush = false;
+	bool ret;
+
+	clip.extents.x1 = draw->x + drw_x;
+	clip.extents.y1 = draw->y + drw_y;
+	clip.extents.x2 = clip.extents.x1 + drw_w;
+	clip.extents.y2 = clip.extents.y1 + drw_h;
+	clip.data = NULL;
+
+	RegionIntersect(&clip, &clip, gc->pCompositeClip);
+	if (!RegionNotEmpty(&clip))
+		return Success;
+
+	DBG(("%s: src=(%d, %d),(%d, %d), dst=(%d, %d),(%d, %d), id=%d, sizep=%dx%d, sync?=%d\n",
+	     __FUNCTION__,
+	     src_x, src_y, src_w, src_h,
+	     drw_x, drw_y, drw_w, drw_h,
+	     format->id, width, height, sync));
+
+	DBG(("%s: region %d:(%d, %d), (%d, %d)\n", __FUNCTION__,
+	     region_num_rects(&clip),
+	     clip.extents.x1, clip.extents.y1,
+	     clip.extents.x2, clip.extents.y2));
+
+	sna_video_frame_init(video, format->id, width, height, &frame);
+
+	if (!sna_video_clip_helper(video, &frame, &crtc, &dstBox,
+				   src_x, src_y, drw_x + draw->x, drw_y + draw->y,
+				   src_w, src_h, drw_w, drw_h,
+				   &clip))
+		return Success;
+
+	flags = MOVE_WRITE | __MOVE_FORCE;
+	if (clip.data)
+		flags |= MOVE_READ;
+
+	if (!sna_pixmap_move_area_to_gpu(pixmap, &clip.extents, flags)) {
+		DBG(("%s: attempting to render to a non-GPU pixmap\n",
+		     __FUNCTION__));
+		return BadAlloc;
+	}
+
+	sna_video_frame_set_rotation(video, &frame, RR_Rotate_0);
+
+	if (xvmc_passthrough(format->id)) {
+		DBG(("%s: using passthough, name=%d\n",
+		     __FUNCTION__, *(uint32_t *)buf));
+
+		frame.bo = kgem_create_for_name(&sna->kgem, *(uint32_t*)buf);
+		if (frame.bo == NULL) {
+			DBG(("%s: failed to open bo\n", __FUNCTION__));
+			return BadAlloc;
+		}
+
+		if (kgem_bo_size(frame.bo) < frame.size) {
+			DBG(("%s: bo size=%d, expected=%d\n",
+			     __FUNCTION__, kgem_bo_size(frame.bo), frame.size));
+			kgem_bo_destroy(&sna->kgem, frame.bo);
+			return BadAlloc;
+		}
+
+		frame.image.x1 = 0;
+		frame.image.y1 = 0;
+		frame.image.x2 = frame.width;
+		frame.image.y2 = frame.height;
+	} else {
+		if (!sna_video_copy_data(video, &frame, buf)) {
+			DBG(("%s: failed to copy frame\n", __FUNCTION__));
+			kgem_bo_destroy(&sna->kgem, frame.bo);
+			return BadAlloc;
+		}
+	}
+
+	if (crtc && video->SyncToVblank != 0 &&
+	    sna_pixmap_is_scanout(sna, pixmap)) {
+		kgem_set_mode(&sna->kgem, KGEM_RENDER, sna_pixmap(pixmap)->gpu_bo);
+		flush = sna_wait_for_scanline(sna, pixmap, crtc,
+					      &clip.extents);
+	}
+
+	ret = Success;
+	if (!sna->render.video(sna, video, &frame, &clip, pixmap)) {
+		DBG(("%s: failed to render video\n", __FUNCTION__));
+		ret = BadAlloc;
+	} else
+		DamageDamageRegion(draw, &clip);
+
+	kgem_bo_destroy(&sna->kgem, frame.bo);
+
+	/* Push the frame to the GPU as soon as possible so
+	 * we can hit the next vsync.
+	 */
+	if (flush || sync)
+		kgem_submit(&sna->kgem);
+
+	RegionUninit(&clip);
+
+	return ret;
+}
+
+static int
+sna_video_textured_query(ddQueryImageAttributes_ARGS)
+{
+	int size, tmp;
+
+	if (*w > 8192)
+		*w = 8192;
+	if (*h > 8192)
+		*h = 8192;
+
+	*w = (*w + 1) & ~1;
+	if (offsets)
+		offsets[0] = 0;
+
+	switch (format->id) {
+		/* IA44 is for XvMC only */
+	case FOURCC_IA44:
+	case FOURCC_AI44:
+		if (pitches)
+			pitches[0] = *w;
+		size = *w * *h;
+		break;
+	case FOURCC_YV12:
+	case FOURCC_I420:
+		*h = (*h + 1) & ~1;
+		size = (*w + 3) & ~3;
+		if (pitches)
+			pitches[0] = size;
+		size *= *h;
+		if (offsets)
+			offsets[1] = size;
+		tmp = ((*w >> 1) + 3) & ~3;
+		if (pitches)
+			pitches[1] = pitches[2] = tmp;
+		tmp *= (*h >> 1);
+		size += tmp;
+		if (offsets)
+			offsets[2] = size;
+		size += tmp;
+		break;
+	case FOURCC_UYVY:
+	case FOURCC_YUY2:
+	default:
+		size = *w << 1;
+		if (pitches)
+			pitches[0] = size;
+		size *= *h;
+		break;
+	case FOURCC_XVMC:
+		*h = (*h + 1) & ~1;
+		size = sizeof(uint32_t);
+		if (pitches)
+			pitches[0] = size;
+		break;
+	}
+
+	return size;
+}
+
+void sna_video_textured_setup(struct sna *sna, ScreenPtr screen)
+{
+	XvAdaptorPtr adaptor;
+	struct sna_video *video;
+	int nports = 16, i;
+
+	if (!sna->render.video) {
+		xf86DrvMsg(sna->scrn->scrnIndex, X_INFO,
+			   "Textured video not supported on this hardware\n");
+		return;
+	}
+
+	if (wedged(sna)) {
+		xf86DrvMsg(sna->scrn->scrnIndex, X_WARNING,
+			   "cannot enable XVideo whilst the GPU is wedged\n");
+		return;
+	}
+
+	adaptor = sna_xv_adaptor_alloc(sna);
+	if (adaptor == NULL)
+		return;
+
+	video = calloc(nports, sizeof(struct sna_video));
+	adaptor->pPorts = calloc(nports, sizeof(XvPortRec));
+	if (video == NULL || adaptor->pPorts == NULL) {
+		free(video);
+		free(adaptor->pPorts);
+		sna->xv.num_adaptors--;
+		return;
+	}
+
+
+	adaptor->type = XvInputMask | XvImageMask;
+	adaptor->pScreen = screen;
+	adaptor->name = (char *)"Intel(R) Textured Video";
+	adaptor->nEncodings = 1;
+	adaptor->pEncodings = xnfalloc(sizeof(XvEncodingRec));
+	adaptor->pEncodings[0].id = 0;
+	adaptor->pEncodings[0].pScreen = screen;
+	adaptor->pEncodings[0].name = (char *)"XV_IMAGE";
+	adaptor->pEncodings[0].width = sna->render.max_3d_size;
+	adaptor->pEncodings[0].height = sna->render.max_3d_size;
+	adaptor->pEncodings[0].rate.numerator = 1;
+	adaptor->pEncodings[0].rate.denominator = 1;
+	adaptor->pFormats = Formats;
+	adaptor->nFormats = sna_xv_fixup_formats(screen, Formats,
+						 ARRAY_SIZE(Formats));
+	adaptor->nAttributes = ARRAY_SIZE(Attributes);
+	adaptor->pAttributes = (XvAttributeRec *)Attributes;
+	adaptor->nImages = ARRAY_SIZE(Images);
+	adaptor->pImages = (XvImageRec *)Images;
+#if XORG_XV_VERSION < 2
+	adaptor->ddAllocatePort = sna_xv_alloc_port;
+	adaptor->ddFreePort = sna_xv_free_port;
+#endif
+	adaptor->ddPutVideo = NULL;
+	adaptor->ddPutStill = NULL;
+	adaptor->ddGetVideo = NULL;
+	adaptor->ddGetStill = NULL;
+	adaptor->ddStopVideo = sna_video_textured_stop;
+	adaptor->ddSetPortAttribute = sna_video_textured_set_attribute;
+	adaptor->ddGetPortAttribute = sna_video_textured_get_attribute;
+	adaptor->ddQueryBestSize = sna_video_textured_best_size;
+	adaptor->ddPutImage = sna_video_textured_put_image;
+	adaptor->ddQueryImageAttributes = sna_video_textured_query;
+
+	for (i = 0; i < nports; i++) {
+		struct sna_video *v = &video[i];
+		XvPortPtr port = &adaptor->pPorts[i];
+
+		v->sna = sna;
+		v->textured = true;
+		v->alignment = 4;
+		v->SyncToVblank = (sna->flags & SNA_NO_WAIT) == 0;
+
+		RegionNull(&v->clip);
+
+		port->id = FakeClientID(0);
+		AddResource(port->id, XvGetRTPort(), port);
+
+		port->pAdaptor = adaptor;
+		port->pNotify =  NULL;
+		port->pDraw =  NULL;
+		port->client =  NULL;
+		port->grab.client =  NULL;
+		port->time = currentTime;
+		port->devPriv.ptr = v;
+	}
+	adaptor->base_id = adaptor->pPorts[0].id;
+	adaptor->nPorts = nports;
+
+	xvBrightness = MAKE_ATOM("XV_BRIGHTNESS");
+	xvContrast = MAKE_ATOM("XV_CONTRAST");
+	xvSyncToVblank = MAKE_ATOM("XV_SYNC_TO_VBLANK");
+
+	DBG(("%s: '%s' initialized %d ports\n", __FUNCTION__, adaptor->name, adaptor->nPorts));
+}
+@
+
+
+1.2
+log
+@Update to xf86-video-intel 2.99.909
+Tested by jsg@@, kettenis@@ and myself on a wide range of intel cards.
+@
+text
+@d59 1
+a59 3
+static int sna_video_textured_stop(ClientPtr client,
+				   XvPortPtr port,
+				   DrawablePtr draw)
+d72 1
+a72 4
+sna_video_textured_set_attribute(ClientPtr client,
+				 XvPortPtr port,
+				 Atom attribute,
+				 INT32 value)
+d98 1
+a98 4
+sna_video_textured_get_attribute(ClientPtr client,
+				 XvPortPtr port,
+				 Atom attribute,
+				 INT32 *value)
+d115 1
+a115 7
+sna_video_textured_best_size(ClientPtr client,
+			     XvPortPtr port,
+			     CARD8 motion,
+			     CARD16 vid_w, CARD16 vid_h,
+			     CARD16 drw_w, CARD16 drw_h,
+			     unsigned int *p_w,
+			     unsigned int *p_h)
+d142 1
+a142 12
+sna_video_textured_put_image(ClientPtr client,
+			     DrawablePtr draw,
+			     XvPortPtr port,
+			     GCPtr gc,
+			     INT16 src_x, INT16 src_y,
+			     CARD16 src_w, CARD16 src_h,
+			     INT16 drw_x, INT16 drw_y,
+			     CARD16 drw_w, CARD16 drw_h,
+			     XvImagePtr format,
+			     unsigned char *buf,
+			     Bool sync,
+			     CARD16 width, CARD16 height)
+d148 1
+d171 2
+a172 2
+	DBG(("%s: region %ld:(%d, %d), (%d, %d)\n", __FUNCTION__,
+	     (long)RegionNumRects(&clip),
+a175 6
+	if (!sna_pixmap_move_to_gpu(pixmap, MOVE_READ | MOVE_WRITE)) {
+		DBG(("%s: attempting to render to a non-GPU pixmap\n",
+		     __FUNCTION__));
+		return BadAlloc;
+	}
+
+d184 12
+d253 1
+a253 7
+sna_video_textured_query(ClientPtr client,
+			 XvPortPtr port,
+			 XvImagePtr format,
+			 unsigned short *w,
+			 unsigned short *h,
+			 int *pitches,
+			 int *offsets)
+d362 1
+d365 1
+a383 1
+		v->rotation = RR_Rotate_0;
+d405 2
+@
+
+
+1.1
+log
+@Update to xf86-video-intel 2.20.19.
+
+A recent kernel with kernel modesetting support is required.
+Thanks to jsg@@ and kettenis@@ for their work.
+@
+text
+@a36 5
+#ifdef SNA_XVMC
+#define _SNA_XVMC_SERVER_
+#include "sna_video_hwmc.h"
+#endif
+
+d41 2
+a42 3
+#define NUM_FORMATS 3
+static const XF86VideoFormatRec Formats[NUM_FORMATS] = {
+	{15, TrueColor}, {16, TrueColor}, {24, TrueColor}
+d45 4
+a48 6
+//#define NUM_TEXTURED_ATTRIBUTES 3
+#define NUM_TEXTURED_ATTRIBUTES 1
+static const XF86AttributeRec TexturedAttributes[] = {
+	{XvSettable | XvGettable, -1, 1, "XV_SYNC_TO_VBLANK"},
+	{XvSettable | XvGettable, -128, 127, "XV_BRIGHTNESS"},
+	{XvSettable | XvGettable, 0, 255, "XV_CONTRAST"},
+d51 1
+a51 9
+#ifdef SNA_XVMC
+#define NUM_IMAGES 5
+#define XVMC_IMAGE 1
+#else
+#define NUM_IMAGES 4
+#define XVMC_IMAGE 0
+#endif
+
+static const XF86ImageRec Images[NUM_IMAGES] = {
+d56 1
+a56 26
+#ifdef SNA_XVMC
+	{
+		/*
+		 * Below, a dummy picture type that is used in XvPutImage
+		 * only to do an overlay update.
+		 * Introduced for the XvMC client lib.
+		 * Defined to have a zero data size.
+		 */
+		FOURCC_XVMC,
+		XvYUV,
+		LSBFirst,
+		{'X', 'V', 'M', 'C',
+			0x00, 0x00, 0x00, 0x10, 0x80, 0x00, 0x00, 0xAA, 0x00,
+			0x38, 0x9B, 0x71},
+		12,
+		XvPlanar,
+		3,
+		0, 0, 0, 0,
+		8, 8, 8,
+		1, 2, 2,
+		1, 2, 2,
+		{'Y', 'V', 'U',
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		XvTopToBottom},
+#endif
+d59 3
+a61 13
+static int xvmc_passthrough(int id)
+{
+#ifdef SNA_XVMC
+	return id == FOURCC_XVMC;
+#else
+	return 0;
+	(void)id;
+#endif
+}
+
+static void sna_video_textured_stop(ScrnInfoPtr scrn,
+				    pointer data,
+				    Bool shutdown)
+d63 1
+a63 2
+	struct sna *sna = to_sna(scrn);
+	struct sna_video *video = data;
+d67 2
+a68 1
+	REGION_EMPTY(scrn->pScreen, &video->clip);
+d70 1
+a70 4
+	if (!shutdown)
+		return;
+
+	sna_video_free_buffers(sna, video);
+d74 2
+a75 1
+sna_video_textured_set_attribute(ScrnInfoPtr scrn,
+d77 1
+a77 2
+				 INT32 value,
+				 pointer data)
+d79 1
+a79 1
+	struct sna_video *video = data;
+d103 2
+a104 1
+sna_video_textured_get_attribute(ScrnInfoPtr scrn,
+d106 1
+a106 2
+				 INT32 *value,
+				 pointer data)
+d108 1
+a108 1
+	struct sna_video *video = data;
+d122 6
+a127 5
+static void
+sna_video_textured_best_size(ScrnInfoPtr scrn,
+			     Bool motion,
+			     short vid_w, short vid_h,
+			     short drw_w, short drw_h,
+d129 1
+a129 2
+			     unsigned int *p_h,
+			     pointer data)
+d138 2
+d156 12
+a167 9
+sna_video_textured_put_image(ScrnInfoPtr scrn,
+			     short src_x, short src_y,
+			     short drw_x, short drw_y,
+			     short src_w, short src_h,
+			     short drw_w, short drw_h,
+			     int id, unsigned char *buf,
+			     short width, short height,
+			     Bool sync, RegionPtr clip, pointer data,
+			     DrawablePtr drawable)
+d169 2
+a170 2
+	struct sna *sna = to_sna(scrn);
+	struct sna_video *video = data;
+d172 1
+a172 1
+	PixmapPtr pixmap = get_drawable_pixmap(drawable);
+d174 1
+d179 10
+d193 1
+a193 1
+	     id, width, height, sync));
+d195 4
+a198 4
+	if (buf == 0) {
+		DBG(("%s: garbage video buffer\n", __FUNCTION__));
+		return BadAlloc;
+	}
+d206 1
+a206 1
+	sna_video_frame_init(sna, video, id, width, height, &frame);
+d208 2
+a209 3
+	if (!sna_video_clip_helper(scrn, video, &frame,
+				   &crtc, &dstBox,
+				   src_x, src_y, drw_x, drw_y,
+d211 1
+a211 1
+				   clip))
+d214 1
+a214 1
+	if (xvmc_passthrough(id)) {
+d218 3
+a220 3
+		if (sna->kgem.gen < 031) {
+			/* XXX: i915 is not support and needs some
+			 * serious care.  grep for KMS in i915_hwmc.c */
+d224 4
+a227 3
+		frame.bo = kgem_create_for_name(&sna->kgem, *(uint32_t*)buf);
+		if (frame.bo == NULL) {
+			DBG(("%s: failed to open bo\n", __FUNCTION__));
+a230 1
+		assert(kgem_bo_size(frame.bo) >= frame.size);
+d236 1
+a236 1
+		if (!sna_video_copy_data(sna, video, &frame, buf)) {
+d247 1
+a247 1
+					      &clip->extents);
+d251 1
+a251 4
+	if (!sna->render.video(sna, video, &frame, clip,
+			       src_w, src_h, drw_w, drw_h,
+			       drw_x - src_x, drw_y - src_y,
+			       pixmap)) {
+d255 1
+a255 1
+		DamageDamageRegion(drawable, clip);
+d262 1
+a262 1
+	if (flush)
+d265 2
+d271 7
+a277 4
+sna_video_textured_query(ScrnInfoPtr scrn,
+			 int id,
+			 unsigned short *w, unsigned short *h,
+			 int *pitches, int *offsets)
+d290 1
+a290 1
+	switch (id) {
+a323 1
+#ifdef SNA_XVMC
+a329 1
+#endif
+d335 1
+a335 2
+XF86VideoAdaptorPtr sna_video_textured_setup(struct sna *sna,
+					     ScreenPtr screen)
+d337 1
+a337 2
+	XF86VideoAdaptorPtr adaptor;
+	XF86AttributePtr attrs;
+a338 1
+	DevUnion *devUnions;
+d342 1
+a342 1
+		xf86DrvMsg(sna->scrn->scrnIndex, X_WARNING,
+d344 1
+a344 1
+		return NULL;
+d350 1
+a350 1
+		return NULL;
+d353 4
+a356 1
+	adaptor = calloc(1, sizeof(XF86VideoAdaptorRec));
+d358 2
+a359 8
+	devUnions = calloc(nports, sizeof(DevUnion));
+#if NUM_TEXTURED_ATTRIBUTES
+	attrs = calloc(NUM_TEXTURED_ATTRIBUTES, sizeof(XF86AttributeRec));
+	if (adaptor == NULL ||
+	    video == NULL ||
+	    devUnions == NULL ||
+	    attrs == NULL) {
+		free(adaptor);
+d361 3
+a363 3
+		free(devUnions);
+		free(attrs);
+		return NULL;
+a364 9
+#else
+	if (adaptor == NULL || video == NULL || devUnions == NULL) {
+		free(adaptor);
+		free(video);
+		free(devUnions);
+		return NULL;
+	}
+	attrs = NULL;
+#endif
+d366 4
+a369 3
+	adaptor->type = XvWindowMask | XvInputMask | XvImageMask;
+	adaptor->flags = 0;
+	adaptor->name = "Intel(R) Textured Video";
+d371 1
+a371 1
+	adaptor->pEncodings = xnfalloc(sizeof(XF86VideoEncodingRec));
+d373 2
+a374 1
+	adaptor->pEncodings[0].name = "XV_IMAGE";
+d379 19
+a397 20
+	adaptor->nFormats = NUM_FORMATS;
+	adaptor->pFormats = (XF86VideoFormatPtr)Formats;
+	adaptor->nPorts = nports;
+	adaptor->pPortPrivates = devUnions;
+	adaptor->nAttributes = NUM_TEXTURED_ATTRIBUTES;
+	adaptor->pAttributes = attrs;
+	memcpy(attrs, TexturedAttributes,
+	       NUM_TEXTURED_ATTRIBUTES * sizeof(XF86AttributeRec));
+	adaptor->nImages = NUM_IMAGES;
+	adaptor->pImages = (XF86ImagePtr)Images;
+	adaptor->PutVideo = NULL;
+	adaptor->PutStill = NULL;
+	adaptor->GetVideo = NULL;
+	adaptor->GetStill = NULL;
+	adaptor->StopVideo = sna_video_textured_stop;
+	adaptor->SetPortAttribute = sna_video_textured_set_attribute;
+	adaptor->GetPortAttribute = sna_video_textured_get_attribute;
+	adaptor->QueryBestSize = sna_video_textured_best_size;
+	adaptor->PutImage = sna_video_textured_put_image;
+	adaptor->QueryImageAttributes = sna_video_textured_query;
+d401 1
+d403 1
+d407 1
+a407 1
+		v->SyncToVblank = 1;
+a408 1
+		/* gotta uninit this someplace, XXX: shouldn't be necessary for textured */
+d411 10
+a420 1
+		adaptor->pPortPrivates[i].ptr = v;
+d422 2
+a427 2
+
+	return adaptor;
+@
+

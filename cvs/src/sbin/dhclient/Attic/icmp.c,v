@@ -1,0 +1,421 @@
+head	1.6;
+access;
+symbols;
+locks; strict;
+comment	@ * @;
+
+
+1.6
+date	2004.02.23.19.32.59;	author henning;	state dead;
+branches;
+next	1.5;
+
+1.5
+date	2004.02.07.13.59.45;	author henning;	state Exp;
+branches;
+next	1.4;
+
+1.4
+date	2004.02.07.13.26.35;	author henning;	state Exp;
+branches;
+next	1.3;
+
+1.3
+date	2004.02.04.12.16.56;	author henning;	state Exp;
+branches;
+next	1.2;
+
+1.2
+date	2004.02.04.01.18.26;	author henning;	state Exp;
+branches;
+next	1.1;
+
+1.1
+date	2004.01.18.01.26.20;	author deraadt;	state Exp;
+branches;
+next	;
+
+
+desc
+@@
+
+
+1.6
+log
+@not used not needed
+@
+text
+@/*	$OpenBSD: icmp.c,v 1.5 2004/02/07 13:59:45 henning Exp $	*/
+
+/*
+ * ICMP Protocol engine - for sending out pings and receiving responses.
+ */
+
+/*
+ * Copyright (c) 1997, 1998 The Internet Software Consortium.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of The Internet Software Consortium nor the names
+ *    of its contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE INTERNET SOFTWARE CONSORTIUM AND
+ * CONTRIBUTORS ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED.  IN NO EVENT SHALL THE INTERNET SOFTWARE CONSORTIUM OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
+ * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * This software has been written for the Internet Software Consortium
+ * by Ted Lemon <mellon@@fugue.com> in cooperation with Vixie
+ * Enterprises.  To learn more about the Internet Software Consortium,
+ * see ``http://www.vix.com/isc''.  To learn more about Vixie
+ * Enterprises, see ``http://www.vix.com''.
+ */
+
+#include "dhcpd.h"
+#include <netinet/in_systm.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+
+static int icmp_protocol_initialized;
+static int icmp_protocol_fd;
+
+/*
+ * Initialize the ICMP protocol.
+ */
+void
+icmp_startup(int routep, void (*handler)(struct iaddr, u_int8_t *, int))
+{
+	struct protoent *proto;
+	int protocol = 1;
+	int state;
+
+	/* Only initialize icmp once. */
+	if (icmp_protocol_initialized)
+		error("attempted to reinitialize icmp protocol");
+	icmp_protocol_initialized = 1;
+
+	/* Get the protocol number (should be 1). */
+	proto = getprotobyname("icmp");
+	if (proto)
+		protocol = proto->p_proto;
+
+	/* Get a raw socket for the ICMP protocol. */
+	icmp_protocol_fd = socket(AF_INET, SOCK_RAW, protocol);
+	if (icmp_protocol_fd < 0)
+		error("unable to create icmp socket: %m");
+
+	/* Make sure it does routing... */
+	state = 0;
+	if (setsockopt(icmp_protocol_fd, SOL_SOCKET, SO_DONTROUTE,
+	    (char *)&state, sizeof(state)) < 0)
+		error("Unable to disable SO_DONTROUTE on ICMP socket: %m");
+
+	add_protocol("icmp", icmp_protocol_fd, icmp_echoreply, (void *)handler);
+}
+
+int
+icmp_echorequest(struct iaddr *addr)
+{
+	struct sockaddr_in to;
+	struct icmp icmp;
+	int status;
+
+	if (!icmp_protocol_initialized)
+		error("attempt to use ICMP protocol before initialization.");
+
+	memset(&to, 0, sizeof(to));
+	to.sin_len = sizeof(to);
+	to.sin_family = AF_INET;
+	to.sin_port = 0;
+	memcpy(&to.sin_addr, addr->iabuf, sizeof(to.sin_addr)); /* XXX */
+
+	icmp.icmp_type = ICMP_ECHO;
+	icmp.icmp_code = 0;
+	icmp.icmp_cksum = 0;
+	icmp.icmp_seq = 0;
+#ifdef PTRSIZE_64BIT
+	icmp.icmp_id =
+	    ((u_int32_t)(u_int64_t)addr) ^ (u_int32_t)(((u_int64_t)addr) >> 32);
+#else
+	icmp.icmp_id = (u_int32_t)addr;
+#endif
+
+	icmp.icmp_cksum = wrapsum(checksum((unsigned char *)&icmp,
+	    sizeof(icmp), 0));
+
+	/* Send the ICMP packet... */
+	status = sendto(icmp_protocol_fd, (char *)&icmp, sizeof(icmp), 0,
+	    (struct sockaddr *)&to, sizeof(to));
+	if (status < 0)
+		warn("icmp_echorequest %s: %m", inet_ntoa(to.sin_addr));
+
+	if (status != sizeof(icmp))
+		return (0);
+	return (1);
+}
+
+void
+icmp_echoreply(struct protocol *protocol)
+{
+	struct icmp *icfrom;
+	struct sockaddr_in from;
+	u_int8_t icbuf[1500];
+	int status, len;
+	socklen_t salen;
+	struct iaddr ia;
+	void (*handler)(struct iaddr, u_int8_t *, int);
+
+	salen = sizeof(from);
+	status = recvfrom(protocol->fd, (char *)icbuf, sizeof(icbuf), 0,
+	    (struct sockaddr *)&from, &salen);
+	if (status < 0) {
+		warn("icmp_echoreply: %m");
+		return;
+	}
+
+	/* Probably not for us. */
+	if (status < sizeof(struct ip) + sizeof(*icfrom))
+		return;
+
+	len = status - sizeof(struct ip);
+	icfrom = (struct icmp *)(icbuf + sizeof(struct ip));
+
+	/* Silently discard ICMP packets that aren't echoreplies. */
+	if (icfrom->icmp_type != ICMP_ECHOREPLY)
+		return;
+
+	/* If we were given a second-stage handler, call it. */
+	if (protocol->local) {
+		handler = (void (*)(struct iaddr, u_int8_t *, int))
+		    protocol->local;
+		memcpy(ia.iabuf, &from.sin_addr, sizeof(from.sin_addr));
+		ia.len = sizeof(from.sin_addr);
+
+		(*handler)(ia, icbuf, len);
+	}
+}
+@
+
+
+1.5
+log
+@KNF
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: icmp.c,v 1.4 2004/02/07 13:26:35 henning Exp $	*/
+@
+
+
+1.4
+log
+@more KNF From: Emil Mikulic <emikulic@@dmr.ath.cx>
+great job.
+no binary change.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: icmp.c,v 1.3 2004/02/04 12:16:56 henning Exp $	*/
+d81 1
+a81 1
+	   (char *)&state, sizeof(state)) < 0)
+d88 1
+a88 1
+icmp_echorequest (struct iaddr *addr)
+d108 2
+a109 2
+	icmp.icmp_id = ((u_int32_t)(u_int64_t)addr) ^
+  			(u_int32_t)(((u_int64_t)addr) >> 32);
+@
+
+
+1.3
+log
+@$OpenBSD$, tedu
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD$	*/
+d3 3
+a5 2
+/* ICMP Protocol engine - for sending out pings and receiving
+   responses. */
+d53 3
+a55 2
+/* Initialize the ICMP protocol. */
+
+d69 1
+a69 1
+	proto = getprotobyname ("icmp");
+d74 1
+a74 1
+	icmp_protocol_fd = socket (AF_INET, SOCK_RAW, protocol);
+d76 1
+a76 1
+		error ("unable to create icmp socket: %m");
+d81 1
+a81 1
+	   (char *)&state, sizeof state) < 0)
+d97 2
+a98 2
+	memset(&to, 0, sizeof to);
+	to.sin_len = sizeof to;
+d101 1
+a101 1
+	memcpy (&to.sin_addr, addr->iabuf, sizeof to.sin_addr); /* XXX */
+d108 2
+a109 2
+	icmp.icmp_id = (((u_int32_t)(u_int64_t)addr) ^
+  			(u_int32_t)(((u_int64_t)addr) >> 32));
+d115 1
+a115 1
+					     sizeof icmp, 0));
+d118 2
+a119 2
+	status = sendto (icmp_protocol_fd, (char *)&icmp, sizeof icmp, 0,
+	    (struct sockaddr *)&to, sizeof to);
+d123 3
+a125 3
+	if (status != sizeof icmp)
+		return 0;
+	return 1;
+d133 1
+a133 1
+	u_int8_t icbuf [1500];
+d139 3
+a141 3
+	salen = sizeof from;
+	status = recvfrom (protocol->fd, (char *)icbuf, sizeof icbuf, 0,
+			  (struct sockaddr *)&from, &salen);
+d143 1
+a143 1
+		warn ("icmp_echoreply: %m");
+d148 1
+a148 1
+	if (status < (sizeof (struct ip)) + (sizeof *icfrom))
+d151 2
+a152 2
+	len = status - sizeof (struct ip);
+	icfrom = (struct icmp *)(icbuf + sizeof (struct ip));
+d160 4
+a163 4
+		handler = ((void (*)(struct iaddr, u_int8_t *, int))
+			   protocol->local);
+		memcpy (ia.iabuf, &from.sin_addr, sizeof from.sin_addr);
+		ia.len = sizeof from.sin_addr;
+d165 1
+a165 1
+		(*handler) (ia, icbuf, len);
+@
+
+
+1.2
+log
+@8579 lines of KNF, ANSO and zap-junk diff without the resulting binary
+changing by a single byte.
+partly from theo
+@
+text
+@d1 1
+a1 1
+/* icmp.c
+d3 1
+a3 1
+   ICMP Protocol engine - for sending out pings and receiving
+@
+
+
+1.1
+log
+@this is where dhclient will start surgery
+@
+text
+@d54 2
+a55 3
+void icmp_startup (routep, handler)
+	int routep;
+	void (*handler) PROTO ((struct iaddr, u_int8_t *, int));
+d63 1
+a63 1
+		error ("attempted to reinitialize icmp protocol");
+d69 1
+a69 1
+		protocol = proto -> p_proto;
+d78 3
+a80 3
+	if (setsockopt (icmp_protocol_fd, SOL_SOCKET, SO_DONTROUTE,
+			(char *)&state, sizeof state) < 0)
+		error ("Unable to disable SO_DONTROUTE on ICMP socket: %m");
+d82 1
+a82 2
+	add_protocol ("icmp", icmp_protocol_fd, icmp_echoreply,
+		      (void *)handler);
+d85 2
+a86 2
+int icmp_echorequest (addr)
+	struct iaddr *addr;
+d93 1
+a93 1
+		error ("attempt to use ICMP protocol before initialization.");
+d98 2
+a99 2
+	to.sin_port = 0; /* unused. */
+	memcpy (&to.sin_addr, addr -> iabuf, sizeof to.sin_addr); /* XXX */
+d112 1
+a112 1
+	icmp.icmp_cksum = wrapsum (checksum ((unsigned char *)&icmp,
+d117 1
+a117 1
+			 (struct sockaddr *)&to, sizeof to);
+d119 1
+a119 1
+		warn ("icmp_echorequest %s: %m", inet_ntoa(to.sin_addr));
+d126 2
+a127 2
+void icmp_echoreply (protocol)
+	struct protocol *protocol;
+d135 1
+a135 1
+	void (*handler) PROTO ((struct iaddr, u_int8_t *, int));
+d138 1
+a138 1
+	status = recvfrom (protocol -> fd, (char *)icbuf, sizeof icbuf, 0,
+d146 1
+a146 1
+	if (status < (sizeof (struct ip)) + (sizeof *icfrom)) {
+a147 1
+	}
+d153 1
+a153 1
+	if (icfrom -> icmp_type != ICMP_ECHOREPLY) {
+a154 1
+	}
+d157 3
+a159 4
+	if (protocol -> local) {
+		handler = ((void (*) PROTO ((struct iaddr,
+					    u_int8_t *, int)))
+			   protocol -> local);
+@
+

@@ -1,4 +1,4 @@
-head	1.411;
+head	1.412;
 access;
 symbols
 	OPENBSD_6_1:1.405.0.4
@@ -58,6 +58,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.412
+date	2017.04.10.21.47.44;	author krw;	state Exp;
+branches;
+next	1.411;
+commitid	ubZF40SEC22PLlgj;
 
 1.411
 date	2017.04.09.20.44.13;	author krw;	state Exp;
@@ -2225,15 +2231,22 @@ desc
 @@
 
 
-1.411
+1.412
 log
-@Seven casts, a couple of tweaks and CFLAGS+=-Wsign-compare for the
-win.
+@Rework -L logic to use the idiom used in handling the leases file.
+i.e. open FILE during program set up and use the FILE created for
+the rest of the program lifetime after dropping privilege and
+pledge()'ing. No need for passing messages to the priv process.
 
-No intentional functional change.
+Tweak lease file handling a bit in passing.
+
+Monitoring the -L file with external programs like sysutils/entr
+still works.
+
+Looks good to sthen@@.
 @
 text
-@/*	$OpenBSD: dhclient.c,v 1.410 2017/04/08 20:16:04 krw Exp $	*/
+@/*	$OpenBSD: dhclient.c,v 1.411 2017/04/09 20:44:13 krw Exp $	*/
 
 /*
  * Copyright 2004 Henning Brauer <henning@@openbsd.org>
@@ -2364,7 +2377,6 @@ char		*resolv_conf_contents(struct interface_info *ifi,
 		     struct option_data *, struct option_data *,
 		     struct option_data *);
 void		 write_resolv_conf(u_int8_t *, size_t);
-void		 write_option_db(u_int8_t *, size_t);
 
 struct client_lease *apply_defaults(struct client_lease *);
 struct client_lease *clone_lease(struct client_lease *);
@@ -2412,6 +2424,7 @@ void	take_charge(struct interface_info *);
 #define	ADVANCE(x, n) (x += ROUNDUP((n)->sa_len))
 
 static FILE *leaseFile;
+static FILE *optionDB;
 
 void
 sighdlr(int sig)
@@ -2645,8 +2658,10 @@ routehandler(struct interface_info *ifi)
 				}
 			} else {
 				/* Let monitoring programs see link loss. */
-				if (strlen(path_option_db))
-					write_option_db("", 0);
+				if (optionDB) {
+					rewind(optionDB);
+					ftruncate(fileno(optionDB), 0);
+				}
 				/* No need to wait for anything but link. */
 				cancel_timeout();
 			}
@@ -2874,15 +2889,6 @@ main(int argc, char *argv[])
 		close(tailfd);
 	}
 
-	if ((fd = open(path_dhclient_db,
-	    O_RDONLY|O_EXLOCK|O_CREAT|O_NOFOLLOW, 0640)) == -1)
-		fatal("can't open and lock %s", path_dhclient_db);
-	read_client_leases(ifi);
-	if ((leaseFile = fopen(path_dhclient_db, "w")) == NULL)
-		fatal("can't open %s", path_dhclient_db);
-	rewrite_client_leases(ifi);
-	close(fd);
-
 	/*
 	 * Do the initial status check and possible force up before creating
 	 * the routing socket. If we bounce the interface down and up while
@@ -2908,6 +2914,20 @@ main(int argc, char *argv[])
 		fatal("setsockopt(ROUTE_TABLEFILTER)");
 
 	take_charge(ifi);
+
+	if ((fd = open(path_dhclient_db,
+	    O_RDONLY|O_EXLOCK|O_CREAT|O_NOFOLLOW, 0640)) == -1)
+		fatal("can't open and lock %s", path_dhclient_db);
+	read_client_leases(ifi);
+	if ((leaseFile = fopen(path_dhclient_db, "w")) == NULL)
+		fatal("can't open %s", path_dhclient_db);
+	rewrite_client_leases(ifi);
+	close(fd);
+
+	if (strlen(path_option_db) != 0) {
+		if ((optionDB = fopen(path_option_db, "w")) == NULL)
+			fatal("can't open %s", path_option_db);
+	}
 
 	/* Register the interface. */
 	if_register_receive(ifi);
@@ -4134,7 +4154,6 @@ rewrite_client_leases(struct interface_info *ifi)
 	if (!leaseFile)	/* XXX */
 		fatalx("lease file not open");
 
-	fflush(leaseFile);
 	rewind(leaseFile);
 
 	/*
@@ -4168,32 +4187,28 @@ void
 rewrite_option_db(struct interface_info *ifi, struct client_lease *offered,
     struct client_lease *effective)
 {
-	u_int8_t db[8192];
 	char *leasestr;
-	size_t n;
 
-	if (strlen(path_option_db) == 0)
+	if (!optionDB)
 		return;
 
-	memset(db, 0, sizeof(db));
+	rewind(optionDB);
 
 	leasestr = lease_as_string(ifi, "offered", offered);
-	if (leasestr) {
-		n = strlcat(db, leasestr, sizeof(db));
-		if (n >= sizeof(db))
-			log_warnx("cannot fit offered lease into option db");
-	} else
+	if (leasestr)
+		fprintf(optionDB, "%s", leasestr);
+	else
 		log_warnx("cannot make offered lease into string");
 
 	leasestr = lease_as_string(ifi, "effective", effective);
-	if (leasestr) {
-		n = strlcat(db, leasestr, sizeof(db));
-		if (n >= sizeof(db))
-			log_warnx("cannot fit effective lease into option db");
-	} else
+	if (leasestr)
+		fprintf(optionDB, "%s", leasestr);
+	else
 		log_warnx("cannot make effective lease into string");
 
-	write_option_db(db, strlen(db));
+	fflush(optionDB);
+	ftruncate(fileno(optionDB), ftello(optionDB));
+	fsync(fileno(optionDB));
 }
 
 void
@@ -4781,38 +4796,6 @@ apply_ignore_list(char *ignore_list)
 }
 
 void
-write_option_db(u_int8_t *contents, size_t sz)
-{
-	int rslt;
-
-	rslt = imsg_compose(unpriv_ibuf, IMSG_WRITE_OPTION_DB,
-	    0, 0, -1, contents, sz);
-	if (rslt == -1)
-		log_warn("write_option_db: imsg_compose");
-
-	flush_unpriv_ibuf("write_option_db");
-}
-
-void
-priv_write_option_db(struct imsg *imsg)
-{
-	u_int8_t *contents;
-	size_t sz;
-
-	if (imsg->hdr.len < IMSG_HEADER_SIZE) {
-		log_warnx("short IMSG_WRITE_OPTION_DB");
-		return;
-	}
-
-	contents = imsg->data;
-	sz = imsg->hdr.len - IMSG_HEADER_SIZE;
-
-	priv_write_file(path_option_db,
-	    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
-	    S_IRUSR | S_IWUSR | S_IRGRP, contents, sz);
-}
-
-void
 priv_write_file(char *path, int flags, mode_t mode,
     u_int8_t *contents, size_t sz)
 {
@@ -5235,6 +5218,100 @@ take_charge(struct interface_info *ifi)
 			routehandler(ifi);
 	}
 }
+@
+
+
+1.411
+log
+@Seven casts, a couple of tweaks and CFLAGS+=-Wsign-compare for the
+win.
+
+No intentional functional change.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dhclient.c,v 1.410 2017/04/08 20:16:04 krw Exp $	*/
+a131 1
+void		 write_option_db(u_int8_t *, size_t);
+d179 1
+d413 4
+a416 2
+				if (strlen(path_option_db))
+					write_option_db("", 0);
+a643 9
+	if ((fd = open(path_dhclient_db,
+	    O_RDONLY|O_EXLOCK|O_CREAT|O_NOFOLLOW, 0640)) == -1)
+		fatal("can't open and lock %s", path_dhclient_db);
+	read_client_leases(ifi);
+	if ((leaseFile = fopen(path_dhclient_db, "w")) == NULL)
+		fatal("can't open %s", path_dhclient_db);
+	rewrite_client_leases(ifi);
+	close(fd);
+
+d670 14
+a1908 1
+	fflush(leaseFile);
+a1941 1
+	u_int8_t db[8192];
+a1942 1
+	size_t n;
+d1944 1
+a1944 1
+	if (strlen(path_option_db) == 0)
+d1947 1
+a1947 1
+	memset(db, 0, sizeof(db));
+d1950 3
+a1952 5
+	if (leasestr) {
+		n = strlcat(db, leasestr, sizeof(db));
+		if (n >= sizeof(db))
+			log_warnx("cannot fit offered lease into option db");
+	} else
+d1956 3
+a1958 5
+	if (leasestr) {
+		n = strlcat(db, leasestr, sizeof(db));
+		if (n >= sizeof(db))
+			log_warnx("cannot fit effective lease into option db");
+	} else
+d1961 3
+a1963 1
+	write_option_db(db, strlen(db));
+a2547 32
+}
+
+void
+write_option_db(u_int8_t *contents, size_t sz)
+{
+	int rslt;
+
+	rslt = imsg_compose(unpriv_ibuf, IMSG_WRITE_OPTION_DB,
+	    0, 0, -1, contents, sz);
+	if (rslt == -1)
+		log_warn("write_option_db: imsg_compose");
+
+	flush_unpriv_ibuf("write_option_db");
+}
+
+void
+priv_write_option_db(struct imsg *imsg)
+{
+	u_int8_t *contents;
+	size_t sz;
+
+	if (imsg->hdr.len < IMSG_HEADER_SIZE) {
+		log_warnx("short IMSG_WRITE_OPTION_DB");
+		return;
+	}
+
+	contents = imsg->data;
+	sz = imsg->hdr.len - IMSG_HEADER_SIZE;
+
+	priv_write_file(path_option_db,
+	    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+	    S_IRUSR | S_IWUSR | S_IRGRP, contents, sz);
 @
 
 

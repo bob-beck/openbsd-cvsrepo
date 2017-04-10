@@ -1,4 +1,4 @@
-head	1.18;
+head	1.19;
 access;
 symbols
 	OPENBSD_6_1:1.18.0.4
@@ -14,6 +14,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.19
+date	2017.04.10.17.11.13;	author jsing;	state Exp;
+branches;
+next	1.18;
+commitid	3nmBs0stdHQq3Td1;
 
 1.18
 date	2016.11.04.15.32.40;	author jsing;	state Exp;
@@ -128,14 +134,19 @@ desc
 @@
 
 
-1.18
+1.19
 log
-@Avoid signed vs unsigned comparisons.
+@Rework name verification code so that a match is indicated via an argument,
+rather than return codes. More strictly follow RFC 6125, in particular only
+check the CN if there are no SAN identifiers present in the certificate
+(per section 6.4.4).
 
-ok miod@@
+Previous behaviour questioned by Daniel Stenberg <daniel at haxx dot se>.
+
+ok beck@@ jca@@
 @
 text
-@/* $OpenBSD: tls_verify.c,v 1.17 2016/09/04 12:26:43 bcook Exp $ */
+@/* $OpenBSD: tls_verify.c,v 1.18 2016/11/04 15:32:40 jsing Exp $ */
 /*
  * Copyright (c) 2014 Jeremie Courreges-Anglas <jca@@openbsd.org>
  *
@@ -163,11 +174,6 @@ text
 
 #include <tls.h>
 #include "tls_internal.h"
-
-static int tls_match_name(const char *cert_name, const char *name);
-static int tls_check_subject_altname(struct tls *ctx, X509 *cert,
-    const char *name);
-static int tls_check_common_name(struct tls *ctx, X509 *cert, const char *name);
 
 static int
 tls_match_name(const char *cert_name, const char *name)
@@ -221,20 +227,28 @@ tls_match_name(const char *cert_name, const char *name)
 	return -1;
 }
 
-/* See RFC 5280 section 4.2.1.6 for SubjectAltName details. */
+/*
+ * See RFC 5280 section 4.2.1.6 for SubjectAltName details.
+ * alt_match is set to 1 if a matching alternate name is found.
+ * alt_exists is set to 1 if any known alternate name exists in the certificate.
+ */
 static int
-tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
+tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name,
+    int *alt_match, int *alt_exists)
 {
 	STACK_OF(GENERAL_NAME) *altname_stack = NULL;
 	union tls_addr addrbuf;
 	int addrlen, type;
 	int count, i;
-	int rv = -1;
+	int rv = 0;
+
+	*alt_match = 0;
+	*alt_exists = 0;
 
 	altname_stack = X509_get_ext_d2i(cert, NID_subject_alt_name,
 	    NULL, NULL);
 	if (altname_stack == NULL)
-		return -1;
+		return 0;
 
 	if (inet_pton(AF_INET, name, &addrbuf) == 1) {
 		type = GEN_IPADD;
@@ -252,6 +266,10 @@ tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
 		GENERAL_NAME	*altname;
 
 		altname = sk_GENERAL_NAME_value(altname_stack, i);
+
+		if (altname->type == GEN_DNS || altname->type == GEN_IPADD)
+			*alt_exists = 1;
+
 		if (altname->type != type)
 			continue;
 
@@ -270,7 +288,7 @@ tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
 					    "NUL byte in subjectAltName, "
 					    "probably a malicious certificate",
 					    name);
-					rv = -2;
+					rv = -1;
 					break;
 				}
 
@@ -280,16 +298,16 @@ tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
 				 * dNSName must be rejected.
 				 */
 				if (strcmp(data, " ") == 0) {
-					tls_set_error(ctx,
+					tls_set_errorx(ctx,
 					    "error verifying name '%s': "
 					    "a dNSName of \" \" must not be "
 					    "used", name);
-					rv = -2;
+					rv = -1;
 					break;
 				}
 
 				if (tls_match_name(data, name) == 0) {
-					rv = 0;
+					*alt_match = 1;
 					break;
 				}
 			} else {
@@ -311,7 +329,7 @@ tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
 				tls_set_errorx(ctx,
 				    "Unexpected negative length for an "
 				    "IP address: %d", datalen);
-				rv = -2;
+				rv = -1;
 				break;
 			}
 
@@ -321,7 +339,7 @@ tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
 			 */
 			if (datalen == addrlen &&
 			    memcmp(data, &addrbuf, addrlen) == 0) {
-				rv = 0;
+				*alt_match = 1;
 				break;
 			}
 		}
@@ -332,13 +350,16 @@ tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
 }
 
 static int
-tls_check_common_name(struct tls *ctx, X509 *cert, const char *name)
+tls_check_common_name(struct tls *ctx, X509 *cert, const char *name,
+    int *cn_match)
 {
 	X509_NAME *subject_name;
 	char *common_name = NULL;
 	union tls_addr addrbuf;
 	int common_name_len;
-	int rv = -1;
+	int rv = 0;
+
+	*cn_match = 0;
 
 	subject_name = X509_get_subject_name(cert);
 	if (subject_name == NULL)
@@ -362,41 +383,136 @@ tls_check_common_name(struct tls *ctx, X509 *cert, const char *name)
 		tls_set_errorx(ctx, "error verifying name '%s': "
 		    "NUL byte in Common Name field, "
 		    "probably a malicious certificate", name);
-		rv = -2;
+		rv = -1;
 		goto out;
 	}
 
+	/*
+	 * We don't want to attempt wildcard matching against IP addresses,
+	 * so perform a simple comparison here.
+	 */
 	if (inet_pton(AF_INET,  name, &addrbuf) == 1 ||
 	    inet_pton(AF_INET6, name, &addrbuf) == 1) {
-		/*
-		 * We don't want to attempt wildcard matching against IP
-		 * addresses, so perform a simple comparison here.
-		 */
 		if (strcmp(common_name, name) == 0)
-			rv = 0;
-		else
-			rv = -1;
+			*cn_match = 1;
 		goto out;
 	}
 
 	if (tls_match_name(common_name, name) == 0)
-		rv = 0;
+		*cn_match = 1;
+
  out:
 	free(common_name);
 	return rv;
 }
 
 int
-tls_check_name(struct tls *ctx, X509 *cert, const char *name)
+tls_check_name(struct tls *ctx, X509 *cert, const char *name, int *match)
 {
-	int	rv;
+	int alt_exists;
 
+	*match = 0;
+
+	if (tls_check_subject_altname(ctx, cert, name, match,
+	    &alt_exists) == -1)
+		return -1;
+
+	/*
+	 * As per RFC 6125 section 6.4.4, if any known alternate name existed
+	 * in the certificate, we do not attempt to match on the CN.
+	 */
+	if (*match || alt_exists)
+		return 0;
+
+	return tls_check_common_name(ctx, cert, name, match);
+}
+@
+
+
+1.18
+log
+@Avoid signed vs unsigned comparisons.
+
+ok miod@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: tls_verify.c,v 1.17 2016/09/04 12:26:43 bcook Exp $ */
+a29 5
+static int tls_match_name(const char *cert_name, const char *name);
+static int tls_check_subject_altname(struct tls *ctx, X509 *cert,
+    const char *name);
+static int tls_check_common_name(struct tls *ctx, X509 *cert, const char *name);
+
+d82 5
+a86 1
+/* See RFC 5280 section 4.2.1.6 for SubjectAltName details. */
+d88 2
+a89 1
+tls_check_subject_altname(struct tls *ctx, X509 *cert, const char *name)
+d95 4
+a98 1
+	int rv = -1;
+d103 1
+a103 1
+		return -1;
+d121 4
+d143 1
+a143 1
+					rv = -2;
+d153 1
+a153 1
+					tls_set_error(ctx,
+d157 1
+a157 1
+					rv = -2;
+d162 1
+a162 1
+					rv = 0;
+d184 1
+a184 1
+				rv = -2;
+d194 1
+a194 1
+				rv = 0;
+d205 2
+a206 1
+tls_check_common_name(struct tls *ctx, X509 *cert, const char *name)
+d212 3
+a214 1
+	int rv = -1;
+d238 1
+a238 1
+		rv = -2;
+d242 4
+a247 4
+		/*
+		 * We don't want to attempt wildcard matching against IP
+		 * addresses, so perform a simple comparison here.
+		 */
+d249 1
+a249 3
+			rv = 0;
+		else
+			rv = -1;
+d254 2
+a255 1
+		rv = 0;
+d262 1
+a262 1
+tls_check_name(struct tls *ctx, X509 *cert, const char *name)
+d264 1
+a264 1
+	int	rv;
+d266 12
+a277 3
 	rv = tls_check_subject_altname(ctx, cert, name);
 	if (rv == 0 || rv == -2)
 		return rv;
-
+d279 1
+a279 1
 	return tls_check_common_name(ctx, cert, name);
-}
 @
 
 

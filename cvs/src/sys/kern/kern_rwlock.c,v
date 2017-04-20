@@ -1,4 +1,4 @@
-head	1.27;
+head	1.28;
 access;
 symbols
 	OPENBSD_6_1:1.27.0.10
@@ -61,6 +61,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.28
+date	2017.04.20.13.33.00;	author visa;	state Exp;
+branches;
+next	1.27;
+commitid	wskxDpGV1KoZOcPL;
 
 1.27
 date	2015.03.14.07.33.42;	author jsg;	state Exp;
@@ -214,12 +220,14 @@ desc
 @@
 
 
-1.27
+1.28
 log
-@add sys/atomic.h back for membar_* needed for at least armv7
+@Hook up rwlock(9) to witness(4).
+
+Loosely based on a diff from Christian Ludwig
 @
 text
-@/*	$OpenBSD: kern_rwlock.c,v 1.26 2015/03/14 03:38:50 jsg Exp $	*/
+@/*	$OpenBSD: kern_rwlock.c,v 1.27 2015/03/14 07:33:42 jsg Exp $	*/
 
 /*
  * Copyright (c) 2002, 2003 Artur Grabowski <art@@openbsd.org>
@@ -244,6 +252,7 @@ text
 #include <sys/rwlock.h>
 #include <sys/limits.h>
 #include <sys/atomic.h>
+#include <sys/witness.h>
 
 /* XXX - temporary measure until proc0 is properly aligned */
 #define RW_PROC(p) (((long)p) & ~RWLOCK_MASK)
@@ -308,31 +317,39 @@ static const struct rwlock_op {
 };
 
 void
-rw_enter_read(struct rwlock *rwl)
+_rw_enter_read(struct rwlock *rwl LOCK_FL_VARS)
 {
 	unsigned long owner = rwl->rwl_owner;
 
 	if (__predict_false((owner & RWLOCK_WRLOCK) ||
 	    rw_cas(&rwl->rwl_owner, owner, owner + RWLOCK_READ_INCR)))
-		rw_enter(rwl, RW_READ);
-	else
+		_rw_enter(rwl, RW_READ LOCK_FL_ARGS);
+	else {
 		membar_enter();
+		WITNESS_CHECKORDER(&rwl->rwl_lock_obj, LOP_NEWORDER, file, line,
+		    NULL);
+		WITNESS_LOCK(&rwl->rwl_lock_obj, 0, file, line);
+	}
 }
 
 void
-rw_enter_write(struct rwlock *rwl)
+_rw_enter_write(struct rwlock *rwl LOCK_FL_VARS)
 {
 	struct proc *p = curproc;
 
 	if (__predict_false(rw_cas(&rwl->rwl_owner, 0,
 	    RW_PROC(p) | RWLOCK_WRLOCK)))
-		rw_enter(rwl, RW_WRITE);
-	else
+		_rw_enter(rwl, RW_WRITE LOCK_FL_ARGS);
+	else {
 		membar_enter();
+		WITNESS_CHECKORDER(&rwl->rwl_lock_obj,
+		    LOP_EXCLUSIVE | LOP_NEWORDER, file, line, NULL);
+		WITNESS_LOCK(&rwl->rwl_lock_obj, LOP_EXCLUSIVE, file, line);
+	}
 }
 
 void
-rw_exit_read(struct rwlock *rwl)
+_rw_exit_read(struct rwlock *rwl LOCK_FL_VARS)
 {
 	unsigned long owner = rwl->rwl_owner;
 
@@ -341,11 +358,13 @@ rw_exit_read(struct rwlock *rwl)
 	membar_exit();
 	if (__predict_false((owner & RWLOCK_WAIT) ||
 	    rw_cas(&rwl->rwl_owner, owner, owner - RWLOCK_READ_INCR)))
-		rw_exit(rwl);
+		_rw_exit(rwl LOCK_FL_ARGS);
+	else
+		WITNESS_UNLOCK(&rwl->rwl_lock_obj, 0, file, line);
 }
 
 void
-rw_exit_write(struct rwlock *rwl)
+_rw_exit_write(struct rwlock *rwl LOCK_FL_VARS)
 {
 	unsigned long owner = rwl->rwl_owner;
 
@@ -354,7 +373,9 @@ rw_exit_write(struct rwlock *rwl)
 	membar_exit();
 	if (__predict_false((owner & RWLOCK_WAIT) ||
 	    rw_cas(&rwl->rwl_owner, owner, 0)))
-		rw_exit(rwl);
+		_rw_exit(rwl LOCK_FL_ARGS);
+	else
+		WITNESS_UNLOCK(&rwl->rwl_lock_obj, LOP_EXCLUSIVE, file, line);
 }
 
 #ifdef DIAGNOSTIC
@@ -393,20 +414,48 @@ rw_enter_diag(struct rwlock *rwl, int flags)
 #define rw_enter_diag(r, f)
 #endif
 
-void
-rw_init(struct rwlock *rwl, const char *name)
+static void
+_rw_init_flags_witness(struct rwlock *rwl, const char *name, int lo_flags,
+    struct lock_type *type)
 {
 	rwl->rwl_owner = 0;
 	rwl->rwl_name = name;
+
+#ifdef WITNESS
+	rwl->rwl_lock_obj.lo_flags = lo_flags;
+	rwl->rwl_lock_obj.lo_name = name;
+	rwl->rwl_lock_obj.lo_type = type;
+	WITNESS_INIT(&rwl->rwl_lock_obj, type);
+#else
+	(void)type;
+	(void)lo_flags;
+#endif
+}
+
+void
+_rw_init_flags(struct rwlock *rwl, const char *name, int flags,
+    struct lock_type *type)
+{
+	_rw_init_flags_witness(rwl, name, RWLOCK_LO_FLAGS(flags), type);
 }
 
 int
-rw_enter(struct rwlock *rwl, int flags)
+_rw_enter(struct rwlock *rwl, int flags LOCK_FL_VARS)
 {
 	const struct rwlock_op *op;
 	struct sleep_state sls;
 	unsigned long inc, o;
 	int error;
+#ifdef WITNESS
+	int lop_flags;
+
+	lop_flags = LOP_NEWORDER;
+	if (flags & RW_WRITE)
+		lop_flags |= LOP_EXCLUSIVE;
+	if ((flags & RW_NOSLEEP) == 0 && (flags & RW_DOWNGRADE) == 0)
+		WITNESS_CHECKORDER(&rwl->rwl_lock_obj, lop_flags, file, line,
+		    NULL);
+#endif
 
 	op = &rw_ops[(flags & RW_OPMASK) - 1];
 
@@ -448,11 +497,16 @@ retry:
 	    (RWLOCK_WRLOCK|RWLOCK_WAIT)))
 		wakeup(rwl);
 
+	if (flags & RW_DOWNGRADE)
+		WITNESS_DOWNGRADE(&rwl->rwl_lock_obj, lop_flags, file, line);
+	else
+		WITNESS_LOCK(&rwl->rwl_lock_obj, lop_flags, file, line);
+
 	return (0);
 }
 
 void
-rw_exit(struct rwlock *rwl)
+_rw_exit(struct rwlock *rwl LOCK_FL_VARS)
 {
 	unsigned long owner = rwl->rwl_owner;
 	int wrlock = owner & RWLOCK_WRLOCK;
@@ -462,6 +516,9 @@ rw_exit(struct rwlock *rwl)
 		rw_assert_wrlock(rwl);
 	else
 		rw_assert_rdlock(rwl);
+
+	WITNESS_UNLOCK(&rwl->rwl_lock_obj, wrlock ? LOP_EXCLUSIVE : 0,
+	    file, line);
 
 	membar_exit();
 	do {
@@ -519,14 +576,16 @@ rw_assert_unlocked(struct rwlock *rwl)
 
 /* recursive rwlocks; */
 void
-rrw_init(struct rrwlock *rrwl, char *name)
+_rrw_init_flags(struct rrwlock *rrwl, char *name, int flags,
+    struct lock_type *type)
 {
 	memset(rrwl, 0, sizeof(struct rrwlock));
-	rw_init(&rrwl->rrwl_lock, name);
+	_rw_init_flags_witness(&rrwl->rrwl_lock, name, RRWLOCK_LO_FLAGS(flags),
+	    type);
 }
 
 int
-rrw_enter(struct rrwlock *rrwl, int flags)
+_rrw_enter(struct rrwlock *rrwl, int flags LOCK_FL_VARS)
 {
 	int	rv;
 
@@ -536,11 +595,13 @@ rrw_enter(struct rrwlock *rrwl, int flags)
 			return (EDEADLK);
 		else {
 			rrwl->rrwl_wcnt++;
+			WITNESS_LOCK(&rrwl->rrwl_lock.rwl_lock_obj,
+			    LOP_EXCLUSIVE, file, line);
 			return (0);
 		}
 	}
 
-	rv = rw_enter(&rrwl->rrwl_lock, flags);
+	rv = _rw_enter(&rrwl->rrwl_lock, flags LOCK_FL_ARGS);
 	if (rv == 0)
 		rrwl->rrwl_wcnt = 1;
 
@@ -548,18 +609,21 @@ rrw_enter(struct rrwlock *rrwl, int flags)
 }
 
 void
-rrw_exit(struct rrwlock *rrwl)
+_rrw_exit(struct rrwlock *rrwl LOCK_FL_VARS)
 {
 
 	if (RWLOCK_OWNER(&rrwl->rrwl_lock) ==
 	    (struct proc *)RW_PROC(curproc)) {
 		KASSERT(rrwl->rrwl_wcnt > 0);
 		rrwl->rrwl_wcnt--;
-		if (rrwl->rrwl_wcnt != 0)
+		if (rrwl->rrwl_wcnt != 0) {
+			WITNESS_UNLOCK(&rrwl->rrwl_lock.rwl_lock_obj,
+			    LOP_EXCLUSIVE, file, line);
 			return;
+		}
 	}
 
-	rw_exit(&rrwl->rrwl_lock);
+	_rw_exit(&rrwl->rrwl_lock LOCK_FL_ARGS);
 }
 
 int
@@ -567,6 +631,83 @@ rrw_status(struct rrwlock *rrwl)
 {
 	return (rw_status(&rrwl->rrwl_lock));
 }
+@
+
+
+1.27
+log
+@add sys/atomic.h back for membar_* needed for at least armv7
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: kern_rwlock.c,v 1.26 2015/03/14 03:38:50 jsg Exp $	*/
+d26 1
+d91 1
+a91 1
+rw_enter_read(struct rwlock *rwl)
+d97 2
+a98 2
+		rw_enter(rwl, RW_READ);
+	else
+d100 4
+d107 1
+a107 1
+rw_enter_write(struct rwlock *rwl)
+d113 2
+a114 2
+		rw_enter(rwl, RW_WRITE);
+	else
+d116 4
+d123 1
+a123 1
+rw_exit_read(struct rwlock *rwl)
+d132 3
+a134 1
+		rw_exit(rwl);
+d138 1
+a138 1
+rw_exit_write(struct rwlock *rwl)
+d147 3
+a149 1
+		rw_exit(rwl);
+d188 3
+a190 2
+void
+rw_init(struct rwlock *rwl, const char *name)
+d194 17
+d214 1
+a214 1
+rw_enter(struct rwlock *rwl, int flags)
+d220 10
+d271 5
+d280 1
+a280 1
+rw_exit(struct rwlock *rwl)
+d291 3
+d350 2
+a351 1
+rrw_init(struct rrwlock *rrwl, char *name)
+d354 2
+a355 1
+	rw_init(&rrwl->rrwl_lock, name);
+d359 1
+a359 1
+rrw_enter(struct rrwlock *rrwl, int flags)
+d369 2
+d375 1
+a375 1
+	rv = rw_enter(&rrwl->rrwl_lock, flags);
+d383 1
+a383 1
+rrw_exit(struct rrwlock *rrwl)
+d390 3
+a392 1
+		if (rrwl->rrwl_wcnt != 0)
+d394 1
+d397 1
+a397 1
+	rw_exit(&rrwl->rrwl_lock);
 @
 
 

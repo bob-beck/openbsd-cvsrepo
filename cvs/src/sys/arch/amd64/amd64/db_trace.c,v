@@ -1,4 +1,4 @@
-head	1.25;
+head	1.26;
 access;
 symbols
 	OPENBSD_6_1:1.25.0.4
@@ -61,6 +61,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.26
+date	2017.04.20.12.41.43;	author visa;	state Exp;
+branches;
+next	1.25;
+commitid	Ok8Q9JWEGQTbpDky;
 
 1.25
 date	2017.02.06.09.13.41;	author mpi;	state Exp;
@@ -210,22 +216,15 @@ desc
 @@
 
 
-1.25
+1.26
 log
-@Implement Dynamic Profiling, a ddb(4) based & gprof compatible kernel
-profiling framework, for i386.
+@Add routines for saving stack traces and printing saved traces
+on amd64 and i386.
 
-Code patching is used to enable probes when entering functions.  The
-probes will call a mcount()-like function to match the behavior of a
-GPROF kernel.
-
-A new sysctl knob, ddb.profile, need to be set to 1 in securelevel 0
-to be able to use this feature.
-
-ok jasper@@, guenther@@, mlarkin@@
+With guenther@@
 @
 text
-@/*	$OpenBSD: db_trace.c,v 1.24 2017/01/24 00:58:55 mpi Exp $	*/
+@/*	$OpenBSD: db_trace.c,v 1.25 2017/02/06 09:13:41 mpi Exp $	*/
 /*	$NetBSD: db_trace.c,v 1.1 2003/04/26 18:39:27 fvdl Exp $	*/
 
 /*
@@ -380,6 +379,28 @@ db_nextframe(struct callframe **fp, db_addr_t *ip, long *argp, int is_trap,
 	}
 }
 
+static inline int
+db_is_trap(const char *name)
+{
+	if (name != NULL) {
+		if (!strcmp(name, "trap"))
+			return TRAP;
+		if (!strcmp(name, "ast"))
+			return AST;
+		if (!strcmp(name, "syscall"))
+			return SYSCALL;
+		if (name[0] == 'X') {
+			if (!strncmp(name, "Xintr", 5) ||
+			    !strncmp(name, "Xresume", 7) ||
+			    !strncmp(name, "Xrecurse", 8) ||
+			    !strcmp(name, "Xdoreti") ||
+			    !strncmp(name, "Xsoft", 5))
+				return INTERRUPT;
+		}
+	}
+	return NONE;
+}
+
 void
 db_stack_trace_print(db_expr_t addr, boolean_t have_addr, db_expr_t count,
     char *modif, int (*pr)(const char *, ...))
@@ -444,27 +465,9 @@ db_stack_trace_print(db_expr_t addr, boolean_t have_addr, db_expr_t count,
 				offset = 0;
 			}
 		}
-		if (INKERNEL(callpc) && name) {
-			if (!strcmp(name, "trap")) {
-				is_trap = TRAP;
-			} else if (!strcmp(name, "ast")) {
-				is_trap = AST;
-			} else if (!strcmp(name, "syscall")) {
-				is_trap = SYSCALL;
-			} else if (name[0] == 'X') {
-				if (!strncmp(name, "Xintr", 5) ||
-				    !strncmp(name, "Xresume", 7) ||
-				    !strncmp(name, "Xrecurse", 8) ||
-				    !strcmp(name, "Xdoreti") ||
-				    !strncmp(name, "Xsoft", 5)) {
-					is_trap = INTERRUPT;
-				} else
-					goto normal;
-			} else
-				goto normal;
+		if (INKERNEL(callpc) && (is_trap = db_is_trap(name)) != NONE)
 			narg = 0;
-		} else {
-		normal:
+		else {
 			is_trap = NONE;
 			narg = db_numargs(frame, name);
 		}
@@ -549,6 +552,68 @@ db_stack_trace_print(db_expr_t addr, boolean_t have_addr, db_expr_t count,
 	}
 }
 
+void
+db_save_stack_trace(struct db_stack_trace *st)
+{
+	struct callframe *frame, *lastframe;
+	db_addr_t callpc;
+	unsigned int i;
+
+	frame = __builtin_frame_address(0);
+
+	callpc = db_get_value((db_addr_t)&frame->f_retaddr, 8, FALSE);
+	frame = frame->f_frame;
+
+	lastframe = NULL;
+	for (i = 0; i < DB_STACK_TRACE_MAX && frame != NULL; i++) {
+		struct trapframe *tf;
+		char		*name;
+		db_expr_t	offset;
+		db_sym_t	sym;
+		int		is_trap;
+
+		st->st_pc[st->st_count++] = callpc;
+		sym = db_search_symbol(callpc, DB_STGY_ANY, &offset);
+		db_symbol_values(sym, &name, NULL);
+
+		if (INKERNEL(callpc))
+			is_trap = db_is_trap(name);
+		else
+			is_trap = NONE;
+
+		if (is_trap == NONE) {
+			lastframe = frame;
+			callpc = frame->f_retaddr;
+			frame = frame->f_frame;
+		} else {
+			if (is_trap == INTERRUPT) {
+				/*
+				 * Interrupt routines don't update %rbp,
+				 * so it still points to the frame that
+				 * was interrupted.  Pull back to just
+				 * above lastframe so we can find the
+				 * trapframe as with syscalls and traps.
+				 */
+				if (lastframe == NULL)
+					break;
+
+				frame =
+				    (struct callframe *)&lastframe->f_retaddr;
+			}
+			lastframe = frame;
+
+			tf = (struct trapframe *)&frame->f_arg0;
+			callpc = (db_addr_t)tf->tf_rip;
+			frame = (struct callframe *)tf->tf_rbp;
+		}
+
+		if (!INKERNEL(frame))
+			break;
+		if (frame <= lastframe)
+			break;
+	}
+}
+
 vaddr_t
 db_get_pc(struct trapframe *tf)
 {
@@ -562,6 +627,53 @@ db_get_probe_addr(struct trapframe *tf)
 {
 	return tf->tf_rip - BKPT_SIZE;
 }
+@
+
+
+1.25
+log
+@Implement Dynamic Profiling, a ddb(4) based & gprof compatible kernel
+profiling framework, for i386.
+
+Code patching is used to enable probes when entering functions.  The
+probes will call a mcount()-like function to match the behavior of a
+GPROF kernel.
+
+A new sysctl knob, ddb.profile, need to be set to 1 in securelevel 0
+to be able to use this feature.
+
+ok jasper@@, guenther@@, mlarkin@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: db_trace.c,v 1.24 2017/01/24 00:58:55 mpi Exp $	*/
+d156 22
+d242 1
+a242 18
+		if (INKERNEL(callpc) && name) {
+			if (!strcmp(name, "trap")) {
+				is_trap = TRAP;
+			} else if (!strcmp(name, "ast")) {
+				is_trap = AST;
+			} else if (!strcmp(name, "syscall")) {
+				is_trap = SYSCALL;
+			} else if (name[0] == 'X') {
+				if (!strncmp(name, "Xintr", 5) ||
+				    !strncmp(name, "Xresume", 7) ||
+				    !strncmp(name, "Xrecurse", 8) ||
+				    !strcmp(name, "Xdoreti") ||
+				    !strncmp(name, "Xsoft", 5)) {
+					is_trap = INTERRUPT;
+				} else
+					goto normal;
+			} else
+				goto normal;
+d244 1
+a244 2
+		} else {
+		normal:
+d326 62
 @
 
 

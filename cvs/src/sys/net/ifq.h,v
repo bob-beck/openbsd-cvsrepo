@@ -1,4 +1,4 @@
-head	1.10;
+head	1.12;
 access;
 symbols
 	OPENBSD_6_1:1.10.0.4
@@ -10,6 +10,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.12
+date	2017.05.03.03.41.09;	author dlg;	state Exp;
+branches;
+next	1.11;
+commitid	lDPcZsasSu1dIT5m;
+
+1.11
+date	2017.05.03.03.14.32;	author dlg;	state Exp;
+branches;
+next	1.10;
+commitid	U6vfhWmPzAgKAqe8;
 
 1.10
 date	2017.03.07.01.29.53;	author dlg;	state Exp;
@@ -76,28 +88,19 @@ desc
 @@
 
 
-1.10
+1.12
 log
-@deprecate ifq_enqueue_try, and let backends drop arbitrary mbufs.
+@update the stack doco to match reality.
 
-mikeb@@ wants priq to be able to drop lower priority packets if the
-current one is high. because ifq avoids freeing an mbuf while an
-ifq mutex is held, he needs a way for a backend to return an arbitrary
-mbuf to drop rather than signal that the current one needs to be
-dropped.
+i hadnt documented that api changes made to support multiple ifqueues
+on a single ifnet.
 
-this lets the backends return the mbuf to be dropped, which may or
-may not be the current one.
-
-to support this ifq_enqueue_try has to be dropped because it can
-only signal about the current mbuf. nothing uses it (except
-ifq_enqueue), so we can get rid of it. it wasnt even documented.
-
-this diff includes some tweaks by mikeb@@ around the statistics
-gathered in ifq_enqueue when an mbuf is dropped.
+a glaring omission is doco for if_attach_queues, but that should
+go into a manpage for driver writers to read, not internal doco on
+the stack.
 @
 text
-@/*	$OpenBSD: ifq.h,v 1.9 2017/01/24 10:08:30 krw Exp $ */
+@/*	$OpenBSD: ifq.h,v 1.11 2017/05/03 03:14:32 dlg Exp $ */
 
 /*
  * Copyright (c) 2015 David Gwynne <dlg@@openbsd.org>
@@ -141,6 +144,7 @@ struct ifqueue {
 	struct mutex		 ifq_mtx;
 	const struct ifq_ops	*ifq_ops;
 	void			*ifq_q;
+	struct mbuf_list	 ifq_free;
 	unsigned int		 ifq_len;
 	unsigned int		 ifq_oactive;
 
@@ -179,6 +183,11 @@ struct ifqueue {
  * transmission. It does this by queueing the packet on an ifqueue and
  * notifying the driver to start transmission of the queued packets.
  *
+ * A network device may have multiple contexts for the transmission
+ * of packets, ie, independent transmit rings. An network device
+ * represented by a struct ifnet may have multiple ifqueue structures,
+ * each of which represents an independent context.
+ *
  * struct ifqueue also provides the point where conditioning of
  * traffic (ie, priq and hfsc) is implemented, and provides some
  * infrastructure to assist in the implementation of network drivers.
@@ -194,9 +203,9 @@ struct ifqueue {
  * == Network Stack API
  *
  * The network stack is responsible for initialising and destroying
- * the ifqueue structure, changing the traffic conditioner on an
- * interface queue, enqueuing packets for transmission, and notifying
- * the driver to start transmission.
+ * the ifqueue structures, changing the traffic conditioner on an
+ * interface, enqueuing packets for transmission, and notifying
+ * the driver to start transmission of a particular ifqueue.
  *
  * === ifq_init()
  *
@@ -216,6 +225,11 @@ struct ifqueue {
  * the ifqueue. All the pending mbufs are removed from the previous
  * conditioner and requeued on the new.
  *
+ * === ifq_idx()
+ *
+ * ifq_idx() selects a specific ifqueue from the current ifnet
+ * structure for use in the transmission of the mbuf.
+ *
  * === ifq_enqueue()
  *
  * ifq_enqueue() attempts to fit an mbuf onto the ifqueue. The
@@ -225,12 +239,11 @@ struct ifqueue {
  * === ifq_start()
  *
  * Once a packet has been successfully queued with ifq_enqueue(),
- * the network card is notified with a call to if_start(). If an
- * interface is marked with IFXF_MPSAFE in its if_xflags field,
- * if_start() calls ifq_start() to dispatch the interfaces start
- * routine. Calls to ifq_start() run in the ifqueue serialisation
- * context, guaranteeing that only one instance of ifp->if_start()
- * will be running in the system at any point in time.
+ * the network card is notified with a call to ifq_start().
+ * Calls to ifq_start() run in the ifqueue serialisation context,
+ * guaranteeing that only one instance of ifp->if_qstart() will be
+ * running on behalf of a specific ifqueue in the system at any point
+ * in time.
  *
  * == Traffic conditioners API
  *
@@ -259,6 +272,15 @@ struct ifqueue {
  *
  * The queue lock acquired with ifq_q_enter() is released with
  * ifq_q_leave().
+ *
+ * === ifq_mfreem()
+ *
+ * A goal of the API is to avoid freeing an mbuf while mutexs are
+ * held. Because the ifq API manages the lock on behalf of the backend
+ * ifqops, the backend should not directly free mbufs. If a conditioner
+ * backend needs to drop a packet during the handling of ifqop_deq_begin,
+ * it may free it by calling ifq_mfreem(). This accounts for the drop,
+ * and schedules the free of the mbuf outside the hold of ifq_mtx.
  *
  *
  * == Network Driver API
@@ -309,17 +331,29 @@ struct ifqueue {
  *
  * == Attach
  *
- * A driver advertises it's ability to run its start routine by setting
- * the IFXF_MPSAFE flag in ifp->if_xflags before calling if_attach():
+ * A driver advertises it's ability to run its start routine without
+ * the kernel lock by setting the IFXF_MPSAFE flag in ifp->if_xflags
+ * before calling if_attach(). Advertising an MPSAFE start routine
+ * also implies that the driver understands that a network card can
+ * have multiple rings or transmit queues, and therefore provides
+ * if_qstart function (which takes an ifqueue pointer) instead of an
+ * if_start function (which takes an ifnet pointer).
  *
- *	ifp->if_xflags = IFXF_MPSAFE;
- *	ifp->if_start = drv_start;
- *	if_attach(ifp);
+ *	void	drv_start(struct ifqueue *);
  *
- * The network stack will then wrap its calls to ifp->if_start with
- * ifq_start() to guarantee there is only one instance of that function
- * running in the system and to serialise it with other work the driver
- * may provide.
+ *	void
+ *	drv_attach()
+ *	{
+ *	...
+ *		ifp->if_xflags = IFXF_MPSAFE;
+ *		ifp->if_qstart = drv_start;
+ *		if_attach(ifp);
+ *	}
+ *
+ * The network stack will then call ifp->if_qstart via ifq_start()
+ * to guarantee there is only one instance of that function running
+ * in the system and to serialise it with other work the driver may
+ * provide.
  *
  * == Initialise
  *
@@ -342,24 +376,25 @@ struct ifqueue {
  * packets:
  *
  *	void
- *	drv_start(struct ifnet *ifp)
+ *	drv_start(struct ifqueue *ifq)
  *	{
+ *		struct ifnet *ifp = ifq->ifq_if;
  *		struct drv_softc *sc = ifp->if_softc;
  *		struct mbuf *m;
  *		int kick = 0;
  *
  *		if (NO_LINK) {
- *			ifq_purge(&ifp->if_snd);
+ *			ifq_purge(ifq);
  *			return;
  *		}
  *
  *		for (;;) {
  *			if (NO_SPACE) {
- *				ifq_set_oactive(&ifp->if_snd);
+ *				ifq_set_oactive(ifq);
  *				break;
  *			}
  *
- *			m = ifq_dequeue(&ifp->if_snd);
+ *			m = ifq_dequeue(ifq);
  *			if (m == NULL)
  *				break;
  *
@@ -380,16 +415,14 @@ struct ifqueue {
  * processing:
  *
  *	void
- *	drv_txeof(struct drv_softc *sc)
+ *	drv_txeof(struct ifqueue *ifq)
  *	{
- *		struct ifnet *ifp = &sc->sc_if;
- *
  *		while (COMPLETED_PKTS) {
  *			// unmap packets, m_freem() the mbufs.
  *		}
  *
- *		if (ifq_is_oactive(&ifp->if_snd))
- *			ifq_restart(&ifp->if_snd);
+ *		if (ifq_is_oactive(ifq))
+ *			ifq_restart(ifq);
  *	}
  *
  * == Stop
@@ -402,16 +435,25 @@ struct ifqueue {
  *	drv_down(struct drv_softc *sc)
  *	{
  *		struct ifnet *ifp = &sc->sc_if;
+ *		struct ifqueue *ifq;
+ *		int i;
  *
  *		CLR(ifp->if_flags, IFF_RUNNING);
  *		DISABLE_INTERRUPTS();
  *
- *		ifq_barrier(&ifp->if_snd);
+ *		for (i = 0; i < sc->sc_num_queues; i++) {
+ * 			ifq = ifp->if_ifqs[i];
+ *			ifq_barrier(ifq);
+ *		}
+ *
  *		intr_barrier(sc->sc_ih);
  *
  *		FREE_RESOURCES();
  *
- *		ifq_clr_oactive();
+ *		for (i = 0; i < sc->sc_num_queues; i++) {
+ * 			ifq = ifp->if_ifqs[i];
+ *			ifq_clr_oactive(ifq);
+ *		}
  *	}
  *
  */
@@ -441,6 +483,7 @@ struct mbuf	*ifq_deq_begin(struct ifqueue *);
 void		 ifq_deq_commit(struct ifqueue *, struct mbuf *);
 void		 ifq_deq_rollback(struct ifqueue *, struct mbuf *);
 struct mbuf	*ifq_dequeue(struct ifqueue *);
+void		 ifq_mfreem(struct ifqueue *, struct mbuf *);
 unsigned int	 ifq_purge(struct ifqueue *);
 void		*ifq_q_enter(struct ifqueue *, const struct ifq_ops *);
 void		 ifq_q_leave(struct ifqueue *, void *);
@@ -495,6 +538,117 @@ extern const struct ifq_ops * const ifq_priq_ops;
 #endif /* _KERNEL */
 
 #endif /* _NET_IFQ_H_ */
+@
+
+
+1.11
+log
+@add ifq_mfreem() so ifq backends can free packets during dequeue.
+
+a goal of the ifq api is to avoid freeing an mbuf while holding a
+lock. to acheive this it allowed the backend enqueue operation to
+return a single mbuf to be freed. however, mikeb@@ is working on a
+backend that wants to free packets during dequeue. to support this,
+ifq_mfreem queues a packet during dequeue for freeing at the end
+of the ifq serialiser.
+
+there's some doco in ifq.h about it.
+
+requested by mikeb@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.h,v 1.10 2017/03/07 01:29:53 dlg Exp $ */
+d84 5
+d104 3
+a106 3
+ * the ifqueue structure, changing the traffic conditioner on an
+ * interface queue, enqueuing packets for transmission, and notifying
+ * the driver to start transmission.
+d126 5
+d140 5
+a144 6
+ * the network card is notified with a call to if_start(). If an
+ * interface is marked with IFXF_MPSAFE in its if_xflags field,
+ * if_start() calls ifq_start() to dispatch the interfaces start
+ * routine. Calls to ifq_start() run in the ifqueue serialisation
+ * context, guaranteeing that only one instance of ifp->if_start()
+ * will be running in the system at any point in time.
+d232 9
+a240 2
+ * A driver advertises it's ability to run its start routine by setting
+ * the IFXF_MPSAFE flag in ifp->if_xflags before calling if_attach():
+d242 13
+a254 8
+ *	ifp->if_xflags = IFXF_MPSAFE;
+ *	ifp->if_start = drv_start;
+ *	if_attach(ifp);
+ *
+ * The network stack will then wrap its calls to ifp->if_start with
+ * ifq_start() to guarantee there is only one instance of that function
+ * running in the system and to serialise it with other work the driver
+ * may provide.
+d277 1
+a277 1
+ *	drv_start(struct ifnet *ifp)
+d279 1
+d285 1
+a285 1
+ *			ifq_purge(&ifp->if_snd);
+d291 1
+a291 1
+ *				ifq_set_oactive(&ifp->if_snd);
+d295 1
+a295 1
+ *			m = ifq_dequeue(&ifp->if_snd);
+d316 1
+a316 1
+ *	drv_txeof(struct drv_softc *sc)
+a317 2
+ *		struct ifnet *ifp = &sc->sc_if;
+ *
+d322 2
+a323 2
+ *		if (ifq_is_oactive(&ifp->if_snd))
+ *			ifq_restart(&ifp->if_snd);
+d336 2
+d342 5
+a346 1
+ *		ifq_barrier(&ifp->if_snd);
+d351 4
+a354 1
+ *		ifq_clr_oactive();
+@
+
+
+1.10
+log
+@deprecate ifq_enqueue_try, and let backends drop arbitrary mbufs.
+
+mikeb@@ wants priq to be able to drop lower priority packets if the
+current one is high. because ifq avoids freeing an mbuf while an
+ifq mutex is held, he needs a way for a backend to return an arbitrary
+mbuf to drop rather than signal that the current one needs to be
+dropped.
+
+this lets the backends return the mbuf to be dropped, which may or
+may not be the current one.
+
+to support this ifq_enqueue_try has to be dropped because it can
+only signal about the current mbuf. nothing uses it (except
+ifq_enqueue), so we can get rid of it. it wasnt even documented.
+
+this diff includes some tweaks by mikeb@@ around the statistics
+gathered in ifq_enqueue when an mbuf is dropped.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.h,v 1.9 2017/01/24 10:08:30 krw Exp $ */
+d45 1
+d165 9
+d355 1
 @
 
 

@@ -55,7 +55,8 @@ commitid	xhCjnCHlv8E30xdN;
 
 1.131
 date	2017.03.28.21.38.44;	author mlarkin;	state Exp;
-branches;
+branches
+	1.131.4.1;
 next	1.130;
 commitid	HpE70ru2yypE3gDN;
 
@@ -845,6 +846,12 @@ date	2016.07.14.17.28.38;	author stefan;	state Exp;
 branches;
 next	;
 commitid	Yza0ve6fAQG6RRw1;
+
+1.131.4.1
+date	2017.05.03.02.29.16;	author jsg;	state Exp;
+branches;
+next	;
+commitid	G8fCSoM66ex6Gjxp;
 
 
 desc
@@ -7608,6 +7615,230 @@ text
 a1 1
 /*	$OpenBSD: vmm.c,v 1.130 2017/03/27 19:00:38 mlarkin Exp $	*/
 d4641 1
+@
+
+
+1.131.4.1
+log
+@OpenBSD 6.1 errata 002, May 2, 2017
+
+vmm(4) mismanaged floating point contexts.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: vmm.c,v 1.131 2017/03/28 21:38:44 mlarkin Exp $	*/
+a25 1
+#include <sys/user.h>
+a33 1
+#include <machine/fpu.h>
+a147 1
+int vmx_handle_xsetbv(struct vcpu *);
+d363 1
+a363 1
+	pool_init(&vcpu_pool, sizeof(struct vcpu), 64, IPL_NONE, PR_WAITOK,
+a2377 3
+	/* xcr0 power on default sets bit 0 (x87 state) */
+	vcpu->vc_gueststate.vg_xcr0 = XCR0_X87;
+
+d2503 1
+a2503 1
+	cr0 = rcr0() & ~CR0_TS;
+a3358 36
+ * vmm_fpusave
+ *
+ * Modified version of fpusave_cpu from fpu.c that only saves the FPU context
+ * and does not call splipi/splx. Must be called with interrupts disabled.
+ */
+void
+vmm_fpusave(void)
+{
+	struct proc *p;
+	struct cpu_info *ci = curcpu();
+
+	p = ci->ci_fpcurproc;
+	if (p == NULL)
+		return;
+
+	if (ci->ci_fpsaving != 0)
+		panic("%s: recursive save!", __func__);
+	/*
+	 * Set ci->ci_fpsaving, so that any pending exception will be
+	 * thrown away.  (It will be caught again if/when the FPU
+	 * state is restored.)
+	 */
+	ci->ci_fpsaving = 1;
+	if (xsave_mask)
+		xsave(&p->p_addr->u_pcb.pcb_savefpu, xsave_mask);
+	else
+		fxsave(&p->p_addr->u_pcb.pcb_savefpu);
+	ci->ci_fpsaving = 0;
+
+	p->p_addr->u_pcb.pcb_cr0 |= CR0_TS;
+
+	p->p_addr->u_pcb.pcb_fpcpu = NULL;
+	ci->ci_fpcurproc = NULL;
+}
+
+/*
+a3408 2
+		case VMX_EXIT_XSETBV:
+			break;
+a3532 37
+
+		/* Disable interrupts and save the current FPU state. */
+		disable_intr();
+		clts();
+		vmm_fpusave();
+
+		/* Initialize the guest FPU if not inited already */
+		if (!vcpu->vc_fpuinited) {
+			fninit();
+			bzero(&vcpu->vc_g_fpu.fp_fxsave,
+			    sizeof(vcpu->vc_g_fpu.fp_fxsave));
+			vcpu->vc_g_fpu.fp_fxsave.fx_fcw =
+			    __INITIAL_NPXCW__;
+			vcpu->vc_g_fpu.fp_fxsave.fx_mxcsr =
+			    __INITIAL_MXCSR__;
+			fxrstor(&vcpu->vc_g_fpu.fp_fxsave);
+
+			vcpu->vc_fpuinited = 1;
+		}
+
+		if (xsave_mask) {
+			/* Restore guest XCR0 and FPU context */
+			if (vcpu->vc_gueststate.vg_xcr0 & ~xsave_mask) {
+				DPRINTF("%s: guest attempted to set invalid "
+				    "bits in xcr0\n", __func__);
+				ret = EINVAL;
+				stts();
+				enable_intr();
+				break;
+			}
+
+			/* Restore guest %xcr0 */
+			xrstor(&vcpu->vc_g_fpu, xsave_mask);
+			xsetbv(0, vcpu->vc_gueststate.vg_xcr0);
+		} else
+			fxrstor(&vcpu->vc_g_fpu.fp_fxsave);
+
+a3536 29
+		/*
+		 * On exit, interrupts are disabled, and we are running with
+		 * the guest FPU state still possibly on the CPU. Save the FPU
+		 * state before re-enabling interrupts.
+		 */
+		if (xsave_mask) {
+			/* Save guest %xcr0 */
+			vcpu->vc_gueststate.vg_xcr0 = xgetbv(0);
+
+			/* Restore host %xcr0 */
+			xsetbv(0, xsave_mask);
+
+			/*
+			 * Save full copy of FPU state - guest content is
+			 * always a subset of host's save area (see xsetbv
+			 * exit handler)
+			 */	
+			xsave(&vcpu->vc_g_fpu, xsave_mask);
+		} else
+			fxsave(&vcpu->vc_g_fpu);
+
+		/*
+		 * FPU state is invalid, set CR0_TS to force DNA trap on next
+		 * access.
+		 */
+		stts();
+
+		enable_intr();
+
+a3549 1
+				KERNEL_LOCK();
+a3830 4
+	case VMX_EXIT_XSETBV:
+		ret = vmx_handle_xsetbv(vcpu);
+		update_rip = 1;
+		break;
+a4354 56
+ * vmx_handle_xsetbv
+ *
+ * Handler for xsetbv instructions. We allow the guest VM to set xcr0 values
+ * limited to the xsave_mask in use in the host.
+ *
+ * Parameters:
+ *  vcpu: vcpu structure containing instruction info causing the exit
+ *
+ * Return value:
+ *  0: The operation was successful
+ *  EINVAL: An error occurred
+ */
+int
+vmx_handle_xsetbv(struct vcpu *vcpu)
+{
+	uint64_t insn_length;
+	uint64_t *rax, *rdx, *rcx;;
+
+	if (vmread(VMCS_INSTRUCTION_LENGTH, &insn_length)) {
+		printf("%s: can't obtain instruction length\n", __func__);
+		return (EINVAL);
+	}
+
+	/* All XSETBV instructions are 0x0F 0x01 0xD1 */
+	KASSERT(insn_length == 3);
+
+	rax = &vcpu->vc_gueststate.vg_rax;
+	rcx = &vcpu->vc_gueststate.vg_rcx;
+	rdx = &vcpu->vc_gueststate.vg_rdx;
+
+	if (*rcx != 0) {
+		DPRINTF("%s: guest specified invalid xcr register number "
+		    "%lld\n", __func__, *rcx);
+		/* XXX this should #GP(0) instead of killing the guest */
+		return (EINVAL);
+	}
+
+	/*
+	 * No bits in %edx are currently supported. Check this, and validate
+	 * against the host mask.
+	 */
+	if (*rdx != 0 || (*rax & ~xsave_mask)) {
+		DPRINTF("%s: guest specified invalid xcr0 content "
+		    "(0x%llx:0x%llx)\n", __func__, *rdx, *rax);
+		/* XXX this should #GP(0) instead of killing the guest */
+		return (EINVAL);
+	}
+
+	vcpu->vc_gueststate.vg_xcr0 = *rax;
+
+	vcpu->vc_gueststate.vg_rip += insn_length;
+
+	return (0);
+}
+	
+/*
+a4416 1
+	uint32_t eax, ebx, ecx, edx;
+a4434 2
+	CPUID_LEAF(rax, 0, eax, ebx, ecx, edx);
+
+d4437 1
+a4437 1
+		*rax = 0x0d; /* cpuid_level */
+d4584 7
+a4590 13
+	case 0x0d:	/* Processor ext. state information */
+		if (*rcx == 0) {
+			*rax = xsave_mask;
+			*rbx = ebx;
+			*rcx = ecx;
+			*rdx = edx;
+		} else {
+			CPUID_LEAF(rax, *rcx, eax, ebx, ecx, edx);
+			*rax = eax;
+			*rbx = ebx;
+			*rcx = ecx;
+			*rdx = edx;
+		}
 @
 
 

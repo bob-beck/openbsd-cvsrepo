@@ -1,4 +1,4 @@
-head	1.3;
+head	1.4;
 access;
 symbols
 	OPENBSD_6_1:1.2.0.14
@@ -18,6 +18,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.4
+date	2017.05.15.11.23.25;	author mikeb;	state Exp;
+branches;
+next	1.3;
+commitid	MV7SeE82QLGXQJBO;
 
 1.3
 date	2017.04.26.15.50.59;	author mikeb;	state Exp;
@@ -40,19 +46,14 @@ desc
 @@
 
 
-1.3
+1.4
 log
-@Perform H-FSC root queue allocation in the kernel
+@Hook up FQ-CoDel to the tree and enable configuration in the pfctl(8)
 
-Since only leaf queues can have packets assigned to them,
-H-FSC requires the user specified root queue to have a
-parent.  To simplify userland tools and the configuration
-interface, the kernel can be leveraged to set it up.
-
-ok henning
+OK sthen, visa
 @
 text
-@/*	$OpenBSD: pfctl_queue.c,v 1.2 2014/04/19 14:22:32 henning Exp $ */
+@/*	$OpenBSD: pfctl_queue.c,v 1.3 2017/04/26 15:50:59 mikeb Exp $ */
 
 /*
  * Copyright (c) 2003 - 2013 Henning Brauer <henning@@openbsd.org>
@@ -80,12 +81,14 @@ text
 #include <arpa/inet.h>
 
 #include <err.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <net/hfsc.h>
+#include <net/fq_codel.h>
 
 #include "pfctl.h"
 #include "pfctl_parser.h"
@@ -94,7 +97,10 @@ text
 #define STAT_INTERVAL	5
 
 struct queue_stats {
-	struct hfsc_class_stats	 data;
+	union {
+		struct hfsc_class_stats	hfsc;
+		struct fqcodel_stats	fqc;
+	}			 data;
 	int			 avgn;
 	double			 avg_bytes;
 	double			 avg_packets;
@@ -250,14 +256,33 @@ pfctl_print_queue_node(int dev, struct pfctl_queue_node *node, int opts)
 void
 pfctl_print_queue_nodestat(int dev, const struct pfctl_queue_node *node)
 {
+	struct hfsc_class_stats *stats =
+	    (struct hfsc_class_stats *)&node->qstats.data.hfsc;
+	struct fqcodel_stats *fqstats =
+	    (struct fqcodel_stats *)&node->qstats.data.fqc;
+
 	printf("  [ pkts: %10llu  bytes: %10llu  "
 	    "dropped pkts: %6llu bytes: %6llu ]\n",
-	    (unsigned long long)node->qstats.data.xmit_cnt.packets,
-	    (unsigned long long)node->qstats.data.xmit_cnt.bytes,
-	    (unsigned long long)node->qstats.data.drop_cnt.packets,
-	    (unsigned long long)node->qstats.data.drop_cnt.bytes);
-	printf("  [ qlength: %3d/%3d ]\n", node->qstats.data.qlength,
-	    node->qstats.data.qlimit);
+	    (unsigned long long)stats->xmit_cnt.packets,
+	    (unsigned long long)stats->xmit_cnt.bytes,
+	    (unsigned long long)stats->drop_cnt.packets,
+	    (unsigned long long)stats->drop_cnt.bytes);
+	if (node->qs.flags & PFQS_FLOWQUEUE) {
+		double avg = 0, dev = 0;
+
+		if (fqstats->flows > 0) {
+			avg = (double)fqstats->delaysum /
+			    (double)fqstats->flows;
+			dev = sqrt(fmax(0, (double)fqstats->delaysumsq /
+			    (double)fqstats->flows) - avg * avg);
+		}
+
+		printf("  [ qlength: %3d/%3d  avg delay: %.3fms std-dev: %.3fms"
+		    "  flows: %3d ]\n", stats->qlength, stats->qlimit,
+		    avg / 1000, dev / 1000, fqstats->flows);
+	} else
+		printf("  [ qlength: %3d/%3d ]\n", stats->qlength,
+		    stats->qlimit);
 
 	if (node->qstats.avgn < 2)
 		return;
@@ -270,19 +295,22 @@ pfctl_print_queue_nodestat(int dev, const struct pfctl_queue_node *node)
 void
 update_avg(struct queue_stats *s)
 {
+	struct hfsc_class_stats *stats =
+	    (struct hfsc_class_stats *)&s->data;
+
 	if (s->avgn > 0) {
-		if (s->data.xmit_cnt.bytes >= s->prev_bytes)
+		if (stats->xmit_cnt.bytes >= s->prev_bytes)
 			s->avg_bytes = ((s->avg_bytes * (s->avgn - 1)) +
-			    (s->data.xmit_cnt.bytes - s->prev_bytes)) /
+			    (stats->xmit_cnt.bytes - s->prev_bytes)) /
 			    s->avgn;
-		if (s->data.xmit_cnt.packets >= s->prev_packets)
+		if (stats->xmit_cnt.packets >= s->prev_packets)
 			s->avg_packets = ((s->avg_packets * (s->avgn - 1)) +
-			    (s->data.xmit_cnt.packets - s->prev_packets)) /
+			    (stats->xmit_cnt.packets - s->prev_packets)) /
 			    s->avgn;
 	}
 
-	s->prev_bytes = s->data.xmit_cnt.bytes;
-	s->prev_packets = s->data.xmit_cnt.packets;
+	s->prev_bytes = stats->xmit_cnt.bytes;
+	s->prev_packets = stats->xmit_cnt.packets;
 	if (s->avgn < AVGN_MAX)
 		s->avgn++;
 }
@@ -313,6 +341,55 @@ rate2str(double rate)
 
 	return (buf);
 }
+@
+
+
+1.3
+log
+@Perform H-FSC root queue allocation in the kernel
+
+Since only leaf queues can have packets assigned to them,
+H-FSC requires the user specified root queue to have a
+parent.  To simplify userland tools and the configuration
+interface, the kernel can be leveraged to set it up.
+
+ok henning
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pfctl_queue.c,v 1.2 2014/04/19 14:22:32 henning Exp $ */
+d29 1
+d36 1
+d45 4
+a48 1
+	struct hfsc_class_stats	 data;
+d204 5
+d211 20
+a230 6
+	    (unsigned long long)node->qstats.data.xmit_cnt.packets,
+	    (unsigned long long)node->qstats.data.xmit_cnt.bytes,
+	    (unsigned long long)node->qstats.data.drop_cnt.packets,
+	    (unsigned long long)node->qstats.data.drop_cnt.bytes);
+	printf("  [ qlength: %3d/%3d ]\n", node->qstats.data.qlength,
+	    node->qstats.data.qlimit);
+d243 3
+d247 1
+a247 1
+		if (s->data.xmit_cnt.bytes >= s->prev_bytes)
+d249 1
+a249 1
+			    (s->data.xmit_cnt.bytes - s->prev_bytes)) /
+d251 1
+a251 1
+		if (s->data.xmit_cnt.packets >= s->prev_packets)
+d253 1
+a253 1
+			    (s->data.xmit_cnt.packets - s->prev_packets)) /
+d257 2
+a258 2
+	s->prev_bytes = s->data.xmit_cnt.bytes;
+	s->prev_packets = s->data.xmit_cnt.packets;
 @
 
 

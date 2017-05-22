@@ -1,9 +1,21 @@
-head	1.9;
+head	1.11;
 access;
 symbols;
 locks; strict;
 comment	@ * @;
 
+
+1.11
+date	2017.05.22.17.52.16;	author millert;	state Exp;
+branches;
+next	1.10;
+commitid	8exzS3Wt08YmG6Kc;
+
+1.10
+date	2017.05.22.17.16.43;	author millert;	state Exp;
+branches;
+next	1.9;
+commitid	mul0SAacMJBhDtvN;
 
 1.9
 date	2017.05.21.11.54.41;	author jsg;	state Exp;
@@ -64,10 +76,9 @@ desc
 @@
 
 
-1.9
+1.11
 log
-@correct a return value test
-ok millert@@
+@Add timing and test name options.
 @
 text
 @/*
@@ -86,10 +97,15 @@ text
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/time.h>
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <time.h>
+#include <unistd.h>
 #include <err.h>
 
 /*
@@ -99,9 +115,536 @@ text
  * Additional "killer" input taken from:
  *  David R. Musser's "Introspective Sorting and Selection Algorithms"
  *  http://calmerthanyouare.org/2014/06/11/algorithmic-complexity-attacks-and-libc-qsort.html
- *  M. D. McIlroy's "A Killer Adversary for Quicksort" targeting B & M qsort
+ *  M. D. McIlroy's "A Killer Adversary for Quicksort"
  */
 
+struct test_distribution {
+	const char *name;
+	void (*fill)(int *x, int n, int m);
+	int (*test)(struct test_distribution *d, int n, int *x, int *y, int *z);
+};
+
+#define min(a, b)	(((a) < (b)) ? (a) : (b))
+
+static size_t compares;
+static size_t max_compares;
+static size_t abrt_compares;
+static sigjmp_buf cmpjmp;
+static bool dump_table, timing, verbose;
+
+extern int antiqsort(int n, int *a, int *ptr);
+
+static int
+cmp(const void *v1, const void *v2)
+{
+	const int a = *(const int *)v1;
+	const int b = *(const int *)v2;
+
+	return a > b ? 1 : a < b ? -1 : 0;
+}
+
+static int
+cmp_checked(const void *v1, const void *v2)
+{
+	const int a = *(const int *)v1;
+	const int b = *(const int *)v2;
+
+	compares++;
+	if (compares > abrt_compares)
+		siglongjmp(cmpjmp, 1);
+	return a > b ? 1 : a < b ? -1 : 0;
+}
+
+static int
+check_result(char *sub, int *got, int *expected, struct test_distribution *d,
+    int m, int n)
+{
+	int i;
+
+	if (verbose || compares > max_compares) {
+		if (sub != NULL) {
+			if (m != 0) {
+				warnx("%s (%s): m: %d, n: %d, %zu compares, "
+				    "max %zu(%zu)", d->name, sub, m, n,
+				    compares, max_compares, abrt_compares);
+			} else {
+				warnx("%s (%s): n: %d, %zu compares, "
+				    "max %zu(%zu)", d->name, sub, n,
+				    compares, max_compares, abrt_compares);
+			}
+		} else {
+			if (m != 0) {
+				warnx("%s: m: %d, n: %d, %zu compares, "
+				    "max %zu(%zu)", d->name, m, n,
+				    compares, max_compares, abrt_compares);
+			} else {
+				warnx("%s: n: %d, %zu compares, "
+				    "max %zu(%zu)", d->name, n,
+				    compares, max_compares, abrt_compares);
+			}
+		}
+	}
+
+	for (i = 0; i < n; i++) {
+		if (got[i] != expected[i])
+			break;
+	}
+	if (i == n)
+		return 0;
+
+	if (sub != NULL) {
+		warnx("%s (%s): failure at %d, m: %d, n: %d",
+		    d->name, sub, i, m, n);
+	} else {
+		warnx("%s: failure at %d, m: %d, n: %d",
+		    d->name, i, m, n);
+	}
+	return 1;
+}
+
+static void
+fill_sawtooth(int *x, int n, int m)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		x[i] = i % m;
+}
+
+static void
+fill_random(int *x, int n, int m)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		x[i] = arc4random_uniform(m);
+}
+
+static void
+fill_stagger(int *x, int n, int m)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		x[i] = (i * m + i) % n;
+}
+
+static void
+fill_plateau(int *x, int n, int m)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		x[i] = min(i, m);
+}
+
+static void
+fill_shuffle(int *x, int n, int m)
+{
+	int i, j, k;
+
+	for (i = 0, j = 0, k = 1; i < n; i++)
+		x[i] = arc4random_uniform(m) ? (j += 2) : (k += 2);
+}
+
+static void
+fill_bsd_killer(int *x, int n, int m)
+{
+	int i, k;
+
+	/* 4.4BSD insertion sort optimization killer, Mats Linander */
+	k = n / 2;
+	for (i = 0; i < n; i++) {
+		if (i < k)
+			x[i] = k - i;
+		else if (i > k)
+			x[i] = n + k + 1 - i;
+		else
+			x[i] = k + 1;
+	}
+}
+
+static void
+fill_med3_killer(int *x, int n, int m)
+{
+	int i, k;
+
+	/*
+	 * Median of 3 killer, as seen in David R Musser's
+	 * "Introspective Sorting and Selection Algorithms"
+	 */
+	if (n & 1) {
+		/* odd size, store last at end and make even. */
+		x[n - 1] = n;
+		n--;
+	}
+	k = n / 2;
+	for (i = 0; i < n; i++) {
+		if (i & 1) {
+			x[i] = k + x[i - 1];
+		} else {
+			x[i] = i + 1;
+		}
+	}
+}
+
+static void
+print_timing(struct test_distribution *d, char *sub, int m, int n, double elapsed)
+{
+	if (sub != NULL) {
+		if (m != 0) {
+			warnx("%s (%s): m: %d, n: %d, %f seconds",
+			    d->name, sub, m, n, elapsed);
+		} else {
+			warnx("%s (%s): n: %d, %f seconds",
+			    d->name, sub, n, elapsed);
+		}
+	} else {
+		if (m != 0) {
+			warnx("%s: m: %d, n: %d, %f seconds",
+			    d->name, m, n, elapsed);
+		} else {
+			warnx("%s: n: %d, %f seconds",
+			    d->name, n, elapsed);
+		}
+	}
+}
+
+static int
+do_test(struct test_distribution *d, char *sub, int m, int n, int *y, int *z)
+{
+	int ret = 0;
+	struct timespec before, after;
+
+	compares = 0;
+	if (sigsetjmp(cmpjmp, 1) != 0) {
+		if (sub != NULL) {
+			warnx("%s (%s): qsort aborted after %zu compares, m: %d, n: %d",
+			    d->name, sub, compares, m, n);
+		} else {
+			warnx("%s: qsort aborted after %zu compares, m: %d, n: %d",
+			    d->name, compares, m, n);
+		}
+		ret = 1;
+	} else {
+		if (timing)
+			clock_gettime(CLOCK_MONOTONIC, &before);
+		qsort(y, n, sizeof(y[0]), cmp_checked);
+		if (timing) {
+			double elapsed;
+			clock_gettime(CLOCK_MONOTONIC, &after);
+			timespecsub(&after, &before, &after);
+			elapsed = after.tv_sec + after.tv_nsec / 1000000000.0;
+			print_timing(d, sub, m, n, elapsed);
+		}
+		if (check_result(sub, y, z, d, m, n) != 0)
+			ret = 1;
+	}
+	return ret;
+}
+
+static int
+test_perturbed(struct test_distribution *d, int n, int *x, int *y, int *z)
+{
+	int i, j, m;
+	int ret = 0;
+
+	for (m = 1; m < 2 * n; m *= 2) {
+		/* Fill in x[n] modified by m */
+		d->fill(x, n, m);
+
+		/* Test on copy of x[] */
+		for (i = 0; i < n; i++)
+			y[i] = z[i] = x[i];
+		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
+			err(1, NULL);
+		if (do_test(d, "copy", m, n, y, z) != 0)
+			ret = 1;
+
+		/* Test on reversed copy of x[] */
+		for (i = 0, j = n - 1; i < n; i++, j--)
+			y[i] = z[i] = x[j];
+		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
+			err(1, NULL);
+		if (do_test(d, "reversed", m, n, y, z) != 0)
+			ret = 1;
+
+		/* Test with front half of x[] reversed */
+		for (i = 0, j = (n / 2) - 1; i < n / 2; i++, j--)
+			y[i] = z[i] = x[j];
+		for (; i < n; i++)
+			y[i] = z[i] = x[i];
+		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
+			err(1, NULL);
+		if (do_test(d, "front reversed", m, n, y, z) != 0)
+			ret = 1;
+
+		/* Test with back half of x[] reversed */
+		for (i = 0; i < n / 2; i++)
+			y[i] = z[i] = x[i];
+		for (j = n - 1; i < n; i++, j--)
+			y[i] = z[i] = x[j];
+		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
+			err(1, NULL);
+		if (do_test(d, "back reversed", m, n, y, z) != 0)
+			ret = 1;
+
+		/* Test on sorted copy of x[] */
+		if (mergesort(x, n, sizeof(x[0]), cmp) != 0)
+			err(1, NULL);
+		for (i = 0; i < n; i++)
+			y[i] = x[i];
+		if (do_test(d, "sorted", m, n, y, x) != 0)
+			ret = 1;
+
+		/* Test with i%5 added to x[i] (dither) */
+		for (i = 0, j = n - 1; i < n; i++, j--)
+			y[i] = z[i] = x[j] + (i % 5);
+		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
+			err(1, NULL);
+		if (do_test(d, "front reversed", m, n, y, z) != 0)
+			ret = 1;
+	}
+
+	return ret;
+}
+
+/*
+ * Like test_perturbed() but because the input is tailored to cause
+ * quicksort to go quadratic we don't perturb the input.
+ */
+static int
+test_simple(struct test_distribution *d, int n, int *x, int *y, int *z)
+{
+	int i, ret = 0;
+
+	/* Fill in x[n] */
+	d->fill(x, n, 0);
+
+	/* Make a copy of x[] */
+	for (i = 0; i < n; i++)
+		y[i] = z[i] = x[i];
+	if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
+		err(1, NULL);
+	if (do_test(d, NULL, 0, n, y, z) != 0)
+		ret = 1;
+
+	return ret;
+}
+
+/*
+ * Use D. McIlroy's "Killer Adversary for Quicksort"
+ * We don't compare the results in this case.
+ */
+static int
+test_antiqsort(struct test_distribution *d, int n, int *x, int *y, int *z)
+{
+	struct timespec before, after;
+	int i, ret = 0;
+
+	/*
+	 * We expect antiqsort to generate > 1.5 * nlgn compares.
+	 * If introspection is not used, it will be > 10 * nlgn compares.
+	 */
+	if (timing)
+		clock_gettime(CLOCK_MONOTONIC, &before);
+	i = antiqsort(n, x, y);
+	if (timing)
+		clock_gettime(CLOCK_MONOTONIC, &after);
+	if (i > abrt_compares)
+		ret = 1;
+	if (dump_table) {
+		printf("/* %d items, %d compares */\n", n, i);
+		printf("static const int table_%d[] = {", n);
+		for (i = 0; i < n - 1; i++) {
+			if ((i % 12) == 0)
+				printf("\n\t");
+			printf("%4d, ", x[i]);
+		}
+		printf("%4d\n};\n", x[i]);
+	} else {
+		if (timing) {
+			double elapsed;
+			timespecsub(&after, &before, &after);
+			elapsed = after.tv_sec + after.tv_nsec / 1000000000.0;
+			print_timing(d, NULL, 0, n, elapsed);
+		}
+		if (verbose || ret != 0) {
+			warnx("%s: n: %d, %d compares, max %zu(%zu)",
+			    d->name, n, i, max_compares, abrt_compares);
+		}
+	}
+
+	return ret;
+}
+
+static struct test_distribution distributions[] = {
+	{ "sawtooth", fill_sawtooth, test_perturbed },
+	{ "random", fill_random, test_perturbed },
+	{ "stagger", fill_stagger, test_perturbed },
+	{ "plateau", fill_plateau, test_perturbed },
+	{ "shuffle", fill_shuffle, test_perturbed },
+	{ "bsd_killer", fill_bsd_killer, test_simple },
+	{ "med3_killer", fill_med3_killer, test_simple },
+	{ "antiqsort", NULL, test_antiqsort },
+	{ NULL }
+};
+
+static int
+run_tests(int n, const char *name)
+{
+	int *x, *y, *z;
+	int i, nlgn = 0;
+	int ret = 0;
+	struct test_distribution *d;
+
+	/*
+	 * We expect A*n*lg(n) compares where A is between 1 and 2.
+	 * For A > 1.5, print a warning.
+	 * For A > 10 abort the test since qsort has probably gone quadratic.
+	 */
+	for (i = n - 1; i > 0; i >>= 1)
+	    nlgn++;
+	nlgn *= n;
+	max_compares = nlgn * 1.5;
+	abrt_compares = nlgn * 10;
+
+	x = reallocarray(NULL, n, sizeof(x[0]));
+	y = reallocarray(NULL, n, sizeof(y[0]));
+	z = reallocarray(NULL, n, sizeof(z[0]));
+	if (x == NULL || y == NULL || z == NULL)
+		err(1, NULL);
+
+	for (d = distributions; d->name != NULL; d++) {
+		if (name != NULL && strcmp(name, d->name) != 0)
+			continue;
+		if (d->test(d, n, x, y, z) != 0)
+			ret = 1;
+	}
+
+	free(x);
+	free(y);
+	free(z);
+	return ret;
+}
+
+__dead void
+usage(void)
+{
+        fprintf(stderr, "usage: qsort_test [-dvt] [-n test_name] [num ...]\n");
+	exit(1);
+}
+
+int
+main(int argc, char *argv[])
+{
+	char *nums[] = { "100", "1023", "1024", "1025", "4095", "4096", "4097" };
+	int ch, n, ret = 0;
+	char *name = NULL;
+
+        while ((ch = getopt(argc, argv, "dn:tv")) != -1) {
+                switch (ch) {
+                case 'd':
+                        dump_table = true;
+                        break;
+                case 'n':
+                        name = optarg;
+                        break;
+                case 't':
+                        timing = true;
+                        break;
+                case 'v':
+                        verbose = true;
+                        break;
+                default:
+                        usage();
+                        break;
+                }
+        }
+        argc -= optind;
+        argv += optind;
+
+	if (argc == 0) {
+		argv = nums;
+		argc = sizeof(nums) / sizeof(nums[0]);
+	}
+
+	while (argc > 0) {
+		n = atoi(*argv);
+		if (run_tests(n, name) != 0)
+			ret = 1;
+		argc--;
+		argv++;
+	}
+
+	return ret;
+}
+@
+
+
+1.10
+log
+@Instead of embedding pre-generated tables from  McIlroy's "A Killer
+Adversary for Quicksort", just include the code to generate them.
+Also allow the number of elements to be specified on the command line.
+@
+text
+@d17 2
+d24 1
+d50 1
+a50 1
+static bool dump_table, verbose;
+d83 9
+a91 2
+			warnx("%s (%s): m: %d, n: %d, %zu compares, max %zu(%zu)",
+			    d->name, sub, m, n, compares, max_compares, abrt_compares);
+d93 9
+a101 2
+			warnx("%s: m: %d, n: %d, %zu compares, max %zu(%zu)",
+			    d->name, m, n, compares, max_compares, abrt_compares);
+d208 22
+d234 1
+d247 2
+d250 7
+d359 1
+d366 2
+d369 2
+d382 11
+a392 3
+	} else if (verbose || ret != 0) {
+		warnx("%s: n: %d, %d compares, max %zu(%zu)",
+		    d->name, n, i, max_compares, abrt_compares);
+d411 1
+a411 1
+run_tests(int n)
+d436 2
+d451 1
+a451 1
+        fprintf(stderr, "usage: qsort_test [-dv] [num ...]\n");
+d460 1
+d462 1
+a462 1
+        while ((ch = getopt(argc, argv, "dv")) != -1) {
+d467 6
+d491 1
+a491 1
+		if (run_tests(n) != 0)
+@
+
+
+1.9
+log
+@correct a return value test
+ok millert@@
+@
+text
+@d17 1
+d22 1
+d32 1
+a32 1
+ *  M. D. McIlroy's "A Killer Adversary for Quicksort" targeting B & M qsort
+d35 4
+a38 10
 enum distribution {
     SAWTOOTH,
     RAND,
@@ -112,15 +655,9 @@ enum distribution {
     BSD_KILLER,
     MED3_KILLER,
     INVALID
-};
-
-#define min(a, b)	(((a) < (b)) ? (a) : (b))
-
-static size_t compares;
-static size_t max_compares;
-static size_t abrt_compares;
-static sigjmp_buf cmpjmp;
-
+d47 1
+d49 1
+a49 1317
 /*
  * Bentley and McIlroy "killer" input generated by from McIlroy's
  * "A Killer Adversary for Quicksort" program.
@@ -1438,55 +1975,31 @@ static const int bmkiller_4097[] = {
 	3970, 3975, 3985, 3995, 4001, 4011, 4016, 4026, 4032, 4042, 4047, 4057, 
 	4089, 4090, 4094, 4095,    5
 };
-
-static int
-cmp(const void *v1, const void *v2)
-{
-	const int a = *(const int *)v1;
-	const int b = *(const int *)v2;
-
-	return a > b ? 1 : a < b ? -1 : 0;
-}
-
-static int
-cmp_checked(const void *v1, const void *v2)
-{
-	const int a = *(const int *)v1;
-	const int b = *(const int *)v2;
-
-	compares++;
-	if (compares > abrt_compares)
-		siglongjmp(cmpjmp, 1);
-	return a > b ? 1 : a < b ? -1 : 0;
-}
-
-static int
+d73 1
+a73 1
 check_result(char *prefix, int *got, int *expected, enum distribution dist,
-    int m, int n)
-{
-	int i;
-
+d78 8
+a85 3
 	if (compares > max_compares) {
 		warnx("%s: %zu compares, max %zu, dist %d, m: %d, n: %d",
 		    prefix, compares, max_compares, dist, m, n);
-	}
-
-	for (i = 0; i < n; i++) {
+d89 12
+a100 5
 		if (got[i] != expected[i]) {
 			warnx("%s: failure at %d, dist %d, m: %d, n: %d",
 			    prefix, i, dist, m, n);
 			return 1;
 		}
-	}
+d102 28
+a129 1
 	return 0;
-}
-
-static void
+d133 10
+a142 1
 fill_test_array(int *x, int n, int dist, int m)
-{
-	int i, j, k;
+a144 1
 	const int *bmk;
-
+d146 41
+a186 60
 	switch (dist) {
 	case SAWTOOTH:
 		for (i = 0; i < n; i++)
@@ -1547,7 +2060,7 @@ fill_test_array(int *x, int n, int dist, int m)
 				x[i] = n + k + 1 - i;
 			else
 				x[i] = k + 1;
-		}
+a187 22
 		break;
 	case MED3_KILLER:
 		/*
@@ -1570,34 +2083,30 @@ fill_test_array(int *x, int n, int dist, int m)
 		break;
 	default:
 		err(1, "unexpected distribution %d", dist);
-	}
-}
-
-static int
+d192 1
+a192 1
 test_distribution(int dist, int m, int n, int *x, int *y, int *z)
-{
+a193 1
 	int i, j;
-	int ret = 0;
-
+a195 6
 	/* Fill in x[] based on distribution and 'm' */
 	fill_test_array(x, n, dist, m);
 
 	/* Test on copy of x[] */
 	for (i = 0; i < n; i++)
 		y[i] = z[i] = x[i];
-	compares = 0;
-	if (sigsetjmp(cmpjmp, 1) != 0) {
+d198 7
+a204 2
 		warnx("qsort aborted: %zu compares, dist %d, m: %d, n: %d",
 		    compares, dist, m, n);
-		ret = 1;
-	} else {
-		qsort(y, n, sizeof(y[0]), cmp_checked);
-		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
-			err(1, NULL);
+d208 19
+d229 1
+a229 1
 		if (check_result("copy", y, z, dist, m, n) != 0)
-			ret = 1;
+a230 1
 	}
-
+d232 3
+a234 10
 	/* Test on reversed copy of x[] */
 	for (i = 0, j = n - 1; i < n; i++, j--)
 		y[i] = z[i] = x[j];
@@ -1608,12 +2117,13 @@ test_distribution(int dist, int m, int n, int *x, int *y, int *z)
 		ret = 1;
 	} else {
 		qsort(y, n, sizeof(y[0]), cmp_checked);
-		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
-			err(1, NULL);
+d237 1
+a237 1
 		if (check_result("reversed", y, z, dist, m, n) != 0)
-			ret = 1;
+a238 1
 	}
-
+d240 5
+a244 12
 	/* Test with front half of x[] reversed */
 	for (i = 0, j = (n / 2) - 1; i < n / 2; i++, j--)
 		y[i] = z[i] = x[j];
@@ -1626,12 +2136,13 @@ test_distribution(int dist, int m, int n, int *x, int *y, int *z)
 		ret = 1;
 	} else {
 		qsort(y, n, sizeof(y[0]), cmp_checked);
-		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
-			err(1, NULL);
+d247 1
+a247 1
 		if (check_result("front reversed", y, z, dist, m, n) != 0)
-			ret = 1;
+a248 1
 	}
-
+d250 5
+a254 12
 	/* Test with back half of x[] reversed */
 	for (i = 0; i < n / 2; i++)
 		y[i] = z[i] = x[i];
@@ -1644,12 +2155,13 @@ test_distribution(int dist, int m, int n, int *x, int *y, int *z)
 		ret = 1;
 	} else {
 		qsort(y, n, sizeof(y[0]), cmp_checked);
-		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
-			err(1, NULL);
+d257 1
+a257 1
 		if (check_result("back reversed", y, z, dist, m, n) != 0)
-			ret = 1;
+a258 1
 	}
-
+d260 6
+a265 13
 	/* Test on sorted copy of x[] */
 	if (mergesort(x, n, sizeof(x[0]), cmp) != 0)
 		err(1, NULL);
@@ -1663,9 +2175,10 @@ test_distribution(int dist, int m, int n, int *x, int *y, int *z)
 	} else {
 		qsort(y, n, sizeof(y[0]), cmp_checked);
 		if (check_result("sorted", y, x, dist, m, n) != 0)
-			ret = 1;
+a266 1
 	}
-
+d268 3
+a270 10
 	/* Test with i%5 added to x[i] (dither) */
 	for (i = 0, j = n - 1; i < n; i++, j--)
 		y[i] = z[i] = x[j] + (i % 5);
@@ -1676,35 +2189,27 @@ test_distribution(int dist, int m, int n, int *x, int *y, int *z)
 		ret = 1;
 	} else {
 		qsort(y, n, sizeof(y[0]), cmp_checked);
-		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
-			err(1, NULL);
+d273 1
+a273 1
 		if (check_result("dithered", y, z, dist, m, n) != 0)
-			ret = 1;
-	}
-
-	return ret;
-}
-
-/*
+d281 1
+a281 1
  * Like test_distribution() but because the input is tailored to cause
- * quicksort to go quadratic we don't perturb the input.
- */
-static int
+d285 1
+a285 1
 test_killer(int dist, int n, int *x, int *y, int *z)
-{
-	int i, ret = 0;
-
+d289 2
+a290 2
 	/* Fill in x[] with "killer" input */
 	fill_test_array(x, n, dist, 0);
-
-	/* Make a copy of x[] */
-	for (i = 0; i < n; i++)
-		y[i] = z[i] = x[i];
+d295 23
+a317 4
 	compares = 0;
 	if (sigsetjmp(cmpjmp, 1) != 0) {
 		warnx("qsort aborted: %zu compares, dist %d, n: %d",
 		    compares, dist, n);
-		ret = 1;
+d319 12
+a330 8
 	} else {
 		qsort(y, n, sizeof(y[0]), cmp_checked);
 		if (mergesort(z, n, sizeof(z[0]), cmp) != 0)
@@ -1713,36 +2218,17 @@ test_killer(int dist, int n, int *x, int *y, int *z)
 		compares = 0;
 		if (check_result("killer", y, z, dist, 0, n) != 0)
 			ret = 1;
-	}
-
-	return ret;
-}
-
-static int
-run_tests(int n)
-{
-	int *x, *y, *z;
+d336 12
+d352 3
+a354 3
 	int m, ret = 0;
 	int idx, nlgn = 0;
 	enum distribution dist;
-
-	/*
-	 * We expect A*n*lg(n) compares where A is between 1 and 2.
-	 * For A > 1.5, print a warning.
-	 * For A > 10 abort the test since qsort has probably gone quadratic.
-	 */
+d361 1
+a361 1
 	for (idx = n - 1; idx > 0; idx >>= 1)
-	    nlgn++;
-	nlgn *= n;
-	max_compares = nlgn * 1.5;
-	abrt_compares = nlgn * 10;
-
-	x = reallocarray(NULL, n, sizeof(x[0]));
-	y = reallocarray(NULL, n, sizeof(y[0]));
-	z = reallocarray(NULL, n, sizeof(z[0]));
-	if (x == NULL || y == NULL || z == NULL)
-		err(1, NULL);
-
+d373 3
+a375 15
 	for (dist = SAWTOOTH; dist != INVALID; dist++) {
 		switch (dist) {
 		case BM_KILLER:
@@ -1758,27 +2244,15 @@ run_tests(int n)
 			}
 			break;
 		}
-	}
-
-	free(x);
-	free(y);
-	free(z);
-	return ret;
-}
-
-int
-main(int argc, char *argv[])
-{
+d384 7
+d394 23
+a416 2
 	int *nn, nums[] = { 100, 1023, 1024, 1025, 4095, 4096, 4097, -1 };
 	int n, ret = 0;
-
+d418 2
+a419 1
 	for (nn = nums; (n = *nn) > 0; nn++) {
-		if (run_tests(n) != 0)
-			ret = 1;
-	}
-
-	return ret;
-}
+d422 2
 @
 
 

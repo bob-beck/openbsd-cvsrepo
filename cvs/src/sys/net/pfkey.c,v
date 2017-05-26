@@ -1,4 +1,4 @@
-head	1.41;
+head	1.42;
 access;
 symbols
 	OPENBSD_6_1:1.40.0.4
@@ -87,6 +87,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.42
+date	2017.05.26.19.11.20;	author claudio;	state Exp;
+branches;
+next	1.41;
+commitid	75Un0Xf6t3OWFP1E;
 
 1.41
 date	2017.05.16.12.24.01;	author mpi;	state Exp;
@@ -341,14 +347,14 @@ desc
 @@
 
 
-1.41
+1.42
 log
-@Replace remaining splsoftassert(IPL_SOFTNET) by NET_ASSERT_LOCKED().
-
-ok visa@@
+@There is only one version of pfkey in OpenBSD and this will not change any
+time soon so remove all the code to support multiple pfkey versions.
+OK mpi@@
 @
 text
-@/*	$OpenBSD: pfkey.c,v 1.40 2017/03/13 20:18:21 claudio Exp $	*/
+@/*	$OpenBSD: pfkey.c,v 1.41 2017/05/16 12:24:01 mpi Exp $	*/
 
 /*
  *	@@(#)COPYRIGHT	1.1 (NRL) 17 January 1995
@@ -432,12 +438,11 @@ text
 #include <sys/domain.h>
 #include <net/raw_cb.h>
 
-#define PFKEY_PROTOCOL_MAX 3
-static struct pfkey_version *pfkey_versions[PFKEY_PROTOCOL_MAX+1] =
-    { NULL, NULL, NULL, NULL };
+#define PFKEYV2_PROTOCOL 2
 
 #define PFKEY_MSG_MAXSZ 4096
 
+struct domain pfkeydomain;
 struct sockaddr pfkey_addr = { 2, PF_KEY, };
 
 int pfkey_usrreq(struct socket *, int , struct mbuf *, struct mbuf *,
@@ -446,41 +451,6 @@ int pfkey_output(struct mbuf *, struct socket *, struct sockaddr *,
     struct mbuf *);
 
 void pfkey_init(void);
-int pfkey_buildprotosw(void);
-
-int
-pfkey_register(struct pfkey_version *version)
-{
-	int rval;
-
-	if ((version->protocol > PFKEY_PROTOCOL_MAX) ||
-	    (version->protocol < 0))
-		return (EPROTONOSUPPORT);
-
-	if (pfkey_versions[version->protocol])
-		return (EADDRINUSE);
-
-	pfkey_versions[version->protocol] = version;
-
-	if ((rval = pfkey_buildprotosw()) != 0) {
-		pfkey_versions[version->protocol] = NULL;
-		return (rval);
-	}
-
-	return (0);
-}
-
-int
-pfkey_unregister(struct pfkey_version *version)
-{
-	int rval;
-
-	if ((rval = pfkey_buildprotosw()) != 0)
-		return (rval);
-
-	pfkey_versions[version->protocol] = NULL;
-	return (0);
-}
 
 int
 pfkey_sendup(struct socket *socket, struct mbuf *packet, int more)
@@ -531,8 +501,7 @@ pfkey_output(struct mbuf *mbuf, struct socket *socket, struct sockaddr *dstaddr,
 
 	m_copydata(mbuf, 0, mbuf->m_pkthdr.len, message);
 
-	error = pfkey_versions[socket->so_proto->pr_protocol]->send(socket,
-	    message, mbuf->m_pkthdr.len);
+	error = pfkeyv2_send(socket, message, mbuf->m_pkthdr.len);
 
 ret:
 	m_freem(mbuf);
@@ -547,11 +516,6 @@ pfkey_attach(struct socket *so, int proto)
 	if ((so->so_state & SS_PRIV) == 0)
 		return EACCES;
 
-	if ((so->so_proto->pr_protocol > PFKEY_PROTOCOL_MAX) ||
-	    (so->so_proto->pr_protocol < 0) ||
-	    !pfkey_versions[so->so_proto->pr_protocol])
-		return (EPROTONOSUPPORT);
-
 	if (!(so->so_pcb = malloc(sizeof(struct rawcb),
 	    M_PCB, M_DONTWAIT | M_ZERO)))
 		return (ENOMEM);
@@ -564,8 +528,7 @@ pfkey_attach(struct socket *so, int proto)
 	soisconnected(so);
 
 	so->so_options |= SO_USELOOPBACK;
-	if ((rval =
-	    pfkey_versions[so->so_proto->pr_protocol]->create(so)) != 0)
+	if ((rval = pfkeyv2_create(so)) != 0)
 		goto ret;
 
 	return (0);
@@ -580,7 +543,7 @@ pfkey_detach(struct socket *socket, struct proc *p)
 {
 	int rval, i;
 
-	rval = pfkey_versions[socket->so_proto->pr_protocol]->release(socket);
+	rval = pfkeyv2_release(socket);
 	i = raw_usrreq(socket, PRU_DETACH, NULL, NULL, NULL, p);
 
 	if (!rval)
@@ -595,11 +558,6 @@ pfkey_usrreq(struct socket *socket, int req, struct mbuf *mbuf,
 {
 	int rval;
 
-	if ((socket->so_proto->pr_protocol > PFKEY_PROTOCOL_MAX) ||
-	    (socket->so_proto->pr_protocol < 0) ||
-	    !pfkey_versions[socket->so_proto->pr_protocol])
-		return (EPROTONOSUPPORT);
-
 	switch (req) {
 	case PRU_DETACH:
 		return (pfkey_detach(socket, p));
@@ -611,6 +569,112 @@ pfkey_usrreq(struct socket *socket, int req, struct mbuf *mbuf,
 	return (rval);
 }
 
+static struct protosw pfkeysw[] = {
+{
+  .pr_type	= SOCK_RAW,
+  .pr_domain	= &pfkeydomain,
+  .pr_protocol	= PFKEYV2_PROTOCOL,
+  .pr_flags	= PR_ATOMIC | PR_ADDR,
+  .pr_output	= pfkey_output,
+  .pr_usrreq	= pfkey_usrreq,
+  .pr_attach	= pfkey_attach,
+  .pr_sysctl	= pfkeyv2_sysctl,
+}
+};
+
+struct domain pfkeydomain = {
+  .dom_family = PF_KEY,
+  .dom_name = "PF_KEY",
+  .dom_init = pfkey_init,
+  .dom_protosw = pfkeysw,
+  .dom_protoswNPROTOSW = &pfkeysw[nitems(pfkeysw)],
+};
+
+void
+pfkey_init(void)
+{
+	rn_init(sizeof(struct sockaddr_encap));
+}
+@
+
+
+1.41
+log
+@Replace remaining splsoftassert(IPL_SOFTNET) by NET_ASSERT_LOCKED().
+
+ok visa@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pfkey.c,v 1.40 2017/03/13 20:18:21 claudio Exp $	*/
+d85 1
+a85 3
+#define PFKEY_PROTOCOL_MAX 3
+static struct pfkey_version *pfkey_versions[PFKEY_PROTOCOL_MAX+1] =
+    { NULL, NULL, NULL, NULL };
+d89 1
+a97 35
+int pfkey_buildprotosw(void);
+
+int
+pfkey_register(struct pfkey_version *version)
+{
+	int rval;
+
+	if ((version->protocol > PFKEY_PROTOCOL_MAX) ||
+	    (version->protocol < 0))
+		return (EPROTONOSUPPORT);
+
+	if (pfkey_versions[version->protocol])
+		return (EADDRINUSE);
+
+	pfkey_versions[version->protocol] = version;
+
+	if ((rval = pfkey_buildprotosw()) != 0) {
+		pfkey_versions[version->protocol] = NULL;
+		return (rval);
+	}
+
+	return (0);
+}
+
+int
+pfkey_unregister(struct pfkey_version *version)
+{
+	int rval;
+
+	if ((rval = pfkey_buildprotosw()) != 0)
+		return (rval);
+
+	pfkey_versions[version->protocol] = NULL;
+	return (0);
+}
+d148 1
+a148 2
+	error = pfkey_versions[socket->so_proto->pr_protocol]->send(socket,
+	    message, mbuf->m_pkthdr.len);
+a162 5
+	if ((so->so_proto->pr_protocol > PFKEY_PROTOCOL_MAX) ||
+	    (so->so_proto->pr_protocol < 0) ||
+	    !pfkey_versions[so->so_proto->pr_protocol])
+		return (EPROTONOSUPPORT);
+
+d175 1
+a175 2
+	if ((rval =
+	    pfkey_versions[so->so_proto->pr_protocol]->create(so)) != 0)
+d190 1
+a190 1
+	rval = pfkey_versions[socket->so_proto->pr_protocol]->release(socket);
+a204 5
+	if ((socket->so_proto->pr_protocol > PFKEY_PROTOCOL_MAX) ||
+	    (socket->so_proto->pr_protocol < 0) ||
+	    !pfkey_versions[socket->so_proto->pr_protocol])
+		return (EPROTONOSUPPORT);
+
+d216 2
+a217 7
 struct domain pfkeydomain = {
   .dom_family = PF_KEY,
   .dom_name = "PF_KEY",
@@ -618,15 +682,12 @@ struct domain pfkeydomain = {
 };
 
 static struct protosw pfkey_protosw_template = {
-  .pr_type	= SOCK_RAW,
-  .pr_domain	= &pfkeydomain,
+d220 1
+a220 1
   .pr_protocol	= -1,
-  .pr_flags	= PR_ATOMIC | PR_ADDR,
-  .pr_output	= pfkey_output,
-  .pr_usrreq	= pfkey_usrreq,
-  .pr_attach	= pfkey_attach,
-};
-
+d225 2
+d229 7
+a235 46
 int
 pfkey_buildprotosw(void)
 {
@@ -673,17 +734,12 @@ pfkey_buildprotosw(void)
 
 	return (0);
 }
-
-void
-pfkey_init(void)
-{
-	rn_init(sizeof(struct sockaddr_encap));
+a240 5
 
 	if (pfkey_buildprotosw() != 0)
 		return;
 
 	pfkeyv2_init();
-}
 @
 
 

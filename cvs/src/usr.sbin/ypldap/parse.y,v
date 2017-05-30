@@ -1,4 +1,4 @@
-head	1.21;
+head	1.22;
 access;
 symbols
 	OPENBSD_6_1:1.21.0.4
@@ -40,6 +40,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.22
+date	2017.05.30.09.33.31;	author jmatthew;	state Exp;
+branches;
+next	1.21;
+commitid	egu4B2UiCIANQ1k3;
 
 1.21
 date	2017.01.05.13.53.10;	author krw;	state Exp;
@@ -158,17 +164,13 @@ desc
 @@
 
 
-1.21
+1.22
 log
-@Replace hand-rolled for(;;) emptying of 'symhead' TAILQ with more
-modern TAILQ_FOREACH_SAFE().
-
-No intentional functional change.
-
-ok millert@@ bluhm@@ gilles@@
+@Teach ypldap to use tls when connecting to ldap servers.
+libtls help from jsing@@, linker help from deraadt@@
 @
 text
-@/*	$OpenBSD: parse.y,v 1.20 2017/01/05 12:42:19 krw Exp $	*/
+@/*	$OpenBSD: parse.y,v 1.21 2017/01/05 13:53:10 krw Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@@openbsd.org>
@@ -271,11 +273,12 @@ typedef struct {
 %token	SERVER FILTER ATTRIBUTE BASEDN BINDDN GROUPDN BINDCRED MAPS CHANGE DOMAIN PROVIDE
 %token	USER GROUP TO EXPIRE HOME SHELL GECOS UID GID INTERVAL
 %token	PASSWD NAME FIXED LIST GROUPNAME GROUPPASSWD GROUPGID MAP
-%token	INCLUDE DIRECTORY CLASS PORT ERROR GROUPMEMBERS
+%token	INCLUDE DIRECTORY CLASS PORT ERROR GROUPMEMBERS LDAPS TLS CAFILE
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.number>	opcode attribute
-%type	<v.string>	port
+%type	<v.number>	port
+%type	<v.number>	ssl
 
 %%
 
@@ -327,8 +330,28 @@ varset		: STRING '=' STRING			{
 		}
 		;
 
-port		: /* empty */	{ $$ = NULL; }
-		| PORT STRING	{ $$ = $2; }
+port		: PORT STRING				{
+			struct servent *servent;
+
+			servent = getservbyname($2, "tcp");
+			if (servent == NULL) {
+				yyerror("port %s is invalid", $2);
+				free($2);
+				YYERROR;
+			}
+			$$ = ntohs(servent->s_port);
+			free($2);
+		}
+		| PORT NUMBER				{
+			if ($2 <= 0 || $2 >= (int)USHRT_MAX) {
+				yyerror("invalid port: %lld", $2);
+				YYERROR;
+			}
+			$$ = $2;
+		}
+		| /* empty */				{
+			$$ = 0;
+		}
 		;
 
 opcode		: GROUP					{ $$ = 0; }
@@ -438,7 +461,12 @@ diropt		: BINDDN STRING				{
 		}
 		;
 
-directory	: DIRECTORY STRING port {
+ssl		: /* empty */				{ $$ = 0; }
+		| LDAPS					{ $$ = F_SSL; }
+		| TLS					{ $$ = F_STARTTLS; }
+		;
+
+directory	: DIRECTORY STRING port ssl {
 			if ((idm = calloc(1, sizeof(*idm))) == NULL)
 				fatal(NULL);
 			idm->idm_id = conf->sc_maxid++;
@@ -450,8 +478,54 @@ directory	: DIRECTORY STRING port {
 				free($2);
 				YYERROR;
 			}
-
 			free($2);
+
+			idm->idm_port = $3;
+
+			if ($4 != 0) {
+				if (tls_init()) {
+					yyerror("tls init failed");
+					YYERROR;
+				}
+
+				idm->idm_flags |= $4;
+				idm->idm_tls_config = tls_config_new();
+				if (idm->idm_tls_config == NULL) {
+					yyerror("tls config failed");
+					YYERROR;
+				}
+
+				if (tls_config_set_protocols(
+				    idm->idm_tls_config,
+				    TLS_PROTOCOLS_ALL) == -1) {
+					yyerror("tls set protocols failed: %s",
+					    tls_config_error(
+					    idm->idm_tls_config));
+					tls_config_free(idm->idm_tls_config);
+					idm->idm_tls_config = NULL;
+					YYERROR;
+				}
+				if (tls_config_set_ciphers(idm->idm_tls_config,
+				    "compat") == -1) {
+					yyerror("tls set ciphers failed: %s",
+					    tls_config_error(
+					    idm->idm_tls_config));
+					tls_config_free(idm->idm_tls_config);
+					idm->idm_tls_config = NULL;
+					YYERROR;
+				}
+
+				if (tls_config_set_ca_file(idm->idm_tls_config,
+				    conf->sc_cafile) == -1) {
+					yyerror("tls set CA bundle failed: %s",
+					    tls_config_error(
+					    idm->idm_tls_config));
+					tls_config_free(idm->idm_tls_config);
+					idm->idm_tls_config = NULL;
+					YYERROR;
+				}
+			}
+
 		} '{' optnl diropts '}'			{
 			TAILQ_INSERT_TAIL(&conf->sc_idms, idm, idm_entry);
 			idm = NULL;
@@ -494,6 +568,10 @@ main		: INTERVAL NUMBER			{
 			}
 			free($3);
 		}
+		| CAFILE STRING				{
+			free(conf->sc_cafile);
+			conf->sc_cafile = $2;
+		} 
 		;
 
 diropts		: diropts diropt nl
@@ -538,6 +616,7 @@ lookup(char *s)
 		{ "basedn",		BASEDN },
 		{ "bindcred",		BINDCRED },
 		{ "binddn",		BINDDN },
+		{ "cafile",		CAFILE },
 		{ "change",		CHANGE },
 		{ "class",		CLASS },
 		{ "directory",		DIRECTORY },
@@ -556,6 +635,7 @@ lookup(char *s)
 		{ "home",		HOME },
 		{ "include",		INCLUDE },
 		{ "interval",		INTERVAL },
+		{ "ldaps",		LDAPS },
 		{ "list",		LIST },
 		{ "map",		MAP },
 		{ "maps",		MAPS },
@@ -565,6 +645,7 @@ lookup(char *s)
 		{ "provide",		PROVIDE },
 		{ "server",		SERVER },
 		{ "shell",		SHELL },
+		{ "tls",		TLS },
 		{ "to",			TO },
 		{ "uid",		UID },
 		{ "user",		USER },
@@ -901,6 +982,11 @@ parse_config(struct env *x_conf, const char *filename, int opts)
 	TAILQ_INIT(&conf->sc_idms);
 	conf->sc_conf_tv.tv_sec = DEFAULT_INTERVAL;
 	conf->sc_conf_tv.tv_usec = 0;
+	conf->sc_cafile = strdup(YPLDAP_CERT_FILE);
+	if (conf->sc_cafile == NULL) {
+		log_warn("malloc");
+		return (-1);
+	}
 
 	errors = 0;
 
@@ -1013,6 +1099,43 @@ symget(const char *nam)
 	}
 	return (NULL);
 }
+@
+
+
+1.21
+log
+@Replace hand-rolled for(;;) emptying of 'symhead' TAILQ with more
+modern TAILQ_FOREACH_SAFE().
+
+No intentional functional change.
+
+ok millert@@ bluhm@@ gilles@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: parse.y,v 1.20 2017/01/05 12:42:19 krw Exp $	*/
+d104 1
+a104 1
+%token	INCLUDE DIRECTORY CLASS PORT ERROR GROUPMEMBERS
+d108 2
+a109 1
+%type	<v.string>	port
+d161 22
+a182 2
+port		: /* empty */	{ $$ = NULL; }
+		| PORT STRING	{ $$ = $2; }
+d292 6
+a297 1
+directory	: DIRECTORY STRING port {
+d309 47
+a356 1
+			free($2);
+d399 4
+d447 1
+d466 1
+d476 1
+d813 5
 @
 
 

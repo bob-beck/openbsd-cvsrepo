@@ -1,4 +1,4 @@
-head	1.309;
+head	1.310;
 access;
 symbols
 	OPENBSD_6_1:1.295.0.4
@@ -98,6 +98,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.310
+date	2017.05.31.05.59.09;	author mpi;	state Exp;
+branches;
+next	1.309;
+commitid	XqMqqfSTUVDwiwE7;
 
 1.309
 date	2017.05.30.12.09.27;	author friehm;	state Exp;
@@ -1858,16 +1864,30 @@ desc
 @@
 
 
-1.309
+1.310
 log
-@Carp balancing ip does not work since there is a mac filter in
-ether_input(). Now we use mbuf tags instead of modifying the MAC
-address.
+@Move IPv4 & IPv6 incoming/forwarding path, PIPEX ppp processing and
+IPv4 & IPv6 dispatch functions outside the KERNEL_LOCK().
 
-ok mpi@@
+We currently rely on the NET_LOCK() serializing access to most global
+data structures for that.  IP input queues are no longer used in the
+forwarding case.  They still exist as boundary between the network and
+transport layers because TCP/UDP & friends still need the KERNEL_LOCK().
+
+Since we do not want to grab the NET_LOCK() for every packet, the
+softnet thread will do it once before processing a batch.  That means
+the L2 processing path, which is currently running without lock, will
+now run with the NET_LOCK().
+
+IPsec isn't ready to run without KERNEL_LOCK(), so the softnet thread
+will grab the KERNEL_LOCK() as soon as ``ipsec_in_use'' is set.
+
+Tested by Hrvoje Popovski.
+
+ok visa@@, bluhm@@, henning@@
 @
 text
-@/*	$OpenBSD: ip_input.c,v 1.308 2017/05/30 07:50:37 mpi Exp $	*/
+@/*	$OpenBSD: ip_input.c,v 1.309 2017/05/30 12:09:27 friehm Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -1996,6 +2016,7 @@ int ip_sysctl_ipstat(void *, size_t *, void *);
 static struct mbuf_queue	ipsend_mq;
 
 void	ip_ours(struct mbuf *);
+void	ip_local(struct mbuf *);
 int	ip_dooptions(struct mbuf *, struct ifnet *);
 int	in_ouraddr(struct mbuf *, struct ifnet *, struct rtentry **);
 
@@ -2076,27 +2097,31 @@ ip_init(void)
 	mq_init(&ipsend_mq, 64, IPL_SOFTNET);
 }
 
+/*
+ * Enqueue packet for local delivery.  Queuing is used as a boundary
+ * between the network layer (input/forward path) running without
+ * KERNEL_LOCK() and the transport layer still needing it.
+ */
 void
-ipv4_input(struct ifnet *ifp, struct mbuf *m)
+ip_ours(struct mbuf *m)
 {
 	niq_enqueue(&ipintrq, m);
 }
 
+/*
+ * Dequeue and process locally delivered packets.
+ */
 void
 ipintr(void)
 {
 	struct mbuf *m;
 
-	/*
-	 * Get next datagram off input queue and get IP header
-	 * in first mbuf.
-	 */
 	while ((m = niq_dequeue(&ipintrq)) != NULL) {
-#ifdef	DIAGNOSTIC
+#ifdef DIAGNOSTIC
 		if ((m->m_flags & M_PKTHDR) == 0)
 			panic("ipintr no HDR");
 #endif
-		ip_input(m);
+		ip_local(m);
 	}
 }
 
@@ -2106,17 +2131,12 @@ ipintr(void)
  * Checksum and byte swap header.  Process options. Forward or deliver.
  */
 void
-ip_input(struct mbuf *m)
+ipv4_input(struct ifnet *ifp, struct mbuf *m)
 {
-	struct ifnet	*ifp;
 	struct rtentry	*rt = NULL;
 	struct ip	*ip;
 	int hlen, len;
 	in_addr_t pfrdr = 0;
-
-	ifp = if_get(m->m_pkthdr.ph_ifidx);
-	if (ifp == NULL)
-		goto bad;
 
 	ipstat_inc(ips_total);
 	if (m->m_len < sizeof (struct ip) &&
@@ -2332,13 +2352,11 @@ ip_input(struct mbuf *m)
 #endif /* IPSEC */
 
 	ip_forward(m, ifp, rt, pfrdr);
-	if_put(ifp);
 	return;
 bad:
 	m_freem(m);
 out:
 	rtfree(rt);
-	if_put(ifp);
 }
 
 /*
@@ -2347,12 +2365,14 @@ out:
  * If fragmented try to reassemble.  Pass to next level.
  */
 void
-ip_ours(struct mbuf *m)
+ip_local(struct mbuf *m)
 {
 	struct ip *ip = mtod(m, struct ip *);
 	struct ipq *fp;
 	struct ipqent *ipqe;
 	int mff, hlen;
+
+	KERNEL_ASSERT_LOCKED();
 
 	hlen = ip->ip_hl << 2;
 
@@ -3550,18 +3570,37 @@ ip_send_dispatch(void *xmq)
 	struct mbuf *m;
 	struct mbuf_list ml;
 	int s;
+#ifdef IPSEC
+	int locked = 0;
+#endif /* IPSEC */
 
 	mq_delist(mq, &ml);
 	if (ml_empty(&ml))
 		return;
 
-	KERNEL_LOCK();
+#ifdef IPSEC
+	/*
+	 * IPsec is not ready to run without KERNEL_LOCK().  So all
+	 * the traffic on your machine is punished if you have IPsec
+	 * enabled.
+	 */
+	extern int ipsec_in_use;
+	if (ipsec_in_use) {
+		KERNEL_LOCK();
+		locked = 1;
+	}
+#endif /* IPSEC */
+
 	NET_LOCK(s);
 	while ((m = ml_dequeue(&ml)) != NULL) {
 		ip_output(m, NULL, NULL, 0, NULL, NULL, 0);
 	}
 	NET_UNLOCK(s);
-	KERNEL_UNLOCK();
+
+#ifdef IPSEC
+	if (locked)
+		KERNEL_UNLOCK();
+#endif /* IPSEC */
 }
 
 void
@@ -3570,6 +3609,63 @@ ip_send(struct mbuf *m)
 	mq_enqueue(&ipsend_mq, m);
 	task_add(softnettq, &ipsend_task);
 }
+@
+
+
+1.309
+log
+@Carp balancing ip does not work since there is a mac filter in
+ether_input(). Now we use mbuf tags instead of modifying the MAC
+address.
+
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ip_input.c,v 1.308 2017/05/30 07:50:37 mpi Exp $	*/
+d130 1
+d211 5
+d217 1
+a217 1
+ipv4_input(struct ifnet *ifp, struct mbuf *m)
+d222 3
+a229 4
+	/*
+	 * Get next datagram off input queue and get IP header
+	 * in first mbuf.
+	 */
+d231 1
+a231 1
+#ifdef	DIAGNOSTIC
+d235 1
+a235 1
+		ip_input(m);
+d245 1
+a245 1
+ip_input(struct mbuf *m)
+a246 1
+	struct ifnet	*ifp;
+a251 4
+	ifp = if_get(m->m_pkthdr.ph_ifidx);
+	if (ifp == NULL)
+		goto bad;
+
+a465 1
+	if_put(ifp);
+a470 1
+	if_put(ifp);
+d479 1
+a479 1
+ip_ours(struct mbuf *m)
+d486 2
+d1684 3
+d1692 13
+a1704 1
+	KERNEL_LOCK();
+d1710 5
+a1714 1
+	KERNEL_UNLOCK();
 @
 
 

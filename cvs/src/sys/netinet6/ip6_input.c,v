@@ -1,4 +1,4 @@
-head	1.193;
+head	1.194;
 access;
 symbols
 	OPENBSD_6_1:1.181.0.4
@@ -83,6 +83,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.194
+date	2017.05.31.05.59.09;	author mpi;	state Exp;
+branches;
+next	1.193;
+commitid	XqMqqfSTUVDwiwE7;
 
 1.193
 date	2017.05.30.12.09.27;	author friehm;	state Exp;
@@ -1227,16 +1233,30 @@ desc
 @@
 
 
-1.193
+1.194
 log
-@Carp balancing ip does not work since there is a mac filter in
-ether_input(). Now we use mbuf tags instead of modifying the MAC
-address.
+@Move IPv4 & IPv6 incoming/forwarding path, PIPEX ppp processing and
+IPv4 & IPv6 dispatch functions outside the KERNEL_LOCK().
 
-ok mpi@@
+We currently rely on the NET_LOCK() serializing access to most global
+data structures for that.  IP input queues are no longer used in the
+forwarding case.  They still exist as boundary between the network and
+transport layers because TCP/UDP & friends still need the KERNEL_LOCK().
+
+Since we do not want to grab the NET_LOCK() for every packet, the
+softnet thread will do it once before processing a batch.  That means
+the L2 processing path, which is currently running without lock, will
+now run with the NET_LOCK().
+
+IPsec isn't ready to run without KERNEL_LOCK(), so the softnet thread
+will grab the KERNEL_LOCK() as soon as ``ipsec_in_use'' is set.
+
+Tested by Hrvoje Popovski.
+
+ok visa@@, bluhm@@, henning@@
 @
 text
-@/*	$OpenBSD: ip6_input.c,v 1.192 2017/05/30 07:50:37 mpi Exp $	*/
+@/*	$OpenBSD: ip6_input.c,v 1.193 2017/05/30 12:09:27 friehm Exp $	*/
 /*	$KAME: ip6_input.c,v 1.188 2001/03/29 05:34:31 itojun Exp $	*/
 
 /*
@@ -1357,6 +1377,7 @@ struct niqueue ip6intrq = NIQUEUE_INITIALIZER(IFQ_MAXLEN, NETISR_IPV6);
 struct cpumem *ip6counters;
 
 void ip6_ours(struct mbuf *);
+void ip6_local(struct mbuf *);
 int ip6_check_rh0hdr(struct mbuf *, int *);
 int ip6_hbhchcheck(struct mbuf *, int *, int *, int *);
 int ip6_hopopts_input(u_int32_t *, u_int32_t *, struct mbuf **, int *);
@@ -1398,28 +1419,37 @@ ip6_init(void)
 	ip6counters = counters_alloc(ip6s_ncounters);
 }
 
+/*
+ * Enqueue packet for local delivery.  Queuing is used as a boundary
+ * between the network layer (input/forward path) running without
+ * KERNEL_LOCK() and the transport layer still needing it.
+ */
 void
-ipv6_input(struct ifnet *ifp, struct mbuf *m)
+ip6_ours(struct mbuf *m)
 {
 	niq_enqueue(&ip6intrq, m);
 }
 
 /*
- * IP6 input interrupt handling. Just pass the packet to ip6_input.
+ * Dequeue and process locally delivered packets.
  */
 void
 ip6intr(void)
 {
 	struct mbuf *m;
 
-	while ((m = niq_dequeue(&ip6intrq)) != NULL)
-		ip6_input(m);
+	while ((m = niq_dequeue(&ip6intrq)) != NULL) {
+#ifdef DIAGNOSTIC
+		if ((m->m_flags & M_PKTHDR) == 0)
+			panic("ipintr no HDR");
+#endif
+		ip6_local(m);
+	}
 }
 
 void
-ip6_input(struct mbuf *m)
+ipv6_input(struct ifnet *ifp, struct mbuf *m)
 {
-	struct ifnet *ifp;
 	struct ip6_hdr *ip6;
 	struct sockaddr_in6 sin6;
 	struct rtentry *rt = NULL;
@@ -1429,10 +1459,6 @@ ip6_input(struct mbuf *m)
 	struct in6_addr odst;
 #endif
 	int srcrt = 0;
-
-	ifp = if_get(m->m_pkthdr.ph_ifidx);
-	if (ifp == NULL)
-		goto bad;
 
 	ip6stat_inc(ip6s_total);
 
@@ -1679,8 +1705,8 @@ ip6_input(struct mbuf *m)
 			inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst));
 			/* address is not ready, so discard the packet. */
 			nd6log((LOG_INFO,
-			    "ip6_input: packet to an unready address %s->%s\n",
-			    src, dst));
+			    "%s: packet to an unready address %s->%s\n",
+			    __func__, src, dst));
 
 			goto bad;
 		} else {
@@ -1732,17 +1758,15 @@ ip6_input(struct mbuf *m)
 #endif /* IPSEC */
 
 	ip6_forward(m, rt, srcrt);
-	if_put(ifp);
 	return;
  bad:
 	m_freem(m);
  out:
 	rtfree(rt);
-	if_put(ifp);
 }
 
 void
-ip6_ours(struct mbuf *m)
+ip6_local(struct mbuf *m)
 {
 	int off, nxt;
 
@@ -2694,18 +2718,37 @@ ip6_send_dispatch(void *xmq)
 	struct mbuf *m;
 	struct mbuf_list ml;
 	int s;
+#ifdef IPSEC
+	int locked = 0;
+#endif /* IPSEC */
 
 	mq_delist(mq, &ml);
 	if (ml_empty(&ml))
 		return;
 
-	KERNEL_LOCK();
+#ifdef IPSEC
+	/*
+	 * IPsec is not ready to run without KERNEL_LOCK().  So all
+	 * the traffic on your machine is punished if you have IPsec
+	 * enabled.
+	 */
+	extern int ipsec_in_use;
+	if (ipsec_in_use) {
+		KERNEL_LOCK();
+		locked = 1;
+	}
+#endif /* IPSEC */
+
 	NET_LOCK(s);
 	while ((m = ml_dequeue(&ml)) != NULL) {
 		ip6_output(m, NULL, NULL, IPV6_MINMTU, NULL, NULL);
 	}
 	NET_UNLOCK(s);
-	KERNEL_UNLOCK();
+
+#ifdef IPSEC
+	if (locked)
+		KERNEL_UNLOCK();
+#endif /* IPSEC */
 }
 
 void
@@ -2714,6 +2757,61 @@ ip6_send(struct mbuf *m)
 	mq_enqueue(&ip6send_mq, m);
 	task_add(softnettq, &ip6send_task);
 }
+@
+
+
+1.193
+log
+@Carp balancing ip does not work since there is a mac filter in
+ether_input(). Now we use mbuf tags instead of modifying the MAC
+address.
+
+ok mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ip6_input.c,v 1.192 2017/05/30 07:50:37 mpi Exp $	*/
+d122 1
+d164 5
+d170 1
+a170 1
+ipv6_input(struct ifnet *ifp, struct mbuf *m)
+d176 1
+a176 1
+ * IP6 input interrupt handling. Just pass the packet to ip6_input.
+d183 7
+a189 2
+	while ((m = niq_dequeue(&ip6intrq)) != NULL)
+		ip6_input(m);
+d193 1
+a193 1
+ip6_input(struct mbuf *m)
+a194 1
+	struct ifnet *ifp;
+a204 4
+	ifp = if_get(m->m_pkthdr.ph_ifidx);
+	if (ifp == NULL)
+		goto bad;
+
+d450 2
+a451 2
+			    "ip6_input: packet to an unready address %s->%s\n",
+			    src, dst));
+a502 1
+	if_put(ifp);
+a507 1
+	if_put(ifp);
+d511 1
+a511 1
+ip6_ours(struct mbuf *m)
+d1463 3
+d1471 13
+a1483 1
+	KERNEL_LOCK();
+d1489 5
+a1493 1
+	KERNEL_UNLOCK();
 @
 
 

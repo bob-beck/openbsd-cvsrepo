@@ -1,4 +1,4 @@
-head	1.84;
+head	1.85;
 access;
 symbols
 	OPENBSD_6_1:1.84.0.4
@@ -61,6 +61,12 @@ symbols
 locks; strict;
 comment	@# @;
 
+
+1.85
+date	2017.05.31.19.18.18;	author deraadt;	state Exp;
+branches;
+next	1.84;
+commitid	HlDgymhwBU2bW7Tm;
 
 1.84
 date	2017.02.06.09.15.51;	author mpi;	state Exp;
@@ -533,12 +539,27 @@ desc
 @@
 
 
-1.84
+1.85
 log
-@Sync a comment with i386.
+@Split early startup code out of locore.S into locore0.S.  Adjust link
+run so that this locore0.o is always at the start of the executable.
+But randomize the link order of all other .o files in the kernel, so
+that their exec/rodata/data/bss segments land all over the place.
+Late during kernel boot, unmap the early startup code.
+
+As a result, the internal layout of every newly build bsd kernel is
+different from past kernels.  Internal relative offsets are not known
+to an outside attacker.  The only known offsets are in the startup code,
+which has been unmapped.
+
+Ramdisk kernels cannot be compiled like this, because they are gzip'd.
+When the internal pointer references change, the compression dictionary
+bloats and results in poorer compression.
+
+ok kettenis mlarkin visa, also thanks to tedu for getting me back to this
 @
 text
-@/*	$OpenBSD: locore.S,v 1.83 2016/09/04 09:22:28 mpi Exp $	*/
+@/*	$OpenBSD: locore.S,v 1.84 2017/02/06 09:15:51 mpi Exp $	*/
 /*	$NetBSD: locore.S,v 1.13 2004/03/25 18:33:17 drochner Exp $	*/
 
 /*
@@ -680,11 +701,6 @@ text
 #define SET_CURPCB(reg)			movq	reg,CPUVAR(CURPCB)
 
 
-/* XXX temporary kluge; these should not be here */
-/* Get definitions for IOM_BEGIN, IOM_END, and IOM_SIZE */
-#include <dev/isa/isareg.h>
-
-
 /*
  * Initialization
  */
@@ -770,6 +786,515 @@ gdt64_start:
 	.quad 0x00cf92000000ffff	/* kernel DS */
 gdt64_end:
 
+/*
+ * Some hackage to deal with 64bit symbols in 32 bit mode.
+ * This may not be needed if things are cleaned up a little.
+ */
+
+/*****************************************************************************/
+
+/*
+ * Signal trampoline; copied to top of user stack.
+ * gdb's backtrace logic matches against the instructions in this.
+ */
+	.section .rodata
+	.globl	_C_LABEL(sigcode)
+_C_LABEL(sigcode):
+	call	*%rax
+
+	movq	%rsp,%rdi
+	pushq	%rdi			/* fake return address */
+	movq	$SYS_sigreturn,%rax
+	syscall
+	.globl	_C_LABEL(sigcoderet)
+_C_LABEL(sigcoderet):
+	movq	$SYS_exit,%rax
+	syscall
+	.globl	_C_LABEL(esigcode)
+_C_LABEL(esigcode):
+
+	.globl	_C_LABEL(sigfill)
+_C_LABEL(sigfill):
+	int3
+_C_LABEL(esigfill):
+	.globl	_C_LABEL(sigfillsiz)
+_C_LABEL(sigfillsiz):
+	.long	_C_LABEL(esigfill) - _C_LABEL(sigfill)
+
+	.text
+/*
+ * void lgdt(struct region_descriptor *rdp);
+ * Change the global descriptor table.
+ */
+NENTRY(lgdt)
+	/* Reload the descriptor table. */
+	movq	%rdi,%rax
+	lgdt	(%rax)
+	/* Flush the prefetch q. */
+	jmp	1f
+	nop
+1:	/* Reload "stale" selectors. */
+	movl	$GSEL(GDATA_SEL, SEL_KPL),%eax
+	movl	%eax,%ds
+	movl	%eax,%es
+	movl	%eax,%ss
+	/* Reload code selector by doing intersegment return. */
+	popq	%rax
+	pushq	$GSEL(GCODE_SEL, SEL_KPL)
+	pushq	%rax
+	lretq
+
+ENTRY(setjmp)
+	/*
+	 * Only save registers that must be preserved across function
+	 * calls according to the ABI (%rbx, %rsp, %rbp, %r12-%r15)
+	 * and %rip.
+	 */
+	movq	%rdi,%rax
+	movq	%rbx,(%rax)
+	movq	%rsp,8(%rax)
+	movq	%rbp,16(%rax)
+	movq	%r12,24(%rax)
+	movq	%r13,32(%rax)
+	movq	%r14,40(%rax)
+	movq	%r15,48(%rax)
+	movq	(%rsp),%rdx
+	movq	%rdx,56(%rax)
+	xorl	%eax,%eax
+	ret
+
+ENTRY(longjmp)
+	movq	%rdi,%rax
+	movq	(%rax),%rbx
+	movq	8(%rax),%rsp
+	movq	16(%rax),%rbp
+	movq	24(%rax),%r12
+	movq	32(%rax),%r13
+	movq	40(%rax),%r14
+	movq	48(%rax),%r15
+	movq	56(%rax),%rdx
+	movq	%rdx,(%rsp)
+	xorl	%eax,%eax
+	incl	%eax
+	ret
+
+/*****************************************************************************/
+
+/*
+ * int cpu_switchto(struct proc *old, struct proc *new)
+ * Switch from "old" proc to "new".
+ */
+ENTRY(cpu_switchto)
+	pushq	%rbx
+	pushq	%rbp
+	pushq	%r12
+	pushq	%r13
+	pushq	%r14
+	pushq	%r15
+
+	movq	%rdi, %r13
+	movq	%rsi, %r12
+
+	/* Record new proc. */
+	movb	$SONPROC,P_STAT(%r12)	# p->p_stat = SONPROC
+	SET_CURPROC(%r12,%rcx)
+
+	movl	CPUVAR(CPUID),%edi
+
+	/* If old proc exited, don't bother. */
+	testq	%r13,%r13
+	jz	switch_exited
+
+	/*
+	 * Save old context.
+	 *
+	 * Registers:
+	 *   %rax, %rcx - scratch
+	 *   %r13 - old proc, then old pcb
+	 *   %r12 - new proc
+	 *   %edi - cpuid
+	 */
+
+	movq	P_ADDR(%r13),%r13
+
+	/* clear the old pmap's bit for the cpu */
+	movq	PCB_PMAP(%r13),%rcx
+	lock
+	btrq	%rdi,PM_CPUS(%rcx)
+
+	/* Save stack pointers. */
+	movq	%rsp,PCB_RSP(%r13)
+	movq	%rbp,PCB_RBP(%r13)
+
+switch_exited:
+	/* did old proc run in userspace?  then reset the segment regs */
+	btrl	$CPUF_USERSEGS_BIT, CPUVAR(FLAGS)
+	jnc	restore_saved
+
+	/* set %ds, %es, and %fs to expected value to prevent info leak */
+	movw	$(GSEL(GUDATA_SEL, SEL_UPL)),%ax
+	movw	%ax,%ds
+	movw	%ax,%es
+	movw	%ax,%fs
+
+restore_saved:
+	/*
+	 * Restore saved context.
+	 *
+	 * Registers:
+	 *   %rax, %rcx, %rdx - scratch
+	 *   %r13 - new pcb
+	 *   %r12 - new process
+	 */
+
+	/* No interrupts while loading new state. */
+	cli
+	movq	P_ADDR(%r12),%r13
+
+	/* Restore stack pointers. */
+	movq	PCB_RSP(%r13),%rsp
+	movq	PCB_RBP(%r13),%rbp
+
+	movq	CPUVAR(TSS),%rcx
+	movq	PCB_KSTACK(%r13),%rdx
+	movq	%rdx,TSS_RSP0(%rcx)
+
+	movq	PCB_CR3(%r13),%rax
+	movq	%rax,%cr3
+
+	/* Don't bother with the rest if switching to a system process. */
+	testl	$P_SYSTEM,P_FLAG(%r12)
+	jnz	switch_restored
+
+	/* set the new pmap's bit for the cpu */
+	movl	CPUVAR(CPUID),%edi
+	movq	PCB_PMAP(%r13),%rcx
+	lock
+	btsq	%rdi,PM_CPUS(%rcx)
+#ifdef DIAGNOSTIC
+	jc	_C_LABEL(switch_pmcpu_set)
+#endif
+
+switch_restored:
+	/* Restore cr0 (including FPU state). */
+	movl	PCB_CR0(%r13),%ecx
+#ifdef MULTIPROCESSOR
+	movq	PCB_FPCPU(%r13),%r8
+	cmpq	CPUVAR(SELF),%r8
+	jz	1f
+	orl	$CR0_TS,%ecx
+1:
+#endif
+	movq	%rcx,%cr0
+
+	SET_CURPCB(%r13)
+
+	/* Interrupts are okay again. */
+	sti
+
+switch_return:
+
+	popq	%r15
+	popq	%r14
+	popq	%r13
+	popq	%r12
+	popq	%rbp
+	popq	%rbx
+	ret
+
+ENTRY(cpu_idle_enter)
+	movq	_C_LABEL(cpu_idle_enter_fcn),%rax
+	cmpq	$0,%rax
+	je	1f
+	jmpq	*%rax
+1:
+	ret
+
+ENTRY(cpu_idle_cycle)
+	movq	_C_LABEL(cpu_idle_cycle_fcn),%rax
+	cmpq	$0,%rax
+	je	1f
+	call	*%rax
+	ret
+1:
+	sti
+	hlt
+	ret
+
+ENTRY(cpu_idle_leave)
+	movq	_C_LABEL(cpu_idle_leave_fcn),%rax
+	cmpq	$0,%rax
+	je	1f
+	jmpq	*%rax
+1:
+	ret
+
+	.globl	_C_LABEL(panic)
+
+#ifdef DIAGNOSTIC
+NENTRY(switch_pmcpu_set)
+	movabsq	$1f,%rdi
+	call	_C_LABEL(panic)
+	/* NOTREACHED */
+1:	.asciz	"activate already active pmap"
+#endif /* DIAGNOSTIC */
+
+/*
+ * savectx(struct pcb *pcb);
+ * Update pcb, saving current processor state.
+ */
+ENTRY(savectx)
+	/* Save stack pointers. */
+	movq	%rsp,PCB_RSP(%rdi)
+	movq	%rbp,PCB_RBP(%rdi)
+
+	ret
+
+IDTVEC(syscall32)
+	sysret		/* go away please */
+
+/*
+ * syscall insn entry. This currently isn't much faster, but
+ * it can be made faster in the future.
+ */
+IDTVEC(syscall)
+	/*
+	 * Enter here with interrupts blocked; %rcx contains the caller's
+	 * %rip and the original rflags has been copied to %r11.  %cs and
+	 * %ss have been updated to the kernel segments, but %rsp is still
+	 * the user-space value.
+	 * First order of business is to swap to the kernel gs.base so that
+	 * we can access our struct cpu_info and use the scratch space there
+	 * to switch to our kernel stack.  Once that's in place we can
+	 * unblock interrupts and save the rest of the syscall frame.
+	 */
+	swapgs
+	movq	%r15,CPUVAR(SCRATCH)
+	movq	CPUVAR(CURPCB),%r15
+	movq	PCB_KSTACK(%r15),%r15
+	xchgq	%r15,%rsp
+	sti
+
+	/*
+	 * XXX don't need this whole frame, split of the
+	 * syscall frame and trapframe is needed.
+	 * First, leave some room for the trapno, error,
+	 * ss:rsp, etc, so that all GP registers can be
+	 * saved. Then, fill in the rest.
+	 */
+	pushq	$(GSEL(GUDATA_SEL, SEL_UPL))
+	pushq	%r15
+	subq	$(TF_RSP-TF_TRAPNO),%rsp
+	movq	CPUVAR(SCRATCH),%r15
+	subq	$32,%rsp
+	INTR_SAVE_GPRS
+	movq	%r11, TF_RFLAGS(%rsp)	/* old rflags from syscall insn */
+	movq	$(GSEL(GUCODE_SEL, SEL_UPL)), TF_CS(%rsp)
+	movq	%rcx,TF_RIP(%rsp)
+	movq	$2,TF_ERR(%rsp)		/* ignored */
+
+	movq	CPUVAR(CURPROC),%r14
+	movq	%rsp,P_MD_REGS(%r14)	# save pointer to frame
+	andl	$~MDP_IRET,P_MD_FLAGS(%r14)
+	movq	%rsp,%rdi
+	call	_C_LABEL(syscall)
+
+.Lsyscall_check_asts:
+	/* Check for ASTs on exit to user mode. */
+	cli
+	CHECK_ASTPENDING(%r11)
+	je	2f
+	CLEAR_ASTPENDING(%r11)
+	sti
+	movq	%rsp,%rdi
+	call	_C_LABEL(ast)
+	jmp	.Lsyscall_check_asts
+
+2:
+#ifdef DIAGNOSTIC
+	cmpl	$IPL_NONE,CPUVAR(ILEVEL)
+	jne	.Lsyscall_spl_not_lowered
+#endif /* DIAGNOSTIC */
+
+	/* Could registers have been changed that require an iretq? */
+	testl	$MDP_IRET, P_MD_FLAGS(%r14)
+	jne	intr_fast_exit
+
+	movq	TF_RDI(%rsp),%rdi
+	movq	TF_RSI(%rsp),%rsi
+	movq	TF_R8(%rsp),%r8
+	movq	TF_R9(%rsp),%r9
+	movq	TF_R10(%rsp),%r10
+	movq	TF_R12(%rsp),%r12
+	movq	TF_R13(%rsp),%r13
+	movq	TF_R14(%rsp),%r14
+	movq	TF_R15(%rsp),%r15
+	movq	TF_RBP(%rsp),%rbp
+	movq	TF_RBX(%rsp),%rbx
+
+	INTR_RESTORE_SELECTORS
+
+	movq	TF_RDX(%rsp),%rdx
+	movq	TF_RAX(%rsp),%rax
+
+	movq	TF_RIP(%rsp),%rcx
+	movq	TF_RFLAGS(%rsp),%r11
+	movq	TF_RSP(%rsp),%rsp
+	sysretq
+
+#ifdef DIAGNOSTIC
+.Lsyscall_spl_not_lowered:
+	movabsq	$4f, %rdi
+	movl	TF_RAX(%rsp),%esi
+	movl	TF_RDI(%rsp),%edx
+	movl	%ebx,%ecx
+	movl	CPUVAR(ILEVEL),%r8d
+	xorq	%rax,%rax
+	call	_C_LABEL(printf)
+#ifdef DDB
+	int	$3
+#endif /* DDB */
+	movl	$IPL_NONE,CPUVAR(ILEVEL)
+	jmp	.Lsyscall_check_asts
+4:	.asciz	"WARNING: SPL NOT LOWERED ON SYSCALL %d %d EXIT %x %x\n"
+#endif
+
+
+NENTRY(proc_trampoline)
+#ifdef MULTIPROCESSOR
+	call	_C_LABEL(proc_trampoline_mp)
+#endif
+	movl	$IPL_NONE,CPUVAR(ILEVEL)
+	movq	%r13,%rdi
+	call	*%r12
+	movq	CPUVAR(CURPROC),%r14
+	jmp	.Lsyscall_check_asts
+
+
+/*
+ * Return via iretq, for real interrupts and signal returns
+ */
+NENTRY(intr_fast_exit)
+	movq	TF_RDI(%rsp),%rdi
+	movq	TF_RSI(%rsp),%rsi
+	movq	TF_R8(%rsp),%r8
+	movq	TF_R9(%rsp),%r9
+	movq	TF_R10(%rsp),%r10
+	movq	TF_R12(%rsp),%r12
+	movq	TF_R13(%rsp),%r13
+	movq	TF_R14(%rsp),%r14
+	movq	TF_R15(%rsp),%r15
+	movq	TF_RBP(%rsp),%rbp
+	movq	TF_RBX(%rsp),%rbx
+
+	testq	$SEL_RPL,TF_CS(%rsp)
+	je	5f
+
+	INTR_RESTORE_SELECTORS
+
+5:	movq	TF_RDX(%rsp),%rdx
+	movq	TF_RCX(%rsp),%rcx
+	movq	TF_R11(%rsp),%r11
+	movq	TF_RAX(%rsp),%rax
+
+#if !defined(GPROF) && defined(DDBPROF)
+	/*
+	 * If we are returning from a probe trap we need to fix the
+	 * stack layout and emulate the patched instruction.
+	 *
+	 * The code below does that by trashing %rax, so it MUST be
+	 * restored afterward.
+	 */
+	cmpl	$INTR_FAKE_TRAP, TF_ERR(%rsp)
+	je	.Lprobe_fixup
+#endif /* !defined(GPROF) && defined(DDBPROF) */
+
+	addq	$TF_RIP,%rsp
+
+	.globl	_C_LABEL(doreti_iret)
+_C_LABEL(doreti_iret):
+	iretq
+
+
+#if !defined(GPROF) && defined(DDBPROF)
+.Lprobe_fixup:
+	/* Reserve enough room to emulate "pushq %rbp". */
+	subq	$16, %rsp
+
+	/* Shift hardware-saved registers. */
+	movq	(TF_RIP + 16)(%rsp), %rax
+	movq	%rax, TF_RIP(%rsp)
+	movq	(TF_CS + 16)(%rsp), %rax
+	movq	%rax, TF_CS(%rsp)
+	movq	(TF_RFLAGS + 16)(%rsp), %rax
+	movq	%rax, TF_RFLAGS(%rsp)
+	movq	(TF_RSP + 16)(%rsp), %rax
+	movq	%rax, TF_RSP(%rsp)
+	movq	(TF_SS + 16)(%rsp), %rax
+	movq	%rax, TF_SS(%rsp)
+
+	/* Pull 8 bytes off the stack and store %rbp in the expected location.*/
+	movq	TF_RSP(%rsp), %rax
+	subq	$8, %rax
+	movq	%rax, TF_RSP(%rsp)
+	movq	%rbp, (%rax)
+
+	/* Write back overwritten %rax */
+	movq	(TF_RAX + 16)(%rsp),%rax
+
+	addq	$TF_RIP,%rsp
+	iretq
+#endif /* !defined(GPROF) && defined(DDBPROF) */
+
+ENTRY(pagezero)
+	movq    $-PAGE_SIZE,%rdx
+	subq    %rdx,%rdi
+	xorq    %rax,%rax
+1:
+	movnti  %rax,(%rdi,%rdx)
+	movnti  %rax,8(%rdi,%rdx)
+	movnti  %rax,16(%rdi,%rdx)
+	movnti  %rax,24(%rdi,%rdx)
+	addq    $32,%rdx
+	jne     1b
+	sfence
+	ret
+
+#if NXEN > 0
+	/* Hypercall page needs to be page aligned */
+	.text
+	.align	NBPG, 0xcc
+	.globl	_C_LABEL(xen_hypercall_page)
+_C_LABEL(xen_hypercall_page):
+	.skip	0x1000, 0xcc
+#endif /* NXEN > 0 */
+
+#if NHYPERV > 0
+	/* Hypercall page needs to be page aligned */
+	.text
+	.align	NBPG, 0xcc
+	.globl	_C_LABEL(hv_hypercall_page)
+_C_LABEL(hv_hypercall_page):
+	.skip	0x1000, 0xcc
+#endif /* NXEN > 0 */
+@
+
+
+1.84
+log
+@Sync a comment with i386.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: locore.S,v 1.83 2016/09/04 09:22:28 mpi Exp $	*/
+a142 5
+/* XXX temporary kluge; these should not be here */
+/* Get definitions for IOM_BEGIN, IOM_END, and IOM_SIZE */
+#include <dev/isa/isareg.h>
+
+
+a227 10
 farjmp64:
 	.long	longmode-KERNBASE
 	.word	GSEL(GCODE_SEL, SEL_KPL)
@@ -780,11 +1305,7 @@ tmpstk:
 	.globl _C_LABEL(cpu_private)
 	.comm _C_LABEL(cpu_private),NBPG,NBPG
 
-/*
- * Some hackage to deal with 64bit symbols in 32 bit mode.
- * This may not be needed if things are cleaned up a little.
- */
-
+a232 503
 	.text
 	.globl	_C_LABEL(kernel_text)
 	.set	_C_LABEL(kernel_text),KERNTEXTOFF
@@ -1288,474 +1809,7 @@ longmode_hi:
 
 	call 	_C_LABEL(main)
 
-/*****************************************************************************/
-
-/*
- * Signal trampoline; copied to top of user stack.
- * gdb's backtrace logic matches against the instructions in this.
- */
-	.section .rodata
-	.globl	_C_LABEL(sigcode)
-_C_LABEL(sigcode):
-	call	*%rax
-
-	movq	%rsp,%rdi
-	pushq	%rdi			/* fake return address */
-	movq	$SYS_sigreturn,%rax
-	syscall
-	.globl	_C_LABEL(sigcoderet)
-_C_LABEL(sigcoderet):
-	movq	$SYS_exit,%rax
-	syscall
-	.globl	_C_LABEL(esigcode)
-_C_LABEL(esigcode):
-
-	.globl	_C_LABEL(sigfill)
-_C_LABEL(sigfill):
-	int3
-_C_LABEL(esigfill):
-	.globl	_C_LABEL(sigfillsiz)
-_C_LABEL(sigfillsiz):
-	.long	_C_LABEL(esigfill) - _C_LABEL(sigfill)
-
-	.text
-/*
- * void lgdt(struct region_descriptor *rdp);
- * Change the global descriptor table.
- */
-NENTRY(lgdt)
-	/* Reload the descriptor table. */
-	movq	%rdi,%rax
-	lgdt	(%rax)
-	/* Flush the prefetch q. */
-	jmp	1f
-	nop
-1:	/* Reload "stale" selectors. */
-	movl	$GSEL(GDATA_SEL, SEL_KPL),%eax
-	movl	%eax,%ds
-	movl	%eax,%es
-	movl	%eax,%ss
-	/* Reload code selector by doing intersegment return. */
-	popq	%rax
-	pushq	$GSEL(GCODE_SEL, SEL_KPL)
-	pushq	%rax
-	lretq
-
-ENTRY(setjmp)
-	/*
-	 * Only save registers that must be preserved across function
-	 * calls according to the ABI (%rbx, %rsp, %rbp, %r12-%r15)
-	 * and %rip.
-	 */
-	movq	%rdi,%rax
-	movq	%rbx,(%rax)
-	movq	%rsp,8(%rax)
-	movq	%rbp,16(%rax)
-	movq	%r12,24(%rax)
-	movq	%r13,32(%rax)
-	movq	%r14,40(%rax)
-	movq	%r15,48(%rax)
-	movq	(%rsp),%rdx
-	movq	%rdx,56(%rax)
-	xorl	%eax,%eax
-	ret
-
-ENTRY(longjmp)
-	movq	%rdi,%rax
-	movq	(%rax),%rbx
-	movq	8(%rax),%rsp
-	movq	16(%rax),%rbp
-	movq	24(%rax),%r12
-	movq	32(%rax),%r13
-	movq	40(%rax),%r14
-	movq	48(%rax),%r15
-	movq	56(%rax),%rdx
-	movq	%rdx,(%rsp)
-	xorl	%eax,%eax
-	incl	%eax
-	ret
-
-/*****************************************************************************/
-
-/*
- * int cpu_switchto(struct proc *old, struct proc *new)
- * Switch from "old" proc to "new".
- */
-ENTRY(cpu_switchto)
-	pushq	%rbx
-	pushq	%rbp
-	pushq	%r12
-	pushq	%r13
-	pushq	%r14
-	pushq	%r15
-
-	movq	%rdi, %r13
-	movq	%rsi, %r12
-
-	/* Record new proc. */
-	movb	$SONPROC,P_STAT(%r12)	# p->p_stat = SONPROC
-	SET_CURPROC(%r12,%rcx)
-
-	movl	CPUVAR(CPUID),%edi
-
-	/* If old proc exited, don't bother. */
-	testq	%r13,%r13
-	jz	switch_exited
-
-	/*
-	 * Save old context.
-	 *
-	 * Registers:
-	 *   %rax, %rcx - scratch
-	 *   %r13 - old proc, then old pcb
-	 *   %r12 - new proc
-	 *   %edi - cpuid
-	 */
-
-	movq	P_ADDR(%r13),%r13
-
-	/* clear the old pmap's bit for the cpu */
-	movq	PCB_PMAP(%r13),%rcx
-	lock
-	btrq	%rdi,PM_CPUS(%rcx)
-
-	/* Save stack pointers. */
-	movq	%rsp,PCB_RSP(%r13)
-	movq	%rbp,PCB_RBP(%r13)
-
-switch_exited:
-	/* did old proc run in userspace?  then reset the segment regs */
-	btrl	$CPUF_USERSEGS_BIT, CPUVAR(FLAGS)
-	jnc	restore_saved
-
-	/* set %ds, %es, and %fs to expected value to prevent info leak */
-	movw	$(GSEL(GUDATA_SEL, SEL_UPL)),%ax
-	movw	%ax,%ds
-	movw	%ax,%es
-	movw	%ax,%fs
-
-restore_saved:
-	/*
-	 * Restore saved context.
-	 *
-	 * Registers:
-	 *   %rax, %rcx, %rdx - scratch
-	 *   %r13 - new pcb
-	 *   %r12 - new process
-	 */
-
-	/* No interrupts while loading new state. */
-	cli
-	movq	P_ADDR(%r12),%r13
-
-	/* Restore stack pointers. */
-	movq	PCB_RSP(%r13),%rsp
-	movq	PCB_RBP(%r13),%rbp
-
-	movq	CPUVAR(TSS),%rcx
-	movq	PCB_KSTACK(%r13),%rdx
-	movq	%rdx,TSS_RSP0(%rcx)
-
-	movq	PCB_CR3(%r13),%rax
-	movq	%rax,%cr3
-
-	/* Don't bother with the rest if switching to a system process. */
-	testl	$P_SYSTEM,P_FLAG(%r12)
-	jnz	switch_restored
-
-	/* set the new pmap's bit for the cpu */
-	movl	CPUVAR(CPUID),%edi
-	movq	PCB_PMAP(%r13),%rcx
-	lock
-	btsq	%rdi,PM_CPUS(%rcx)
-#ifdef DIAGNOSTIC
-	jc	_C_LABEL(switch_pmcpu_set)
-#endif
-
-switch_restored:
-	/* Restore cr0 (including FPU state). */
-	movl	PCB_CR0(%r13),%ecx
-#ifdef MULTIPROCESSOR
-	movq	PCB_FPCPU(%r13),%r8
-	cmpq	CPUVAR(SELF),%r8
-	jz	1f
-	orl	$CR0_TS,%ecx
-1:
-#endif
-	movq	%rcx,%cr0
-
-	SET_CURPCB(%r13)
-
-	/* Interrupts are okay again. */
-	sti
-
-switch_return:
-
-	popq	%r15
-	popq	%r14
-	popq	%r13
-	popq	%r12
-	popq	%rbp
-	popq	%rbx
-	ret
-
-ENTRY(cpu_idle_enter)
-	movq	_C_LABEL(cpu_idle_enter_fcn),%rax
-	cmpq	$0,%rax
-	je	1f
-	jmpq	*%rax
-1:
-	ret
-
-ENTRY(cpu_idle_cycle)
-	movq	_C_LABEL(cpu_idle_cycle_fcn),%rax
-	cmpq	$0,%rax
-	je	1f
-	call	*%rax
-	ret
-1:
-	sti
-	hlt
-	ret
-
-ENTRY(cpu_idle_leave)
-	movq	_C_LABEL(cpu_idle_leave_fcn),%rax
-	cmpq	$0,%rax
-	je	1f
-	jmpq	*%rax
-1:
-	ret
-
-	.globl	_C_LABEL(panic)
-
-#ifdef DIAGNOSTIC
-NENTRY(switch_pmcpu_set)
-	movabsq	$1f,%rdi
-	call	_C_LABEL(panic)
-	/* NOTREACHED */
-1:	.asciz	"activate already active pmap"
-#endif /* DIAGNOSTIC */
-
-/*
- * savectx(struct pcb *pcb);
- * Update pcb, saving current processor state.
- */
-ENTRY(savectx)
-	/* Save stack pointers. */
-	movq	%rsp,PCB_RSP(%rdi)
-	movq	%rbp,PCB_RBP(%rdi)
-
-	ret
-
-IDTVEC(syscall32)
-	sysret		/* go away please */
-
-/*
- * syscall insn entry. This currently isn't much faster, but
- * it can be made faster in the future.
- */
-IDTVEC(syscall)
-	/*
-	 * Enter here with interrupts blocked; %rcx contains the caller's
-	 * %rip and the original rflags has been copied to %r11.  %cs and
-	 * %ss have been updated to the kernel segments, but %rsp is still
-	 * the user-space value.
-	 * First order of business is to swap to the kernel gs.base so that
-	 * we can access our struct cpu_info and use the scratch space there
-	 * to switch to our kernel stack.  Once that's in place we can
-	 * unblock interrupts and save the rest of the syscall frame.
-	 */
-	swapgs
-	movq	%r15,CPUVAR(SCRATCH)
-	movq	CPUVAR(CURPCB),%r15
-	movq	PCB_KSTACK(%r15),%r15
-	xchgq	%r15,%rsp
-	sti
-
-	/*
-	 * XXX don't need this whole frame, split of the
-	 * syscall frame and trapframe is needed.
-	 * First, leave some room for the trapno, error,
-	 * ss:rsp, etc, so that all GP registers can be
-	 * saved. Then, fill in the rest.
-	 */
-	pushq	$(GSEL(GUDATA_SEL, SEL_UPL))
-	pushq	%r15
-	subq	$(TF_RSP-TF_TRAPNO),%rsp
-	movq	CPUVAR(SCRATCH),%r15
-	subq	$32,%rsp
-	INTR_SAVE_GPRS
-	movq	%r11, TF_RFLAGS(%rsp)	/* old rflags from syscall insn */
-	movq	$(GSEL(GUCODE_SEL, SEL_UPL)), TF_CS(%rsp)
-	movq	%rcx,TF_RIP(%rsp)
-	movq	$2,TF_ERR(%rsp)		/* ignored */
-
-	movq	CPUVAR(CURPROC),%r14
-	movq	%rsp,P_MD_REGS(%r14)	# save pointer to frame
-	andl	$~MDP_IRET,P_MD_FLAGS(%r14)
-	movq	%rsp,%rdi
-	call	_C_LABEL(syscall)
-
-.Lsyscall_check_asts:
-	/* Check for ASTs on exit to user mode. */
-	cli
-	CHECK_ASTPENDING(%r11)
-	je	2f
-	CLEAR_ASTPENDING(%r11)
-	sti
-	movq	%rsp,%rdi
-	call	_C_LABEL(ast)
-	jmp	.Lsyscall_check_asts
-
-2:
-#ifdef DIAGNOSTIC
-	cmpl	$IPL_NONE,CPUVAR(ILEVEL)
-	jne	.Lsyscall_spl_not_lowered
-#endif /* DIAGNOSTIC */
-
-	/* Could registers have been changed that require an iretq? */
-	testl	$MDP_IRET, P_MD_FLAGS(%r14)
-	jne	intr_fast_exit
-
-	movq	TF_RDI(%rsp),%rdi
-	movq	TF_RSI(%rsp),%rsi
-	movq	TF_R8(%rsp),%r8
-	movq	TF_R9(%rsp),%r9
-	movq	TF_R10(%rsp),%r10
-	movq	TF_R12(%rsp),%r12
-	movq	TF_R13(%rsp),%r13
-	movq	TF_R14(%rsp),%r14
-	movq	TF_R15(%rsp),%r15
-	movq	TF_RBP(%rsp),%rbp
-	movq	TF_RBX(%rsp),%rbx
-
-	INTR_RESTORE_SELECTORS
-
-	movq	TF_RDX(%rsp),%rdx
-	movq	TF_RAX(%rsp),%rax
-
-	movq	TF_RIP(%rsp),%rcx
-	movq	TF_RFLAGS(%rsp),%r11
-	movq	TF_RSP(%rsp),%rsp
-	sysretq
-
-#ifdef DIAGNOSTIC
-.Lsyscall_spl_not_lowered:
-	movabsq	$4f, %rdi
-	movl	TF_RAX(%rsp),%esi
-	movl	TF_RDI(%rsp),%edx
-	movl	%ebx,%ecx
-	movl	CPUVAR(ILEVEL),%r8d
-	xorq	%rax,%rax
-	call	_C_LABEL(printf)
-#ifdef DDB
-	int	$3
-#endif /* DDB */
-	movl	$IPL_NONE,CPUVAR(ILEVEL)
-	jmp	.Lsyscall_check_asts
-4:	.asciz	"WARNING: SPL NOT LOWERED ON SYSCALL %d %d EXIT %x %x\n"
-#endif
-
-
-NENTRY(proc_trampoline)
-#ifdef MULTIPROCESSOR
-	call	_C_LABEL(proc_trampoline_mp)
-#endif
-	movl	$IPL_NONE,CPUVAR(ILEVEL)
-	movq	%r13,%rdi
-	call	*%r12
-	movq	CPUVAR(CURPROC),%r14
-	jmp	.Lsyscall_check_asts
-
-
-/*
- * Return via iretq, for real interrupts and signal returns
- */
-NENTRY(intr_fast_exit)
-	movq	TF_RDI(%rsp),%rdi
-	movq	TF_RSI(%rsp),%rsi
-	movq	TF_R8(%rsp),%r8
-	movq	TF_R9(%rsp),%r9
-	movq	TF_R10(%rsp),%r10
-	movq	TF_R12(%rsp),%r12
-	movq	TF_R13(%rsp),%r13
-	movq	TF_R14(%rsp),%r14
-	movq	TF_R15(%rsp),%r15
-	movq	TF_RBP(%rsp),%rbp
-	movq	TF_RBX(%rsp),%rbx
-
-	testq	$SEL_RPL,TF_CS(%rsp)
-	je	5f
-
-	INTR_RESTORE_SELECTORS
-
-5:	movq	TF_RDX(%rsp),%rdx
-	movq	TF_RCX(%rsp),%rcx
-	movq	TF_R11(%rsp),%r11
-	movq	TF_RAX(%rsp),%rax
-
-#if !defined(GPROF) && defined(DDBPROF)
-	/*
-	 * If we are returning from a probe trap we need to fix the
-	 * stack layout and emulate the patched instruction.
-	 *
-	 * The code below does that by trashing %rax, so it MUST be
-	 * restored afterward.
-	 */
-	cmpl	$INTR_FAKE_TRAP, TF_ERR(%rsp)
-	je	.Lprobe_fixup
-#endif /* !defined(GPROF) && defined(DDBPROF) */
-
-	addq	$TF_RIP,%rsp
-
-	.globl	_C_LABEL(doreti_iret)
-_C_LABEL(doreti_iret):
-	iretq
-
-
-#if !defined(GPROF) && defined(DDBPROF)
-.Lprobe_fixup:
-	/* Reserve enough room to emulate "pushq %rbp". */
-	subq	$16, %rsp
-
-	/* Shift hardware-saved registers. */
-	movq	(TF_RIP + 16)(%rsp), %rax
-	movq	%rax, TF_RIP(%rsp)
-	movq	(TF_CS + 16)(%rsp), %rax
-	movq	%rax, TF_CS(%rsp)
-	movq	(TF_RFLAGS + 16)(%rsp), %rax
-	movq	%rax, TF_RFLAGS(%rsp)
-	movq	(TF_RSP + 16)(%rsp), %rax
-	movq	%rax, TF_RSP(%rsp)
-	movq	(TF_SS + 16)(%rsp), %rax
-	movq	%rax, TF_SS(%rsp)
-
-	/* Pull 8 bytes off the stack and store %rbp in the expected location.*/
-	movq	TF_RSP(%rsp), %rax
-	subq	$8, %rax
-	movq	%rax, TF_RSP(%rsp)
-	movq	%rbp, (%rax)
-
-	/* Write back overwritten %rax */
-	movq	(TF_RAX + 16)(%rsp),%rax
-
-	addq	$TF_RIP,%rsp
-	iretq
-#endif /* !defined(GPROF) && defined(DDBPROF) */
-
-ENTRY(pagezero)
-	movq    $-PAGE_SIZE,%rdx
-	subq    %rdx,%rdi
-	xorq    %rax,%rax
-1:
-	movnti  %rax,(%rdi,%rdx)
-	movnti  %rax,8(%rdi,%rdx)
-	movnti  %rax,16(%rdi,%rdx)
-	movnti  %rax,24(%rdi,%rdx)
-	addq    $32,%rdx
-	jne     1b
-	sfence
-	ret
+a700 11
 
 	.section .codepatch,"a"
 	.align  8, 0xcc
@@ -1767,24 +1821,6 @@ _C_LABEL(codepatch_begin):
 	.globl _C_LABEL(codepatch_end)
 _C_LABEL(codepatch_end):
 	.previous
-
-#if NXEN > 0
-	/* Hypercall page needs to be page aligned */
-	.text
-	.align	NBPG, 0xcc
-	.globl	_C_LABEL(xen_hypercall_page)
-_C_LABEL(xen_hypercall_page):
-	.skip	0x1000, 0xcc
-#endif /* NXEN > 0 */
-
-#if NHYPERV > 0
-	/* Hypercall page needs to be page aligned */
-	.text
-	.align	NBPG, 0xcc
-	.globl	_C_LABEL(hv_hypercall_page)
-_C_LABEL(hv_hypercall_page):
-	.skip	0x1000, 0xcc
-#endif /* NXEN > 0 */
 @
 
 

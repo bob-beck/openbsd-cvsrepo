@@ -1,4 +1,4 @@
-head	1.307;
+head	1.308;
 access;
 symbols
 	OPENBSD_6_1:1.298.0.4
@@ -58,6 +58,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.308
+date	2017.05.31.10.44.00;	author claudio;	state Exp;
+branches;
+next	1.307;
+commitid	tiSkyeLqu7f48PM9;
 
 1.307
 date	2017.05.29.07.49.27;	author phessler;	state Exp;
@@ -1634,14 +1640,15 @@ desc
 @@
 
 
-1.307
+1.308
 log
-@remove the file permission check for bgpd.conf
-
-OK deraadt@@, henning@@, sthen@@, and everyone who has ever been annoyed
+@Rework the way we do extended communities (mainly in the parser) and update
+the IANA table to a somewhat more complete list. This includes BGP Prefix
+Origin Validation State support via the ext-community ovs keyword.
+OK henning@@ benno@@ based on a diff by Job Snijders
 @
 text
-@/*	$OpenBSD: parse.y,v 1.306 2017/05/28 15:16:33 henning Exp $ */
+@/*	$OpenBSD: parse.y,v 1.307 2017/05/29 07:49:27 phessler Exp $ */
 
 /*
  * Copyright (c) 2002, 2003, 2004 Henning Brauer <henning@@openbsd.org>
@@ -1793,7 +1800,7 @@ int		 getcommunity(char *);
 int		 parsecommunity(struct filter_community *, char *);
 int64_t 	 getlargecommunity(char *);
 int		 parselargecommunity(struct filter_largecommunity *, char *);
-int		 parsesubtype(char *);
+int		 parsesubtype(char *, int *, int *);
 int		 parseextvalue(char *, u_int32_t *);
 int		 parseextcommunity(struct filter_extcommunity *, char *,
 		    char *);
@@ -2514,13 +2521,13 @@ rdomainopts	: RD STRING {
 			}
 			rd = betoh64(rd) & 0xffffffffffffULL;
 			switch (ext.type) {
-			case EXT_COMMUNITY_TWO_AS:
+			case EXT_COMMUNITY_TRANS_TWO_AS:
 				rd |= (0ULL << 48);
 				break;
-			case EXT_COMMUNITY_IPV4:
+			case EXT_COMMUNITY_TRANS_IPV4:
 				rd |= (1ULL << 48);
 				break;
-			case EXT_COMMUNITY_FOUR_AS:
+			case EXT_COMMUNITY_TRANS_FOUR_AS:
 				rd |= (2ULL << 48);
 				break;
 			default:
@@ -4732,26 +4739,23 @@ parselargecommunity(struct filter_largecommunity *c, char *s)
 }
 
 int
-parsesubtype(char *type)
+parsesubtype(char *name, int *type, int *subtype)
 {
-	/* this has to be sorted always */
-	static const struct keywords keywords[] = {
-		{ "bdc",	EXT_COMMUNITY_BGP_COLLECT },
-		{ "odi",	EXT_COMMUNITY_OSPF_DOM_ID },
-		{ "ori",	EXT_COMMUNITY_OSPF_RTR_ID },
-		{ "ort",	EXT_COMMUNITY_OSPF_RTR_TYPE },
-		{ "rt",		EXT_COMMUNITY_ROUTE_TGT },
-		{ "soo",	EXT_COMMUNITY_ROUTE_ORIG }
-	};
-	const struct keywords	*p;
+	const struct ext_comm_pairs *cp;
+	int found = 0;
 
-	p = bsearch(type, keywords, sizeof(keywords)/sizeof(keywords[0]),
-	    sizeof(keywords[0]), kw_cmp);
-
-	if (p)
-		return (p->k_val);
-	else
-		return (-1);
+	for (cp = iana_ext_comms; cp->subname != NULL; cp++) {
+		if (strcmp(name, cp->subname) == 0) {
+			if (found == 0) {
+				*type = cp->type;
+				*subtype = cp->subtype;
+			}
+			found++;
+		}
+	}
+	if (found > 1)
+		*type = -1;
+	return (found);
 }
 
 int
@@ -4770,10 +4774,10 @@ parseextvalue(char *s, u_int32_t *v)
 			return (-1);
 		}
 		*v = uval;
-		if (uval > USHRT_MAX)
-			return (EXT_COMMUNITY_FOUR_AS);
+		if (uval <= USHRT_MAX)
+			return (EXT_COMMUNITY_TRANS_TWO_AS);
 		else
-			return (EXT_COMMUNITY_TWO_AS);
+			return (EXT_COMMUNITY_TRANS_FOUR_AS);
 	} else if (strchr(p + 1, '.') == NULL) {
 		/* AS_DOT number (4-byte) */
 		*p++ = '\0';
@@ -4788,7 +4792,7 @@ parseextvalue(char *s, u_int32_t *v)
 			return (-1);
 		}
 		*v = uval | (uvalh << 16);
-		return (EXT_COMMUNITY_FOUR_AS);
+		return (EXT_COMMUNITY_TRANS_FOUR_AS);
 	} else {
 		/* more than one dot -> IP address */
 		if (inet_aton(s, &ip) == 0) {
@@ -4796,7 +4800,7 @@ parseextvalue(char *s, u_int32_t *v)
 			return (-1);
 		}
 		*v = ip.s_addr;
-		return (EXT_COMMUNITY_IPV4);
+		return (EXT_COMMUNITY_TRANS_IPV4);
 	}
 	return (-1);
 }
@@ -4804,21 +4808,59 @@ parseextvalue(char *s, u_int32_t *v)
 int
 parseextcommunity(struct filter_extcommunity *c, char *t, char *s)
 {
-	const struct ext_comm_pairs	 iana[] = IANA_EXT_COMMUNITIES;
+	const struct ext_comm_pairs *cp;
 	const char 	*errstr;
 	u_int64_t	 ullval;
 	u_int32_t	 uval;
 	char		*p, *ep;
-	unsigned int	 i;
 	int		 type, subtype;
 
-	if ((subtype = parsesubtype(t)) == -1) {
+	if (parsesubtype(t, &type, &subtype) == 0) {
 		yyerror("Bad ext-community unknown type");
 		return (-1);
 	}
 
-	if ((p = strchr(s, ':')) == NULL) {
-		type = EXT_COMMUNITY_OPAQUE,
+	switch (type) {
+	case -1:
+		if ((p = strchr(s, ':')) == NULL) {
+			yyerror("Bad ext-community %s is %s", s, errstr);
+			return (-1);
+		}
+		*p++ = '\0';
+		if ((type = parseextvalue(s, &uval)) == -1)
+			return (-1);
+		switch (type) {
+		case EXT_COMMUNITY_TRANS_TWO_AS:
+			ullval = strtonum(p, 0, UINT_MAX, &errstr);
+			break;
+		case EXT_COMMUNITY_TRANS_IPV4:
+		case EXT_COMMUNITY_TRANS_FOUR_AS:
+			ullval = strtonum(p, 0, USHRT_MAX, &errstr);
+			break;
+		default:
+			fatalx("parseextcommunity: unexpected result");
+		}
+		if (errstr) {
+			yyerror("Bad ext-community %s is %s", p, errstr);
+			return (-1);
+		}
+		switch (type) {
+		case EXT_COMMUNITY_TRANS_TWO_AS:
+			c->data.ext_as.as = uval;
+			c->data.ext_as.val = ullval;
+			break;
+		case EXT_COMMUNITY_TRANS_IPV4:
+			c->data.ext_ip.addr.s_addr = uval;
+			c->data.ext_ip.val = ullval;
+			break;
+		case EXT_COMMUNITY_TRANS_FOUR_AS:
+			c->data.ext_as4.as4 = uval;
+			c->data.ext_as4.val = ullval;
+			break;
+		}
+		break;
+	case EXT_COMMUNITY_TRANS_OPAQUE:
+	case EXT_COMMUNITY_TRANS_EVPN:
 		errno = 0;
 		ullval = strtoull(s, &ep, 0);
 		if (s[0] == '\0' || *ep != '\0') {
@@ -4830,49 +4872,26 @@ parseextcommunity(struct filter_extcommunity *c, char *t, char *s)
 			return (-1);
 		}
 		c->data.ext_opaq = ullval;
-	} else {
-		*p++ = '\0';
-		if ((type = parseextvalue(s, &uval)) == -1)
-			return (-1);
-		switch (type) {
-		case EXT_COMMUNITY_TWO_AS:
-			ullval = strtonum(p, 0, UINT_MAX, &errstr);
-			break;
-		case EXT_COMMUNITY_IPV4:
-		case EXT_COMMUNITY_FOUR_AS:
-			ullval = strtonum(p, 0, USHRT_MAX, &errstr);
-			break;
-		default:
-			fatalx("parseextcommunity: unexpected result");
-		}
-		if (errstr) {
-			yyerror("Bad ext-community %s is %s", p,
-			    errstr);
+		break;
+	case EXT_COMMUNITY_NON_TRANS_OPAQUE:
+		if (strcmp(s, "valid") == 0)
+			c->data.ext_opaq = EXT_COMMUNITY_OVS_VALID;
+		else if (strcmp(s, "invalid") == 0)
+			c->data.ext_opaq = EXT_COMMUNITY_OVS_INVALID;
+		else if (strcmp(s, "not-found") == 0)
+			c->data.ext_opaq = EXT_COMMUNITY_OVS_NOTFOUND;
+		else {
+			yyerror("Bad ext-community %s is %s", s, errstr);
 			return (-1);
 		}
-		switch (type) {
-		case EXT_COMMUNITY_TWO_AS:
-			c->data.ext_as.as = uval;
-			c->data.ext_as.val = ullval;
-			break;
-		case EXT_COMMUNITY_IPV4:
-			c->data.ext_ip.addr.s_addr = uval;
-			c->data.ext_ip.val = ullval;
-			break;
-		case EXT_COMMUNITY_FOUR_AS:
-			c->data.ext_as4.as4 = uval;
-			c->data.ext_as4.val = ullval;
-			break;
-		}
+		break;
 	}
 	c->type = type;
 	c->subtype = subtype;
 
 	/* verify type/subtype combo */
-	for (i = 0; i < sizeof(iana)/sizeof(iana[0]); i++) {
-		if (iana[i].type == type && iana[i].subtype == subtype) {
-			if (iana[i].transitive)
-				c->type |= EXT_COMMUNITY_TRANSITIVE;
+	for (cp = iana_ext_comms; cp->subname != NULL; cp++) {
+		if (cp->type == type && cp->subtype == subtype) {
 			c->flags |= EXT_COMMUNITY_FLAG_VALID;
 			return (0);
 		}
@@ -5513,6 +5532,118 @@ get_rule(enum action_types type)
 	}
 	return (r);
 }
+@
+
+
+1.307
+log
+@remove the file permission check for bgpd.conf
+
+OK deraadt@@, henning@@, sthen@@, and everyone who has ever been annoyed
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: parse.y,v 1.306 2017/05/28 15:16:33 henning Exp $ */
+d153 1
+a153 1
+int		 parsesubtype(char *);
+d874 1
+a874 1
+			case EXT_COMMUNITY_TWO_AS:
+d877 1
+a877 1
+			case EXT_COMMUNITY_IPV4:
+d880 1
+a880 1
+			case EXT_COMMUNITY_FOUR_AS:
+d3092 1
+a3092 1
+parsesubtype(char *type)
+d3094 2
+a3095 10
+	/* this has to be sorted always */
+	static const struct keywords keywords[] = {
+		{ "bdc",	EXT_COMMUNITY_BGP_COLLECT },
+		{ "odi",	EXT_COMMUNITY_OSPF_DOM_ID },
+		{ "ori",	EXT_COMMUNITY_OSPF_RTR_ID },
+		{ "ort",	EXT_COMMUNITY_OSPF_RTR_TYPE },
+		{ "rt",		EXT_COMMUNITY_ROUTE_TGT },
+		{ "soo",	EXT_COMMUNITY_ROUTE_ORIG }
+	};
+	const struct keywords	*p;
+d3097 12
+a3108 7
+	p = bsearch(type, keywords, sizeof(keywords)/sizeof(keywords[0]),
+	    sizeof(keywords[0]), kw_cmp);
+
+	if (p)
+		return (p->k_val);
+	else
+		return (-1);
+d3127 2
+a3128 2
+		if (uval > USHRT_MAX)
+			return (EXT_COMMUNITY_FOUR_AS);
+d3130 1
+a3130 1
+			return (EXT_COMMUNITY_TWO_AS);
+d3145 1
+a3145 1
+		return (EXT_COMMUNITY_FOUR_AS);
+d3153 1
+a3153 1
+		return (EXT_COMMUNITY_IPV4);
+d3161 1
+a3161 1
+	const struct ext_comm_pairs	 iana[] = IANA_EXT_COMMUNITIES;
+a3165 1
+	unsigned int	 i;
+d3168 1
+a3168 1
+	if ((subtype = parsesubtype(t)) == -1) {
+d3173 4
+a3176 10
+	if ((p = strchr(s, ':')) == NULL) {
+		type = EXT_COMMUNITY_OPAQUE,
+		errno = 0;
+		ullval = strtoull(s, &ep, 0);
+		if (s[0] == '\0' || *ep != '\0') {
+			yyerror("Bad ext-community bad value");
+			return (-1);
+		}
+		if (errno == ERANGE && ullval > EXT_COMMUNITY_OPAQUE_MAX) {
+			yyerror("Bad ext-community value to big");
+a3178 2
+		c->data.ext_opaq = ullval;
+	} else {
+d3183 1
+a3183 1
+		case EXT_COMMUNITY_TWO_AS:
+d3186 2
+a3187 2
+		case EXT_COMMUNITY_IPV4:
+		case EXT_COMMUNITY_FOUR_AS:
+d3194 1
+a3194 2
+			yyerror("Bad ext-community %s is %s", p,
+			    errstr);
+d3198 1
+a3198 1
+		case EXT_COMMUNITY_TWO_AS:
+d3202 1
+a3202 1
+		case EXT_COMMUNITY_IPV4:
+d3206 1
+a3206 1
+		case EXT_COMMUNITY_FOUR_AS:
+d3211 27
+d3243 2
+a3244 4
+	for (i = 0; i < sizeof(iana)/sizeof(iana[0]); i++) {
+		if (iana[i].type == type && iana[i].subtype == subtype) {
+			if (iana[i].transitive)
+				c->type |= EXT_COMMUNITY_TRANSITIVE;
 @
 
 

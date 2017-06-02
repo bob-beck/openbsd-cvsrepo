@@ -1,4 +1,4 @@
-head	1.127;
+head	1.128;
 access;
 symbols
 	OPENBSD_6_1:1.125.0.4
@@ -48,6 +48,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.128
+date	2017.06.01.23.22.14;	author dlg;	state Exp;
+branches;
+next	1.127;
+commitid	45puB1zmY4KCvlV9;
 
 1.127
 date	2017.04.10.02.15.54;	author jsg;	state Exp;
@@ -714,28 +720,23 @@ desc
 @@
 
 
-1.127
+1.128
 log
-@Attempt to map msk(4) interrupt via MSI.
+@reorder ops in sk_start to avoid possibly rolling back ifq_deq.
 
-The device tree that ships with the overdrive 1000 has an interrupt-map
-property that is known to be wrong.  Using MSI on msk makes the builtin
-Ethernet on the overdrive 1000 work.
+instead of checking for space after beggining to deq a packet, check
+for space before committing to handling a packet. this means we
+can use ifq_dequeue instead of ifq_deq_begin/commit/rollback.
 
-Tested on arm64 with
-"Marvell Yukon 88E8059" rev 0x00, Yukon-2 Optima (0x1)
+this is a port of src/sys/dev/pci/if_sk.c r1.187, but tweaked to
+account for msk using twice the tx ring descriptors thanks to its
+annoying support for 64bit addresses.
 
-and i386 with
-"Marvell Yukon 88E8072" rev 0x10, Yukon-2 Extreme rev. B0 (0x2)
-
-Committing this early in the release cycle to try find cases where using
-MSI doesn't work.
-
-Based on part of an earlier patch from jmatthew@@
-ok jmatthew@@ kettenis@@
+tested on an od1000
+ok jmatthew@@ sthen@@
 @
 text
-@/*	$OpenBSD: if_msk.c,v 1.126 2017/04/08 03:36:50 jmatthew Exp $	*/
+@/*	$OpenBSD: if_msk.c,v 1.127 2017/04/10 02:15:54 jsg Exp $	*/
 
 /*
  * Copyright (c) 1997, 1998, 1999, 2000
@@ -2226,30 +2227,19 @@ msk_encap(struct sk_if_softc *sc_if, struct mbuf *m_head, u_int32_t *txidx)
 
 	cur = frag = *txidx;
 
-#ifdef MSK_DEBUG
-	if (mskdebug >= 2)
-		msk_dump_mbuf(m_head);
-#endif
-
-	/*
-	 * Start packing the mbufs in this chain into
-	 * the fragment pointers. Stop when we run out
-	 * of fragments or hit the end of the mbuf chain.
-	 */
-	if (bus_dmamap_load_mbuf(sc->sc_dmatag, txmap, m_head,
-	    BUS_DMA_NOWAIT)) {
-		DPRINTFN(2, ("msk_encap: dmamap failed\n"));
-		return (ENOBUFS);
+	switch (bus_dmamap_load_mbuf(sc->sc_dmatag, txmap, m_head,
+	    BUS_DMA_STREAMING | BUS_DMA_NOWAIT)) {
+	case 0:
+		break;
+	case EFBIG: /* mbuf chain is too fragmented */
+		if (m_defrag(m_head, M_DONTWAIT) == 0 &&
+		    bus_dmamap_load_mbuf(sc->sc_dmatag, txmap, m_head,
+		    BUS_DMA_STREAMING | BUS_DMA_NOWAIT) == 0)
+			break;
+		/* FALLTHROUGH */
+	default:
+		return (1);
 	}
-
-	entries = txmap->dm_nsegs * 2;
-	if (entries > (MSK_TX_RING_CNT - sc_if->sk_cdata.sk_tx_cnt - 2)) {
-		DPRINTFN(2, ("msk_encap: too few descriptors free\n"));
-		bus_dmamap_unload(sc->sc_dmatag, txmap);
-		return (ENOBUFS);
-	}
-
-	DPRINTFN(2, ("msk_encap: dm_nsegs=%d\n", txmap->dm_nsegs));
 
 	/* Sync the DMA map. */
 	bus_dmamap_sync(sc->sc_dmatag, txmap, 0, txmap->dm_mapsize,
@@ -2322,12 +2312,16 @@ msk_start(struct ifnet *ifp)
 	struct sk_if_softc	*sc_if = ifp->if_softc;
 	struct mbuf		*m_head = NULL;
 	u_int32_t		idx = sc_if->sk_cdata.sk_tx_prod;
-	int			pkts = 0;
+	int			post = 0;
 
-	DPRINTFN(2, ("msk_start\n"));
+	for (;;) {
+		if (sc_if->sk_cdata.sk_tx_cnt + (SK_NTXSEG * 2) + 1 >
+		    MSK_TX_RING_CNT) {
+			ifq_set_oactive(&ifp->if_snd);
+			break;
+		}
 
-	while (sc_if->sk_cdata.sk_tx_chain[idx].sk_mbuf == NULL) {
-		m_head = ifq_deq_begin(&ifp->if_snd);
+		m_head = ifq_dequeue(&ifp->if_snd);
 		if (m_head == NULL)
 			break;
 
@@ -2337,14 +2331,11 @@ msk_start(struct ifnet *ifp)
 		 * for the NIC to drain the ring.
 		 */
 		if (msk_encap(sc_if, m_head, &idx)) {
-			ifq_deq_rollback(&ifp->if_snd, m_head);
-			ifq_set_oactive(&ifp->if_snd);
-			break;
+			m_freem(m_head);
+			continue;
 		}
 
 		/* now we are committed to transmit the packet */
-		ifq_deq_commit(&ifp->if_snd, m_head);
-		pkts++;
 
 		/*
 		 * If there's a BPF listener, bounce a copy of this frame
@@ -2354,18 +2345,17 @@ msk_start(struct ifnet *ifp)
 		if (ifp->if_bpf)
 			bpf_mtap(ifp->if_bpf, m_head, BPF_DIRECTION_OUT);
 #endif
+		post = 1;
 	}
-	if (pkts == 0)
+	if (post == 0)
 		return;
 
 	/* Transmit */
-	if (idx != sc_if->sk_cdata.sk_tx_prod) {
-		sc_if->sk_cdata.sk_tx_prod = idx;
-		SK_IF_WRITE_2(sc_if, 1, SK_TXQA1_Y2_PREF_PUTIDX, idx);
+	sc_if->sk_cdata.sk_tx_prod = idx;
+	SK_IF_WRITE_2(sc_if, 1, SK_TXQA1_Y2_PREF_PUTIDX, idx);
 
-		/* Set a timeout in case the chip goes out to lunch. */
-		ifp->if_timer = MSK_TX_TIMEOUT;
-	}
+	/* Set a timeout in case the chip goes out to lunch. */
+	ifp->if_timer = MSK_TX_TIMEOUT;
 }
 
 void
@@ -3036,6 +3026,91 @@ msk_dump_mbuf(struct mbuf *m)
 	}
 }
 #endif
+@
+
+
+1.127
+log
+@Attempt to map msk(4) interrupt via MSI.
+
+The device tree that ships with the overdrive 1000 has an interrupt-map
+property that is known to be wrong.  Using MSI on msk makes the builtin
+Ethernet on the overdrive 1000 work.
+
+Tested on arm64 with
+"Marvell Yukon 88E8059" rev 0x00, Yukon-2 Optima (0x1)
+
+and i386 with
+"Marvell Yukon 88E8072" rev 0x10, Yukon-2 Extreme rev. B0 (0x2)
+
+Committing this early in the release cycle to try find cases where using
+MSI doesn't work.
+
+Based on part of an earlier patch from jmatthew@@
+ok jmatthew@@ kettenis@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_msk.c,v 1.126 2017/04/08 03:36:50 jmatthew Exp $	*/
+d1492 12
+a1503 14
+#ifdef MSK_DEBUG
+	if (mskdebug >= 2)
+		msk_dump_mbuf(m_head);
+#endif
+
+	/*
+	 * Start packing the mbufs in this chain into
+	 * the fragment pointers. Stop when we run out
+	 * of fragments or hit the end of the mbuf chain.
+	 */
+	if (bus_dmamap_load_mbuf(sc->sc_dmatag, txmap, m_head,
+	    BUS_DMA_NOWAIT)) {
+		DPRINTFN(2, ("msk_encap: dmamap failed\n"));
+		return (ENOBUFS);
+a1505 9
+	entries = txmap->dm_nsegs * 2;
+	if (entries > (MSK_TX_RING_CNT - sc_if->sk_cdata.sk_tx_cnt - 2)) {
+		DPRINTFN(2, ("msk_encap: too few descriptors free\n"));
+		bus_dmamap_unload(sc->sc_dmatag, txmap);
+		return (ENOBUFS);
+	}
+
+	DPRINTFN(2, ("msk_encap: dm_nsegs=%d\n", txmap->dm_nsegs));
+
+d1577 1
+a1577 1
+	int			pkts = 0;
+d1579 6
+a1584 1
+	DPRINTFN(2, ("msk_start\n"));
+d1586 1
+a1586 2
+	while (sc_if->sk_cdata.sk_tx_chain[idx].sk_mbuf == NULL) {
+		m_head = ifq_deq_begin(&ifp->if_snd);
+d1596 2
+a1597 3
+			ifq_deq_rollback(&ifp->if_snd, m_head);
+			ifq_set_oactive(&ifp->if_snd);
+			break;
+a1600 2
+		ifq_deq_commit(&ifp->if_snd, m_head);
+		pkts++;
+d1610 1
+d1612 1
+a1612 1
+	if (pkts == 0)
+d1616 2
+a1617 3
+	if (idx != sc_if->sk_cdata.sk_tx_prod) {
+		sc_if->sk_cdata.sk_tx_prod = idx;
+		SK_IF_WRITE_2(sc_if, 1, SK_TXQA1_Y2_PREF_PUTIDX, idx);
+d1619 2
+a1620 3
+		/* Set a timeout in case the chip goes out to lunch. */
+		ifp->if_timer = MSK_TX_TIMEOUT;
+	}
 @
 
 

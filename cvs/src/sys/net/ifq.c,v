@@ -1,4 +1,4 @@
-head	1.11;
+head	1.12;
 access;
 symbols
 	OPENBSD_6_1:1.9.0.4
@@ -10,6 +10,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.12
+date	2017.06.02.00.07.12;	author dlg;	state Exp;
+branches;
+next	1.11;
+commitid	CjDTAixq8wWpb9cw;
 
 1.11
 date	2017.05.03.20.55.29;	author mikeb;	state Exp;
@@ -82,18 +88,25 @@ desc
 @@
 
 
-1.11
+1.12
 log
-@Provide a function to dispose of a list of mbufs on dequeue
+@be less tricky about when ifq_free is handled.
 
-ifq_mfreeml() is similar to the ifq_mfreem(), but takes an mbuf list
-as an argument.  This also lets these functions subtract the number
-of packets to be disposed of from the ifq length.
+instead of assuming start routines only run inside the ifq serialiser,
+only rely on the serialisation provided by the ifq mtx which is
+explicitly used during ifq_deq ops.
 
-OK dlg
+ie, free the mbufs in ifq_free at the end of ifq_deq ops instead
+of in the ifq_serialiser loop. ifq deq ops arent necessarily called
+within the serialiser.
+
+this should fix panics caused by fq codel on top of bce (which calls
+bce_start from it's tx completion path instead of ifq_restart).
+
+ok mikeb@@
 @
 text
-@/*	$OpenBSD: ifq.c,v 1.10 2017/05/03 03:14:32 dlg Exp $ */
+@/*	$OpenBSD: ifq.c,v 1.11 2017/05/03 20:55:29 mikeb Exp $ */
 
 /*
  * Copyright (c) 2015 David Gwynne <dlg@@openbsd.org>
@@ -165,7 +178,6 @@ void	ifq_barrier_task(void *);
 void
 ifq_serialize(struct ifqueue *ifq, struct task *t)
 {
-	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct task work;
 
 	if (ISSET(t->t_flags, TASK_ONQUEUE))
@@ -192,20 +204,9 @@ ifq_serialize(struct ifqueue *ifq, struct task *t)
 			mtx_enter(&ifq->ifq_task_mtx);
 		}
 
-		/*
-		 * ifq->ifq_free is only modified by dequeue, which
-		 * is only called from within this serialization
-		 * context. it is therefore safe to access and modify
-		 * here without taking ifq->ifq_mtx.
-		 */
-		ml = ifq->ifq_free;
-		ml_init(&ifq->ifq_free);
-
 		ifq->ifq_serializer = NULL;
 	}
 	mtx_leave(&ifq->ifq_task_mtx);
-
-	ml_purge(&ml);
 }
 
 int
@@ -381,16 +382,36 @@ ifq_enqueue(struct ifqueue *ifq, struct mbuf *m)
 	return (dm == m ? ENOBUFS : 0);
 }
 
+static inline void
+ifq_deq_enter(struct ifqueue *ifq)
+{
+	mtx_enter(&ifq->ifq_mtx);
+}
+
+static inline void
+ifq_deq_leave(struct ifqueue *ifq)
+{
+	struct mbuf_list ml;
+
+	ml = ifq->ifq_free;
+	ml_init(&ifq->ifq_free);
+
+	mtx_leave(&ifq->ifq_mtx);
+
+	if (!ml_empty(&ml))
+		ml_purge(&ml);
+}
+
 struct mbuf *
 ifq_deq_begin(struct ifqueue *ifq)
 {
 	struct mbuf *m = NULL;
 	void *cookie;
 
-	mtx_enter(&ifq->ifq_mtx);
+	ifq_deq_enter(ifq);
 	if (ifq->ifq_len == 0 ||
 	    (m = ifq->ifq_ops->ifqop_deq_begin(ifq, &cookie)) == NULL) {
-		mtx_leave(&ifq->ifq_mtx);
+		ifq_deq_leave(ifq);
 		return (NULL);
 	}
 
@@ -409,7 +430,7 @@ ifq_deq_commit(struct ifqueue *ifq, struct mbuf *m)
 
 	ifq->ifq_ops->ifqop_deq_commit(ifq, m, cookie);
 	ifq->ifq_len--;
-	mtx_leave(&ifq->ifq_mtx);
+	ifq_deq_leave(ifq);
 }
 
 void
@@ -417,7 +438,7 @@ ifq_deq_rollback(struct ifqueue *ifq, struct mbuf *m)
 {
 	KASSERT(m != NULL);
 
-	mtx_leave(&ifq->ifq_mtx);
+	ifq_deq_leave(ifq);
 }
 
 struct mbuf *
@@ -476,7 +497,7 @@ ifq_q_leave(struct ifqueue *ifq, void *q)
 void
 ifq_mfreem(struct ifqueue *ifq, struct mbuf *m)
 {
-	IFQ_ASSERT_SERIALIZED(ifq);
+	MUTEX_ASSERT_LOCKED(&ifq->ifq_mtx);
 
 	ifq->ifq_len--;
 	ifq->ifq_qdrops++;
@@ -486,7 +507,7 @@ ifq_mfreem(struct ifqueue *ifq, struct mbuf *m)
 void
 ifq_mfreeml(struct ifqueue *ifq, struct mbuf_list *ml)
 {
-	IFQ_ASSERT_SERIALIZED(ifq);
+	MUTEX_ASSERT_LOCKED(&ifq->ifq_mtx);
 
 	ifq->ifq_len -= ml_len(ml);
 	ifq->ifq_qdrops += ml_len(ml);
@@ -602,6 +623,57 @@ priq_purge(struct ifqueue *ifq, struct mbuf_list *ml)
 		ml_enlist(ml, pl);
 	} while (prio > 0);
 }
+@
+
+
+1.11
+log
+@Provide a function to dispose of a list of mbufs on dequeue
+
+ifq_mfreeml() is similar to the ifq_mfreem(), but takes an mbuf list
+as an argument.  This also lets these functions subtract the number
+of packets to be disposed of from the ifq length.
+
+OK dlg
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ifq.c,v 1.10 2017/05/03 03:14:32 dlg Exp $ */
+a72 1
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+a98 9
+		/*
+		 * ifq->ifq_free is only modified by dequeue, which
+		 * is only called from within this serialization
+		 * context. it is therefore safe to access and modify
+		 * here without taking ifq->ifq_mtx.
+		 */
+		ml = ifq->ifq_free;
+		ml_init(&ifq->ifq_free);
+
+a101 2
+
+	ml_purge(&ml);
+d277 20
+d303 1
+a303 1
+	mtx_enter(&ifq->ifq_mtx);
+d306 1
+a306 1
+		mtx_leave(&ifq->ifq_mtx);
+d325 1
+a325 1
+	mtx_leave(&ifq->ifq_mtx);
+d333 1
+a333 1
+	mtx_leave(&ifq->ifq_mtx);
+d392 1
+a392 1
+	IFQ_ASSERT_SERIALIZED(ifq);
+d402 1
+a402 1
+	IFQ_ASSERT_SERIALIZED(ifq);
 @
 
 

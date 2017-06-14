@@ -1,4 +1,4 @@
-head	1.192;
+head	1.196;
 access;
 symbols
 	OPENBSD_6_1:1.166.0.4
@@ -14,6 +14,30 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.196
+date	2017.06.14.16.58.28;	author stsp;	state Exp;
+branches;
+next	1.195;
+commitid	hjNQpct7rKGhXctW;
+
+1.195
+date	2017.06.14.16.57.47;	author stsp;	state Exp;
+branches;
+next	1.194;
+commitid	sEHiunZbPzW1bchR;
+
+1.194
+date	2017.06.14.16.56.50;	author stsp;	state Exp;
+branches;
+next	1.193;
+commitid	rO67QhGrA8KcvIJv;
+
+1.193
+date	2017.06.14.16.56.04;	author stsp;	state Exp;
+branches;
+next	1.192;
+commitid	NRw9Z32ri1vzeCx5;
 
 1.192
 date	2017.06.09.13.47.26;	author stsp;	state Exp;
@@ -1172,33 +1196,15 @@ desc
 @@
 
 
-1.192
+1.196
 log
-@Introduce iwm_nic_assert_locked() to verify that the driver has correctly
-requested MAC access before accessing certain registers, as required
-by the hardware.
-
-Use it to assert that hardware is still in an accessible state before
-reading or writing such a register. For now, panic if that check fails.
-The long term goal is to make this a non-fatal error and handle it properly
-in all code paths that end up reading or writing such a register.
-
-Fix a missing NIC lock on 8000 hardware, found by this new assertion.
-
-Also, grab the NIC lock early during hardware init and keep it until init
-is done. The previous code relinquished and reacquired the NIC lock several
-times during the init sequence. It seems this is what was causing some random
-errors when the interface was brought up, such as "could not enable Tx queue",
-"could not add aux station", and "could not add phy context".
-For some reason, bsd.rd kernels were suffering particularly hard from such
-problems, to the point where some machines could not be upgraded over iwm(4).
-This change does not eliminate such problems entirely but is a step forward.
-
-Prodded by deraadt@@
-This change has already been in snaps for a while.
+@Currently, iwm(4) uses only one phy context, so stop sending commands to the
+firmware for unused ones. This should be refactored further, but for now this
+change is good enough to reduce the amount of commands we throw at the firmware.
+ok deraadt@@
 @
 text
-@/*	$OpenBSD: if_iwm.c,v 1.191 2017/06/09 13:46:15 stsp Exp $	*/
+@/*	$OpenBSD: if_iwm.c,v 1.195 2017/06/14 16:57:47 stsp Exp $	*/
 
 /*
  * Copyright (c) 2014, 2016 genua gmbh <info@@genua.de>
@@ -4326,6 +4332,7 @@ iwm_load_ucode_wait_alive(struct iwm_softc *sc,
 int
 iwm_run_init_mvm_ucode(struct iwm_softc *sc, int justnvm)
 {
+	const int wait_flags = (IWM_INIT_COMPLETE | IWM_CALIB_COMPLETE);
 	int err;
 
 	if ((sc->sc_flags & IWM_FLAG_RFKILL) && !justnvm) {
@@ -4377,10 +4384,10 @@ iwm_run_init_mvm_ucode(struct iwm_softc *sc, int justnvm)
 		return err;
 
 	/*
-	 * Nothing to do but wait for the init complete notification
-	 * from the firmware
+	 * Nothing to do but wait for the init complete and phy DB
+	 * notifications from the firmware.
 	 */
-	while (!sc->sc_init_complete) {
+	while ((sc->sc_init_complete & wait_flags) != wait_flags) {
 		err = tsleep(&sc->sc_init_complete, 0, "iwminit", 2*hz);
 		if (err)
 			break;
@@ -6822,6 +6829,7 @@ iwm_newstate_task(void *psc)
 		sc->sc_flags |= IWM_FLAG_SCANNING;
 		ic->ic_state = nstate;
 		iwm_led_blink_start(sc);
+		wakeup(&ic->ic_state); /* wake iwm_init() */
 		return;
 
 	case IEEE80211_S_AUTH:
@@ -7204,7 +7212,7 @@ iwm_init_hw(struct iwm_softc *sc)
 		goto err;
 	}
 
-	for (i = 0; i < IWM_NUM_PHY_CTX; i++) {
+	for (i = 0; i < 1; i++) {
 		/*
 		 * The channel used here isn't relevant as it's
 		 * going to be overwritten in the other flows.
@@ -7301,7 +7309,8 @@ int
 iwm_init(struct ifnet *ifp)
 {
 	struct iwm_softc *sc = ifp->if_softc;
-	int err;
+	struct ieee80211com *ic = &sc->sc_ic;
+	int err, generation;
 
 	if (sc->sc_flags & IWM_FLAG_HW_INITED) {
 		return 0;
@@ -7318,6 +7327,20 @@ iwm_init(struct ifnet *ifp)
 	ifp->if_flags |= IFF_RUNNING;
 
 	ieee80211_begin_scan(ifp);
+
+	/* 
+	 * ieee80211_begin_scan() ends up scheduling iwm_newstate_task().
+	 * Wait until the transition to SCAN state has completed.
+	 */
+	do {
+		generation = sc->sc_generation;
+		err = tsleep(&ic->ic_state, PCATCH, "iwminit", hz);
+		if (generation != sc->sc_generation)
+			return ENXIO;
+		if (err)
+			return err;
+	} while (ic->ic_state != IEEE80211_S_SCAN);
+
 	sc->sc_flags |= IWM_FLAG_HW_INITED;
 
 	return 0;
@@ -7451,16 +7474,19 @@ iwm_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	struct iwm_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifreq *ifr;
-	int s, err = 0;
+	int s, err = 0, generation = sc->sc_generation;
 
 	/*
 	 * Prevent processes from entering this function while another
 	 * process is tsleep'ing in it.
 	 */
 	err = rw_enter(&sc->ioctl_rwl, RW_WRITE | RW_INTR);
+	if (err == 0 && generation != sc->sc_generation) {
+		rw_exit(&sc->ioctl_rwl);
+		return ENXIO;
+	}
 	if (err)
 		return err;
-
 	s = splnet();
 
 	switch (cmd) {
@@ -7880,6 +7906,8 @@ iwm_notif_intr(struct iwm_softc *sc)
 			struct iwm_calib_res_notif_phy_db *phy_db_notif;
 			SYNC_RESP_STRUCT(phy_db_notif, pkt);
 			iwm_phy_db_set_section(sc, phy_db_notif);
+			sc->sc_init_complete |= IWM_CALIB_COMPLETE;
+			wakeup(&sc->sc_init_complete);
 			break;
 		}
 
@@ -7946,7 +7974,7 @@ iwm_notif_intr(struct iwm_softc *sc)
 			break;
 
 		case IWM_INIT_COMPLETE_NOTIF:
-			sc->sc_init_complete = 1;
+			sc->sc_init_complete |= IWM_INIT_COMPLETE;
 			wakeup(&sc->sc_init_complete);
 			break;
 
@@ -8619,8 +8647,13 @@ iwm_init_task(void *arg1)
 	struct iwm_softc *sc = arg1;
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
 	int s;
+	int generation = sc->sc_generation;
 
 	rw_enter_write(&sc->ioctl_rwl);
+	if (generation != sc->sc_generation) {
+		rw_exit(&sc->ioctl_rwl);
+		return;
+	}
 	s = splnet();
 
 	if (sc->sc_flags & IWM_FLAG_HW_INITED)
@@ -8680,6 +8713,107 @@ struct cfattach iwm_ca = {
 	sizeof(struct iwm_softc), iwm_match, iwm_attach,
 	NULL, iwm_activate
 };
+@
+
+
+1.195
+log
+@When a task in iwm(4) obtains an rwlock(9), bail out if the device was
+reset while the task was asleep waiting for the lock.
+ok deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_iwm.c,v 1.194 2017/06/14 16:56:50 stsp Exp $	*/
+d6009 1
+a6009 1
+	for (i = 0; i < IWM_NUM_PHY_CTX; i++) {
+@
+
+
+1.194
+log
+@Make the iwm(4) ioctl handler wait until the transition to SCAN has completed
+when bringing the interface up. Otherwise we get racy behaviour when running
+ifconfig commands which issue several ioctls in quick succession.
+Should fix the occasional "could not initiate scan" errors.
+ok deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_iwm.c,v 1.193 2017/06/14 16:56:04 stsp Exp $	*/
+d6271 1
+a6271 1
+	int s, err = 0;
+d6278 4
+a6283 1
+
+d7444 1
+d7447 4
+@
+
+
+1.193
+log
+@Make iwm(4) wait for the PHY calibration result notification during HW init.
+Code inspection revealed that Linux does this, and so should we.
+ok deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_iwm.c,v 1.192 2017/06/09 13:47:26 stsp Exp $	*/
+d5626 1
+d6106 2
+a6107 1
+	int err;
+d6124 14
+@
+
+
+1.192
+log
+@Introduce iwm_nic_assert_locked() to verify that the driver has correctly
+requested MAC access before accessing certain registers, as required
+by the hardware.
+
+Use it to assert that hardware is still in an accessible state before
+reading or writing such a register. For now, panic if that check fails.
+The long term goal is to make this a non-fatal error and handle it properly
+in all code paths that end up reading or writing such a register.
+
+Fix a missing NIC lock on 8000 hardware, found by this new assertion.
+
+Also, grab the NIC lock early during hardware init and keep it until init
+is done. The previous code relinquished and reacquired the NIC lock several
+times during the init sequence. It seems this is what was causing some random
+errors when the interface was brought up, such as "could not enable Tx queue",
+"could not add aux station", and "could not add phy context".
+For some reason, bsd.rd kernels were suffering particularly hard from such
+problems, to the point where some machines could not be upgraded over iwm(4).
+This change does not eliminate such problems entirely but is a step forward.
+
+Prodded by deraadt@@
+This change has already been in snaps for a while.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_iwm.c,v 1.191 2017/06/09 13:46:15 stsp Exp $	*/
+d3129 1
+d3181 2
+a3182 2
+	 * Nothing to do but wait for the init complete notification
+	 * from the firmware
+d3184 1
+a3184 1
+	while (!sc->sc_init_complete) {
+d6684 2
+d6752 1
+a6752 1
+			sc->sc_init_complete = 1;
 @
 
 

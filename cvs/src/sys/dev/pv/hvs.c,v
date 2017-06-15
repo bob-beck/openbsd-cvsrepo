@@ -1,9 +1,27 @@
-head	1.5;
+head	1.8;
 access;
 symbols;
 locks; strict;
 comment	@ * @;
 
+
+1.8
+date	2017.06.15.18.21.08;	author mikeb;	state Exp;
+branches;
+next	1.7;
+commitid	dYlUEWclkTW5VC15;
+
+1.7
+date	2017.06.15.18.05.52;	author mikeb;	state Exp;
+branches;
+next	1.6;
+commitid	NJ1EtwsO5e36X7pU;
+
+1.6
+date	2017.06.15.18.00.26;	author mikeb;	state Exp;
+branches;
+next	1.5;
+commitid	ychJmaKdO00EZxp6;
 
 1.5
 date	2017.06.15.15.01.28;	author mikeb;	state Exp;
@@ -40,17 +58,9 @@ desc
 @@
 
 
-1.5
+1.8
 log
-@Correct the number of targets vs number of LUNs
-
-jsg@@ has found out that the number of targets wasn't correct and
-it turns out that the device supports up to 2 targets and 1 or 64
-LUNs depending on whether it's taking over an IDE device or is a
-virtual SCSI.
-
-While here make sure the command response is copied back only for
-synchronous commands that are issued during initialization phase.
+@Provide storage for the response message in each CCB
 @
 text
 @/*-
@@ -206,16 +216,10 @@ struct hvs_srb {
 #define SRB_FLAGS_ADAPTER_CACHE_ENABLE	 0x00000200
 #define SRB_FLAGS_FREE_SENSE_BUFFER	 0x00000400
 
-/* SRB command for Win7 and older */
 struct hvs_cmd_io {
 	struct hvs_cmd_hdr	 cmd_hdr;
 	struct hvs_srb		 cmd_srb;
-} __packed;
-
-/* SRB command with Win8 extensions */
-struct hvs_cmd_xio {
-	struct hvs_cmd_hdr	 cmd_hdr;
-	struct hvs_srb		 cmd_srb;
+	/* Win8 extensions */
 	uint16_t		 _reserved;
 	uint8_t			 cmd_qtag;
 	uint8_t			 cmd_qaction;
@@ -231,7 +235,6 @@ union hvs_cmd {
 	struct hvs_cmd_ver	 ver;
 	struct hvs_cmd_chp	 chp;
 	struct hvs_cmd_io	 io;
-	struct hvs_cmd_xio	 xio;
 	uint8_t			 pad[HVS_CMD_SIZE];
 } __packed;
 
@@ -242,9 +245,9 @@ union hvs_cmd {
 struct hvs_softc;
 
 struct hvs_ccb {
-	struct hvs_softc	*ccb_softc;
-	union hvs_cmd		*ccb_cmd;   /* associated command */
 	struct scsi_xfer	*ccb_xfer;  /* associated transfer */
+	union hvs_cmd		*ccb_cmd;   /* associated command */
+	union hvs_cmd		 ccb_rsp;   /* response */
 	bus_dmamap_t		 ccb_dmap;  /* transfer map */
 	uint64_t		 ccb_rid;   /* request id */
 	struct vmbus_gpa_range	*ccb_sgl;
@@ -264,12 +267,8 @@ struct hvs_softc {
 	int			 sc_proto;
 	int			 sc_flags;
 #define  HVSF_SCSI		  0x0001
-#define  HVSF_XIO		  0x0002
+#define  HVSF_W8PLUS		  0x0002
 	struct hvs_chp		 sc_props;
-
-	union hvs_cmd		 sc_resp;
-	struct mutex		 sc_resplck;
-	uint32_t		 sc_rid;
 
 	/* CCBs */
 	int			 sc_nccb;
@@ -292,15 +291,15 @@ void	hvs_attach(struct device *, struct device *, void *);
 
 void	hvs_scsi_cmd(struct scsi_xfer *);
 void	hvs_scsi_cmd_done(struct hvs_ccb *);
-int	hvs_start(struct hvs_ccb *);
-int	hvs_poll(struct hvs_ccb *);
+int	hvs_start(struct hvs_softc *, struct hvs_ccb *);
+int	hvs_poll(struct hvs_softc *, struct hvs_ccb *);
 void	hvs_poll_done(struct hvs_ccb *);
 void	hvs_intr(void *);
 void	hvs_scsi_probe(void *arg);
 void	hvs_scsi_done(struct scsi_xfer *, int);
 
 int	hvs_connect(struct hvs_softc *);
-void	hvs_cmd_done(struct hvs_ccb *);
+void	hvs_empty_done(struct hvs_ccb *);
 
 int	hvs_alloc_ccbs(struct hvs_softc *);
 void	hvs_free_ccbs(struct hvs_softc *);
@@ -361,7 +360,7 @@ hvs_attach(struct device *parent, struct device *self, void *aux)
 	    sc->sc_proto & 0xff);
 
 	if (sc->sc_proto >= HVS_PROTO_VERSION_WIN8)
-		sc->sc_flags |= HVSF_XIO;
+		sc->sc_flags |= HVSF_W8PLUS;
 
 	task_set(&sc->sc_probetask, hvs_scsi_probe, sc);
 
@@ -389,7 +388,6 @@ hvs_scsi_cmd(struct scsi_xfer *xs)
 	struct hvs_ccb *ccb = xs->io;
 	union hvs_cmd cmd;
 	struct hvs_cmd_io *io = &cmd.io;
-	struct hvs_cmd_xio *xio = &cmd.xio;
 	struct hvs_srb *srb = &io->cmd_srb;
 	int i, rv, flags = BUS_DMA_NOWAIT;
 
@@ -419,30 +417,31 @@ hvs_scsi_cmd(struct scsi_xfer *xs)
 	switch (xs->flags & (SCSI_DATA_IN | SCSI_DATA_OUT)) {
 	case SCSI_DATA_IN:
 		srb->srb_direction = SRB_DATA_READ;
-		if (sc->sc_flags & HVSF_XIO)
-			xio->cmd_srbflags |= SRB_FLAGS_DATA_IN;
+		if (sc->sc_flags & HVSF_W8PLUS)
+			io->cmd_srbflags |= SRB_FLAGS_DATA_IN;
 		flags |= BUS_DMA_WRITE;
 		break;
 	case SCSI_DATA_OUT:
 		srb->srb_direction = SRB_DATA_WRITE;
-		if (sc->sc_flags & HVSF_XIO)
-			xio->cmd_srbflags |= SRB_FLAGS_DATA_OUT;
+		if (sc->sc_flags & HVSF_W8PLUS)
+			io->cmd_srbflags |= SRB_FLAGS_DATA_OUT;
 		flags |= BUS_DMA_READ;
 		break;
 	default:
 		srb->srb_direction = SRB_DATA_NONE;
-		if (sc->sc_flags & HVSF_XIO)
-			xio->cmd_srbflags |= SRB_FLAGS_NO_DATA_TRANSFER;
+		if (sc->sc_flags & HVSF_W8PLUS)
+			io->cmd_srbflags |= SRB_FLAGS_NO_DATA_TRANSFER;
 		break;
 	}
 
 	srb->srb_datalen = xs->datalen;
 
-	if (sc->sc_flags & HVSF_XIO) {
-		srb->srb_reqlen = sizeof(*xio);
+	if (sc->sc_flags & HVSF_W8PLUS) {
+		srb->srb_reqlen = sizeof(*io);
 		srb->srb_senselen = SENSE_DATA_LEN;
 	} else {
-		srb->srb_reqlen = sizeof(*io);
+		srb->srb_reqlen = sizeof(struct hvs_cmd_hdr) +
+		    sizeof(struct hvs_srb);
 		srb->srb_senselen = SENSE_DATA_LEN_WIN7;
 	}
 
@@ -480,9 +479,9 @@ hvs_scsi_cmd(struct scsi_xfer *xs)
 #endif
 
 	if (xs->flags & SCSI_POLL)
-		rv = hvs_poll(ccb);
+		rv = hvs_poll(sc, ccb);
 	else
-		rv = hvs_start(ccb);
+		rv = hvs_start(sc, ccb);
 	if (rv) {
 		KERNEL_LOCK();
 		hvs_scsi_done(xs, XS_DRIVER_STUFFUP);
@@ -493,9 +492,8 @@ hvs_scsi_cmd(struct scsi_xfer *xs)
 }
 
 int
-hvs_start(struct hvs_ccb *ccb)
+hvs_start(struct hvs_softc *sc, struct hvs_ccb *ccb)
 {
-	struct hvs_softc *sc = ccb->ccb_softc;
 	union hvs_cmd *cmd = ccb->ccb_cmd;
 	int rv;
 
@@ -526,16 +524,21 @@ hvs_poll_done(struct hvs_ccb *ccb)
 {
 	int *rv = ccb->ccb_cookie;
 
+	if (ccb->ccb_cmd) {
+		memcpy(&ccb->ccb_rsp, ccb->ccb_cmd, HVS_CMD_SIZE);
+		ccb->ccb_cmd = &ccb->ccb_rsp;
+	} else
+		memset(&ccb->ccb_rsp, 0, HVS_CMD_SIZE);
+
 	*rv = 0;
 }
 
 int
-hvs_poll(struct hvs_ccb *ccb)
+hvs_poll(struct hvs_softc *sc, struct hvs_ccb *ccb)
 {
-	struct hvs_softc *sc = ccb->ccb_softc;
 	void (*done)(struct hvs_ccb *);
 	void *cookie;
-	int rv = 1;
+	int s, rv = 1;
 
 	done = ccb->ccb_done;
 	cookie = ccb->ccb_cookie;
@@ -543,14 +546,16 @@ hvs_poll(struct hvs_ccb *ccb)
 	ccb->ccb_done = hvs_poll_done;
 	ccb->ccb_cookie = &rv;
 
-	if (hvs_start(ccb)) {
+	if (hvs_start(sc, ccb)) {
 		ccb->ccb_cookie = cookie;
 		ccb->ccb_done = done;
 		return (-1);
 	}
 
 	while (rv == 1) {
+		s = splbio();
 		hvs_intr(sc);
+		splx(s);
 		delay(10);
 	}
 
@@ -744,15 +749,13 @@ hvs_connect(struct hvs_softc *sc)
 	struct hvs_ccb *ccb;
 	int i;
 
-	mtx_init(&sc->sc_resplck, IPL_BIO);
-
 	ccb = scsi_io_get(&sc->sc_iopool, SCSI_POLL);
 	if (ccb == NULL) {
 		printf(": failed to allocate ccb\n");
 		return (-1);
 	}
 
-	ccb->ccb_done = hvs_cmd_done;
+	ccb->ccb_done = hvs_empty_done;
 
 	cmd = (struct hvs_cmd_ver *)&ucmd;
 
@@ -766,14 +769,14 @@ hvs_connect(struct hvs_softc *sc)
 	cmd->cmd_flags = VMBUS_CHANPKT_FLAG_RC;
 
 	ccb->ccb_cmd = &ucmd;
-	if (hvs_poll(ccb)) {
+	if (hvs_poll(sc, ccb)) {
 		printf(": failed to send initialization command\n");
 		scsi_io_put(&sc->sc_iopool, ccb);
 		return (-1);
 	}
-	if (sc->sc_resp.cmd_status != 0) {
+	if (ccb->ccb_rsp.cmd_status != 0) {
 		printf(": failed to initialize, status %#x\n",
-		    sc->sc_resp.cmd_status);
+		    ccb->ccb_rsp.cmd_status);
 		scsi_io_put(&sc->sc_iopool, ccb);
 		return (-1);
 	}
@@ -791,12 +794,12 @@ hvs_connect(struct hvs_softc *sc)
 		cmd->cmd_ver = protos[i];
 
 		ccb->ccb_cmd = &ucmd;
-		if (hvs_poll(ccb)) {
+		if (hvs_poll(sc, ccb)) {
 			printf(": failed to send protocol query\n");
 			scsi_io_put(&sc->sc_iopool, ccb);
 			return (-1);
 		}
-		if (sc->sc_resp.cmd_status == 0) {
+		if (ccb->ccb_rsp.cmd_status == 0) {
 			sc->sc_proto = protos[i];
 			break;
 		}
@@ -817,19 +820,19 @@ hvs_connect(struct hvs_softc *sc)
 	cmd->cmd_flags = VMBUS_CHANPKT_FLAG_RC;
 
 	ccb->ccb_cmd = &ucmd;
-	if (hvs_poll(ccb)) {
+	if (hvs_poll(sc, ccb)) {
 		printf(": failed to send channel properties query\n");
 		scsi_io_put(&sc->sc_iopool, ccb);
 		return (-1);
 	}
-	if (sc->sc_resp.cmd_op != HVS_MSG_IODONE ||
-	    sc->sc_resp.cmd_status != 0) {
+	if (ccb->ccb_rsp.cmd_op != HVS_MSG_IODONE ||
+	    ccb->ccb_rsp.cmd_status != 0) {
 		printf(": failed to obtain channel properties, status %#x\n",
-		    sc->sc_resp.cmd_status);
+		    ccb->ccb_rsp.cmd_status);
 		scsi_io_put(&sc->sc_iopool, ccb);
 		return (-1);
 	}
-	chp = &sc->sc_resp.chp.cmd_chp;
+	chp = &ccb->ccb_rsp.chp.cmd_chp;
 
 	DPRINTF(": proto %#x path %u target %u maxchan %u",
 	    chp->chp_proto, chp->chp_path, chp->chp_target,
@@ -852,15 +855,15 @@ hvs_connect(struct hvs_softc *sc)
 	cmd->cmd_flags = VMBUS_CHANPKT_FLAG_RC;
 
 	ccb->ccb_cmd = &ucmd;
-	if (hvs_poll(ccb)) {
+	if (hvs_poll(sc, ccb)) {
 		printf(": failed to send initialization finish\n");
 		scsi_io_put(&sc->sc_iopool, ccb);
 		return (-1);
 	}
-	if (sc->sc_resp.cmd_op != HVS_MSG_IODONE ||
-	    sc->sc_resp.cmd_status != 0) {
+	if (ccb->ccb_rsp.cmd_op != HVS_MSG_IODONE ||
+	    ccb->ccb_rsp.cmd_status != 0) {
 		printf(": failed to finish initialization, status %#x\n",
-		    sc->sc_resp.cmd_status);
+		    ccb->ccb_rsp.cmd_status);
 		scsi_io_put(&sc->sc_iopool, ccb);
 		return (-1);
 	}
@@ -871,12 +874,9 @@ hvs_connect(struct hvs_softc *sc)
 }
 
 void
-hvs_cmd_done(struct hvs_ccb *ccb)
+hvs_empty_done(struct hvs_ccb *ccb)
 {
-	struct hvs_softc *sc = ccb->ccb_softc;
-
-	if (ccb->ccb_cmd)
-		memcpy(&sc->sc_resp, ccb->ccb_cmd, HVS_CMD_SIZE);
+	/* nothing */
 }
 
 int
@@ -913,7 +913,6 @@ hvs_alloc_ccbs(struct hvs_softc *sc)
 			goto errout;
 		}
 
-		sc->sc_ccbs[i].ccb_softc = sc;
 		sc->sc_ccbs[i].ccb_rid = i;
 		hvs_put_ccb(sc, &sc->sc_ccbs[i]);
 	}
@@ -982,6 +981,195 @@ hvs_put_ccb(void *xsc, void *io)
 	SIMPLEQ_INSERT_HEAD(&sc->sc_ccb_fq, ccb, ccb_link);
 	mtx_leave(&sc->sc_ccb_fqlck);
 }
+@
+
+
+1.7
+log
+@Remove the structure definition for an old (pre Win8) I/O request type
+since the new one is backwards compatible and the correct length of the
+request can be specified w/o an actual definition.
+@
+text
+@d183 1
+a183 1
+	struct hvs_softc	*ccb_softc;
+d185 1
+a185 1
+	struct scsi_xfer	*ccb_xfer;  /* associated transfer */
+a207 4
+	union hvs_cmd		 sc_resp;
+	struct mutex		 sc_resplck;
+	uint32_t		 sc_rid;
+
+d229 2
+a230 2
+int	hvs_start(struct hvs_ccb *);
+int	hvs_poll(struct hvs_ccb *);
+d417 1
+a417 1
+		rv = hvs_poll(ccb);
+d419 1
+a419 1
+		rv = hvs_start(ccb);
+d430 1
+a430 1
+hvs_start(struct hvs_ccb *ccb)
+a431 1
+	struct hvs_softc *sc = ccb->ccb_softc;
+a459 1
+	struct hvs_softc *sc = ccb->ccb_softc;
+d463 2
+a464 2
+		memcpy(&sc->sc_resp, ccb->ccb_cmd, HVS_CMD_SIZE);
+		ccb->ccb_cmd = &sc->sc_resp;
+d466 1
+a466 1
+		memset(&sc->sc_resp, 0, HVS_CMD_SIZE);
+d472 1
+a472 1
+hvs_poll(struct hvs_ccb *ccb)
+a473 1
+	struct hvs_softc *sc = ccb->ccb_softc;
+d484 1
+a484 1
+	if (hvs_start(ccb)) {
+a686 2
+	mtx_init(&sc->sc_resplck, IPL_BIO);
+
+d707 1
+a707 1
+	if (hvs_poll(ccb)) {
+d712 1
+a712 1
+	if (sc->sc_resp.cmd_status != 0) {
+d714 1
+a714 1
+		    sc->sc_resp.cmd_status);
+d732 1
+a732 1
+		if (hvs_poll(ccb)) {
+d737 1
+a737 1
+		if (sc->sc_resp.cmd_status == 0) {
+d758 1
+a758 1
+	if (hvs_poll(ccb)) {
+d763 2
+a764 2
+	if (sc->sc_resp.cmd_op != HVS_MSG_IODONE ||
+	    sc->sc_resp.cmd_status != 0) {
+d766 1
+a766 1
+		    sc->sc_resp.cmd_status);
+d770 1
+a770 1
+	chp = &sc->sc_resp.chp.cmd_chp;
+d793 1
+a793 1
+	if (hvs_poll(ccb)) {
+d798 2
+a799 2
+	if (sc->sc_resp.cmd_op != HVS_MSG_IODONE ||
+	    sc->sc_resp.cmd_status != 0) {
+d801 1
+a801 1
+		    sc->sc_resp.cmd_status);
+a850 1
+		sc->sc_ccbs[i].ccb_softc = sc;
+@
+
+
+1.6
+log
+@Put back copying of the response message into the polling callback
+
+The response message is allocated on the stack of hvs_intr and its
+content is valid during a single message processing loop iteration.
+Due to the fact that polled transfers finish completion in a callee
+context, the cached pointer to the response message becomes stale
+very quickly.  To avoid this situation the poll completion callback
+needs to make sure the content of the response is provided to the
+next completion routine.
+@
+text
+@a153 1
+/* SRB command for Win7 and older */
+d157 1
+a157 6
+} __packed;
+
+/* SRB command with Win8 extensions */
+struct hvs_cmd_xio {
+	struct hvs_cmd_hdr	 cmd_hdr;
+	struct hvs_srb		 cmd_srb;
+a172 1
+	struct hvs_cmd_xio	 xio;
+d205 1
+a205 1
+#define  HVSF_XIO		  0x0002
+d302 1
+a302 1
+		sc->sc_flags |= HVSF_XIO;
+a329 1
+	struct hvs_cmd_xio *xio = &cmd.xio;
+d359 2
+a360 2
+		if (sc->sc_flags & HVSF_XIO)
+			xio->cmd_srbflags |= SRB_FLAGS_DATA_IN;
+d365 2
+a366 2
+		if (sc->sc_flags & HVSF_XIO)
+			xio->cmd_srbflags |= SRB_FLAGS_DATA_OUT;
+d371 2
+a372 2
+		if (sc->sc_flags & HVSF_XIO)
+			xio->cmd_srbflags |= SRB_FLAGS_NO_DATA_TRANSFER;
+d378 2
+a379 2
+	if (sc->sc_flags & HVSF_XIO) {
+		srb->srb_reqlen = sizeof(*xio);
+d382 2
+a383 1
+		srb->srb_reqlen = sizeof(*io);
+@
+
+
+1.5
+log
+@Correct the number of targets vs number of LUNs
+
+jsg@@ has found out that the number of targets wasn't correct and
+it turns out that the device supports up to 2 targets and 1 or 64
+LUNs depending on whether it's taking over an IDE device or is a
+virtual SCSI.
+
+While here make sure the command response is copied back only for
+synchronous commands that are issued during initialization phase.
+@
+text
+@d248 1
+a248 1
+void	hvs_cmd_done(struct hvs_ccb *);
+d472 1
+d475 6
+d490 1
+a490 1
+	int rv = 1;
+d505 1
+d507 1
+d709 1
+a709 1
+	ccb->ccb_done = hvs_cmd_done;
+d828 1
+a828 1
+hvs_cmd_done(struct hvs_ccb *ccb)
+d830 1
+a830 4
+	struct hvs_softc *sc = ccb->ccb_softc;
+
+	if (ccb->ccb_cmd)
+		memcpy(&sc->sc_resp, ccb->ccb_cmd, HVS_CMD_SIZE);
 @
 
 

@@ -1,4 +1,4 @@
-head	1.212;
+head	1.214;
 access;
 symbols
 	OPENBSD_6_1:1.207.0.4
@@ -87,6 +87,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.214
+date	2017.06.16.01.55.45;	author dlg;	state Exp;
+branches;
+next	1.213;
+commitid	lmVxndefRxY5hqss;
+
+1.213
+date	2017.06.16.01.33.20;	author dlg;	state Exp;
+branches;
+next	1.212;
+commitid	leZJR70c9dSWCx65;
 
 1.212
 date	2017.06.15.03.50.50;	author dlg;	state Exp;
@@ -1315,9 +1327,29 @@ desc
 @@
 
 
-1.212
+1.214
 log
-@report contention on caches global data to userland.
+@add garbage collection of unused lists percpu cached items.
+
+the cpu caches in pools amortise the cost of accessing global
+structures by moving lists of items around instead of individual
+items. excess lists of items are stored in the global pool struct,
+but these idle lists never get returned back to the system for use
+elsewhere.
+
+this adds a timestamp to the global idle list, which is updated
+when the idle list stops being empty. if the idle list hasn't been
+empty for a while, it means the per cpu caches arent using the idle
+entries and they can be recovered. timestamping the pages prevents
+recovery of a lot of items that may be used again shortly. eg, rx
+ring processing and replenishing from rate limited interrupts tends
+to allocate and free items in large chunks, which the timestamping
+smooths out.
+
+gc'ed lists are returned to the pool pages, which in turn get gc'ed
+back to uvm.
+
+ok visa@@
 @
 text
 @/*	$OpenBSD: subr_pool.c,v 1.211 2017/06/15 03:48:50 dlg Exp $	*/
@@ -1457,6 +1489,7 @@ struct pool_cache {
 void	*pool_cache_get(struct pool *);
 void	 pool_cache_put(struct pool *, void *);
 void	 pool_cache_destroy(struct pool *);
+void	 pool_cache_gc(struct pool *);
 #endif
 void	 pool_cache_pool_info(struct pool *, struct kinfo_pool *);
 int	 pool_cache_info(struct pool *, void *, size_t *);
@@ -1478,6 +1511,7 @@ void	 pool_p_free(struct pool *, struct pool_page_header *);
 
 void	 pool_update_curpage(struct pool *);
 void	*pool_do_get(struct pool *, int, int *);
+void	 pool_do_put(struct pool *, void *);
 int	 pool_chk_page(struct pool *, struct pool_page_header *, int);
 int	 pool_chk(struct pool *);
 void	 pool_get_done(void *, void *);
@@ -2033,7 +2067,6 @@ pool_do_get(struct pool *pp, int flags, int *slowdown)
 void
 pool_put(struct pool *pp, void *v)
 {
-	struct pool_item *pi = v;
 	struct pool_page_header *ph, *freeph = NULL;
 
 #ifdef DIAGNOSTIC
@@ -2049,6 +2082,37 @@ pool_put(struct pool *pp, void *v)
 #endif
 
 	mtx_enter(&pp->pr_mtx);
+
+	pool_do_put(pp, v);
+
+	pp->pr_nout--;
+	pp->pr_nput++;
+
+	/* is it time to free a page? */
+	if (pp->pr_nidle > pp->pr_maxpages &&
+	    (ph = TAILQ_FIRST(&pp->pr_emptypages)) != NULL &&
+	    (ticks - ph->ph_tick) > (hz * pool_wait_free)) {
+		freeph = ph;
+		pool_p_remove(pp, freeph);
+	}
+
+	mtx_leave(&pp->pr_mtx);
+
+	if (freeph != NULL)
+		pool_p_free(pp, freeph);
+
+	if (!TAILQ_EMPTY(&pp->pr_requests)) {
+		mtx_enter(&pp->pr_requests_mtx);
+		pool_runqueue(pp, PR_NOWAIT);
+		mtx_leave(&pp->pr_requests_mtx);
+	}
+}
+
+void
+pool_do_put(struct pool *pp, void *v)
+{
+	struct pool_item *pi = v;
+	struct pool_page_header *ph;
 
 	splassert(pp->pr_ipl);
 
@@ -2092,27 +2156,6 @@ pool_put(struct pool *pp, void *v)
 		TAILQ_REMOVE(&pp->pr_partpages, ph, ph_entry);
 		TAILQ_INSERT_TAIL(&pp->pr_emptypages, ph, ph_entry);
 		pool_update_curpage(pp);
-	}
-
-	pp->pr_nout--;
-	pp->pr_nput++;
-
-	/* is it time to free a page? */
-	if (pp->pr_nidle > pp->pr_maxpages &&
-	    (ph = TAILQ_FIRST(&pp->pr_emptypages)) != NULL &&
-	    (ticks - ph->ph_tick) > (hz * pool_wait_free)) {
-		freeph = ph;
-		pool_p_remove(pp, freeph);
-	}
-	mtx_leave(&pp->pr_mtx);
-
-	if (freeph != NULL)
-		pool_p_free(pp, freeph);
-
-	if (!TAILQ_EMPTY(&pp->pr_requests)) {
-		mtx_enter(&pp->pr_requests_mtx);
-		pool_runqueue(pp, PR_NOWAIT);
-		mtx_leave(&pp->pr_requests_mtx);
 	}
 }
 
@@ -2788,6 +2831,11 @@ pool_gc_pages(void *null)
 	rw_enter_read(&pool_lock);
 	s = splvm(); /* XXX go to splvm until all pools _setipl properly */
 	SIMPLEQ_FOREACH(pp, &pool_head, pr_poollist) {
+#ifdef MULTIPROCESSOR
+		if (pp->pr_cache != NULL)
+			pool_cache_gc(pp);
+#endif
+
 		if (pp->pr_nidle <= pp->pr_minpages || /* guess */
 		    !mtx_enter_try(&pp->pr_mtx)) /* try */
 			continue;
@@ -2954,8 +3002,10 @@ pool_cache_init(struct pool *pp)
 	arc4random_buf(pp->pr_cache_magic, sizeof(pp->pr_cache_magic));
 	TAILQ_INIT(&pp->pr_cache_lists);
 	pp->pr_cache_nlist = 0;
+	pp->pr_cache_tick = ticks;
 	pp->pr_cache_items = 8;
 	pp->pr_cache_contention = 0;
+	pp->pr_cache_ngc = 0;
 
 	CPUMEM_FOREACH(pc, &i, cm) {
 		pc->pc_actv = NULL;
@@ -2970,6 +3020,8 @@ pool_cache_init(struct pool *pp)
 		pc->pc_nlput = 0;
 		pc->pc_nout = 0;
 	}
+
+	membar_producer();
 
 	pp->pr_cache = cm;
 }
@@ -3052,6 +3104,9 @@ pool_cache_list_free(struct pool *pp, struct pool_cache *pc,
     struct pool_cache_item *ci)
 {
 	pool_list_enter(pp);
+	if (TAILQ_EMPTY(&pp->pr_cache_lists))
+		pp->pr_cache_tick = ticks;
+
 	TAILQ_INSERT_TAIL(&pp->pr_cache_lists, ci, ci_nextl);
 	pp->pr_cache_nlist++;
 
@@ -3186,11 +3241,13 @@ pool_cache_list_put(struct pool *pp, struct pool_cache_item *pl)
 
 	rpl = TAILQ_NEXT(pl, ci_nextl);
 
+	mtx_enter(&pp->pr_mtx);
 	do {
 		next = pl->ci_next;
-		pool_put(pp, pl);
+		pool_do_put(pp, pl);
 		pl = next;
 	} while (pl != NULL);
+	mtx_leave(&pp->pr_mtx);
 
 	return (rpl);
 }
@@ -3203,8 +3260,10 @@ pool_cache_destroy(struct pool *pp)
 	struct cpumem_iter i;
 	struct cpumem *cm;
 
+	rw_enter_write(&pool_lock); /* serialise with the gc */
 	cm = pp->pr_cache;
 	pp->pr_cache = NULL; /* make pool_put avoid the cache */
+	rw_exit_write(&pool_lock);
 
 	CPUMEM_FOREACH(pc, &i, cm) {
 		pool_cache_list_put(pp, pc->pc_actv);
@@ -3216,6 +3275,29 @@ pool_cache_destroy(struct pool *pp)
 	pl = TAILQ_FIRST(&pp->pr_cache_lists);
 	while (pl != NULL)
 		pl = pool_cache_list_put(pp, pl);
+}
+
+void
+pool_cache_gc(struct pool *pp)
+{
+	if ((ticks - pp->pr_cache_tick) > (hz * pool_wait_gc) &&
+	    !TAILQ_EMPTY(&pp->pr_cache_lists) &&
+	    mtx_enter_try(&pp->pr_cache_mtx)) {
+		struct pool_cache_item *pl = NULL;
+
+		pl = TAILQ_FIRST(&pp->pr_cache_lists);
+		if (pl != NULL) {
+			TAILQ_REMOVE(&pp->pr_cache_lists, pl, ci_nextl);
+			pp->pr_cache_tick = ticks;
+			pp->pr_cache_nlist--;
+
+			pp->pr_cache_ngc++;
+		}
+
+		mtx_leave(&pp->pr_cache_mtx);
+
+		pool_cache_list_put(pp, pl);
+	}
 }
 
 void
@@ -3265,7 +3347,7 @@ pool_cache_info(struct pool *pp, void *oldp, size_t *oldlenp)
 	memset(&kpc, 0, sizeof(kpc)); /* don't leak padding */
 
 	mtx_enter(&pp->pr_cache_mtx);
-	kpc.pr_ngc = 0; /* notyet */
+	kpc.pr_ngc = pp->pr_cache_ngc;
 	kpc.pr_len = pp->pr_cache_items;
 	kpc.pr_nlist = pp->pr_cache_nlist;
 	kpc.pr_contention = pp->pr_cache_contention;
@@ -3353,6 +3435,85 @@ pool_cache_cpus_info(struct pool *pp, void *oldp, size_t *oldlenp)
 	return (EOPNOTSUPP);
 }
 #endif /* MULTIPROCESSOR */
+@
+
+
+1.213
+log
+@split returning an item to the pool pages out of pool_put as pool_do_put.
+
+this lets pool_cache_list_put return items to the pages. currently,
+if pool_cache_list_put is called while the per cpu caches are
+enabled, the items on the list will put put straight back onto
+another list in the cpu cache. this also avoids counting puts for
+these items twice. a put for the items have already been coutned
+when the items went to a cpu cache, it doesnt need to be counted
+again when it goes back to the pool pages.
+
+another side effect of this is that pool_cache_list_put can take
+the pool mutex once when returning all the items in the list with
+pool_do_put, rather than once per item.
+
+ok visa@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: subr_pool.c,v 1.212 2017/06/15 03:50:50 dlg Exp $	*/
+d138 1
+d1480 5
+d1651 1
+d1654 1
+d1670 2
+d1753 3
+d1909 1
+d1912 1
+d1927 23
+d1996 1
+a1996 1
+	kpc.pr_ngc = 0; /* notyet */
+@
+
+
+1.212
+log
+@report contention on caches global data to userland.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: subr_pool.c,v 1.211 2017/06/15 03:48:50 dlg Exp $	*/
+d159 1
+a714 1
+	struct pool_item *pi = v;
+d731 31
+a804 21
+
+	pp->pr_nout--;
+	pp->pr_nput++;
+
+	/* is it time to free a page? */
+	if (pp->pr_nidle > pp->pr_maxpages &&
+	    (ph = TAILQ_FIRST(&pp->pr_emptypages)) != NULL &&
+	    (ticks - ph->ph_tick) > (hz * pool_wait_free)) {
+		freeph = ph;
+		pool_p_remove(pp, freeph);
+	}
+	mtx_leave(&pp->pr_mtx);
+
+	if (freeph != NULL)
+		pool_p_free(pp, freeph);
+
+	if (!TAILQ_EMPTY(&pp->pr_requests)) {
+		mtx_enter(&pp->pr_requests_mtx);
+		pool_runqueue(pp, PR_NOWAIT);
+		mtx_leave(&pp->pr_requests_mtx);
+	}
+d1877 1
+d1880 1
+a1880 1
+		pool_put(pp, pl);
+d1883 1
 @
 
 

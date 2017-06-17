@@ -1,4 +1,4 @@
-head	1.428;
+head	1.430;
 access;
 symbols
 	OPENBSD_6_1:1.405.0.4
@@ -58,6 +58,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.430
+date	2017.06.17.16.58.55;	author krw;	state Exp;
+branches;
+next	1.429;
+commitid	l7JlcHqNJUIfaJjc;
+
+1.429
+date	2017.06.17.15.53.03;	author krw;	state Exp;
+branches;
+next	1.428;
+commitid	S5as0pLhDvUkyD87;
 
 1.428
 date	2017.06.16.14.12.12;	author krw;	state Exp;
@@ -2327,13 +2339,19 @@ desc
 @@
 
 
-1.428
+1.430
 log
-@Nuke 'is_bootp' field and just use a #define to check if the lease
-has DHO_DHCP_MESSAGE_TYPE info.
+@We accept either the first offer received, or an offer for the
+current address if one arrives inside select_timeout. So there
+is no need to keep a list of received offers. Just keep the
+best one and DECLINE the rest. Nuke now unused 'offered_leases'
+TAILQ.
+
+Also fixes the oddity that the *last* offer for the current
+address is taken rather than the *first*.
 @
 text
-@/*	$OpenBSD: dhclient.c,v 1.427 2017/06/15 17:06:17 krw Exp $	*/
+@/*	$OpenBSD: dhclient.c,v 1.429 2017/06/17 15:53:03 krw Exp $	*/
 
 /*
  * Copyright 2004 Henning Brauer <henning@@openbsd.org>
@@ -2899,7 +2917,6 @@ main(int argc, char *argv[])
 	TAILQ_INIT(&config->reject_list);
 
 	TAILQ_INIT(&ifi->leases);
-	TAILQ_INIT(&ifi->offered_leases);
 
 	read_client_conf(ifi);
 
@@ -3144,37 +3161,17 @@ state_init(struct interface_info *ifi)
 void
 state_selecting(struct interface_info *ifi)
 {
-	struct client_lease *lease, *picked;
+	struct option_data *option;
 
 	cancel_timeout();
 
-	/* Take the first valid DHCPOFFER. */
-	TAILQ_FOREACH_SAFE(picked, &ifi->offered_leases, next, lease) {
-		if (picked->is_invalid == 0) {
-			TAILQ_REMOVE(&ifi->offered_leases, picked, next);
-			break;
-		}
-	}
-	/* DECLINE the rest of the offers. */
-	while (!TAILQ_EMPTY(&ifi->offered_leases)) {
-		lease = TAILQ_FIRST(&ifi->offered_leases);
-		TAILQ_REMOVE(&ifi->offered_leases, lease, next);
-		make_decline(ifi, lease);
-		send_decline(ifi);
-		free_client_lease(lease);
-	}
-
-	if (!picked) {
+	if (ifi->new == NULL) {
 		state_panic(ifi);
 		return;
 	}
 
 	/* If it was a BOOTREPLY, we can just take the lease right now. */
-	if (BOOTP_LEASE(picked)) {
-		struct option_data *option;
-
-		ifi->new = picked;
-
+	if (BOOTP_LEASE(ifi->new)) {
 		/*
 		 * Set (unsigned 32 bit) options
 		 *
@@ -3221,10 +3218,10 @@ state_selecting(struct interface_info *ifi)
 	 * the current xid, as all offers should have had the same
 	 * one.
 	 */
-	make_request(ifi, picked);
+	make_request(ifi, ifi->new);
 
 	/* Toss the lease we picked - we'll get it back in a DHCPACK. */
-	free_client_lease(picked);
+	free_client_lease(ifi->new);
 
 	send_request(ifi);
 }
@@ -3247,11 +3244,7 @@ dhcpack(struct interface_info *ifi, struct option_data *options, char *info)
 	log_info("%s", info);
 
 	lease = packet_to_lease(ifi, options);
-	if (lease->is_invalid) {
-		log_info("Unsatisfactory %s", info);
-		make_decline(ifi, lease);
-		send_decline(ifi);
-		free_client_lease(lease);
+	if (lease == NULL) {
 		ifi->state = S_INIT;
 		state_init(ifi);
 		return;
@@ -3447,8 +3440,7 @@ state_bound(struct interface_info *ifi)
 void
 dhcpoffer(struct interface_info *ifi, struct option_data *options, char *info)
 {
-	struct dhcp_packet *packet = &ifi->recv_packet;
-	struct client_lease *lease, *lp;
+	struct client_lease *lease;
 	time_t stop_selecting;
 
 	if (ifi->state != S_SELECTING) {
@@ -3460,32 +3452,24 @@ dhcpoffer(struct interface_info *ifi, struct option_data *options, char *info)
 
 	log_info("%s", info);
 
-	/* If we've already seen this lease, don't record it again. */
-	TAILQ_FOREACH(lp, &ifi->offered_leases, next) {
-		if (!memcmp(&lp->address.s_addr, &packet->yiaddr,
-		    sizeof(in_addr_t))) {
-#ifdef DEBUG
-			log_debug("Duplicate %s.", info);
-#endif	/* DEBUG */
-			return;
+	lease = packet_to_lease(ifi, options);
+	if (lease != NULL) {
+		if (ifi->new == NULL) {
+			ifi->new = lease;
+		} else if (lease->address.s_addr ==
+		    ifi->requested_address.s_addr) {
+			free_client_lease(ifi->new);
+			ifi->new = lease;
+		}
+		if (ifi->new != lease) {
+			make_decline(ifi, lease);
+			send_decline(ifi);
+			free_client_lease(lease);
 		}
 	}
 
-	lease = packet_to_lease(ifi, options);
-
 	/* Figure out when we're supposed to stop selecting. */
 	stop_selecting = ifi->first_sending + config->select_interval;
-
-	if (TAILQ_EMPTY(&ifi->offered_leases)) {
-		TAILQ_INSERT_HEAD(&ifi->offered_leases, lease, next);
-	} else if (lease->address.s_addr == ifi->requested_address.s_addr) {
-		/* The expected lease - put it at the head of the list. */
-		TAILQ_INSERT_HEAD(&ifi->offered_leases, lease, next);
-	} else {
-		/* Not the expected lease - put it at the end of the list. */
-		TAILQ_INSERT_TAIL(&ifi->offered_leases, lease, next);
-	}
-
 	if (stop_selecting <= time(NULL))
 		state_selecting(ifi);
 	else
@@ -3524,7 +3508,10 @@ addressinuse(struct interface_info *ifi, struct in_addr address, char *ifname)
 
 /*
  * Allocate a client_lease structure and initialize it from the
- * parameters in the specified packet.
+ * parameters in the received packet.
+ *
+ * Return NULL and decline the lease if a valid lease cannot be
+ * constructed.
  */
 struct client_lease *
 packet_to_lease(struct interface_info *ifi, struct option_data *options)
@@ -3536,9 +3523,9 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 	int i;
 
 	lease = calloc(1, sizeof(struct client_lease));
-	if (!lease) {
-		log_warnx("dhcpoffer: no memory to create lease.");
-		return (NULL);
+	if (lease == NULL) {
+		log_warnx("lease declined: no memory for lease.");
+		return NULL;
 	}
 
 	/* Copy the lease options. */
@@ -3547,8 +3534,8 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 			continue;
 		if (!unknown_ok && strncmp("option-",
 		    dhcp_options[i].name, 7) != 0) {
-			log_warnx("dhcpoffer: unknown option %d", i);
-			lease->is_invalid = 1;
+			log_warnx("lease declined: unknown option %d", i);
+			goto decline;
 		}
 		pretty = pretty_print_option(i, &options[i], 0);
 		if (strlen(pretty) == 0)
@@ -3560,9 +3547,11 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 			    options[i].len);
 			if (buf == NULL)
 				continue;
-			if (!res_hnok_list(buf))
-				log_warnx("Bogus data for option %s",
-				    dhcp_options[i].name);
+			if (!res_hnok_list(buf)) {
+				log_warnx("lease declined: invalid host "
+				    "name(s) in %s", dhcp_options[i].name);
+				goto decline;
+			}
 			break;
 		case DHO_DOMAIN_NAME:
 			/*
@@ -3572,17 +3561,17 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 			 * entries in the resolv.conf 'search' statement.
 			 */
 			if (!res_hnok_list(pretty)) {
-				log_warnx("Bogus data for option %s",
-				    dhcp_options[i].name);
-				continue;
+				log_warnx("lease declined: invalid host "
+				    "names in %s", dhcp_options[i].name);
+				goto decline;
 			}
 			break;
 		case DHO_HOST_NAME:
 		case DHO_NIS_DOMAIN:
 			if (!res_hnok(pretty)) {
-				log_warnx("Bogus data for option %s",
-				    dhcp_options[i].name);
-				continue;
+				log_warnx("lease declined: invalid host name "
+				    "in %s", dhcp_options[i].name);
+				goto decline;
 			}
 			break;
 		default:
@@ -3598,9 +3587,9 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 	 */
 	for (i = 0; i < config->required_option_count; i++) {
 		if (!lease->options[config->required_options[i]].len) {
-			log_warnx("Missing required parameter %s",
+			log_warnx("lease declined: %s required but missing",
 			    dhcp_options[i].name);
-			lease->is_invalid = 1;
+			goto decline;
 		}
 	}
 
@@ -3612,9 +3601,9 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 	memset(ifname, 0, sizeof(ifname));
 	if (addressinuse(ifi, lease->address, ifname) &&
 	    strncmp(ifname, ifi->name, IF_NAMESIZE) != 0) {
-		log_warnx("%s already configured on %s",
+		log_warnx("lease declined: %s already configured on %s",
 		    inet_ntoa(lease->address), ifname);
-		lease->is_invalid = 1;
+		goto decline;
 	}
 
 	/* Save the siaddr (a.k.a. next-server) info. */
@@ -3626,14 +3615,14 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 	    packet->sname[0]) {
 		lease->server_name = malloc(DHCP_SNAME_LEN + 1);
 		if (!lease->server_name) {
-			log_warnx("dhcpoffer: no memory for server name.");
-			lease->is_invalid = 1;
+			log_warnx("lease declined:: no memory for SNAME.");
+			goto decline;
 		}
 		memcpy(lease->server_name, packet->sname, DHCP_SNAME_LEN);
 		lease->server_name[DHCP_SNAME_LEN] = '\0';
 		if (!res_hnok(lease->server_name)) {
-			log_warnx("Bogus server name %s", lease->server_name);
-			lease->is_invalid = 1;
+			log_warnx("lease declined: invalid host name in SNAME");
+			goto decline;
 		}
 	}
 
@@ -3644,13 +3633,19 @@ packet_to_lease(struct interface_info *ifi, struct option_data *options)
 		/* Don't count on the NUL terminator. */
 		lease->filename = malloc(DHCP_FILE_LEN + 1);
 		if (!lease->filename) {
-			log_warnx("dhcpoffer: no memory for filename.");
-			lease->is_invalid = 1;
+			log_warnx("lease declined: no memory for filename.");
+			goto decline;
 		}
 		memcpy(lease->filename, packet->file, DHCP_FILE_LEN);
 		lease->filename[DHCP_FILE_LEN] = '\0';
 	}
 	return lease;
+
+ decline:
+	make_decline(ifi, lease);
+	send_decline(ifi);
+	free_client_lease(lease);
+	return NULL;
 }
 
 void
@@ -4987,6 +4982,181 @@ set_default_client_identifier(struct interface_info *ifi)
 		opt->len = ETHER_ADDR_LEN + 1;
 	}
 }
+@
+
+
+1.429
+log
+@DECLINE offers as they are deemed invalid. Decline them at the
+first problem rather than continuing to look for other reasons
+to decline them. Nuke is_invalid field since it is now unused.
+More informative log message when a lease is determined to be
+unacceptable.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dhclient.c,v 1.428 2017/06/16 14:12:12 krw Exp $	*/
+a566 1
+	TAILQ_INIT(&ifi->offered_leases);
+d811 1
+a811 1
+	struct client_lease *lease, *picked;
+d815 1
+a815 1
+	if (TAILQ_EMPTY(&ifi->offered_leases)) {
+a819 12
+	picked = TAILQ_FIRST(&ifi->offered_leases);
+	TAILQ_REMOVE(&ifi->offered_leases, picked, next);
+
+	/* DECLINE the rest of the offers. */
+	while (!TAILQ_EMPTY(&ifi->offered_leases)) {
+		lease = TAILQ_FIRST(&ifi->offered_leases);
+		TAILQ_REMOVE(&ifi->offered_leases, lease, next);
+		make_decline(ifi, lease);
+		send_decline(ifi);
+		free_client_lease(lease);
+	}
+
+d821 1
+a821 5
+	if (BOOTP_LEASE(picked)) {
+		struct option_data *option;
+
+		ifi->new = picked;
+
+d868 1
+a868 1
+	make_request(ifi, picked);
+d871 1
+a871 1
+	free_client_lease(picked);
+d1090 1
+a1090 2
+	struct dhcp_packet *packet = &ifi->recv_packet;
+	struct client_lease *lease, *lp;
+a1101 11
+	/* If we've already seen this lease, don't record it again. */
+	TAILQ_FOREACH(lp, &ifi->offered_leases, next) {
+		if (!memcmp(&lp->address.s_addr, &packet->yiaddr,
+		    sizeof(in_addr_t))) {
+#ifdef DEBUG
+			log_debug("Duplicate %s.", info);
+#endif	/* DEBUG */
+			return;
+		}
+	}
+
+d1104 2
+a1105 2
+		if (TAILQ_EMPTY(&ifi->offered_leases)) {
+			TAILQ_INSERT_HEAD(&ifi->offered_leases, lease, next);
+d1108 7
+a1114 5
+			/* The expected lease - put it first. */
+			TAILQ_INSERT_HEAD(&ifi->offered_leases, lease, next);
+		} else {
+			/* Put it at the end of the list. */
+			TAILQ_INSERT_TAIL(&ifi->offered_leases, lease, next);
+@
+
+
+1.428
+log
+@Nuke 'is_bootp' field and just use a #define to check if the lease
+has DHO_DHCP_MESSAGE_TYPE info.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dhclient.c,v 1.427 2017/06/15 17:06:17 krw Exp $	*/
+d816 3
+a818 6
+	/* Take the first valid DHCPOFFER. */
+	TAILQ_FOREACH_SAFE(picked, &ifi->offered_leases, next, lease) {
+		if (picked->is_invalid == 0) {
+			TAILQ_REMOVE(&ifi->offered_leases, picked, next);
+			break;
+		}
+d820 4
+a832 5
+	if (!picked) {
+		state_panic(ifi);
+		return;
+	}
+
+d911 1
+a911 5
+	if (lease->is_invalid) {
+		log_info("Unsatisfactory %s", info);
+		make_decline(ifi, lease);
+		send_decline(ifi);
+		free_client_lease(lease);
+d1132 12
+a1146 11
+
+	if (TAILQ_EMPTY(&ifi->offered_leases)) {
+		TAILQ_INSERT_HEAD(&ifi->offered_leases, lease, next);
+	} else if (lease->address.s_addr == ifi->requested_address.s_addr) {
+		/* The expected lease - put it at the head of the list. */
+		TAILQ_INSERT_HEAD(&ifi->offered_leases, lease, next);
+	} else {
+		/* Not the expected lease - put it at the end of the list. */
+		TAILQ_INSERT_TAIL(&ifi->offered_leases, lease, next);
+	}
+
+d1185 4
+a1188 1
+ * parameters in the specified packet.
+d1200 3
+a1202 3
+	if (!lease) {
+		log_warnx("dhcpoffer: no memory to create lease.");
+		return (NULL);
+d1211 2
+a1212 2
+			log_warnx("dhcpoffer: unknown option %d", i);
+			lease->is_invalid = 1;
+d1224 5
+a1228 3
+			if (!res_hnok_list(buf))
+				log_warnx("Bogus data for option %s",
+				    dhcp_options[i].name);
+d1238 3
+a1240 3
+				log_warnx("Bogus data for option %s",
+				    dhcp_options[i].name);
+				continue;
+d1246 3
+a1248 3
+				log_warnx("Bogus data for option %s",
+				    dhcp_options[i].name);
+				continue;
+d1264 1
+a1264 1
+			log_warnx("Missing required parameter %s",
+d1266 1
+a1266 1
+			lease->is_invalid = 1;
+d1278 1
+a1278 1
+		log_warnx("%s already configured on %s",
+d1280 1
+a1280 1
+		lease->is_invalid = 1;
+d1292 2
+a1293 2
+			log_warnx("dhcpoffer: no memory for server name.");
+			lease->is_invalid = 1;
+d1298 2
+a1299 2
+			log_warnx("Bogus server name %s", lease->server_name);
+			lease->is_invalid = 1;
+d1310 2
+a1311 2
+			log_warnx("dhcpoffer: no memory for filename.");
+			lease->is_invalid = 1;
+d1317 6
 @
 
 

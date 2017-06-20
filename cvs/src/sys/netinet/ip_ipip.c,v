@@ -1,4 +1,4 @@
-head	1.84;
+head	1.85;
 access;
 symbols
 	OPENBSD_6_1:1.72.0.4
@@ -82,6 +82,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.85
+date	2017.06.20.11.12.13;	author bluhm;	state Exp;
+branches;
+next	1.84;
+commitid	hmkIwC7Ma691pjPM;
 
 1.84
 date	2017.06.19.17.58.49;	author bluhm;	state Exp;
@@ -598,16 +604,15 @@ desc
 @@
 
 
-1.84
+1.85
 log
-@When dealing with mbuf pointers passed down as function parameters,
-bugs could easily result in use-after-free or double free.  Introduce
-m_freemp() which automatically resets the pointer before freeing
-it.  So we have less dangling pointers in the kernel.
-OK krw@@ mpi@@ claudio@@
+@Do not use the interface pointer after if_put().  Rename ipip_input_gif()
+to ipip_input_if() and always pass the ifp.  Only dump the packet
+to bpf if we are called with a gif(4) interface.
+OK mpi@@
 @
 text
-@/*	$OpenBSD: ip_ipip.c,v 1.83 2017/06/11 19:59:57 bluhm Exp $ */
+@/*	$OpenBSD: ip_ipip.c,v 1.84 2017/06/19 17:58:49 bluhm Exp $ */
 /*
  * The authors of this code are John Ioannidis (ji@@tla.org),
  * Angelos D. Keromytis (kermit@@csd.uch.gr) and
@@ -648,6 +653,8 @@ text
  * IP-inside-IP processing
  */
 
+#include "bpfilter.h"
+#include "gif.h"
 #include "pf.h"
 
 #include <sys/param.h>
@@ -657,6 +664,7 @@ text
 #include <sys/sysctl.h>
 
 #include <net/if.h>
+#include <net/if_types.h>
 #include <net/if_var.h>
 #include <net/route.h>
 #include <net/netisr.h>
@@ -672,8 +680,6 @@ text
 #ifdef MROUTING
 #include <netinet/ip_mroute.h>
 #endif
-
-#include "bpfilter.h"
 
 #if NPF > 0
 #include <net/pfvar.h>
@@ -700,11 +706,13 @@ ipip_init(void)
 }
 
 /*
- * Really only a wrapper for ipip_input_gif(), for use with pr_input.
+ * Really only a wrapper for ipip_input_if(), for use with pr_input.
  */
 int
-ipip_input(struct mbuf **mp, int *offp, int proto, int af)
+ipip_input(struct mbuf **mp, int *offp, int nxt, int af)
 {
+	struct ifnet *ifp;
+
 	/* If we do not accept IP-in-IP explicitly, drop.  */
 	if (!ipip_allow && ((*mp)->m_flags & (M_AUTH|M_CONF)) == 0) {
 		DPRINTF(("%s: dropped due to policy\n", __func__));
@@ -713,7 +721,15 @@ ipip_input(struct mbuf **mp, int *offp, int proto, int af)
 		return IPPROTO_DONE;
 	}
 
-	return ipip_input_gif(mp, offp, proto, af, NULL);
+	ifp = if_get((*mp)->m_pkthdr.ph_ifidx);
+	if (ifp == NULL) {
+		m_freemp(mp);
+		return IPPROTO_DONE;
+	}
+	nxt = ipip_input_if(mp, offp, nxt, af, ifp);
+	if_put(ifp);
+
+	return nxt;
 }
 
 /*
@@ -725,12 +741,11 @@ ipip_input(struct mbuf **mp, int *offp, int proto, int af)
  */
 
 int
-ipip_input_gif(struct mbuf **mp, int *offp, int proto, int oaf,
-    struct ifnet *gifp)
+ipip_input_if(struct mbuf **mp, int *offp, int proto, int oaf,
+    struct ifnet *ifp)
 {
 	struct mbuf *m = *mp;
 	struct sockaddr_in *sin;
-	struct ifnet *ifp;
 	struct ip *ip;
 #ifdef INET6
 	struct sockaddr_in6 *sin6;
@@ -833,8 +848,7 @@ ipip_input_gif(struct mbuf **mp, int *offp, int proto, int oaf,
 		hlen = ip->ip_hl << 2;
 		if (m->m_pkthdr.len < hlen) {
 			ipipstat_inc(ipips_hdrops);
-			m_freem(m);
-			return IPPROTO_DONE;
+			goto bad;
 		}
 		itos = ip->ip_tos;
 		mode = m->m_flags & (M_AUTH|M_CONF) ?
@@ -867,13 +881,9 @@ ipip_input_gif(struct mbuf **mp, int *offp, int proto, int oaf,
 	}
 
 	/* Check for local address spoofing. */
-	ifp = if_get(m->m_pkthdr.ph_ifidx);
-	if (((ifp == NULL) || !(ifp->if_flags & IFF_LOOPBACK)) &&
-	    ipip_allow != 2) {
+	if (!(ifp->if_flags & IFF_LOOPBACK) && ipip_allow != 2) {
 		struct sockaddr_storage ss;
 		struct rtentry *rt;
-
-		if_put(ifp);
 
 		memset(&ss, 0, sizeof(ss));
 
@@ -897,16 +907,14 @@ ipip_input_gif(struct mbuf **mp, int *offp, int proto, int oaf,
 			goto bad;
  		}
 		rtfree(rt);
- 	} else {
-		if_put(ifp);
 	}
 
 	/* Statistics */
 	ipipstat_add(ipips_ibytes, m->m_pkthdr.len - hlen);
 
-#if NBPFILTER > 0
-	if (gifp && gifp->if_bpf)
-		bpf_mtap_af(gifp->if_bpf, iaf, m, BPF_DIRECTION_IN);
+#if NBPFILTER > 0 && NGIF > 0
+	if (ifp->if_type == IFT_GIF && ifp->if_bpf != NULL)
+		bpf_mtap_af(ifp->if_bpf, iaf, m, BPF_DIRECTION_IN);
 #endif
 #if NPF > 0
 	pf_pkt_addr_changed(m);
@@ -1216,6 +1224,62 @@ ipip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	}
 	/* NOTREACHED */
 }
+@
+
+
+1.84
+log
+@When dealing with mbuf pointers passed down as function parameters,
+bugs could easily result in use-after-free or double free.  Introduce
+m_freemp() which automatically resets the pointer before freeing
+it.  So we have less dangling pointers in the kernel.
+OK krw@@ mpi@@ claudio@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ip_ipip.c,v 1.83 2017/06/11 19:59:57 bluhm Exp $ */
+d42 2
+d53 1
+a69 2
+#include "bpfilter.h"
+
+d95 1
+a95 1
+ * Really only a wrapper for ipip_input_gif(), for use with pr_input.
+d98 1
+a98 1
+ipip_input(struct mbuf **mp, int *offp, int proto, int af)
+d100 2
+d110 9
+a118 1
+	return ipip_input_gif(mp, offp, proto, af, NULL);
+d130 2
+a131 2
+ipip_input_gif(struct mbuf **mp, int *offp, int proto, int oaf,
+    struct ifnet *gifp)
+a134 1
+	struct ifnet *ifp;
+d237 1
+a237 2
+			m_freem(m);
+			return IPPROTO_DONE;
+d270 1
+a270 3
+	ifp = if_get(m->m_pkthdr.ph_ifidx);
+	if (((ifp == NULL) || !(ifp->if_flags & IFF_LOOPBACK)) &&
+	    ipip_allow != 2) {
+a273 2
+		if_put(ifp);
+
+a295 2
+ 	} else {
+		if_put(ifp);
+d301 3
+a303 3
+#if NBPFILTER > 0
+	if (gifp && gifp->if_bpf)
+		bpf_mtap_af(gifp->if_bpf, iaf, m, BPF_DIRECTION_IN);
 @
 
 

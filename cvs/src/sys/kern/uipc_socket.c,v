@@ -1,4 +1,4 @@
-head	1.188;
+head	1.189;
 access;
 symbols
 	OPENBSD_6_1:1.181.0.4
@@ -98,6 +98,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.189
+date	2017.06.26.09.32.31;	author mpi;	state Exp;
+branches;
+next	1.188;
+commitid	gZMpLuRopIsWa0cT;
 
 1.188
 date	2017.06.20.17.13.21;	author bluhm;	state Exp;
@@ -1187,12 +1193,25 @@ desc
 @@
 
 
-1.188
+1.189
 log
-@In ddb print socket bit field so_state in hex to match SS_ defines.
+@Assert that the corresponding socket is locked when manipulating socket
+buffers.
+
+This is one step towards unlocking TCP input path.  Note that all the
+functions asserting for the socket lock are not necessarilly MP-safe.
+All the fields of 'struct socket' aren't protected.
+
+Introduce a new kernel-only kqueue hint, NOTE_SUBMIT, to be able to
+tell when a filter needs to lock the underlying data structures.  Logic
+and name taken from NetBSD.
+
+Tested by Hrvoje Popovski.
+
+ok claudio@@, bluhm@@, mikeb@@
 @
 text
-@/*	$OpenBSD: uipc_socket.c,v 1.187 2017/06/20 09:10:04 mpi Exp $	*/
+@/*	$OpenBSD: uipc_socket.c,v 1.188 2017/06/20 17:13:21 bluhm Exp $	*/
 /*	$NetBSD: uipc_socket.c,v 1.21 1996/02/04 02:17:52 christos Exp $	*/
 
 /*
@@ -1410,7 +1429,7 @@ sofree(struct socket *so)
 		so->so_sp = NULL;
 	}
 #endif /* SOCKET_SPLICE */
-	sbrelease(&so->so_snd);
+	sbrelease(so, &so->so_snd);
 	sorflush(so);
 	pool_put(&socket_pool, so);
 }
@@ -1634,7 +1653,7 @@ restart:
 			} else if (addr == 0)
 				snderr(EDESTADDRREQ);
 		}
-		space = sbspace(&so->so_snd);
+		space = sbspace(so, &so->so_snd);
 		if (flags & MSG_OOB)
 			space += 1024;
 		if ((atomic && resid > so->so_snd.sb_hiwat) ||
@@ -2235,7 +2254,7 @@ sorflush(struct socket *so)
 	struct sockbuf *sb = &so->so_rcv;
 	struct protosw *pr = so->so_proto;
 	sa_family_t af = pr->pr_domain->dom_family;
-	struct sockbuf asb;
+	struct socket aso;
 
 	sb->sb_flags |= SB_NOINTR;
 	sblock(sb, M_WAITOK,
@@ -2243,16 +2262,17 @@ sorflush(struct socket *so)
 	    &netlock : NULL);
 	socantrcvmore(so);
 	sbunlock(sb);
-	asb = *sb;
+	aso.so_proto = pr;
+	aso.so_rcv = *sb;
 	memset(sb, 0, sizeof (*sb));
 	/* XXX - the memset stomps all over so_rcv */
-	if (asb.sb_flags & SB_KNOTE) {
-		sb->sb_sel.si_note = asb.sb_sel.si_note;
+	if (aso.so_rcv.sb_flags & SB_KNOTE) {
+		sb->sb_sel.si_note = aso.so_rcv.sb_sel.si_note;
 		sb->sb_flags = SB_KNOTE;
 	}
 	if (pr->pr_flags & PR_RIGHTS && pr->pr_domain->dom_dispose)
-		(*pr->pr_domain->dom_dispose)(asb.sb_mb);
-	sbrelease(&asb);
+		(*pr->pr_domain->dom_dispose)(aso.so_rcv.sb_mb);
+	sbrelease(&aso, &aso.so_rcv);
 }
 
 #ifdef SOCKET_SPLICE
@@ -2464,7 +2484,7 @@ somove(struct socket *so, int wait)
 			maxreached = 1;
 		}
 	}
-	space = sbspace(&sosp->so_snd);
+	space = sbspace(sosp, &sosp->so_snd);
 	if (so->so_oobmark && so->so_oobmark < len &&
 	    so->so_oobmark < space + 1024)
 		space += 1024;
@@ -2829,7 +2849,7 @@ sosetopt(struct socket *so, int level, int optname, struct mbuf *m0)
 					goto bad;
 				}
 				if (sbcheckreserve(cnt, so->so_snd.sb_wat) ||
-				    sbreserve(&so->so_snd, cnt)) {
+				    sbreserve(so, &so->so_snd, cnt)) {
 					error = ENOBUFS;
 					goto bad;
 				}
@@ -2842,7 +2862,7 @@ sosetopt(struct socket *so, int level, int optname, struct mbuf *m0)
 					goto bad;
 				}
 				if (sbcheckreserve(cnt, so->so_rcv.sb_wat) ||
-				    sbreserve(&so->so_rcv, cnt)) {
+				    sbreserve(so, &so->so_rcv, cnt)) {
 					error = ENOBUFS;
 					goto bad;
 				}
@@ -3184,8 +3204,13 @@ int
 filt_sowrite(struct knote *kn, long hint)
 {
 	struct socket *so = kn->kn_fp->f_data;
+	int s;
 
-	kn->kn_data = sbspace(&so->so_snd);
+	if (!(hint & NOTE_SUBMIT))
+		s = solock(so);
+	kn->kn_data = sbspace(so, &so->so_snd);
+	if (!(hint & NOTE_SUBMIT))
+		sounlock(s);
 	if (so->so_state & SS_CANTSENDMORE) {
 		kn->kn_flags |= EV_EOF;
 		kn->kn_fflags = so->so_error;
@@ -3292,6 +3317,50 @@ so_print(void *v,
 }
 #endif
 
+@
+
+
+1.188
+log
+@In ddb print socket bit field so_state in hex to match SS_ defines.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: uipc_socket.c,v 1.187 2017/06/20 09:10:04 mpi Exp $	*/
+d219 1
+a219 1
+	sbrelease(&so->so_snd);
+d443 1
+a443 1
+		space = sbspace(&so->so_snd);
+d1044 1
+a1044 1
+	struct sockbuf asb;
+d1052 2
+a1053 1
+	asb = *sb;
+d1056 2
+a1057 2
+	if (asb.sb_flags & SB_KNOTE) {
+		sb->sb_sel.si_note = asb.sb_sel.si_note;
+d1061 2
+a1062 2
+		(*pr->pr_domain->dom_dispose)(asb.sb_mb);
+	sbrelease(&asb);
+d1274 1
+a1274 1
+	space = sbspace(&sosp->so_snd);
+d1639 1
+a1639 1
+				    sbreserve(&so->so_snd, cnt)) {
+d1652 1
+a1652 1
+				    sbreserve(&so->so_rcv, cnt)) {
+d1994 1
+d1996 5
+a2000 1
+	kn->kn_data = sbspace(&so->so_snd);
 @
 
 

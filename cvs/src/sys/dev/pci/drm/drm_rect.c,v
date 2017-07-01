@@ -1,4 +1,4 @@
-head	1.1;
+head	1.2;
 access;
 symbols
 	OPENBSD_6_1:1.1.0.8
@@ -11,6 +11,12 @@ locks; strict;
 comment	@ * @;
 
 
+1.2
+date	2017.07.01.16.14.10;	author kettenis;	state Exp;
+branches;
+next	1.1;
+commitid	KnwRPOZok9A30HI4;
+
 1.1
 date	2015.09.23.23.12.11;	author kettenis;	state Exp;
 branches;
@@ -22,27 +28,17 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Update inteldrm to the code from Linux 3.14.52 (which corresponds to
-commit 48f8f36a6c8018c2b36ea207aaf68ef5326c5075 on the linux-3.14.y
-branch of the linux-stable tree).  This brings preliminary support for
-the GPU on Intel's Broadwell CPUs.  Don't expect these to work
-perfectly yet.  There are some remaining issues with older hardware as
-well, but no significant regressions have been uncovered.
+@Update inteldrm(4) to code based on Linux 4.4.70.  This brings us support for
+Skylake and Cherryview and better support for Broadwell and Valleyview.  Also
+adds MST support.  Some tweaks to the TTM code and radeondrm(4) to keep it
+working with the updated generic DRM code needed for inteldrm(4).
 
-This also updates some of drm core code.  The radeondrm code remains
-based on Linux 3.8 with some minimal canges to adjust to changes in
-the core drm APIs.
-
-Joint effort with jsg@@, who did the initial update of the relevant drm
-core bits.  Committing this early to make sure it gets more testing
-and make it possible for others to help getting the remaining wrinkles
-straightened out.
+Tested by many.
 @
 text
-@/*	$OpenBSD$	*/
-/*
+@/*
  * Copyright (C) 2011-2013 Intel Corporation
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -65,6 +61,11 @@ text
  * SOFTWARE.
  */
 
+#ifdef __linux__
+#include <linux/errno.h>
+#include <linux/export.h>
+#include <linux/kernel.h>
+#endif
 #include <dev/pci/drm/drmP.h>
 #include <dev/pci/drm/drm_rect.h>
 
@@ -324,7 +325,6 @@ void drm_rect_debug_print(const struct drm_rect *r, bool fixed_point)
 #ifdef DRMDEBUG
 	int w = drm_rect_width(r);
 	int h = drm_rect_height(r);
-#endif
 
 	if (fixed_point)
 		DRM_DEBUG_KMS("%d.%06ux%d.%06u%+d.%06u%+d.%06u\n",
@@ -334,6 +334,177 @@ void drm_rect_debug_print(const struct drm_rect *r, bool fixed_point)
 			      r->y1 >> 16, ((r->y1 & 0xffff) * 15625) >> 10);
 	else
 		DRM_DEBUG_KMS("%dx%d%+d%+d\n", w, h, r->x1, r->y1);
+#endif
 }
 EXPORT_SYMBOL(drm_rect_debug_print);
+
+/**
+ * drm_rect_rotate - Rotate the rectangle
+ * @@r: rectangle to be rotated
+ * @@width: Width of the coordinate space
+ * @@height: Height of the coordinate space
+ * @@rotation: Transformation to be applied
+ *
+ * Apply @@rotation to the coordinates of rectangle @@r.
+ *
+ * @@width and @@height combined with @@rotation define
+ * the location of the new origin.
+ *
+ * @@width correcsponds to the horizontal and @@height
+ * to the vertical axis of the untransformed coordinate
+ * space.
+ */
+void drm_rect_rotate(struct drm_rect *r,
+		     int width, int height,
+		     unsigned int rotation)
+{
+	struct drm_rect tmp;
+
+	if (rotation & (BIT(DRM_REFLECT_X) | BIT(DRM_REFLECT_Y))) {
+		tmp = *r;
+
+		if (rotation & BIT(DRM_REFLECT_X)) {
+			r->x1 = width - tmp.x2;
+			r->x2 = width - tmp.x1;
+		}
+
+		if (rotation & BIT(DRM_REFLECT_Y)) {
+			r->y1 = height - tmp.y2;
+			r->y2 = height - tmp.y1;
+		}
+	}
+
+	switch (rotation & DRM_ROTATE_MASK) {
+	case BIT(DRM_ROTATE_0):
+		break;
+	case BIT(DRM_ROTATE_90):
+		tmp = *r;
+		r->x1 = tmp.y1;
+		r->x2 = tmp.y2;
+		r->y1 = width - tmp.x2;
+		r->y2 = width - tmp.x1;
+		break;
+	case BIT(DRM_ROTATE_180):
+		tmp = *r;
+		r->x1 = width - tmp.x2;
+		r->x2 = width - tmp.x1;
+		r->y1 = height - tmp.y2;
+		r->y2 = height - tmp.y1;
+		break;
+	case BIT(DRM_ROTATE_270):
+		tmp = *r;
+		r->x1 = height - tmp.y2;
+		r->x2 = height - tmp.y1;
+		r->y1 = tmp.x1;
+		r->y2 = tmp.x2;
+		break;
+	default:
+		break;
+	}
+}
+EXPORT_SYMBOL(drm_rect_rotate);
+
+/**
+ * drm_rect_rotate_inv - Inverse rotate the rectangle
+ * @@r: rectangle to be rotated
+ * @@width: Width of the coordinate space
+ * @@height: Height of the coordinate space
+ * @@rotation: Transformation whose inverse is to be applied
+ *
+ * Apply the inverse of @@rotation to the coordinates
+ * of rectangle @@r.
+ *
+ * @@width and @@height combined with @@rotation define
+ * the location of the new origin.
+ *
+ * @@width correcsponds to the horizontal and @@height
+ * to the vertical axis of the original untransformed
+ * coordinate space, so that you never have to flip
+ * them when doing a rotatation and its inverse.
+ * That is, if you do:
+ *
+ * drm_rotate(&r, width, height, rotation);
+ * drm_rotate_inv(&r, width, height, rotation);
+ *
+ * you will always get back the original rectangle.
+ */
+void drm_rect_rotate_inv(struct drm_rect *r,
+			 int width, int height,
+			 unsigned int rotation)
+{
+	struct drm_rect tmp;
+
+	switch (rotation & DRM_ROTATE_MASK) {
+	case BIT(DRM_ROTATE_0):
+		break;
+	case BIT(DRM_ROTATE_90):
+		tmp = *r;
+		r->x1 = width - tmp.y2;
+		r->x2 = width - tmp.y1;
+		r->y1 = tmp.x1;
+		r->y2 = tmp.x2;
+		break;
+	case BIT(DRM_ROTATE_180):
+		tmp = *r;
+		r->x1 = width - tmp.x2;
+		r->x2 = width - tmp.x1;
+		r->y1 = height - tmp.y2;
+		r->y2 = height - tmp.y1;
+		break;
+	case BIT(DRM_ROTATE_270):
+		tmp = *r;
+		r->x1 = tmp.y1;
+		r->x2 = tmp.y2;
+		r->y1 = height - tmp.x2;
+		r->y2 = height - tmp.x1;
+		break;
+	default:
+		break;
+	}
+
+	if (rotation & (BIT(DRM_REFLECT_X) | BIT(DRM_REFLECT_Y))) {
+		tmp = *r;
+
+		if (rotation & BIT(DRM_REFLECT_X)) {
+			r->x1 = width - tmp.x2;
+			r->x2 = width - tmp.x1;
+		}
+
+		if (rotation & BIT(DRM_REFLECT_Y)) {
+			r->y1 = height - tmp.y2;
+			r->y2 = height - tmp.y1;
+		}
+	}
+}
+EXPORT_SYMBOL(drm_rect_rotate_inv);
 @
+
+
+1.1
+log
+@Update inteldrm to the code from Linux 3.14.52 (which corresponds to
+commit 48f8f36a6c8018c2b36ea207aaf68ef5326c5075 on the linux-3.14.y
+branch of the linux-stable tree).  This brings preliminary support for
+the GPU on Intel's Broadwell CPUs.  Don't expect these to work
+perfectly yet.  There are some remaining issues with older hardware as
+well, but no significant regressions have been uncovered.
+
+This also updates some of drm core code.  The radeondrm code remains
+based on Linux 3.8 with some minimal canges to adjust to changes in
+the core drm APIs.
+
+Joint effort with jsg@@, who did the initial update of the relevant drm
+core bits.  Committing this early to make sure it gets more testing
+and make it possible for others to help getting the remaining wrinkles
+straightened out.
+@
+text
+@a0 1
+/*	$OpenBSD$	*/
+d24 5
+a287 1
+#endif
+d297 1
+d300 140
+@
+

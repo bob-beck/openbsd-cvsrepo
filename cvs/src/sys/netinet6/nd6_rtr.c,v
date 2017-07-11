@@ -1,4 +1,4 @@
-head	1.162;
+head	1.163;
 access;
 symbols
 	OPENBSD_6_1:1.157.0.4
@@ -83,6 +83,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.163
+date	2017.07.11.12.51.05;	author florian;	state Exp;
+branches;
+next	1.162;
+commitid	iTlWhLM2orYZnz27;
 
 1.162
 date	2017.07.08.15.45.11;	author florian;	state Exp;
@@ -1050,19 +1056,18 @@ desc
 @@
 
 
-1.162
+1.163
 log
-@Enable slaacd on the installer and temporarily neuter router
-advertisement processing and solicitation sending like we already did
-for the non-install kernels.
+@Purging is at last at hand. Day of Doom is here. All that is evil
+shall all be cleansed.
 
-Next step will be to tedu all that code from the kernel.
+Remove sending of router solicitations and processing of router
+advertisements from the kernel. It's handled by slaacd(8) these days.
 
-OK rpe@@ for the installer bits
-move forward deraadt@@
+Input & OK bluhm@@, mpi@@
 @
 text
-@/*	$OpenBSD: nd6_rtr.c,v 1.161 2017/06/09 12:56:44 mpi Exp $	*/
+@/*	$OpenBSD: nd6_rtr.c,v 1.162 2017/07/08 15:45:11 florian Exp $	*/
 /*	$KAME: nd6_rtr.c,v 1.97 2001/02/07 11:09:13 itojun Exp $	*/
 
 /*
@@ -1121,46 +1126,9 @@ text
 #include <netinet6/nd6.h>
 #include <netinet/icmp6.h>
 
-int rtpref(struct nd_defrouter *);
-struct nd_defrouter *defrtrlist_update(struct nd_defrouter *);
-struct in6_ifaddr *in6_ifadd(struct nd_prefix *, int);
-struct nd_pfxrouter *pfxrtr_lookup(struct nd_prefix *, struct nd_defrouter *);
-void pfxrtr_add(struct nd_prefix *, struct nd_defrouter *);
-void pfxrtr_del(struct nd_pfxrouter *);
-struct nd_pfxrouter *find_pfxlist_reachable_router(struct nd_prefix *);
-void defrouter_delreq(struct nd_defrouter *);
-void purge_detached(struct ifnet *);
-int nd6_prefix_onlink(struct nd_prefix *);
-int nd6_prefix_offlink(struct nd_prefix *);
-void in6_init_address_ltimes(struct nd_prefix *, struct in6_addrlifetime *);
-int prelist_update(struct nd_prefix *, struct nd_defrouter *, struct mbuf *);
-int nd6_prelist_add(struct nd_prefix *, struct nd_defrouter *,
-	struct nd_prefix **);
-void defrouter_addreq(struct nd_defrouter *);
 int rt6_deleteroute(struct rtentry *, void *, unsigned int);
 
-void nd6_addr_add(void *);
-
-void nd6_rs_output_timo(void *);
-void nd6_rs_output_set_timo(int);
-void nd6_rs_output(struct ifnet *, struct in6_ifaddr *);
-void nd6_rs_dev_state(void *);
-
 extern int nd6_recalc_reachtm_interval;
-
-#define ND6_RS_OUTPUT_INTERVAL		60
-#define ND6_RS_OUTPUT_QUICK_INTERVAL	1
-
-struct timeout	nd6_rs_output_timer;
-int		nd6_rs_output_timeout = ND6_RS_OUTPUT_INTERVAL;
-int		nd6_rs_timeout_count = 0;
-
-void
-nd6_rs_init(void)
-{
-	timeout_set_proc(&nd6_rs_output_timer, nd6_rs_output_timo, NULL);
-}
-
 
 /*
  * Receive Router Solicitation Message - just for routers.
@@ -1258,6 +1226,209 @@ nd6_rs_input(struct mbuf *m, int off, int icmp6len)
 	m_freem(m);
 }
 
+/*
+ * Receive Router Advertisement Message.
+ *
+ * Based on RFC 2461
+ */
+void
+nd6_ra_input(struct mbuf *m, int off, int icmp6len)
+{
+	struct ifnet *ifp;
+	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
+	struct nd_router_advert *nd_ra;
+	struct in6_addr saddr6 = ip6->ip6_src;
+	char *lladdr = NULL;
+	int lladdrlen = 0;
+	union nd_opts ndopts;
+	char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+
+	/* Sanity checks */
+	if (ip6->ip6_hlim != 255) {
+		nd6log((LOG_ERR,
+		    "nd6_ra_input: invalid hlim (%d) from %s to %s on %u\n",
+		    ip6->ip6_hlim,
+		    inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src)),
+		    inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst)),
+		    m->m_pkthdr.ph_ifidx));
+		goto bad;
+	}
+
+	if (!IN6_IS_ADDR_LINKLOCAL(&saddr6)) {
+		nd6log((LOG_ERR,
+		    "nd6_ra_input: src %s is not link-local\n",
+		    inet_ntop(AF_INET6, &saddr6, src, sizeof(src))));
+		goto bad;
+	}
+
+	IP6_EXTHDR_GET(nd_ra, struct nd_router_advert *, m, off, icmp6len);
+	if (nd_ra == NULL) {
+		icmp6stat_inc(icp6s_tooshort);
+		return;
+	}
+
+	icmp6len -= sizeof(*nd_ra);
+	nd6_option_init(nd_ra + 1, icmp6len, &ndopts);
+	if (nd6_options(&ndopts) < 0) {
+		nd6log((LOG_INFO,
+		    "nd6_ra_input: invalid ND option, ignored\n"));
+		/* nd6_options have incremented stats */
+		goto freeit;
+	}
+
+	if (ndopts.nd_opts_src_lladdr) {
+		lladdr = (char *)(ndopts.nd_opts_src_lladdr + 1);
+		lladdrlen = ndopts.nd_opts_src_lladdr->nd_opt_len << 3;
+	}
+
+	ifp = if_get(m->m_pkthdr.ph_ifidx);
+	if (ifp == NULL)
+		goto freeit;
+
+	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
+		nd6log((LOG_INFO,
+		    "nd6_ra_input: lladdrlen mismatch for %s "
+		    "(if %d, RA packet %d)\n",
+		    inet_ntop(AF_INET6, &saddr6, src, sizeof(src)),
+		    ifp->if_addrlen, lladdrlen - 2));
+		if_put(ifp);
+		goto bad;
+	}
+
+	nd6_cache_lladdr(ifp, &saddr6, lladdr, lladdrlen, ND_ROUTER_ADVERT, 0);
+	if_put(ifp);
+
+ freeit:
+	m_freem(m);
+	return;
+
+ bad:
+	icmp6stat_inc(icp6s_badra);
+	m_freem(m);
+}
+
+/*
+ * Delete all the routing table entries that use the specified gateway.
+ * XXX: this function causes search through all entries of routing table, so
+ * it shouldn't be called when acting as a router.
+ */
+void
+rt6_flush(struct in6_addr *gateway, struct ifnet *ifp)
+{
+	NET_ASSERT_LOCKED();
+
+	/* We'll care only link-local addresses */
+	if (!IN6_IS_ADDR_LINKLOCAL(gateway))
+		return;
+
+	/* XXX: hack for KAME's link-local address kludge */
+	gateway->s6_addr16[1] = htons(ifp->if_index);
+
+	rtable_walk(ifp->if_rdomain, AF_INET6, rt6_deleteroute, gateway);
+}
+
+int
+rt6_deleteroute(struct rtentry *rt, void *arg, unsigned int id)
+{
+	struct ifnet *ifp;
+	struct rt_addrinfo info;
+	struct in6_addr *gate = (struct in6_addr *)arg;
+	struct sockaddr_in6 sa_mask;
+	int error = 0;
+
+	if (rt->rt_gateway == NULL || rt->rt_gateway->sa_family != AF_INET6)
+		return (0);
+
+	if (!IN6_ARE_ADDR_EQUAL(gate, &satosin6(rt->rt_gateway)->sin6_addr))
+		return (0);
+
+	/*
+	 * Do not delete a static route.
+	 * XXX: this seems to be a bit ad-hoc. Should we consider the
+	 * 'cloned' bit instead?
+	 */
+	if ((rt->rt_flags & RTF_STATIC) != 0)
+		return (0);
+
+	/*
+	 * We delete only host route. This means, in particular, we don't
+	 * delete default route.
+	 */
+	if ((rt->rt_flags & RTF_HOST) == 0)
+		return (0);
+
+	ifp = if_get(rt->rt_ifidx);
+	if (ifp != NULL) {
+		bzero(&info, sizeof(info));
+		info.rti_flags =  rt->rt_flags;
+		info.rti_info[RTAX_DST] = rt_key(rt);
+		info.rti_info[RTAX_GATEWAY] = rt->rt_gateway;
+		info.rti_info[RTAX_NETMASK] = rt_plen2mask(rt, &sa_mask);
+		error = rtrequest_delete(&info, RTP_ANY, ifp, NULL, id);
+	}
+	if_put(ifp);
+
+	return (error != 0 ? error : EAGAIN);
+}
+@
+
+
+1.162
+log
+@Enable slaacd on the installer and temporarily neuter router
+advertisement processing and solicitation sending like we already did
+for the non-install kernels.
+
+Next step will be to tedu all that code from the kernel.
+
+OK rpe@@ for the installer bits
+move forward deraadt@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: nd6_rtr.c,v 1.161 2017/06/09 12:56:44 mpi Exp $	*/
+a59 16
+int rtpref(struct nd_defrouter *);
+struct nd_defrouter *defrtrlist_update(struct nd_defrouter *);
+struct in6_ifaddr *in6_ifadd(struct nd_prefix *, int);
+struct nd_pfxrouter *pfxrtr_lookup(struct nd_prefix *, struct nd_defrouter *);
+void pfxrtr_add(struct nd_prefix *, struct nd_defrouter *);
+void pfxrtr_del(struct nd_pfxrouter *);
+struct nd_pfxrouter *find_pfxlist_reachable_router(struct nd_prefix *);
+void defrouter_delreq(struct nd_defrouter *);
+void purge_detached(struct ifnet *);
+int nd6_prefix_onlink(struct nd_prefix *);
+int nd6_prefix_offlink(struct nd_prefix *);
+void in6_init_address_ltimes(struct nd_prefix *, struct in6_addrlifetime *);
+int prelist_update(struct nd_prefix *, struct nd_defrouter *, struct mbuf *);
+int nd6_prelist_add(struct nd_prefix *, struct nd_defrouter *,
+	struct nd_prefix **);
+void defrouter_addreq(struct nd_defrouter *);
+a61 7
+void nd6_addr_add(void *);
+
+void nd6_rs_output_timo(void *);
+void nd6_rs_output_set_timo(int);
+void nd6_rs_output(struct ifnet *, struct in6_ifaddr *);
+void nd6_rs_dev_state(void *);
+
+a63 14
+#define ND6_RS_OUTPUT_INTERVAL		60
+#define ND6_RS_OUTPUT_QUICK_INTERVAL	1
+
+struct timeout	nd6_rs_output_timer;
+int		nd6_rs_output_timeout = ND6_RS_OUTPUT_INTERVAL;
+int		nd6_rs_timeout_count = 0;
+
+void
+nd6_rs_init(void)
+{
+	timeout_set_proc(&nd6_rs_output_timer, nd6_rs_output_timo, NULL);
+}
+
+
+a159 167
 void
 nd6_rs_output(struct ifnet* ifp, struct in6_ifaddr *ia6)
 {
@@ -1425,23 +1596,13 @@ nd6_rs_dev_state(void *arg)
 		nd6_rs_output_set_timo(ND6_RS_OUTPUT_QUICK_INTERVAL);
 }
 
-/*
- * Receive Router Advertisement Message.
- *
- * Based on RFC 2461
- */
-void
-nd6_ra_input(struct mbuf *m, int off, int icmp6len)
-{
-	struct ifnet *ifp;
+a168 1
 	struct nd_ifinfo *ndi;
-	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
-	struct nd_router_advert *nd_ra;
-	struct in6_addr saddr6 = ip6->ip6_src;
-	union nd_opts ndopts;
+d172 2
+a174 1
 	struct nd_defrouter *dr;
-	char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
-
+d177 1
+a177 18
 	ifp = if_get(m->m_pkthdr.ph_ifidx);
 	if (ifp == NULL)
 		goto freeit;
@@ -1460,39 +1621,15 @@ nd6_ra_input(struct mbuf *m, int off, int icmp6len)
 		/* we saw a RA, stop quick timer */
 		nd6_rs_output_set_timo(ND6_RS_OUTPUT_INTERVAL);
 
-	if (ip6->ip6_hlim != 255) {
-		nd6log((LOG_ERR,
+d180 1
+a180 1
 		    "nd6_ra_input: invalid hlim (%d) from %s to %s on %s\n",
-		    ip6->ip6_hlim,
-		    inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src)),
-		    inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst)),
+d184 1
+a184 1
 		    ifp->if_xname));
-		goto bad;
-	}
-
-	if (!IN6_IS_ADDR_LINKLOCAL(&saddr6)) {
-		nd6log((LOG_ERR,
-		    "nd6_ra_input: src %s is not link-local\n",
-		    inet_ntop(AF_INET6, &saddr6, src, sizeof(src))));
-		goto bad;
-	}
-
-	IP6_EXTHDR_GET(nd_ra, struct nd_router_advert *, m, off, icmp6len);
-	if (nd_ra == NULL) {
-		icmp6stat_inc(icp6s_tooshort);
+a197 1
 		if_put(ifp);
-		return;
-	}
-
-	icmp6len -= sizeof(*nd_ra);
-	nd6_option_init(nd_ra + 1, icmp6len, &ndopts);
-	if (nd6_options(&ndopts) < 0) {
-		nd6log((LOG_INFO,
-		    "nd6_ra_input: invalid ND option, ignored\n"));
-		/* nd6_options have incremented stats */
-		goto freeit;
-	}
-
+a209 114
     {
 	struct nd_defrouter dr0;
 	u_int32_t advreachable = nd_ra->nd_ra_reachable;
@@ -1607,21 +1744,10 @@ nd6_ra_input(struct mbuf *m, int off, int icmp6len)
 	char *lladdr = NULL;
 	int lladdrlen = 0;
 
-	if (ndopts.nd_opts_src_lladdr) {
-		lladdr = (char *)(ndopts.nd_opts_src_lladdr + 1);
-		lladdrlen = ndopts.nd_opts_src_lladdr->nd_opt_len << 3;
-	}
-
-	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
-		nd6log((LOG_INFO,
-		    "nd6_ra_input: lladdrlen mismatch for %s "
-		    "(if %d, RA packet %d)\n",
-		    inet_ntop(AF_INET6, &saddr6, src, sizeof(src)),
-		    ifp->if_addrlen, lladdrlen - 2));
-		goto bad;
-	}
-
-	nd6_cache_lladdr(ifp, &saddr6, lladdr, lladdrlen, ND_ROUTER_ADVERT, 0);
+d215 4
+d225 1
+d230 1
+a230 8
 
 	/*
 	 * Installing a link-layer address might change the state of the
@@ -1630,16 +1756,11 @@ nd6_ra_input(struct mbuf *m, int off, int icmp6len)
 	 */
 	pfxlist_onlink_check();
     }
-
- freeit:
+a232 1
 	if_put(ifp);
-	m_freem(m);
-	return;
-
- bad:
-	icmp6stat_inc(icp6s_badra);
+a237 1
 	if_put(ifp);
-	m_freem(m);
+a238 1435
 }
 
 /*
@@ -3075,71 +3196,6 @@ in6_init_address_ltimes(struct nd_prefix *new, struct in6_addrlifetime *lt6)
 		lt6->ia6t_preferred = time_uptime;
 		lt6->ia6t_preferred += lt6->ia6t_pltime;
 	}
-}
-
-/*
- * Delete all the routing table entries that use the specified gateway.
- * XXX: this function causes search through all entries of routing table, so
- * it shouldn't be called when acting as a router.
- */
-void
-rt6_flush(struct in6_addr *gateway, struct ifnet *ifp)
-{
-	NET_ASSERT_LOCKED();
-
-	/* We'll care only link-local addresses */
-	if (!IN6_IS_ADDR_LINKLOCAL(gateway))
-		return;
-
-	/* XXX: hack for KAME's link-local address kludge */
-	gateway->s6_addr16[1] = htons(ifp->if_index);
-
-	rtable_walk(ifp->if_rdomain, AF_INET6, rt6_deleteroute, gateway);
-}
-
-int
-rt6_deleteroute(struct rtentry *rt, void *arg, unsigned int id)
-{
-	struct ifnet *ifp;
-	struct rt_addrinfo info;
-	struct in6_addr *gate = (struct in6_addr *)arg;
-	struct sockaddr_in6 sa_mask;
-	int error = 0;
-
-	if (rt->rt_gateway == NULL || rt->rt_gateway->sa_family != AF_INET6)
-		return (0);
-
-	if (!IN6_ARE_ADDR_EQUAL(gate, &satosin6(rt->rt_gateway)->sin6_addr))
-		return (0);
-
-	/*
-	 * Do not delete a static route.
-	 * XXX: this seems to be a bit ad-hoc. Should we consider the
-	 * 'cloned' bit instead?
-	 */
-	if ((rt->rt_flags & RTF_STATIC) != 0)
-		return (0);
-
-	/*
-	 * We delete only host route. This means, in particular, we don't
-	 * delete default route.
-	 */
-	if ((rt->rt_flags & RTF_HOST) == 0)
-		return (0);
-
-	ifp = if_get(rt->rt_ifidx);
-	if (ifp != NULL) {
-		bzero(&info, sizeof(info));
-		info.rti_flags =  rt->rt_flags;
-		info.rti_info[RTAX_DST] = rt_key(rt);
-		info.rti_info[RTAX_GATEWAY] = rt->rt_gateway;
-		info.rti_info[RTAX_NETMASK] = rt_plen2mask(rt, &sa_mask);
-		error = rtrequest_delete(&info, RTP_ANY, ifp, NULL, id);
-	}
-	if_put(ifp);
-
-	return (error != 0 ? error : EAGAIN);
-}
 @
 
 

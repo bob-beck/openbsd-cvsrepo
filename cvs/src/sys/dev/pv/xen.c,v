@@ -1,4 +1,4 @@
-head	1.82;
+head	1.84;
 access;
 symbols
 	OPENBSD_6_1:1.81.0.4
@@ -10,6 +10,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.84
+date	2017.07.14.20.08.46;	author mikeb;	state Exp;
+branches;
+next	1.83;
+commitid	dmgdorwonrYN5Y8h;
+
+1.83
+date	2017.07.14.19.09.52;	author mikeb;	state Exp;
+branches;
+next	1.82;
+commitid	HOzKysZJg74DQ6ei;
 
 1.82
 date	2017.06.02.20.25.50;	author mikeb;	state Exp;
@@ -508,17 +520,17 @@ desc
 @@
 
 
-1.82
+1.84
 log
-@Perform grant table page allocation outside of the table mutex
+@Reduce the number of CAS loops from ludicrous to ridiculous
 
-witness(4) has found that km_alloc will trigger an rw_enter via uvm_map
-and vm_map_lock.  While rw_enter is called with RW_SLEEPFAIL, there's
-also an msleep in there, so it's easier to avoid getting in the middle
-of that.
+Now that the source of the delay with releasing grant table entries has
+been identified and fixed the number of attempts to CAS entry flags can
+be substantially reduced and while it's decreased by a factor of 100000,
+it should go down at least a 100 more in the future.
 @
 text
-@/*	$OpenBSD: xen.c,v 1.81 2017/03/19 16:55:31 mikeb Exp $	*/
+@/*	$OpenBSD: xen.c,v 1.83 2017/07/14 19:09:52 mikeb Exp $	*/
 
 /*
  * Copyright (c) 2015, 2016, 2017 Mike Belopuhov
@@ -591,6 +603,7 @@ int	xen_getfeatures(struct xen_softc *);
 int	xen_init_info_page(struct xen_softc *);
 int	xen_init_cbvec(struct xen_softc *);
 int	xen_init_interrupts(struct xen_softc *);
+void	xen_intr_dispatch(void *);
 int	xen_init_grant_tables(struct xen_softc *);
 struct xen_gntent *
 	xen_grant_table_grow(struct xen_softc *);
@@ -1154,6 +1167,27 @@ xen_intsrc_remove(struct xen_softc *sc, evtchn_port_t port)
 	return (xi);
 }
 
+static inline void
+xen_intr_mask_acquired(struct xen_softc *sc, struct xen_intsrc *xi)
+{
+	xi->xi_masked = 1;
+	set_bit(xi->xi_port, &sc->sc_ipg->evtchn_mask[0]);
+}
+
+static inline int
+xen_intr_unmask_release(struct xen_softc *sc, struct xen_intsrc *xi)
+{
+	struct evtchn_unmask eu;
+
+	xi->xi_masked = 0;
+	if (!test_bit(xi->xi_port, &sc->sc_ipg->evtchn_mask[0]))
+		return (0);
+	eu.port = xi->xi_port;
+	xen_intsrc_release(sc, xi);
+	return (xen_evtchn_hypercall(sc, EVTCHNOP_unmask, &eu,
+	    sizeof(eu)));
+}
+
 void
 xen_intr_ack(void)
 {
@@ -1198,8 +1232,8 @@ xen_intr(void)
 				continue;
 			}
 			xi->xi_evcnt.ec_count++;
+			xen_intr_mask_acquired(sc, xi);
 			task_add(xi->xi_taskq, &xi->xi_task);
-			xen_intsrc_release(sc, xi);
 		}
 	}
 }
@@ -1210,10 +1244,8 @@ xen_intr_schedule(xen_intr_handle_t xih)
 	struct xen_softc *sc = xen_sc;
 	struct xen_intsrc *xi;
 
-	if ((xi = xen_intsrc_acquire(sc, (evtchn_port_t)xih)) != NULL) {
+	if ((xi = xen_intsrc_acquire(sc, (evtchn_port_t)xih)) != NULL)
 		task_add(xi->xi_taskq, &xi->xi_task);
-		xen_intsrc_release(sc, xi);
-	}
 }
 
 static void
@@ -1300,6 +1332,9 @@ xen_intr_establish(evtchn_port_t port, xen_intr_handle_t *xih, int domain,
 
 	xi->xi_port = (evtchn_port_t)*xih;
 
+	xi->xi_handler = handler;
+	xi->xi_ctx = arg;
+
 	xi->xi_taskq = taskq_create(name, 1, IPL_NET, TASKQ_MPSAFE);
 	if (!xi->xi_taskq) {
 		printf("%s: failed to create interrupt task for %s\n",
@@ -1307,7 +1342,7 @@ xen_intr_establish(evtchn_port_t port, xen_intr_handle_t *xih, int domain,
 		free(xi, M_DEVBUF, sizeof(*xi));
 		return (-1);
 	}
-	task_set(&xi->xi_task, handler, arg);
+	task_set(&xi->xi_task, xen_intr_dispatch, xi);
 
 	if (port == 0) {
 		/* We're being asked to allocate a new event port */
@@ -1406,6 +1441,18 @@ xen_intr_disestablish(xen_intr_handle_t xih)
 }
 
 void
+xen_intr_dispatch(void *arg)
+{
+	struct xen_softc *sc = xen_sc;
+	struct xen_intsrc *xi = arg;
+
+	if (xi->xi_handler)
+		xi->xi_handler(xi->xi_ctx);
+
+	xen_intr_unmask_release(sc, xi);
+}
+
+void
 xen_intr_enable(void)
 {
 	struct xen_softc *sc = xen_sc;
@@ -1437,8 +1484,7 @@ xen_intr_mask(xen_intr_handle_t xih)
 	struct xen_intsrc *xi;
 
 	if ((xi = xen_intsrc_acquire(sc, port)) != NULL) {
-		xi->xi_masked = 1;
-		set_bit(xi->xi_port, &sc->sc_ipg->evtchn_mask[0]);
+		xen_intr_mask_acquired(sc, xi);
 		xen_intsrc_release(sc, xi);
 	}
 }
@@ -1449,17 +1495,10 @@ xen_intr_unmask(xen_intr_handle_t xih)
 	struct xen_softc *sc = xen_sc;
 	evtchn_port_t port = (evtchn_port_t)xih;
 	struct xen_intsrc *xi;
-	struct evtchn_unmask eu;
 
-	if ((xi = xen_intsrc_acquire(sc, port)) != NULL) {
-		xi->xi_masked = 0;
-		if (!test_bit(xi->xi_port, &sc->sc_ipg->evtchn_mask[0]))
-			return (0);
-		eu.port = xi->xi_port;
-		xen_intsrc_release(sc, xi);
-		return (xen_evtchn_hypercall(sc, EVTCHNOP_unmask, &eu,
-		    sizeof(eu)));
-	}
+	if ((xi = xen_intsrc_acquire(sc, port)) != NULL)
+		return (xen_intr_unmask_release(sc, xi));
+
 	return (0);
 }
 
@@ -1706,7 +1745,7 @@ xen_grant_table_remove(struct xen_softc *sc, grant_ref_t ref)
 	    (ge->ge_table[ref].domid << 16);
 	loop = 0;
 	while (atomic_cas_uint(ptr, flags, GTF_invalid) != flags) {
-		if (loop++ > 100000000) {
+		if (loop++ > 1000) {
 			printf("%s: grant table reference %u is held "
 			    "by domain %d\n", sc->sc_dev.dv_xname, ref +
 			    ge->ge_start, ge->ge_table[ref].domid);
@@ -2053,6 +2092,72 @@ xen_unplug_emulated(void *xsc, int what)
 
 	sc->sc_unplug |= what;
 }
+@
+
+
+1.83
+log
+@Silence the interrupt source until the interrupt task has done its job
+
+This small change significantly improves performance under load and halves
+the number of received interrupts.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xen.c,v 1.82 2017/06/02 20:25:50 mikeb Exp $	*/
+d1216 1
+a1216 1
+		if (loop++ > 100000000) {
+@
+
+
+1.82
+log
+@Perform grant table page allocation outside of the table mutex
+
+witness(4) has found that km_alloc will trigger an rw_enter via uvm_map
+and vm_map_lock.  While rw_enter is called with RW_SLEEPFAIL, there's
+also an msleep in there, so it's easier to avoid getting in the middle
+of that.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: xen.c,v 1.81 2017/03/19 16:55:31 mikeb Exp $	*/
+d74 1
+d638 21
+d703 1
+a704 1
+			xen_intsrc_release(sc, xi);
+d715 1
+a715 1
+	if ((xi = xen_intsrc_acquire(sc, (evtchn_port_t)xih)) != NULL) {
+a716 2
+		xen_intsrc_release(sc, xi);
+	}
+d803 3
+d813 1
+a813 1
+	task_set(&xi->xi_task, handler, arg);
+d912 12
+d955 1
+a955 2
+		xi->xi_masked = 1;
+		set_bit(xi->xi_port, &sc->sc_ipg->evtchn_mask[0]);
+a965 1
+	struct evtchn_unmask eu;
+d967 3
+a969 9
+	if ((xi = xen_intsrc_acquire(sc, port)) != NULL) {
+		xi->xi_masked = 0;
+		if (!test_bit(xi->xi_port, &sc->sc_ipg->evtchn_mask[0]))
+			return (0);
+		eu.port = xi->xi_port;
+		xen_intsrc_release(sc, xi);
+		return (xen_evtchn_hypercall(sc, EVTCHNOP_unmask, &eu,
+		    sizeof(eu)));
+	}
 @
 
 

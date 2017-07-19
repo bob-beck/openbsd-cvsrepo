@@ -1,4 +1,4 @@
-head	1.345;
+head	1.347;
 access;
 symbols
 	OPENBSD_6_1:1.339.0.4
@@ -68,6 +68,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.347
+date	2017.07.19.12.58.31;	author mikeb;	state Exp;
+branches;
+next	1.346;
+commitid	iahjnsaS3YMAv0Za;
+
+1.346
+date	2017.07.19.12.51.30;	author mikeb;	state Exp;
+branches;
+next	1.345;
+commitid	acqfpkzv6C7Xn3G8;
 
 1.345
 date	2017.06.16.19.59.13;	author awolk;	state Exp;
@@ -1819,28 +1831,19 @@ desc
 @@
 
 
-1.345
+1.347
 log
-@pfctl: merge identifical if conditions and void functions discarding ret values
+@Allow HFSC classes to use flow queues
 
-Transform the following functions (which never return anything other than 0, and
-whose return value is never used) to void:
+The FQ-CoDel related configuration (flows, quantum) becomes available
+for the regular bandwidth queue.  Internally the kernel will pick the
+FQ-CoDel for use as a queue manager for the specified class instead of
+the FIFO.
 
-* pfctl_clear_stats, pfctl_clear_interface_flags, pfctl_clear_rules,
-  pfctl_clear_src_nodes, pfctl_clear_states
-* pfctl_kill_src_nodes, pfctl_net_kill_states, pfctl_label_kill_states,
-  pfctl_id_kill_states, pfctl_key_kill_states
-
-inside main: merge two identical if conditions next to each other into one.
-
-Submitted by rain1 (thanks!) with additional credit to:
- - mikeb@@ for pointing out we can void all _clear_ functions
- - ghostyy for pointing out all _kill_ functions can be voided
-
-OK tb@@, mikeb@@
+Discussed with and OK henning@@ at d2k17 as a part of a larger diff.
 @
 text
-@/*	$OpenBSD: pfctl.c,v 1.344 2017/05/30 12:13:04 henning Exp $ */
+@/*	$OpenBSD: pfctl.c,v 1.346 2017/07/19 12:51:30 mikeb Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -3141,8 +3144,14 @@ pfctl_find_childqs(struct pfctl_qsitem *qi)
 	TAILQ_FOREACH(p, &qi->children, entries)
 		flags |= pfctl_find_childqs(p);
 
-	if (qi->qs.flags & PFQS_DEFAULT && !TAILQ_EMPTY(&qi->children))
-		errx(1, "default queue %s is not a leaf queue", qi->qs.qname);
+	if (!TAILQ_EMPTY(&qi->children)) {
+		if (qi->qs.flags & PFQS_DEFAULT)
+			errx(1, "default queue %s is not a leaf queue",
+			    qi->qs.qname);
+		if (qi->qs.flags & PFQS_FLOWQUEUE)
+			errx(1, "flow queue %s is not a leaf queue",
+			    qi->qs.qname);
+	}
 
 	return (flags);
 }
@@ -3171,18 +3180,28 @@ int
 pfctl_load_queues(struct pfctl *pf)
 {
 	struct pfctl_qsitem	*qi, *tempqi;
+	struct pf_queue_scspec	*rtsc, *lssc, *ulsc;
 	u_int32_t		 ticket;
 
 	TAILQ_FOREACH(qi, &qspecs, entries) {
 		if (qi->matches == 0)
-			errx(1, "queue %s: parent %s not found\n", qi->qs.qname,
+			errx(1, "queue %s: parent %s not found", qi->qs.qname,
 			    qi->qs.parent);
-		if (qi->qs.realtime.m1.percent || qi->qs.realtime.m2.percent ||
-		    qi->qs.linkshare.m1.percent ||
-		    qi->qs.linkshare.m2.percent ||
-		    qi->qs.upperlimit.m1.percent ||
-		    qi->qs.upperlimit.m2.percent)
+
+		rtsc = &qi->qs.realtime;
+		lssc = &qi->qs.linkshare;
+		ulsc = &qi->qs.upperlimit;
+
+		if (rtsc->m1.percent || rtsc->m2.percent ||
+		    lssc->m1.percent || lssc->m2.percent ||
+		    ulsc->m1.percent || ulsc->m2.percent)
 			errx(1, "only absolute bandwidth specs for now");
+
+		/* Link sharing policy must be specified for child classes */
+		if (qi->qs.parent[0] != '\0' &&
+		    lssc->m1.absolute == 0 && lssc->m2.absolute == 0)
+			errx(1, "queue %s: no bandwidth was specified",
+			    qi->qs.qname);
 	}
 
 	if ((pf->opts & PF_OPT_NOACTION) == 0)
@@ -3248,7 +3267,17 @@ pfctl_check_qassignments(struct pf_ruleset *rs)
 	if (rs->anchor->path[0] == 0) {
 		TAILQ_FOREACH(qi, &rootqs, entries) {
 			flags = pfctl_find_childqs(qi);
-			if (!(qi->qs.flags & PFQS_FLOWQUEUE) &&
+			if (!(qi->qs.flags & PFQS_ROOTCLASS) &&
+			    !TAILQ_EMPTY(&qi->children)) {
+				if (qi->qs.flags & PFQS_FLOWQUEUE)
+					errx(1, "root queue %s doesn't "
+					    "support hierarchy",
+					    qi->qs.qname);
+				else
+					errx(1, "no bandwidth was specified "
+					    "for root queue %s", qi->qs.qname);
+			}
+			if ((qi->qs.flags & PFQS_ROOTCLASS) &&
 			    !(flags & PFQS_DEFAULT))
 				errx(1, "no default queue specified");
 		}
@@ -4436,6 +4465,69 @@ main(int argc, char *argv[])
 
 	exit(error);
 }
+@
+
+
+1.346
+log
+@Rework HFSC vs FQ-CoDel checks
+
+The selection mechanism introduced in pf_ioctl.c -r1.316 suffers
+from being too ambiguous and lacks robustness. Instead of relying
+on composition of multiple flags in the queue specification, it's
+easier to identify the root class (if it exists) and derive all
+further checks from it.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pfctl.c,v 1.345 2017/06/16 19:59:13 awolk Exp $ */
+d1302 8
+a1309 2
+	if (qi->qs.flags & PFQS_DEFAULT && !TAILQ_EMPTY(&qi->children))
+		errx(1, "default queue %s is not a leaf queue", qi->qs.qname);
+d1338 1
+d1343 1
+a1343 1
+			errx(1, "queue %s: parent %s not found\n", qi->qs.qname,
+d1345 8
+a1352 5
+		if (qi->qs.realtime.m1.percent || qi->qs.realtime.m2.percent ||
+		    qi->qs.linkshare.m1.percent ||
+		    qi->qs.linkshare.m2.percent ||
+		    qi->qs.upperlimit.m1.percent ||
+		    qi->qs.upperlimit.m2.percent)
+d1354 6
+@
+
+
+1.345
+log
+@pfctl: merge identifical if conditions and void functions discarding ret values
+
+Transform the following functions (which never return anything other than 0, and
+whose return value is never used) to void:
+
+* pfctl_clear_stats, pfctl_clear_interface_flags, pfctl_clear_rules,
+  pfctl_clear_src_nodes, pfctl_clear_states
+* pfctl_kill_src_nodes, pfctl_net_kill_states, pfctl_label_kill_states,
+  pfctl_id_kill_states, pfctl_key_kill_states
+
+inside main: merge two identical if conditions next to each other into one.
+
+Submitted by rain1 (thanks!) with additional credit to:
+ - mikeb@@ for pointing out we can void all _clear_ functions
+ - ghostyy for pointing out all _kill_ functions can be voided
+
+OK tb@@, mikeb@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: pfctl.c,v 1.344 2017/05/30 12:13:04 henning Exp $ */
+d1409 11
+a1419 1
+			if (!(qi->qs.flags & PFQS_FLOWQUEUE) &&
 @
 
 

@@ -1,9 +1,15 @@
-head	1.4;
+head	1.5;
 access;
 symbols;
 locks; strict;
 comment	@ * @;
 
+
+1.5
+date	2017.07.19.20.09.35;	author anton;	state Exp;
+branches;
+next	1.4;
+commitid	9MGMBJiyBYpL0tDy;
 
 1.4
 date	2017.06.25.08.31.44;	author anton;	state Exp;
@@ -34,10 +40,21 @@ desc
 @@
 
 
-1.4
+1.5
 log
-@Capture SIGINT and print out all received output so far. Useful when debugging
-broken tests.
+@The first version of the edit program used to test csh, ksh and mail was based
+on the following reasoning: once the program to test has written some data it
+has entered the main-loop and is by now ready to receive user input. At this
+point it should be safe to start writing input and once the program once again
+enters a blocking reading state, its done processing the input. This approach
+was sensitive to timing and determining when a shell is done processing its
+input (if ever) is tricky.
+
+This iteration of the edit program takes a new approach and uses presence of a
+prompt for synchronisation of I/O. It doesn't solve all problems but is a step
+in the right direction.
+
+Joint work with bluhm@@
 @
 text
 @/*
@@ -67,6 +84,10 @@ text
 #include <unistd.h>
 #include <util.h>
 
+#define	WRTIM	50	/* input write timeout */
+#define	PRTIM	5000	/* prompt read timeout */
+
+static size_t		findprompt(const char *, const char *);
 static void		sighandler(int);
 static void __dead	usage(void);
 
@@ -75,16 +96,28 @@ static volatile sig_atomic_t	gotsig;
 int
 main(int argc, char *argv[])
 {
-	char		in[BUFSIZ], out[BUFSIZ];
-	struct termios	tio;
-	struct pollfd	pfd;
-	struct winsize	ws;
-	pid_t		pid;
-	ssize_t		n;
-	size_t		nin, nread, nwrite;
-	int		nready, ptyfd;
+	const char	*linefeed = "\003\004\n\r";
+	const char	*prompt = "";
+	char		 in[BUFSIZ], out[BUFSIZ];
+	struct pollfd	 pfd;
+	struct winsize	 ws;
+	pid_t		 pid;
+	ssize_t		 n;
+	size_t		 nin, nprompt, nread, nwrite;
+	int		 c, nready, ptyfd, readprompt, ret, timeout;
 
-	if (argc < 2)
+	while ((c = getopt(argc, argv, "p:")) != -1) {
+		switch (c) {
+		case 'p':
+			prompt = optarg;
+			break;
+		default:
+			usage();
+		}
+	}
+	argc -= optind;
+	argv += optind;
+	if (argc == 0 || strlen(prompt) == 0)
 		usage();
 
 	nin = 0;
@@ -92,7 +125,7 @@ main(int argc, char *argv[])
 		if (nin == sizeof(in))
 			errx(1, "input buffer too small");
 
-		n = read(0, &in[nin], sizeof(in) - nin);
+		n = read(0, in + nin, sizeof(in) - nin);
 		if (n == -1)
 			err(1, "read");
 		if (n == 0)
@@ -114,22 +147,30 @@ main(int argc, char *argv[])
 	if (pid == -1)
 		err(1, "forkpty");
 	if (pid == 0) {
-		execvp(argv[1], &argv[1]);
-		err(1, "%s", argv[1]);
+		execvp(*argv, argv);
+		err(1, "%s", *argv);
 	}
 
-	nread = nwrite = 0;
-	pfd.fd = ptyfd;
-	pfd.events = (POLLIN | POLLOUT);
+	nprompt = nread = nwrite = ret = 0;
+	readprompt = 1;
 	while (!gotsig) {
-		nready = poll(&pfd, 1, 10);
+		pfd.fd = ptyfd;
+		if (!readprompt && nwrite < nin)
+			pfd.events = POLLOUT;
+		else
+			pfd.events = POLLIN;
+		timeout = readprompt ? PRTIM : WRTIM;
+		nready = poll(&pfd, 1, timeout);
 		if (nready == -1) {
 			if (errno == EINTR)
 				continue;
 			err(1, "poll");
 		}
-		if (nready == 0)
-			break;	/* timeout */
+		if (nready == 0) {
+			if (timeout == PRTIM)
+				ret = 1;
+			break;
+		}
 		if (pfd.revents & (POLLERR | POLLNVAL))
 			errc(1, EBADF, NULL);
 
@@ -137,32 +178,45 @@ main(int argc, char *argv[])
 			if (nread == sizeof(out))
 				errx(1, "output buffer too small");
 
-			n = read(ptyfd, &out[nread], sizeof(out) - nread);
+			n = read(ptyfd, out + nread, sizeof(out) - 1 - nread);
 			if (n == -1)
 				err(1, "read");
 			nread += n;
+			out[nread] = '\0';
+
+			if (readprompt &&
+			    (n = findprompt(out + nprompt, prompt)) > 0) {
+				nprompt += n;
+				readprompt = 0;
+			}
 		} else if (pfd.revents & POLLOUT) {
-			if (nread == 0)
-				continue;
+			if (strchr(linefeed, in[nwrite]) != NULL)
+				readprompt = 1;
 
-			if (tcgetattr(ptyfd, &tio) == -1)
-				err(1, "tcgetattr");
-			if ((tio.c_lflag & ICANON) == ICANON)
-				continue;
-
-			n = write(ptyfd, &in[nwrite], 1);
+			n = write(ptyfd, in + nwrite, 1);
 			if (n == -1)
 				err(1, "write");
 			nwrite += n;
-			if (nwrite == nin)
-				pfd.events &= ~(POLLOUT);
 		}
 	}
 	close(ptyfd);
 
-	printf("%.*s\n", (int)nread, out);
+	printf("%.*s", (int)nread, out);
 
-	return 0;
+	return ret;
+}
+
+static size_t
+findprompt(const char *str, const char *prompt)
+{
+	char	*cp;
+	size_t	 len;
+
+	if ((cp = strstr(str, prompt)) == NULL)
+		return 0;
+	len = strlen(prompt);
+
+	return (cp - str) + len;
 }
 
 static void
@@ -174,9 +228,78 @@ sighandler(int sig)
 static void __dead
 usage(void)
 {
-	fprintf(stderr, "usage: edit command [args]\n");
+	fprintf(stderr, "usage: edit -p prompt command [args]\n");
 	exit(1);
 }
+@
+
+
+1.4
+log
+@Capture SIGINT and print out all received output so far. Useful when debugging
+broken tests.
+@
+text
+@d28 4
+d40 22
+a61 10
+	char		in[BUFSIZ], out[BUFSIZ];
+	struct termios	tio;
+	struct pollfd	pfd;
+	struct winsize	ws;
+	pid_t		pid;
+	ssize_t		n;
+	size_t		nin, nread, nwrite;
+	int		nready, ptyfd;
+
+	if (argc < 2)
+d69 1
+a69 1
+		n = read(0, &in[nin], sizeof(in) - nin);
+d91 2
+a92 2
+		execvp(argv[1], &argv[1]);
+		err(1, "%s", argv[1]);
+d95 2
+a96 3
+	nread = nwrite = 0;
+	pfd.fd = ptyfd;
+	pfd.events = (POLLIN | POLLOUT);
+d98 7
+a104 1
+		nready = poll(&pfd, 1, 10);
+d110 5
+a114 2
+		if (nready == 0)
+			break;	/* timeout */
+d122 1
+a122 1
+			n = read(ptyfd, &out[nread], sizeof(out) - nread);
+d126 7
+d134 2
+a135 7
+			if (nread == 0)
+				continue;
+
+			if (tcgetattr(ptyfd, &tio) == -1)
+				err(1, "tcgetattr");
+			if ((tio.c_lflag & ICANON) == ICANON)
+				continue;
+d137 1
+a137 1
+			n = write(ptyfd, &in[nwrite], 1);
+a140 2
+			if (nwrite == nin)
+				pfd.events &= ~(POLLOUT);
+d145 14
+a158 1
+	printf("%.*s\n", (int)nread, out);
+d160 1
+a160 1
+	return 0;
+d172 1
+a172 1
+	fprintf(stderr, "usage: edit command [args]\n");
 @
 
 

@@ -1,4 +1,4 @@
-head	1.481;
+head	1.483;
 access;
 symbols
 	OPENBSD_6_1:1.405.0.4
@@ -58,6 +58,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.483
+date	2017.07.24.18.13.19;	author krw;	state Exp;
+branches;
+next	1.482;
+commitid	xjcyncKfDSt3Q91S;
+
+1.482
+date	2017.07.24.17.15.41;	author krw;	state Exp;
+branches;
+next	1.481;
+commitid	FSXpMhxAeFtIckUQ;
 
 1.481
 date	2017.07.24.16.17.35;	author krw;	state Exp;
@@ -2645,12 +2657,13 @@ desc
 @@
 
 
-1.481
+1.483
 log
-@Tweak some comments
+@Throw DHO_STATIC_ROUTES to the floor! Roughly! Ensure
+they don't appear in effective leases at all.
 @
 text
-@/*	$OpenBSD: dhclient.c,v 1.480 2017/07/24 13:51:43 krw Exp $	*/
+@/*	$OpenBSD: dhclient.c,v 1.482 2017/07/24 17:15:41 krw Exp $	*/
 
 /*
  * Copyright 2004 Henning Brauer <henning@@openbsd.org>
@@ -2713,6 +2726,8 @@ text
 #include <sys/queue.h>
 
 #include <net/if.h>
+#include <net/if_types.h>
+#include <net/if_dl.h>
 #include <net/route.h>
 
 #include <netinet/in.h>
@@ -2786,6 +2801,9 @@ int		 addressinuse(char *, struct in_addr, char *);
 void		 fork_privchld(struct interface_info *, int, int);
 void		 get_ifname(struct interface_info *, int, char *);
 int		 get_ifa_family(char *, int);
+void		 interface_link_forceup(char *, int);
+int		 interface_status(char *);
+void		 get_hw_address(struct interface_info *);
 
 struct client_lease *apply_defaults(struct client_lease *);
 struct client_lease *clone_lease(struct client_lease *);
@@ -2853,6 +2871,103 @@ get_ifa_family(char *cp, int n)
 	}
 
 	return AF_UNSPEC;
+}
+
+void
+interface_link_forceup(char *name, int ioctlfd)
+{
+	struct ifreq ifr;
+
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	if (ioctl(ioctlfd, SIOCGIFFLAGS, (caddr_t)&ifr) == -1) {
+		log_warn("SIOCGIFFLAGS");
+		return;
+	}
+
+	/* Force it up if it isn't already. */
+	if ((ifr.ifr_flags & IFF_UP) == 0) {
+		ifr.ifr_flags |= IFF_UP;
+		if (ioctl(ioctlfd, SIOCSIFFLAGS, (caddr_t)&ifr) == -1) {
+			log_warn("SIOCSIFFLAGS");
+			return;
+		}
+	}
+}
+
+int
+interface_status(char *name)
+{
+	struct ifaddrs *ifap, *ifa;
+	struct if_data *ifdata;
+
+	if (getifaddrs(&ifap) != 0)
+		fatalx("getifaddrs failed");
+
+	for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+		if ((ifa->ifa_flags & IFF_LOOPBACK) ||
+		    (ifa->ifa_flags & IFF_POINTOPOINT))
+			continue;
+
+		if (strcmp(name, ifa->ifa_name) != 0)
+			continue;
+
+		if (ifa->ifa_addr->sa_family != AF_LINK)
+			continue;
+
+		if ((ifa->ifa_flags & (IFF_UP|IFF_RUNNING)) !=
+		    (IFF_UP|IFF_RUNNING))
+			return 0;
+
+		ifdata = ifa->ifa_data;
+
+		return LINK_STATE_IS_UP(ifdata->ifi_link_state);
+	}
+
+	return 0;
+}
+
+void
+get_hw_address(struct interface_info *ifi)
+{
+	struct ifaddrs *ifap, *ifa;
+	struct sockaddr_dl *sdl;
+	struct if_data *ifdata;
+	int found;
+
+	if (getifaddrs(&ifap) != 0)
+		fatalx("getifaddrs failed");
+
+	found = 0;
+	for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+		if ((ifa->ifa_flags & IFF_LOOPBACK) ||
+		    (ifa->ifa_flags & IFF_POINTOPOINT))
+			continue;
+
+		if (strcmp(ifi->name, ifa->ifa_name) != 0)
+			continue;
+		found = 1;
+
+		if (ifa->ifa_addr->sa_family != AF_LINK)
+			continue;
+
+		sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+		if (sdl->sdl_type != IFT_ETHER ||
+		    sdl->sdl_alen != ETHER_ADDR_LEN)
+			continue;
+
+		ifdata = ifa->ifa_data;
+		ifi->rdomain = ifdata->ifi_rdomain;
+
+		memcpy(ifi->hw_address.ether_addr_octet, LLADDR(sdl),
+		    ETHER_ADDR_LEN);
+		ifi->flags |= IFI_VALID_LLADDR;
+	}
+
+	if (found == 0)
+		fatalx("%s: no such interface", ifi->name);
+
+	freeifaddrs(ifap);
 }
 
 void
@@ -3588,7 +3703,6 @@ bind_lease(struct interface_info *ifi)
 	    &options[DHO_CLASSLESS_STATIC_ROUTES],
 	    &options[DHO_CLASSLESS_MS_STATIC_ROUTES],
 	    &options[DHO_ROUTERS],
-	    &options[DHO_STATIC_ROUTES],
 	    &options[DHO_SUBNET_MASK]);
 
 newlease:
@@ -4869,23 +4983,22 @@ apply_defaults(struct client_lease *lease)
 		}
 	}
 
+	if (newlease->options[DHO_STATIC_ROUTES].len != 0) {
+		log_warnx("DHO_STATIC_ROUTES (option 33) not supported");
+		free(newlease->options[DHO_STATIC_ROUTES].data);
+		newlease->options[DHO_STATIC_ROUTES].data = NULL;
+		newlease->options[DHO_STATIC_ROUTES].len = 0;
+	}
 
 	/*
-	 * RFC 3442 says client *MUST* ignore both DHO_ROUTERS and
-	 * DHO_STATIC_ROUTES when DHO_CLASSLESS_[MS_]_ROUTES present.
-	 *
-	 * Remove them from 'newlease' so that -L will not show them
-	 * as part of the effective lease.
+	 * RFC 3442 says client *MUST* ignore DHO_ROUTERS
+	 * when DHO_CLASSLESS_[MS_]_ROUTES present.
 	 */
 	if ((newlease->options[DHO_CLASSLESS_MS_STATIC_ROUTES].len != 0) ||
 	    (newlease->options[DHO_CLASSLESS_STATIC_ROUTES].len != 0)) {
 		free(newlease->options[DHO_ROUTERS].data);
 		newlease->options[DHO_ROUTERS].data = NULL;
 		newlease->options[DHO_ROUTERS].len = 0;
-
-		free(newlease->options[DHO_STATIC_ROUTES].data);
-		newlease->options[DHO_STATIC_ROUTES].data = NULL;
-		newlease->options[DHO_STATIC_ROUTES].len = 0;
 	}
 
 	return newlease;
@@ -5175,6 +5288,47 @@ set_default_client_identifier(struct interface_info *ifi)
 		opt->len = ETHER_ADDR_LEN + 1;
 	}
 }
+@
+
+
+1.482
+log
+@Shuffle some declarations and functions into the only
+files they are used in. Tweak a bunch of whitespace.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dhclient.c,v 1.481 2017/07/24 16:17:35 krw Exp $	*/
+a1040 1
+	    &options[DHO_STATIC_ROUTES],
+d2321 6
+d2329 2
+a2330 5
+	 * RFC 3442 says client *MUST* ignore both DHO_ROUTERS and
+	 * DHO_STATIC_ROUTES when DHO_CLASSLESS_[MS_]_ROUTES present.
+	 *
+	 * Remove them from 'newlease' so that -L will not show them
+	 * as part of the effective lease.
+a2336 4
+
+		free(newlease->options[DHO_STATIC_ROUTES].data);
+		newlease->options[DHO_STATIC_ROUTES].data = NULL;
+		newlease->options[DHO_STATIC_ROUTES].len = 0;
+@
+
+
+1.481
+log
+@Tweak some comments
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: dhclient.c,v 1.480 2017/07/24 13:51:43 krw Exp $	*/
+d64 2
+d139 3
+d209 97
 @
 
 

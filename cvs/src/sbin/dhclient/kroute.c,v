@@ -1,4 +1,4 @@
-head	1.121;
+head	1.122;
 access;
 symbols
 	OPENBSD_6_1:1.85.0.4
@@ -22,6 +22,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.122
+date	2017.07.29.15.07.47;	author krw;	state Exp;
+branches;
+next	1.121;
+commitid	fs7wm6LApZTZyE2c;
 
 1.121
 date	2017.07.27.12.52.58;	author krw;	state Exp;
@@ -689,12 +695,19 @@ desc
 @@
 
 
-1.121
+1.122
 log
-@Kill extra whitespace that snuck in.
+@Default routes supplied via DHO_CLASSLESS[_MS]_STATIC_ROUTES
+should have the same add_route() logic applied to them as
+the one supplied via DHO_ROUTERS. i.e. add the /32 route
+if needed, create direct route if gateway address is the
+same as interface address.
+
+Simplify logic by using the canonical rtstatic[] version
+of static routes created by lease_as_proposal().
 @
 text
-@/*	$OpenBSD: kroute.c,v 1.120 2017/07/27 12:45:06 krw Exp $	*/
+@/*	$OpenBSD: kroute.c,v 1.121 2017/07/27 12:52:58 krw Exp $	*/
 
 /*
  * Copyright 2012 Kenneth R Westerback <krw@@openbsd.org>
@@ -974,71 +987,24 @@ create_route_label(struct sockaddr_rtlabel *label)
 }
 
 void
-set_routes(struct in_addr addr, struct option_data *classless,
-    struct option_data *msclassless, struct option_data *routers,
-    struct option_data *subnet)
+set_routes(struct in_addr addr, struct in_addr addrmask, uint8_t *rtstatic,
+    unsigned int rtstatic_len)
 {
 	const struct in_addr	 any = { INADDR_ANY };
 	struct in_addr		 dest, gateway, netmask;
-	struct option_data	*opt;
 	unsigned int		 i, bits, bytes;
 
 	flush_routes();
 
-	if (classless->len != 0)
-		opt = classless;
-	else if (msclassless->len != 0)
-		opt = msclassless;
-	else {
-		/* Add default route. */
-		if (routers->len < sizeof(struct in_addr))
-			return;
-
-		/* XXX Only use FIRST router address for now. */
-		gateway.s_addr = ((struct in_addr *)routers->data)->s_addr;
-
-		opt = subnet;
-		if (opt->len == sizeof(struct in_addr)) {
-			netmask.s_addr = ((struct in_addr *)opt->data)->s_addr;
-			if (netmask.s_addr == INADDR_BROADCAST) {
-				/*
-				 * To be compatible with ISC DHCP behavior on
-				 * Linux, if we were given a /32 IP assignment
-				 * then add a /32 direct route for the gateway
-				 * to make it routable.
-				 *
-				 * route add -net $gateway -netmask $netmask
-				 *     -cloning -iface $addr
-				 */
-				add_route(gateway, netmask, addr, any,
-				    RTA_DST | RTA_NETMASK | RTA_GATEWAY,
-				    RTF_CLONING | RTF_STATIC);
-			}
-		}
-
-		if (memcmp(&gateway, &addr, sizeof(addr)) == 0) {
-			/* route -q $rdomain add default -iface $addr */
-			add_route(any, any, gateway, addr,
-			    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
-			    RTF_STATIC);
-		} else {
-			/* route -q $rdomain add default $gateway */
-			add_route(any, any, gateway, addr,
-			    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
-			    RTF_GATEWAY | RTF_STATIC);
-		}
-		return;
-	}
-
 	/* Add classless static routes. */
 	i = 0;
-	while (i < opt->len) {
-		bits = opt->data[i++];
+	while (i < rtstatic_len) {
+		bits = rtstatic[i++];
 		bytes = (bits + 7) / 8;
 
 		if (bytes > sizeof(struct in_addr))
 			return;
-		else if (i + bytes > opt->len)
+		else if (i + bytes > rtstatic_len)
 			return;
 
 		if (bits != 0)
@@ -1046,28 +1012,75 @@ set_routes(struct in_addr addr, struct option_data *classless,
 		else
 			netmask.s_addr = INADDR_ANY;
 
-		memcpy(&dest, &opt->data[i], bytes);
+		memcpy(&dest, &rtstatic[i], bytes);
 		dest.s_addr = dest.s_addr & netmask.s_addr;
 		i += bytes;
 
-		if (i + sizeof(gateway) > opt->len)
+		if (i + sizeof(gateway) > rtstatic_len)
 			return;
-		memcpy(&gateway, &opt->data[i], sizeof(gateway));
+		memcpy(&gateway, &rtstatic[i], sizeof(gateway));
 		i += sizeof(gateway);
 
 		if (gateway.s_addr == INADDR_ANY) {
 			/*
+			 * DIRECT ROUTE
+			 *
 			 * route add -net $dest -netmask $netmask -cloning
 			 *     -iface $addr
 			 */
 			add_route(dest, netmask, addr, any,
 			    RTA_DST | RTA_NETMASK | RTA_GATEWAY,
 			    RTF_CLONING | RTF_STATIC);
-		} else
-			/* route add -net $dest -netmask $netmask $gateway */
+		} else if (netmask.s_addr == INADDR_ANY) {
+			/*
+			 * DEFAULT ROUTE
+			 */
+			if (addrmask.s_addr == INADDR_BROADCAST) {
+				/*
+				 * DIRECT ROUTE TO DEFAULT GATEWAY
+				 *
+				 * To be compatible with ISC DHCP behavior on
+				 * Linux, if we were given a /32 IP assignment
+				 * then add a /32 direct route for the gateway
+				 * to make it routable.
+				 *
+				 * route add -net $gateway -netmask $addrmask
+				 *     -cloning -iface $addr
+				 */
+				add_route(gateway, addrmask, addr, any,
+				    RTA_DST | RTA_NETMASK | RTA_GATEWAY,
+				    RTF_CLONING | RTF_STATIC);
+			}
+
+			if (memcmp(&gateway, &addr, sizeof(addr)) == 0) {
+				/*
+				 * DEFAULT ROUTE IS A DIRECT ROUTE
+				 *
+				 * route add default -iface $addr
+				 */
+				add_route(any, any, gateway, addr,
+				    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
+				    RTF_STATIC);
+			} else {
+				/*
+				* DEFAULT ROUTE IS VIA GATEWAY
+				*
+				* route add default $gateway
+				*/
+				add_route(any, any, gateway, addr,
+				    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
+				    RTF_GATEWAY | RTF_STATIC);
+			}
+		} else {
+			/*
+			 * NON-DIRECT, NON-DEFAULT ROUTE
+			 *
+			 * route add -net $dest -netmask $netmask $gateway
+			 */
 			add_route(dest, netmask, gateway, addr,
 			    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
 			    RTF_GATEWAY | RTF_STATIC);
+		}
 	}
 }
 
@@ -1627,6 +1640,92 @@ populate_rti_info(struct sockaddr **rti_info, struct rt_msghdr *rtm)
 			rti_info[i] = NULL;
 	}
 }
+@
+
+
+1.121
+log
+@Kill extra whitespace that snuck in.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: kroute.c,v 1.120 2017/07/27 12:45:06 krw Exp $	*/
+d281 2
+a282 3
+set_routes(struct in_addr addr, struct option_data *classless,
+    struct option_data *msclassless, struct option_data *routers,
+    struct option_data *subnet)
+a285 1
+	struct option_data	*opt;
+a289 45
+	if (classless->len != 0)
+		opt = classless;
+	else if (msclassless->len != 0)
+		opt = msclassless;
+	else {
+		/* Add default route. */
+		if (routers->len < sizeof(struct in_addr))
+			return;
+
+		/* XXX Only use FIRST router address for now. */
+		gateway.s_addr = ((struct in_addr *)routers->data)->s_addr;
+
+		opt = subnet;
+		if (opt->len == sizeof(struct in_addr)) {
+			netmask.s_addr = ((struct in_addr *)opt->data)->s_addr;
+			if (netmask.s_addr == INADDR_BROADCAST) {
+				/*
+				 * To be compatible with ISC DHCP behavior on
+				 * Linux, if we were given a /32 IP assignment
+				 * then add a /32 direct route for the gateway
+				 * to make it routable.
+				 *
+				 * route add -net $gateway -netmask $netmask
+				 *     -cloning -iface $addr
+				 */
+				add_route(gateway, netmask, addr, any,
+				    RTA_DST | RTA_NETMASK | RTA_GATEWAY,
+				    RTF_CLONING | RTF_STATIC);
+			}
+		}
+
+		if (memcmp(&gateway, &addr, sizeof(addr)) == 0) {
+			/* route -q $rdomain add default -iface $addr */
+			add_route(any, any, gateway, addr,
+			    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
+			    RTF_STATIC);
+		} else {
+			/* route -q $rdomain add default $gateway */
+			add_route(any, any, gateway, addr,
+			    RTA_DST | RTA_NETMASK | RTA_GATEWAY | RTA_IFA,
+			    RTF_GATEWAY | RTF_STATIC);
+		}
+		return;
+	}
+
+d292 2
+a293 2
+	while (i < opt->len) {
+		bits = opt->data[i++];
+d298 1
+a298 1
+		else if (i + bytes > opt->len)
+d306 1
+a306 1
+		memcpy(&dest, &opt->data[i], bytes);
+d310 1
+a310 1
+		if (i + sizeof(gateway) > opt->len)
+d312 1
+a312 1
+		memcpy(&gateway, &opt->data[i], sizeof(gateway));
+d317 2
+d325 46
+a370 2
+		} else
+			/* route add -net $dest -netmask $netmask $gateway */
+d374 1
 @
 
 

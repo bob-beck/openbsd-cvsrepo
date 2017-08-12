@@ -1,4 +1,4 @@
-head	1.206;
+head	1.207;
 access;
 symbols
 	OPENBSD_6_1:1.166.0.4
@@ -14,6 +14,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.207
+date	2017.08.12.19.23.42;	author stsp;	state Exp;
+branches;
+next	1.206;
+commitid	NCdScXwB55nb7X9P;
 
 1.206
 date	2017.08.12.15.10.27;	author stsp;	state Exp;
@@ -1256,20 +1262,23 @@ desc
 @@
 
 
-1.206
+1.207
 log
-@Prevent a NULL pointer deref in iwm(4) which I have seen during testing.
+@In iwm(4), instead of scheduling a task which calls ieee80211_end_scan(),
+call ieee80211_end_scan() directly from interrupt context.
 
-iwm_stop() sets the phy context pointer in the ic_bss node to NULL.
-If iwm_stop() runs in parallel to the newstate task, the newstate task can
-dereference this pointer in iwn_update_quotas() or iwm_binding_cmd().
-So check the pointer for NULL before derefencing.
+This extra task was already part of the original driver code from 2015 (but
+with a workq instead of a task). Back then, the driver had to run two separate
+scan commands in succession, for 2 GHz and then 5 GHz. Which is why a task
+was used, since sending another command requires a sleepable context.
 
-This is a quick and dirty workaround.
-A proper fix for such task races is still pending.
+Nowadays, with our current firmware, a single scan command is sufficient
+so there is no code path which needs to sleep when the scan ends.
+
+ok mpi@@
 @
 text
-@/*	$OpenBSD: if_iwm.c,v 1.205 2017/08/12 14:07:33 stsp Exp $	*/
+@/*	$OpenBSD: if_iwm.c,v 1.206 2017/08/12 15:10:27 stsp Exp $	*/
 
 /*
  * Copyright (c) 2014, 2016 genua gmbh <info@@genua.de>
@@ -1713,7 +1722,7 @@ void	iwm_setrates(struct iwm_node *);
 int	iwm_media_change(struct ifnet *);
 void	iwm_newstate_task(void *);
 int	iwm_newstate(struct ieee80211com *, enum ieee80211_state, int);
-void	iwm_endscan_cb(void *);
+void	iwm_endscan(struct iwm_softc *);
 void	iwm_fill_sf_command(struct iwm_softc *, struct iwm_sf_cfg_cmd *,
 	    struct ieee80211_node *);
 int	iwm_sf_config(struct iwm_softc *, int);
@@ -7225,13 +7234,11 @@ iwm_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 }
 
 void
-iwm_endscan_cb(void *arg)
+iwm_endscan(struct iwm_softc *sc)
 {
-	struct iwm_softc *sc = arg;
 	struct ieee80211com *ic = &sc->sc_ic;
 
-	/* Check if device was reset while scanning. */
-	if (ic->ic_state != IEEE80211_S_SCAN)
+	if ((sc->sc_flags & IWM_FLAG_SCANNING) == 0)
 		return;
 
 	sc->sc_flags &= ~IWM_FLAG_SCANNING;
@@ -7715,7 +7722,6 @@ iwm_stop(struct ifnet *ifp, int disable)
 
 	task_del(systq, &sc->init_task);
 	task_del(sc->sc_nswq, &sc->newstate_task);
-	task_del(sc->sc_eswq, &sc->sc_eswk);
 	task_del(systq, &sc->setrates_task);
 	task_del(systq, &sc->ba_task);
 	task_del(systq, &sc->htprot_task);
@@ -8276,22 +8282,21 @@ iwm_notif_intr(struct iwm_softc *sc)
 		case IWM_SCAN_ITERATION_COMPLETE: {
 			struct iwm_lmac_scan_complete_notif *notif;
 			SYNC_RESP_STRUCT(notif, pkt);
-			task_add(sc->sc_eswq, &sc->sc_eswk);
+			iwm_endscan(sc);
 			break;
 		}
 
 		case IWM_SCAN_COMPLETE_UMAC: {
 			struct iwm_umac_scan_complete *notif;
 			SYNC_RESP_STRUCT(notif, pkt);
-			task_add(sc->sc_eswq, &sc->sc_eswk);
+			iwm_endscan(sc);
 			break;
 		}
 
 		case IWM_SCAN_ITERATION_COMPLETE_UMAC: {
 			struct iwm_umac_scan_iter_complete_notif *notif;
 			SYNC_RESP_STRUCT(notif, pkt);
-
-			task_add(sc->sc_eswq, &sc->sc_eswk);
+			iwm_endscan(sc);
 			break;
 		}
 
@@ -8603,7 +8608,6 @@ iwm_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_pcitag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
 
-	task_set(&sc->sc_eswk, iwm_endscan_cb, sc);
 	rw_init(&sc->ioctl_rwl, "iwmioctl");
 
 	err = pci_get_capability(sc->sc_pct, sc->sc_pcitag,
@@ -8812,9 +8816,6 @@ iwm_attach(struct device *parent, struct device *self, void *aux)
 		goto fail4;
 	}
 
-	sc->sc_eswq = taskq_create("iwmes", 1, IPL_NET, 0);
-	if (sc->sc_eswq == NULL)
-		goto fail4;
 	sc->sc_nswq = taskq_create("iwmns", 1, IPL_NET, 0);
 	if (sc->sc_nswq == NULL)
 		goto fail4;
@@ -9002,6 +9003,55 @@ struct cfattach iwm_ca = {
 	sizeof(struct iwm_softc), iwm_match, iwm_attach,
 	NULL, iwm_activate
 };
+@
+
+
+1.206
+log
+@Prevent a NULL pointer deref in iwm(4) which I have seen during testing.
+
+iwm_stop() sets the phy context pointer in the ic_bss node to NULL.
+If iwm_stop() runs in parallel to the newstate task, the newstate task can
+dereference this pointer in iwn_update_quotas() or iwm_binding_cmd().
+So check the pointer for NULL before derefencing.
+
+This is a quick and dirty workaround.
+A proper fix for such task races is still pending.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_iwm.c,v 1.205 2017/08/12 14:07:33 stsp Exp $	*/
+d445 1
+a445 1
+void	iwm_endscan_cb(void *);
+d5957 1
+a5957 1
+iwm_endscan_cb(void *arg)
+a5958 1
+	struct iwm_softc *sc = arg;
+d5961 1
+a5961 2
+	/* Check if device was reset while scanning. */
+	if (ic->ic_state != IEEE80211_S_SCAN)
+a6444 1
+	task_del(sc->sc_eswq, &sc->sc_eswk);
+d7005 1
+a7005 1
+			task_add(sc->sc_eswq, &sc->sc_eswk);
+d7012 1
+a7012 1
+			task_add(sc->sc_eswq, &sc->sc_eswk);
+d7019 1
+a7019 2
+
+			task_add(sc->sc_eswq, &sc->sc_eswk);
+a7330 1
+	task_set(&sc->sc_eswk, iwm_endscan_cb, sc);
+a7538 3
+	sc->sc_eswq = taskq_create("iwmes", 1, IPL_NET, 0);
+	if (sc->sc_eswq == NULL)
+		goto fail4;
 @
 
 

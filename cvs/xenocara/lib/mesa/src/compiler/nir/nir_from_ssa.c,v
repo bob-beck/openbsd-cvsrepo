@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	mesa-17_1_6:1.1.1.3
 	OPENBSD_6_1:1.1.1.2.0.2
 	OPENBSD_6_1_BASE:1.1.1.2
 	mesa-13_0_6:1.1.1.2
@@ -33,8 +34,14 @@ commitid	OwGfrJACrYJkCVJ4;
 1.1.1.2
 date	2016.12.11.08.33.49;	author jsg;	state Exp;
 branches;
-next	;
+next	1.1.1.3;
 commitid	uuv5VTS15jglEDZU;
+
+1.1.1.3
+date	2017.08.14.09.38.35;	author jsg;	state Exp;
+branches;
+next	;
+commitid	enNyoMGkcgwM3Ww6;
 
 
 desc
@@ -975,4 +982,283 @@ d801 1
 a801 1
    nir_foreach_function(function, shader) {
 @
+
+
+1.1.1.3
+log
+@Import Mesa 17.1.6
+@
+text
+@a28 1
+#include "nir_builder.h"
+d34 1
+a34 1
+ * Boissinot et al.
+d38 1
+a38 1
+   nir_builder builder;
+d43 1
+a43 1
+   bool progress;
+d66 2
+a67 2
+ * based on the concept of a "dominance forest" presented in "Fast Copy
+ * Coalescing and Live-Range Identification" by Budimlic et al. but the
+d69 1
+a69 1
+ * for Correctness, Code Quality, and Efficiency" by Boissinot et al.
+d74 2
+a75 2
+ * merge_nodes in dominance order of the ssa definitions.  (Since the
+ * liveness analysis pass indexes the SSA values in dominance order for us,
+d180 1
+a180 1
+ * Boissinot et al.
+d316 1
+a316 1
+   /* If we don't have any phis, then there's nothing for us to do. */
+a449 13
+static nir_register *
+create_reg_for_ssa_def(nir_ssa_def *def, nir_function_impl *impl)
+{
+   nir_register *reg = nir_local_reg_create(impl);
+
+   reg->name = def->name;
+   reg->num_components = def->num_components;
+   reg->bit_size = def->bit_size;
+   reg->num_array_elems = 0;
+
+   return reg;
+}
+
+d466 7
+a472 2
+      if (node->set->reg == NULL)
+         node->set->reg = create_reg_for_ssa_def(def, state->builder.impl);
+d485 5
+a489 1
+      reg = create_reg_for_ssa_def(def, state->builder.impl);
+a501 1
+      state->progress = true;
+d513 1
+a513 1
+   state->progress = true;
+d520 1
+a520 1
+static void
+a529 1
+         state->progress = true;
+d533 2
+d538 2
+a539 1
+emit_copy(nir_builder *b, nir_src src, nir_src dest_src)
+d550 1
+a550 1
+   nir_alu_instr *mov = nir_alu_instr_create(b->shader, nir_op_imov);
+d555 1
+a555 1
+   nir_builder_instr_insert(b, &mov->instr);
+d558 1
+a558 1
+/* Resolves a single parallel copy operation into a sequence of movs
+d561 1
+a561 1
+ * Correctness, Code Quality, and Efficiency" by Boissinot et al.
+a611 2
+   state->builder.cursor = nir_before_instr(&pcopy->instr);
+
+d675 1
+a675 1
+         emit_copy(&state->builder, values[loc[a]], values[b]);
+d701 1
+a701 1
+      nir_register *reg = nir_local_reg_create(state->builder.impl);
+d711 1
+a711 1
+      emit_copy(&state->builder, values[b], values[num_vals]);
+d754 1
+a754 1
+static bool
+d759 1
+a759 1
+   nir_builder_init(&state.builder, impl);
+d761 1
+a764 1
+   state.progress = false;
+a802 1
+   return state.progress;
+d805 1
+a805 1
+bool
+a807 2
+   bool progress = false;
+
+d810 1
+a810 33
+         progress |= nir_convert_from_ssa_impl(function->impl, phi_webs_only);
+   }
+
+   return progress;
+}
+
+
+static void
+place_phi_read(nir_shader *shader, nir_register *reg,
+               nir_ssa_def *def, nir_block *block)
+{
+   if (block != def->parent_instr->block) {
+      /* Try to go up the single-successor tree */
+      bool all_single_successors = true;
+      struct set_entry *entry;
+      set_foreach(block->predecessors, entry) {
+         nir_block *pred = (nir_block *)entry->key;
+         if (pred->successors[0] && pred->successors[1]) {
+            all_single_successors = false;
+            break;
+         }
+      }
+
+      if (all_single_successors) {
+         /* All predecessors of this block have exactly one successor and it
+          * is this block so they must eventually lead here without
+          * intersecting each other.  Place the reads in the predecessors
+          * instead of this block.
+          */
+         set_foreach(block->predecessors, entry)
+            place_phi_read(shader, reg, def, (nir_block *)entry->key);
+         return;
+      }
+a811 130
+
+   nir_alu_instr *mov = nir_alu_instr_create(shader, nir_op_imov);
+   mov->src[0].src = nir_src_for_ssa(def);
+   mov->dest.dest = nir_dest_for_reg(reg);
+   mov->dest.write_mask = (1 << reg->num_components) - 1;
+   nir_instr_insert(nir_after_block_before_jump(block), &mov->instr);
+}
+
+/** Lower all of the phi nodes in a block to imovs to and from a register
+ *
+ * This provides a very quick-and-dirty out-of-SSA pass that you can run on a
+ * single block to convert all of its phis to a register and some imovs.
+ * The code that is generated, while not optimal for actual codegen in a
+ * back-end, is easy to generate, correct, and will turn into the same set of
+ * phis after you call regs_to_ssa and do some copy propagation.
+ *
+ * The one intelligent thing this pass does is that it places the moves from
+ * the phi sources as high up the predecessor tree as possible instead of in
+ * the exact predecessor.  This means that, in particular, it will crawl into
+ * the deepest nesting of any if-ladders.  In order to ensure that doing so is
+ * safe, it stops as soon as one of the predecessors has multiple successors.
+ */
+bool
+nir_lower_phis_to_regs_block(nir_block *block)
+{
+   nir_function_impl *impl = nir_cf_node_get_function(&block->cf_node);
+   nir_shader *shader = impl->function->shader;
+
+   bool progress = false;
+   nir_foreach_instr_safe(instr, block) {
+      if (instr->type != nir_instr_type_phi)
+         break;
+
+      nir_phi_instr *phi = nir_instr_as_phi(instr);
+      assert(phi->dest.is_ssa);
+
+      nir_register *reg = create_reg_for_ssa_def(&phi->dest.ssa, impl);
+
+      nir_alu_instr *mov = nir_alu_instr_create(shader, nir_op_imov);
+      mov->src[0].src = nir_src_for_reg(reg);
+      mov->dest.write_mask = (1 << phi->dest.ssa.num_components) - 1;
+      nir_ssa_dest_init(&mov->instr, &mov->dest.dest,
+                        phi->dest.ssa.num_components, phi->dest.ssa.bit_size,
+                        phi->dest.ssa.name);
+      nir_instr_insert(nir_after_instr(&phi->instr), &mov->instr);
+
+      nir_ssa_def_rewrite_uses(&phi->dest.ssa,
+                               nir_src_for_ssa(&mov->dest.dest.ssa));
+
+      nir_foreach_phi_src(src, phi) {
+         assert(src->src.is_ssa);
+         place_phi_read(shader, reg, src->src.ssa, src->pred);
+      }
+
+      nir_instr_remove(&phi->instr);
+
+      progress = true;
+   }
+
+   return progress;
+}
+
+struct ssa_def_to_reg_state {
+   nir_function_impl *impl;
+   bool progress;
+};
+
+static bool
+dest_replace_ssa_with_reg(nir_dest *dest, void *void_state)
+{
+   struct ssa_def_to_reg_state *state = void_state;
+
+   if (!dest->is_ssa)
+      return true;
+
+   nir_register *reg = create_reg_for_ssa_def(&dest->ssa, state->impl);
+
+   nir_ssa_def_rewrite_uses(&dest->ssa, nir_src_for_reg(reg));
+
+   nir_instr *instr = dest->ssa.parent_instr;
+   *dest = nir_dest_for_reg(reg);
+   dest->reg.parent_instr = instr;
+   list_addtail(&dest->reg.def_link, &reg->defs);
+
+   state->progress = true;
+
+   return true;
+}
+
+/** Lower all of the SSA defs in a block to registers
+ *
+ * This performs the very simple operation of blindly replacing all of the SSA
+ * defs in the given block with registers.  If not used carefully, this may
+ * result in phi nodes with register sources which is technically invalid.
+ * Fortunately, the register-based into-SSA pass handles them anyway.
+ */
+bool
+nir_lower_ssa_defs_to_regs_block(nir_block *block)
+{
+   nir_function_impl *impl = nir_cf_node_get_function(&block->cf_node);
+   nir_shader *shader = impl->function->shader;
+
+   struct ssa_def_to_reg_state state = {
+      .impl = impl,
+      .progress = false,
+   };
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type == nir_instr_type_ssa_undef) {
+         /* Undefs are just a read of something never written. */
+         nir_ssa_undef_instr *undef = nir_instr_as_ssa_undef(instr);
+         nir_register *reg = create_reg_for_ssa_def(&undef->def, state.impl);
+         nir_ssa_def_rewrite_uses(&undef->def, nir_src_for_reg(reg));
+      } else if (instr->type == nir_instr_type_load_const) {
+         /* Constant loads are SSA-only, we need to insert a move */
+         nir_load_const_instr *load = nir_instr_as_load_const(instr);
+         nir_register *reg = create_reg_for_ssa_def(&load->def, state.impl);
+         nir_ssa_def_rewrite_uses(&load->def, nir_src_for_reg(reg));
+
+         nir_alu_instr *mov = nir_alu_instr_create(shader, nir_op_imov);
+         mov->src[0].src = nir_src_for_ssa(&load->def);
+         mov->dest.dest = nir_dest_for_reg(reg);
+         mov->dest.write_mask = (1 << reg->num_components) - 1;
+         nir_instr_insert(nir_after_instr(&load->instr), &mov->instr);
+      } else {
+         nir_foreach_dest(instr, dest_replace_ssa_with_reg, &state);
+      }
+   }
+
+   return state.progress;
+@
+
 

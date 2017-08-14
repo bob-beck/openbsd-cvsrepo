@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	mesa-17_1_6:1.1.1.4
 	OPENBSD_6_1:1.1.1.3.0.2
 	OPENBSD_6_1_BASE:1.1.1.3
 	mesa-13_0_6:1.1.1.3
@@ -36,8 +37,14 @@ commitid	vYSESphXPMoytdgU;
 1.1.1.3
 date	2017.03.25.00.15.19;	author jsg;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	YgkKuQ9hssScckR1;
+
+1.1.1.4
+date	2017.08.14.09.41.04;	author jsg;	state Exp;
+branches;
+next	;
+commitid	enNyoMGkcgwM3Ww6;
 
 
 desc
@@ -1931,6 +1938,818 @@ anv_invalidate_range(void *start, size_t size)
    __builtin_ia32_mfence();
 }
 
+@
+
+
+1.1.1.4
+log
+@Import Mesa 17.1.6
+@
+text
+@d46 1
+a46 1
+#include "compiler/brw_compiler.h"
+a58 4
+struct anv_buffer;
+struct anv_buffer_view;
+struct anv_image_view;
+
+d66 1
+a68 1
+#include "common/gen_debug.h"
+d71 3
+a73 14
+/* Allowing different clear colors requires us to perform a depth resolve at
+ * the end of certain render passes. This is because while slow clears store
+ * the clear color in the HiZ buffer, fast clears (without a resolve) don't.
+ * See the PRMs for examples describing when additional resolves would be
+ * necessary. To enable fast clears without requiring extra resolves, we set
+ * the clear value to a globally-defined one. We could allow different values
+ * if the user doesn't expect coherent data during or after a render passes
+ * (VK_ATTACHMENT_STORE_OP_DONT_CARE), but such users (aside from the CTS)
+ * don't seem to exist yet. In almost all Vulkan applications tested thus far,
+ * 1.0f seems to be the only value used. The only application that doesn't set
+ * this value does so through the usage of an seemingly uninitialized clear
+ * value.
+ */
+#define ANV_HZ_FC_VAL 1.0f
+d75 1
+a75 1
+#define MAX_VBS         28
+d83 1
+a83 4
+#define MAX_PUSH_DESCRIPTORS 32 /* Minimum requirement */
+
+#define ANV_SVGS_VB_INDEX    MAX_VBS
+#define ANV_DRAWID_VB_INDEX (MAX_VBS + 1)
+d85 1
+a155 13
+static inline union isl_color_value
+vk_to_isl_color(VkClearColorValue color)
+{
+   return (union isl_color_value) {
+      .u32 = {
+         color.uint32[0],
+         color.uint32[1],
+         color.uint32[2],
+         color.uint32[3],
+      },
+   };
+}
+
+d162 1
+a162 1
+   STATIC_ASSERT(sizeof(*src) == sizeof(*dest)); \
+d166 10
+a185 1
+#define anv_debug(format, ...) fprintf(stderr, "debug: " format, ##__VA_ARGS__)
+a188 1
+#define anv_debug(format, ...)
+a190 18
+/**
+ * Warn on ignored extension structs.
+ *
+ * The Vulkan spec requires us to ignore unsupported or unknown structs in
+ * a pNext chain.  In debug mode, emitting warnings for ignored structs may
+ * help us discover structs that we should not have ignored.
+ *
+ *
+ * From the Vulkan 1.0.38 spec:
+ *
+ *    Any component of the implementation (the loader, any enabled layers,
+ *    and drivers) must skip over, without processing (other than reading the
+ *    sType and pNext members) any chained structures with sType values not
+ *    defined by extensions supported by that component.
+ */
+#define anv_debug_ignored_stype(sType) \
+   anv_debug("debug: %s: ignored VkStructureType %u\n", __func__, (sType))
+
+a192 2
+void __anv_perf_warn(const char *file, int line, const char *format, ...)
+   anv_printflike(3, 4);
+d200 1
+a200 19
+   do { \
+      static bool reported = false; \
+      if (!reported) { \
+         __anv_finishme(__FILE__, __LINE__, format, ##__VA_ARGS__); \
+         reported = true; \
+      } \
+   } while (0)
+
+/**
+ * Print a perf warning message.  Set INTEL_DEBUG=perf to see these.
+ */
+#define anv_perf_warn(format, ...) \
+   do { \
+      static bool reported = false; \
+      if (!reported && unlikely(INTEL_DEBUG & DEBUG_PERF)) { \
+         __anv_perf_warn(__FILE__, __LINE__, format, ##__VA_ARGS__); \
+         reported = true; \
+      } \
+   } while (0)
+d212 3
+a214 15
+/* A multi-pointer allocator
+ *
+ * When copying data structures from the user (such as a render pass), it's
+ * common to need to allocate data for a bunch of different things.  Instead
+ * of doing several allocations and having to handle all of the error checking
+ * that entails, it can be easier to do a single allocation.  This struct
+ * helps facilitate that.  The intended usage looks like this:
+ *
+ *    ANV_MULTIALLOC(ma)
+ *    anv_multialloc_add(&ma, &main_ptr, 1);
+ *    anv_multialloc_add(&ma, &substruct1, substruct1Count);
+ *    anv_multialloc_add(&ma, &substruct2, substruct2Count);
+ *
+ *    if (!anv_multialloc_alloc(&ma, pAllocator, VK_ALLOCATION_SCOPE_FOO))
+ *       return vk_error(VK_ERROR_OUT_OF_HOST_MEORY);
+d216 5
+a220 3
+struct anv_multialloc {
+    size_t size;
+    size_t align;
+d222 2
+a223 3
+    uint32_t ptr_count;
+    void **ptrs[8];
+};
+d225 5
+a229 2
+#define ANV_MULTIALLOC_INIT \
+   ((struct anv_multialloc) { 0, })
+d231 5
+a235 68
+#define ANV_MULTIALLOC(_name) \
+   struct anv_multialloc _name = ANV_MULTIALLOC_INIT
+
+__attribute__((always_inline))
+static inline void
+_anv_multialloc_add(struct anv_multialloc *ma,
+                    void **ptr, size_t size, size_t align)
+{
+   size_t offset = align_u64(ma->size, align);
+   ma->size = offset + size;
+   ma->align = MAX2(ma->align, align);
+
+   /* Store the offset in the pointer. */
+   *ptr = (void *)(uintptr_t)offset;
+
+   assert(ma->ptr_count < ARRAY_SIZE(ma->ptrs));
+   ma->ptrs[ma->ptr_count++] = ptr;
+}
+
+#define anv_multialloc_add(_ma, _ptr, _count) \
+   _anv_multialloc_add((_ma), (void **)(_ptr), \
+                       (_count) * sizeof(**(_ptr)), __alignof__(**(_ptr)))
+
+__attribute__((always_inline))
+static inline void *
+anv_multialloc_alloc(struct anv_multialloc *ma,
+                     const VkAllocationCallbacks *alloc,
+                     VkSystemAllocationScope scope)
+{
+   void *ptr = vk_alloc(alloc, ma->size, ma->align, scope);
+   if (!ptr)
+      return NULL;
+
+   /* Fill out each of the pointers with their final value.
+    *
+    *   for (uint32_t i = 0; i < ma->ptr_count; i++)
+    *      *ma->ptrs[i] = ptr + (uintptr_t)*ma->ptrs[i];
+    *
+    * Unfortunately, even though ma->ptr_count is basically guaranteed to be a
+    * constant, GCC is incapable of figuring this out and unrolling the loop
+    * so we have to give it a little help.
+    */
+   STATIC_ASSERT(ARRAY_SIZE(ma->ptrs) == 8);
+#define _ANV_MULTIALLOC_UPDATE_POINTER(_i) \
+   if ((_i) < ma->ptr_count) \
+      *ma->ptrs[_i] = ptr + (uintptr_t)*ma->ptrs[_i]
+   _ANV_MULTIALLOC_UPDATE_POINTER(0);
+   _ANV_MULTIALLOC_UPDATE_POINTER(1);
+   _ANV_MULTIALLOC_UPDATE_POINTER(2);
+   _ANV_MULTIALLOC_UPDATE_POINTER(3);
+   _ANV_MULTIALLOC_UPDATE_POINTER(4);
+   _ANV_MULTIALLOC_UPDATE_POINTER(5);
+   _ANV_MULTIALLOC_UPDATE_POINTER(6);
+   _ANV_MULTIALLOC_UPDATE_POINTER(7);
+#undef _ANV_MULTIALLOC_UPDATE_POINTER
+
+   return ptr;
+}
+
+__attribute__((always_inline))
+static inline void *
+anv_multialloc_alloc2(struct anv_multialloc *ma,
+                      const VkAllocationCallbacks *parent_alloc,
+                      const VkAllocationCallbacks *alloc,
+                      VkSystemAllocationScope scope)
+{
+   return anv_multialloc_alloc(ma, alloc ? alloc : parent_alloc, scope);
+}
+d263 5
+a267 2
+   /** Flags to pass to the kernel through drm_i915_exec_object2::flags */
+   uint32_t flags;
+d278 1
+a278 1
+   bo->flags = 0;
+d345 2
+a346 2
+/* Block pools are backed by a fixed-size 1GB memfd */
+#define BLOCK_POOL_MEMFD_SIZE (1ul << 30)
+d372 1
+a372 1
+#define ANV_MAX_STATE_SIZE_LOG2 20
+d406 1
+d414 1
+a414 1
+anv_flush_range(void *start, size_t size)
+d416 7
+a423 1
+   anv_clflush_range(start, size);
+d426 2
+a427 2
+static inline void
+anv_invalidate_range(void *start, size_t size)
+d429 1
+a429 2
+   anv_clflush_range(start, size);
+   __builtin_ia32_mfence();
+d485 1
+a485 13
+struct anv_memory_type {
+   /* Standard bits passed on to the client */
+   VkMemoryPropertyFlags   propertyFlags;
+   uint32_t                heapIndex;
+
+   /* Driver-internal book-keeping */
+   VkBufferUsageFlags      valid_buffer_usage;
+};
+
+struct anv_memory_heap {
+   /* Standard bits passed on to the client */
+   VkDeviceSize      size;
+   VkMemoryHeapFlags flags;
+d487 1
+a487 3
+   /* Driver-internal book-keeping */
+   bool              supports_48bit_addresses;
+};
+d497 1
+a497 9
+    /** Amount of "GPU memory" we want to advertise
+     *
+     * Clearly, this value is bogus since Intel is a UMA architecture.  On
+     * gen7 platforms, we are limited by GTT size unless we want to implement
+     * fine-grained tracking and GTT splitting.  On Broadwell and above we are
+     * practically unlimited.  However, we will never report more than 3/4 of
+     * the total system ram to try and avoid running out of RAM.
+     */
+    bool                                        supports_48bit_addresses;
+a500 1
+    bool                                        has_exec_async;
+a504 13
+    uint8_t                                     uuid[VK_UUID_SIZE];
+
+    struct {
+      uint32_t                                  type_count;
+      struct anv_memory_type                    types[VK_MAX_MEMORY_TYPES];
+      uint32_t                                  heap_count;
+      struct anv_memory_heap                    heaps[VK_MAX_MEMORY_HEAPS];
+    } memory;
+
+    uint8_t                                     pipeline_cache_uuid[VK_UUID_SIZE];
+    uint8_t                                     driver_uuid[VK_UUID_SIZE];
+    uint8_t                                     device_uuid[VK_UUID_SIZE];
+
+a505 1
+    int                                         local_fd;
+a593 1
+    bool                                        lost;
+d596 1
+a596 8
+static void inline
+anv_state_flush(struct anv_device *device, struct anv_state state)
+{
+   if (device->info.has_llc)
+      return;
+
+   anv_flush_range(state.map, state.alloc_size);
+}
+a603 4
+VkResult anv_device_query_status(struct anv_device *device);
+VkResult anv_device_bo_busy(struct anv_device *device, struct anv_bo *bo);
+VkResult anv_device_wait(struct anv_device *device, struct anv_bo *bo,
+                         int64_t timeout);
+a610 1
+int anv_gem_busy(struct anv_device *device, uint32_t gem_handle);
+a617 2
+int anv_gem_get_context_param(int fd, int context, uint32_t param,
+                              uint64_t *value);
+a620 3
+bool anv_gem_supports_48b_addresses(int fd);
+int anv_gem_gpu_get_reset_stats(struct anv_device *device,
+                                uint32_t *active, uint32_t *pending);
+d641 1
+a641 1
+VkResult anv_reloc_list_add(struct anv_reloc_list *list,
+a671 9
+
+   /**
+    * Current error status of the command buffer. Used to track inconsistent
+    * or incomplete command buffer states that are the consequence of run-time
+    * errors such as out of memory scenarios. We want to track this in the
+    * batch because the command buffer object is not visible to some parts
+    * of the driver.
+    */
+   VkResult                                     status;
+a680 15
+static inline VkResult
+anv_batch_set_error(struct anv_batch *batch, VkResult error)
+{
+   assert(error != VK_SUCCESS);
+   if (batch->status == VK_SUCCESS)
+      batch->status = error;
+   return batch->status;
+}
+
+static inline bool
+anv_batch_has_error(struct anv_batch *batch)
+{
+   return batch->status != VK_SUCCESS;
+}
+
+d723 9
+a731 11
+#define anv_batch_emitn(batch, n, cmd, ...) ({             \
+      void *__dst = anv_batch_emit_dwords(batch, n);       \
+      if (__dst) {                                         \
+         struct cmd __template = {                         \
+            __anv_cmd_header(cmd),                         \
+           .DWordLength = n - __anv_cmd_length_bias(cmd),  \
+            __VA_ARGS__                                    \
+         };                                                \
+         __anv_cmd_pack(cmd)(batch, __dst, &__template);   \
+      }                                                    \
+      __dst;                                               \
+d738 1
+a738 1
+      STATIC_ASSERT(ARRAY_SIZE(dwords0) == ARRAY_SIZE(dwords1));        \
+a739 2
+      if (!dw)                                                          \
+         break;                                                         \
+d754 14
+d801 1
+a801 1
+   struct anv_memory_type *                     type;
+a875 11
+
+         /* Used to determine whether or not we need the surface state to have
+          * the auxiliary buffer enabled.
+          */
+         enum isl_aux_usage aux_usage;
+      };
+
+      struct {
+         struct anv_buffer *buffer;
+         uint64_t offset;
+         uint64_t range;
+a889 23
+struct anv_buffer_view {
+   enum isl_format format; /**< VkBufferViewCreateInfo::format */
+   struct anv_bo *bo;
+   uint32_t offset; /**< Offset into bo. */
+   uint64_t range; /**< VkBufferViewCreateInfo::range */
+
+   struct anv_state surface_state;
+   struct anv_state storage_surface_state;
+   struct anv_state writeonly_storage_surface_state;
+
+   struct brw_image_param storage_image_param;
+};
+
+struct anv_push_descriptor_set {
+   struct anv_descriptor_set set;
+
+   /* Put this field right behind anv_descriptor_set so it fills up the
+    * descriptors[0] field. */
+   struct anv_descriptor descriptors[MAX_PUSH_DESCRIPTORS];
+
+   struct anv_buffer_view buffer_views[MAX_PUSH_DESCRIPTORS];
+};
+
+a900 76
+enum anv_descriptor_template_entry_type {
+   ANV_DESCRIPTOR_TEMPLATE_ENTRY_TYPE_IMAGE,
+   ANV_DESCRIPTOR_TEMPLATE_ENTRY_TYPE_BUFFER,
+   ANV_DESCRIPTOR_TEMPLATE_ENTRY_TYPE_BUFFER_VIEW
+};
+
+struct anv_descriptor_template_entry {
+   /* The type of descriptor in this entry */
+   VkDescriptorType type;
+
+   /* Binding in the descriptor set */
+   uint32_t binding;
+
+   /* Offset at which to write into the descriptor set binding */
+   uint32_t array_element;
+
+   /* Number of elements to write into the descriptor set binding */
+   uint32_t array_count;
+
+   /* Offset into the user provided data */
+   size_t offset;
+
+   /* Stride between elements into the user provided data */
+   size_t stride;
+};
+
+struct anv_descriptor_update_template {
+   /* The descriptor set this template corresponds to. This value is only
+    * valid if the template was created with the templateType
+    * VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET_KHR.
+    */
+   uint8_t set;
+
+   /* Number of entries in this template */
+   uint32_t entry_count;
+
+   /* Entries of the template */
+   struct anv_descriptor_template_entry entries[0];
+};
+
+size_t
+anv_descriptor_set_layout_size(const struct anv_descriptor_set_layout *layout);
+
+void
+anv_descriptor_set_write_image_view(struct anv_descriptor_set *set,
+                                    const struct gen_device_info * const devinfo,
+                                    const VkDescriptorImageInfo * const info,
+                                    VkDescriptorType type,
+                                    uint32_t binding,
+                                    uint32_t element);
+
+void
+anv_descriptor_set_write_buffer_view(struct anv_descriptor_set *set,
+                                     VkDescriptorType type,
+                                     struct anv_buffer_view *buffer_view,
+                                     uint32_t binding,
+                                     uint32_t element);
+
+void
+anv_descriptor_set_write_buffer(struct anv_descriptor_set *set,
+                                struct anv_device *device,
+                                struct anv_state_stream *alloc_stream,
+                                VkDescriptorType type,
+                                struct anv_buffer *buffer,
+                                uint32_t binding,
+                                uint32_t element,
+                                VkDeviceSize offset,
+                                VkDeviceSize range);
+
+void
+anv_descriptor_set_write_template(struct anv_descriptor_set *set,
+                                  struct anv_device *device,
+                                  struct anv_state_stream *alloc_stream,
+                                  const struct anv_descriptor_update_template *template,
+                                  const void *data);
+
+a925 6
+
+   /* Input attachment index (relative to the subpass) */
+   uint8_t input_attachment_index;
+
+   /* For a storage image, whether it is write-only */
+   bool write_only;
+a953 12
+static inline uint64_t
+anv_buffer_get_range(struct anv_buffer *buffer, uint64_t offset, uint64_t range)
+{
+   assert(offset <= buffer->size);
+   if (range == VK_WHOLE_SIZE) {
+      return buffer->size - offset;
+   } else {
+      assert(range <= buffer->size);
+      return range;
+   }
+}
+
+a1009 59
+static inline enum anv_pipe_bits
+anv_pipe_flush_bits_for_access_flags(VkAccessFlags flags)
+{
+   enum anv_pipe_bits pipe_bits = 0;
+
+   unsigned b;
+   for_each_bit(b, flags) {
+      switch ((VkAccessFlagBits)(1 << b)) {
+      case VK_ACCESS_SHADER_WRITE_BIT:
+         pipe_bits |= ANV_PIPE_DATA_CACHE_FLUSH_BIT;
+         break;
+      case VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT:
+         pipe_bits |= ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT;
+         break;
+      case VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:
+         pipe_bits |= ANV_PIPE_DEPTH_CACHE_FLUSH_BIT;
+         break;
+      case VK_ACCESS_TRANSFER_WRITE_BIT:
+         pipe_bits |= ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT;
+         pipe_bits |= ANV_PIPE_DEPTH_CACHE_FLUSH_BIT;
+         break;
+      default:
+         break; /* Nothing to do */
+      }
+   }
+
+   return pipe_bits;
+}
+
+static inline enum anv_pipe_bits
+anv_pipe_invalidate_bits_for_access_flags(VkAccessFlags flags)
+{
+   enum anv_pipe_bits pipe_bits = 0;
+
+   unsigned b;
+   for_each_bit(b, flags) {
+      switch ((VkAccessFlagBits)(1 << b)) {
+      case VK_ACCESS_INDIRECT_COMMAND_READ_BIT:
+      case VK_ACCESS_INDEX_READ_BIT:
+      case VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT:
+         pipe_bits |= ANV_PIPE_VF_CACHE_INVALIDATE_BIT;
+         break;
+      case VK_ACCESS_UNIFORM_READ_BIT:
+         pipe_bits |= ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT;
+         pipe_bits |= ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT;
+         break;
+      case VK_ACCESS_SHADER_READ_BIT:
+      case VK_ACCESS_INPUT_ATTACHMENT_READ_BIT:
+      case VK_ACCESS_TRANSFER_READ_BIT:
+         pipe_bits |= ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT;
+         break;
+      default:
+         break; /* Nothing to do */
+      }
+   }
+
+   return pipe_bits;
+}
+
+d1032 6
+a1095 6
+   enum isl_aux_usage                           aux_usage;
+   enum isl_aux_usage                           input_aux_usage;
+   struct anv_state                             color_rt_state;
+   struct anv_state                             input_att_state;
+
+   VkImageLayout                                current_layout;
+a1096 1
+   bool                                         fast_clear;
+a1097 1
+   bool                                         clear_color_is_zero_one;
+a1122 1
+   uint32_t                                     dynamic_offsets[MAX_DYNAMIC_BUFFERS];
+a1129 16
+   struct anv_push_descriptor_set               push_descriptor;
+
+   /**
+    * Whether or not the gen8 PMA fix is enabled.  We ensure that, at the top
+    * of any command buffer it is disabled by disabling it in EndCommandBuffer
+    * and before invoking the secondary in ExecuteCommands.
+    */
+   bool                                         pma_fix_enabled;
+
+   /**
+    * Whether or not we know for certain that HiZ is enabled for the current
+    * subpass.  If, for whatever reason, we are unsure as to whether HiZ is
+    * enabled or not, this will be false.
+    */
+   bool                                         hiz_enabled;
+
+a1135 13
+   /**
+    * Surface states for color render targets.  These are stored in a single
+    * flat array.  For depth-stencil attachments, the surface state is simply
+    * left blank.
+    */
+   struct anv_state                             render_pass_states;
+
+   /**
+    * A null surface state of the right size to match the framebuffer.  This
+    * is one of the states in render_pass_states.
+    */
+   struct anv_state                             null_surface_state;
+
+d1251 2
+a1252 6
+void anv_cmd_buffer_setup_attachments(struct anv_cmd_buffer *cmd_buffer,
+                                      struct anv_render_pass *pass,
+                                      struct anv_framebuffer *framebuffer,
+                                      const VkClearValue *clear_values);
+
+void anv_cmd_buffer_emit_state_base_address(struct anv_cmd_buffer *cmd_buffer);
+a1265 6
+VkResult
+anv_cmd_buffer_alloc_blorp_binding_table(struct anv_cmd_buffer *cmd_buffer,
+                                         uint32_t num_entries,
+                                         uint32_t *state_offset,
+                                         struct anv_state *bt_state);
+
+d1369 1
+a1369 1
+   assert(shader && shader->ref_cnt >= 1);
+d1376 1
+a1376 1
+   assert(shader && shader->ref_cnt >= 1);
+d1402 5
+a1415 4
+   bool                                         writes_depth;
+   bool                                         depth_test_enable;
+   bool                                         writes_stencil;
+   bool                                         stencil_test_enable;
+a1416 2
+   bool                                         sample_shading_enable;
+   bool                                         kill_pixel;
+a1431 2
+
+   uint32_t                                     interface_descriptor_data[8];
+d1443 1
+a1443 1
+get_##prefix##_prog_data(const struct anv_pipeline *pipeline)        \
+a1453 2
+ANV_DECL_GET_PROG_DATA_FUNC(tcs, MESA_SHADER_TESS_CTRL)
+ANV_DECL_GET_PROG_DATA_FUNC(tes, MESA_SHADER_TESS_EVAL)
+a1457 11
+static inline const struct brw_vue_prog_data *
+anv_pipeline_get_last_vue_prog_data(const struct anv_pipeline *pipeline)
+{
+   if (anv_pipeline_has_stage(pipeline, MESA_SHADER_GEOMETRY))
+      return &get_gs_prog_data(pipeline)->base;
+   else if (anv_pipeline_has_stage(pipeline, MESA_SHADER_TESS_EVAL))
+      return &get_tes_prog_data(pipeline)->base;
+   else
+      return &get_vs_prog_data(pipeline)->base;
+}
+
+a1487 15
+static inline struct isl_swizzle
+anv_swizzle_for_render(struct isl_swizzle swizzle)
+{
+   /* Sometimes the swizzle will have alpha map to one.  We do this to fake
+    * RGB as RGBA for texturing
+    */
+   assert(swizzle.a == ISL_CHANNEL_SELECT_ONE ||
+          swizzle.a == ISL_CHANNEL_SELECT_ALPHA);
+
+   /* But it doesn't matter what we render to that channel */
+   swizzle.a = ISL_CHANNEL_SELECT_ALPHA;
+
+   return swizzle;
+}
+
+a1545 9
+   /**
+    * For color images, this is the aux usage for this image when not used as a
+    * color attachment.
+    *
+    * For depth/stencil images, this is set to ISL_AUX_USAGE_HIZ if the image
+    * has a HiZ buffer.
+    */
+   enum isl_aux_usage aux_usage;
+
+d1549 6
+a1554 10
+/* Returns true if a HiZ-enabled depth buffer can be sampled from. */
+static inline bool
+anv_can_sample_with_hiz(const struct gen_device_info * const devinfo,
+                        const VkImageAspectFlags aspect_mask,
+                        const uint32_t samples)
+{
+   /* Validate the inputs. */
+   assert(devinfo && aspect_mask && samples);
+   return devinfo->gen >= 8 && (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+          samples == 1;
+a1556 24
+void
+anv_gen8_hiz_op_resolve(struct anv_cmd_buffer *cmd_buffer,
+                        const struct anv_image *image,
+                        enum blorp_hiz_op op);
+
+void
+anv_image_ccs_clear(struct anv_cmd_buffer *cmd_buffer,
+                    const struct anv_image *image,
+                    const struct isl_view *view,
+                    const VkImageSubresourceRange *subresourceRange);
+
+enum isl_aux_usage
+anv_layout_to_aux_usage(const struct gen_device_info * const devinfo,
+                        const struct anv_image *image,
+                        const VkImageAspectFlags aspects,
+                        const VkImageLayout layout);
+
+/* This is defined as a macro so that it works for both
+ * VkImageSubresourceRange and VkImageSubresourceLayers
+ */
+#define anv_get_layerCount(_image, _range) \
+   ((_range)->layerCount == VK_REMAINING_ARRAY_LAYERS ? \
+    (_image)->array_size - (_range)->baseArrayLayer : (_range)->layerCount)
+
+d1577 3
+d1583 1
+a1583 11
+   /**
+    * RENDER_SURFACE_STATE when using image as a sampler surface with the
+    * auxiliary buffer disabled.
+    */
+   struct anv_state no_aux_sampler_surface_state;
+
+   /**
+    * RENDER_SURFACE_STATE when using image as a storage image. Separate states
+    * for write-only and readable, using the real format for write-only and the
+    * lowered format for readable.
+    */
+a1584 1
+   struct anv_state writeonly_storage_surface_state;
+d1607 22
+a1691 7
+   uint32_t                                     attachment_count;
+
+   /**
+    * A pointer to all attachment references used in this subpass.
+    * Only valid if ::attachment_count > 0.
+    */
+   VkAttachmentReference *                      attachments;
+d1693 1
+a1693 1
+   VkAttachmentReference *                      input_attachments;
+d1695 3
+a1697 7
+   VkAttachmentReference *                      color_attachments;
+   VkAttachmentReference *                      resolve_attachments;
+
+   VkAttachmentReference                        depth_stencil_attachment;
+
+   /** Subpass has a depth/stencil self-dependency */
+   bool                                         has_ds_self_dep;
+a1702 7
+enum anv_subpass_usage {
+   ANV_SUBPASS_USAGE_DRAW =         (1 << 0),
+   ANV_SUBPASS_USAGE_INPUT =        (1 << 1),
+   ANV_SUBPASS_USAGE_RESOLVE_SRC =  (1 << 2),
+   ANV_SUBPASS_USAGE_RESOLVE_DST =  (1 << 3),
+};
+
+a1703 3
+   /* TODO: Consider using VkAttachmentDescription instead of storing each of
+    * its members individually.
+    */
+a1705 1
+   VkImageUsageFlags                            usage;
+a1708 8
+   VkImageLayout                                initial_layout;
+   VkImageLayout                                final_layout;
+
+   /* An array, indexed by subpass id, of how the attachment will be used. */
+   enum anv_subpass_usage *                     subpass_usage;
+
+   /* The subpass id in which the attachment will be used last. */
+   uint32_t                                     last_subpass_idx;
+d1714 1
+a1714 3
+   VkAttachmentReference *                      subpass_attachments;
+   /* An array of subpass_count+1 flushes, one per subpass boundary */
+   enum anv_pipe_bits *                         subpass_flushes;
+d1719 5
+a1723 1
+#define ANV_PIPELINE_STATISTICS_MASK 0x000007ff
+a1726 4
+   VkQueryPipelineStatisticFlags                pipeline_statistics;
+   /** Stride between slots, in bytes */
+   uint32_t                                     stride;
+   /** Number of slots in this query pool */
+a1748 15
+static inline uint32_t
+anv_get_subpass_id(const struct anv_cmd_state * const cmd_state)
+{
+   /* This function must be called from within a subpass. */
+   assert(cmd_state->pass && cmd_state->subpass);
+
+   const uint32_t subpass_id = cmd_state->subpass - cmd_state->pass->subpasses;
+
+   /* The id of this subpass shouldn't exceed the number of subpasses in this
+    * render pass minus 1.
+    */
+   assert(subpass_id < cmd_state->pass->subpass_count);
+   return subpass_id;
+}
+
+a1791 1
+ANV_DEFINE_NONDISP_HANDLE_CASTS(anv_descriptor_update_template, VkDescriptorUpdateTemplateKHR)
+d1806 15
+d1837 4
 @
 
 

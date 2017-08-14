@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	mesa-17_1_6:1.1.1.4
 	OPENBSD_6_1:1.1.1.3.0.2
 	OPENBSD_6_1_BASE:1.1.1.3
 	mesa-13_0_6:1.1.1.3
@@ -43,8 +44,14 @@ commitid	OwGfrJACrYJkCVJ4;
 1.1.1.3
 date	2016.12.11.08.27.37;	author jsg;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	uuv5VTS15jglEDZU;
+
+1.1.1.4
+date	2017.08.14.09.32.19;	author jsg;	state Exp;
+branches;
+next	;
+commitid	enNyoMGkcgwM3Ww6;
 
 
 desc
@@ -488,6 +495,531 @@ vc4_simulator_destroy(struct vc4_screen *screen)
                 sim_mem_base = NULL;
         }
         mtx_unlock(&exec_mutex);
+@
+
+
+1.1.1.4
+log
+@Import Mesa 17.1.6
+@
+text
+@a23 25
+/**
+ * @@file vc4_simulator.c
+ *
+ * Implements VC4 simulation on top of a non-VC4 GEM fd.
+ *
+ * This file's goal is to emulate the VC4 ioctls' behavior in the kernel on
+ * top of the simpenrose software simulator.  Generally, VC4 driver BOs have a
+ * GEM-side copy of their contents and a simulator-side memory area that the
+ * GEM contents get copied into during simulation.  Once simulation is done,
+ * the simulator's data is copied back out to the GEM BOs, so that rendering
+ * appears on the screen as if actual hardware rendering had been done.
+ *
+ * One of the limitations of this code is that we shouldn't really need a
+ * GEM-side BO for non-window-system BOs.  However, do we need unique BO
+ * handles for each of our GEM bos so that this file can look up its state
+ * from the handle passed in at submit ioctl time (also, a couple of places
+ * outside of this file still call ioctls directly on the fd).
+ *
+ * Another limitation is that BO import doesn't work unless the underlying
+ * window system's BO size matches what VC4 is going to use, which of course
+ * doesn't work out in practice.  This means that for now, only DRI3 (VC4
+ * makes the winsys BOs) is supported, not DRI2 (window system makes the winys
+ * BOs).
+ */
+
+a25 2
+#include <sys/mman.h>
+#include "xf86drm.h"
+a26 1
+#include "util/u_mm.h"
+d35 1
+a35 57
+/** Global (across GEM fds) state for the simulator */
+static struct vc4_simulator_state {
+        mtx_t mutex;
+
+        void *mem;
+        ssize_t mem_size;
+        struct mem_block *heap;
+        struct mem_block *overflow;
+
+        /** Mapping from GEM handle to struct vc4_simulator_bo * */
+        struct hash_table *fd_map;
+
+        int refcount;
+} sim_state = {
+        .mutex = _MTX_INITIALIZER_NP,
+};
+
+/** Per-GEM-fd state for the simulator. */
+struct vc4_simulator_file {
+        int fd;
+
+        /* This is weird -- we make a "vc4_device" per file, even though on
+         * the kernel side this is a global.  We do this so that kernel code
+         * calling us for BO allocation can get to our screen.
+         */
+        struct drm_device dev;
+
+        /** Mapping from GEM handle to struct vc4_simulator_bo * */
+        struct hash_table *bo_map;
+};
+
+/** Wrapper for drm_vc4_bo tracking the simulator-specific state. */
+struct vc4_simulator_bo {
+        struct drm_vc4_bo base;
+        struct vc4_simulator_file *file;
+
+        /** Area for this BO within sim_state->mem */
+        struct mem_block *block;
+        void *winsys_map;
+        uint32_t winsys_stride;
+
+        int handle;
+};
+
+static void *
+int_to_key(int key)
+{
+        return (void *)(uintptr_t)key;
+}
+
+static struct vc4_simulator_file *
+vc4_get_simulator_file_for_fd(int fd)
+{
+        struct hash_entry *entry = _mesa_hash_table_search(sim_state.fd_map,
+                                                           int_to_key(fd + 1));
+        return entry ? entry->data : NULL;
+}
+d42 1
+a42 1
+#define PAGE_ALIGN2		12
+d44 2
+a45 6
+/**
+ * Allocates space in simulator memory and returns a tracking struct for it
+ * that also contains the drm_gem_cma_object struct.
+ */
+static struct vc4_simulator_bo *
+vc4_create_simulator_bo(int fd, int handle, unsigned size)
+d47 5
+a51 14
+        struct vc4_simulator_file *file = vc4_get_simulator_file_for_fd(fd);
+        struct vc4_simulator_bo *sim_bo = rzalloc(file,
+                                                  struct vc4_simulator_bo);
+        struct drm_vc4_bo *bo = &sim_bo->base;
+        struct drm_gem_cma_object *obj = &bo->base;
+        size = align(size, 4096);
+
+        sim_bo->file = file;
+        sim_bo->handle = handle;
+
+        mtx_lock(&sim_state.mutex);
+        sim_bo->block = u_mmAllocMem(sim_state.heap, size + 4, PAGE_ALIGN2, 0);
+        mtx_unlock(&sim_state.mutex);
+        assert(sim_bo->block);
+d53 1
+d55 2
+a56 2
+        obj->base.dev = &file->dev;
+        obj->vaddr = sim_state.mem + sim_bo->block->ofs;
+d59 3
+a61 13
+        *(uint32_t *)(obj->vaddr + size) = BO_SENTINEL;
+
+        /* A handle of 0 is used for vc4_gem.c internal allocations that
+         * don't need to go in the lookup table.
+         */
+        if (handle != 0) {
+                mtx_lock(&sim_state.mutex);
+                _mesa_hash_table_insert(file->bo_map, int_to_key(handle), bo);
+                mtx_unlock(&sim_state.mutex);
+        }
+
+        return sim_bo;
+}
+d63 1
+a63 21
+static void
+vc4_free_simulator_bo(struct vc4_simulator_bo *sim_bo)
+{
+        struct vc4_simulator_file *sim_file = sim_bo->file;
+        struct drm_vc4_bo *bo = &sim_bo->base;
+        struct drm_gem_cma_object *obj = &bo->base;
+
+        if (sim_bo->winsys_map)
+                munmap(sim_bo->winsys_map, obj->base.size);
+
+        mtx_lock(&sim_state.mutex);
+        u_mmFreeMem(sim_bo->block);
+        if (sim_bo->handle) {
+                struct hash_entry *entry =
+                        _mesa_hash_table_search(sim_file->bo_map,
+                                                int_to_key(sim_bo->handle));
+                _mesa_hash_table_remove(sim_file->bo_map, entry);
+        }
+        mtx_unlock(&sim_state.mutex);
+        ralloc_free(sim_bo);
+}
+d65 1
+a65 9
+static struct vc4_simulator_bo *
+vc4_get_simulator_bo(struct vc4_simulator_file *file, int gem_handle)
+{
+        mtx_lock(&sim_state.mutex);
+        struct hash_entry *entry =
+                _mesa_hash_table_search(file->bo_map, int_to_key(gem_handle));
+        mtx_unlock(&sim_state.mutex);
+
+        return entry ? entry->data : NULL;
+d71 5
+a75 4
+        struct vc4_screen *screen = dev->screen;
+        struct vc4_simulator_bo *sim_bo = vc4_create_simulator_bo(screen->fd,
+                                                                  0, size);
+        return &sim_bo->base.base;
+a81 2
+        int fd = dev->screen->fd;
+        struct vc4_simulator_file *file = vc4_get_simulator_file_for_fd(fd);
+d89 1
+a89 4
+                struct vc4_simulator_bo *sim_bo =
+                        vc4_get_simulator_bo(file, bo->handle);
+                struct drm_vc4_bo *drm_bo = &sim_bo->base;
+                struct drm_gem_cma_object *obj = &drm_bo->base;
+d91 1
+a91 1
+                drm_bo->bo = bo;
+d121 1
+a121 2
+                assert(*(uint32_t *)(obj->vaddr +
+                                     obj->base.size) == BO_SENTINEL);
+d128 1
+d197 2
+a198 2
+        bo_state[i].paddr = sim_state.overflow->ofs;
+        bo_state[i].size = sim_state.overflow->size;
+d214 2
+a215 2
+        void *overflow = calloc(1, sim_state.overflow->size);
+        fwrite(overflow, 1, sim_state.overflow->size, f);
+a227 2
+        int fd = screen->fd;
+        struct vc4_simulator_file *file = vc4_get_simulator_file_for_fd(fd);
+d230 1
+a230 2
+        struct vc4_simulator_bo *csim_bo = ctex ? vc4_get_simulator_bo(file, ctex->bo->handle) : NULL;
+        uint32_t winsys_stride = ctex ? csim_bo->winsys_stride : 0;
+d234 5
+a238 1
+        struct drm_device *dev = &file->dev;
+d244 1
+a244 1
+        if (ctex && csim_bo->winsys_map) {
+d255 1
+a255 1
+                               csim_bo->winsys_map + y * winsys_stride,
+d272 1
+a272 1
+                vc4_dump_cl(sim_state.mem + exec.ct1ca,
+d284 1
+a284 1
+                        vc4_dump_cl(sim_state.mem + exec.ct0ca,
+d294 1
+a294 1
+                vc4_dump_cl(sim_state.mem + exec.ct1ca,
+a304 2
+                struct vc4_simulator_bo *sim_bo = (struct vc4_simulator_bo *)bo;
+                struct drm_gem_cma_object *obj = &sim_bo->base.base;
+d306 1
+a306 1
+                assert(*(uint32_t *)(obj->vaddr + obj->base.size) ==
+d308 2
+a309 1
+                vc4_free_simulator_bo(sim_bo);
+d312 1
+a312 1
+        if (ctex && csim_bo->winsys_map) {
+d314 1
+a314 1
+                        memcpy(csim_bo->winsys_map + y * winsys_stride,
+d323 3
+a325 10
+/**
+ * Map the underlying GEM object from the real hardware GEM handle.
+ */
+static void *
+vc4_simulator_map_winsys_bo(int fd, struct vc4_simulator_bo *sim_bo)
+{
+        struct drm_vc4_bo *bo = &sim_bo->base;
+        struct drm_gem_cma_object *obj = &bo->base;
+        int ret;
+        void *map;
+d327 2
+a328 112
+        struct drm_mode_map_dumb map_dumb = {
+                .handle = sim_bo->handle,
+        };
+        ret = drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map_dumb);
+        if (ret != 0) {
+                fprintf(stderr, "map ioctl failure\n");
+                abort();
+        }
+
+        map = mmap(NULL, obj->base.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd, map_dumb.offset);
+        if (map == MAP_FAILED) {
+                fprintf(stderr,
+                        "mmap of bo %d (offset 0x%016llx, size %d) failed\n",
+                        sim_bo->handle, (long long)map_dumb.offset,
+                        (int)obj->base.size);
+                abort();
+        }
+
+        return map;
+}
+
+/**
+ * Do fixups after a BO has been opened from a handle.
+ *
+ * This could be done at DRM_IOCTL_GEM_OPEN/DRM_IOCTL_GEM_PRIME_FD_TO_HANDLE
+ * time, but we're still using drmPrimeFDToHandle() so we have this helper to
+ * be called afterward instead.
+ */
+void vc4_simulator_open_from_handle(int fd, uint32_t winsys_stride,
+                                    int handle, uint32_t size)
+{
+        struct vc4_simulator_bo *sim_bo =
+                vc4_create_simulator_bo(fd, handle, size);
+
+        sim_bo->winsys_stride = winsys_stride;
+        sim_bo->winsys_map = vc4_simulator_map_winsys_bo(fd, sim_bo);
+}
+
+/**
+ * Simulated ioctl(fd, DRM_VC4_CREATE_BO) implementation.
+ *
+ * Making a VC4 BO is just a matter of making a corresponding BO on the host.
+ */
+static int
+vc4_simulator_create_bo_ioctl(int fd, struct drm_vc4_create_bo *args)
+{
+        int ret;
+        struct drm_mode_create_dumb create = {
+                .width = 128,
+                .bpp = 8,
+                .height = (args->size + 127) / 128,
+        };
+
+        ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &create);
+        assert(create.size >= args->size);
+
+        args->handle = create.handle;
+
+        vc4_create_simulator_bo(fd, create.handle, args->size);
+
+        return ret;
+}
+
+/**
+ * Simulated ioctl(fd, DRM_VC4_CREATE_SHADER_BO) implementation.
+ *
+ * In simulation we defer shader validation until exec time.  Just make a host
+ * BO and memcpy the contents in.
+ */
+static int
+vc4_simulator_create_shader_bo_ioctl(int fd,
+                                     struct drm_vc4_create_shader_bo *args)
+{
+        int ret;
+        struct drm_mode_create_dumb create = {
+                .width = 128,
+                .bpp = 8,
+                .height = (args->size + 127) / 128,
+        };
+
+        ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &create);
+        if (ret)
+                return ret;
+        assert(create.size >= args->size);
+
+        args->handle = create.handle;
+
+        vc4_create_simulator_bo(fd, create.handle, args->size);
+
+        struct drm_mode_map_dumb map = {
+                .handle = create.handle
+        };
+        ret = drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map);
+        if (ret)
+                return ret;
+
+        void *shader = mmap(NULL, args->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                            fd, map.offset);
+        memcpy(shader, (void *)(uintptr_t)args->data, args->size);
+        munmap(shader, args->size);
+
+        return 0;
+}
+
+/**
+ * Simulated ioctl(fd, DRM_VC4_MMAP_BO) implementation.
+ *
+ * We just pass this straight through to dumb mmap.
+ */
+static int
+vc4_simulator_mmap_bo_ioctl(int fd, struct drm_vc4_mmap_bo *args)
+d330 5
+a334 91
+        int ret;
+        struct drm_mode_map_dumb map = {
+                .handle = args->handle,
+        };
+
+        ret = drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map);
+        args->offset = map.offset;
+
+        return ret;
+}
+
+static int
+vc4_simulator_gem_close_ioctl(int fd, struct drm_gem_close *args)
+{
+        /* Free the simulator's internal tracking. */
+        struct vc4_simulator_file *file = vc4_get_simulator_file_for_fd(fd);
+        struct vc4_simulator_bo *sim_bo = vc4_get_simulator_bo(file,
+                                                               args->handle);
+
+        vc4_free_simulator_bo(sim_bo);
+
+        /* Pass the call on down. */
+        return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, args);
+}
+
+static int
+vc4_simulator_get_param_ioctl(int fd, struct drm_vc4_get_param *args)
+{
+        switch (args->param) {
+        case DRM_VC4_PARAM_SUPPORTS_BRANCHES:
+        case DRM_VC4_PARAM_SUPPORTS_ETC1:
+        case DRM_VC4_PARAM_SUPPORTS_THREADED_FS:
+                args->value = true;
+                return 0;
+
+        case DRM_VC4_PARAM_V3D_IDENT0:
+                args->value = 0x02000000;
+                return 0;
+
+        case DRM_VC4_PARAM_V3D_IDENT1:
+                args->value = 0x00000001;
+                return 0;
+
+        default:
+                fprintf(stderr, "Unknown DRM_IOCTL_VC4_GET_PARAM(%lld)\n",
+                        (long long)args->param);
+                abort();
+        };
+}
+
+int
+vc4_simulator_ioctl(int fd, unsigned long request, void *args)
+{
+        switch (request) {
+        case DRM_IOCTL_VC4_CREATE_BO:
+                return vc4_simulator_create_bo_ioctl(fd, args);
+        case DRM_IOCTL_VC4_CREATE_SHADER_BO:
+                return vc4_simulator_create_shader_bo_ioctl(fd, args);
+        case DRM_IOCTL_VC4_MMAP_BO:
+                return vc4_simulator_mmap_bo_ioctl(fd, args);
+
+        case DRM_IOCTL_VC4_WAIT_BO:
+        case DRM_IOCTL_VC4_WAIT_SEQNO:
+                /* We do all of the vc4 rendering synchronously, so we just
+                 * return immediately on the wait ioctls.  This ignores any
+                 * native rendering to the host BO, so it does mean we race on
+                 * front buffer rendering.
+                 */
+                return 0;
+
+        case DRM_IOCTL_VC4_GET_PARAM:
+                return vc4_simulator_get_param_ioctl(fd, args);
+
+        case DRM_IOCTL_GEM_CLOSE:
+                return vc4_simulator_gem_close_ioctl(fd, args);
+
+        case DRM_IOCTL_GEM_OPEN:
+        case DRM_IOCTL_GEM_FLINK:
+                return drmIoctl(fd, request, args);
+        default:
+                fprintf(stderr, "Unknown ioctl 0x%08x\n", (int)request);
+                abort();
+        }
+}
+
+static void
+vc4_simulator_init_global(void)
+{
+        mtx_lock(&sim_state.mutex);
+        if (sim_state.refcount++) {
+                mtx_unlock(&sim_state.mutex);
+d338 2
+a339 3
+        sim_state.mem_size = 256 * 1024 * 1024;
+        sim_state.mem = calloc(sim_state.mem_size, 1);
+        if (!sim_state.mem)
+d341 3
+a343 1
+        sim_state.heap = u_mmInit(0, sim_state.mem_size);
+d348 2
+a349 1
+        simpenrose_init_hardware_supply_mem(sim_state.mem, sim_state.mem_size);
+d358 1
+a358 29
+        sim_state.overflow = u_mmAllocMem(sim_state.heap, 32 * 1024 * 1024,
+                                          PAGE_ALIGN2, 0);
+        simpenrose_supply_overflow_mem(sim_state.overflow->ofs,
+                                       sim_state.overflow->size);
+
+        mtx_unlock(&sim_state.mutex);
+
+        sim_state.fd_map =
+                _mesa_hash_table_create(NULL,
+                                        _mesa_hash_pointer,
+                                        _mesa_key_pointer_equal);
+}
+
+void
+vc4_simulator_init(struct vc4_screen *screen)
+{
+        vc4_simulator_init_global();
+
+        screen->sim_file = rzalloc(screen, struct vc4_simulator_file);
+
+        screen->sim_file->bo_map =
+                _mesa_hash_table_create(screen->sim_file,
+                                        _mesa_hash_pointer,
+                                        _mesa_key_pointer_equal);
+
+        mtx_lock(&sim_state.mutex);
+        _mesa_hash_table_insert(sim_state.fd_map, int_to_key(screen->fd + 1),
+                                screen->sim_file);
+        mtx_unlock(&sim_state.mutex);
+d360 1
+a360 1
+        screen->sim_file->dev.screen = screen;
+d366 4
+a369 6
+        mtx_lock(&sim_state.mutex);
+        if (!--sim_state.refcount) {
+                _mesa_hash_table_destroy(sim_state.fd_map, NULL);
+                u_mmDestroy(sim_state.heap);
+                free(sim_state.mem);
+                /* No memsetting it, because it contains the mutex. */
+d371 1
+a371 1
+        mtx_unlock(&sim_state.mutex);
 @
 
 

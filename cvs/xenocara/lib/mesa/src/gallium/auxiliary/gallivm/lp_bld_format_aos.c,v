@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	mesa-17_1_6:1.1.1.4
 	OPENBSD_6_1:1.1.1.3.0.2
 	OPENBSD_6_1_BASE:1.1.1.3
 	mesa-13_0_6:1.1.1.3
@@ -43,8 +44,14 @@ commitid	OwGfrJACrYJkCVJ4;
 1.1.1.3
 date	2016.12.11.08.32.38;	author jsg;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	uuv5VTS15jglEDZU;
+
+1.1.1.4
+date	2017.08.14.09.37.17;	author jsg;	state Exp;
+branches;
+next	;
+commitid	enNyoMGkcgwM3Ww6;
 
 
 desc
@@ -841,6 +848,281 @@ a689 1
 d717 1
 a717 1
          LLVMBuildCall(builder, function, args, ARRAY_SIZE(args), "");
+@
+
+
+1.1.1.4
+log
+@Import Mesa 17.1.6
+@
+text
+@a40 1
+#include "util/u_cpu_detect.h"
+a51 1
+#include "lp_bld_pack.h"
+a52 2
+#include "lp_bld_logic.h"
+#include "lp_bld_bitarit.h"
+a139 67
+/*
+ * Do rounding when converting small unorm values to larger ones.
+ * Not quite 100% accurate, as it's done by appending MSBs, but
+ * should be good enough.
+ */
+
+static inline LLVMValueRef
+scale_bits_up(struct gallivm_state *gallivm,
+              int src_bits,
+              int dst_bits,
+              LLVMValueRef src,
+              struct lp_type src_type)
+{
+   LLVMBuilderRef builder = gallivm->builder;
+   LLVMValueRef result = src;
+
+   if (src_bits == 1 && dst_bits > 1) {
+      /*
+       * Useful for a1 - we'd need quite some repeated copies otherwise.
+       */
+      struct lp_build_context bld;
+      LLVMValueRef dst_mask;
+      lp_build_context_init(&bld, gallivm, src_type);
+      dst_mask = lp_build_const_int_vec(gallivm, src_type,
+                                        (1 << dst_bits) - 1),
+      result = lp_build_cmp(&bld, PIPE_FUNC_EQUAL, src,
+                            lp_build_const_int_vec(gallivm, src_type, 0));
+      result = lp_build_andnot(&bld, dst_mask, result);
+   }
+   else if (dst_bits > src_bits) {
+      /* Scale up bits */
+      int db = dst_bits - src_bits;
+
+      /* Shift left by difference in bits */
+      result = LLVMBuildShl(builder,
+                            src,
+                            lp_build_const_int_vec(gallivm, src_type, db),
+                            "");
+
+      if (db <= src_bits) {
+         /* Enough bits in src to fill the remainder */
+         LLVMValueRef lower = LLVMBuildLShr(builder,
+                                            src,
+                                            lp_build_const_int_vec(gallivm, src_type,
+                                                                   src_bits - db),
+                                            "");
+
+         result = LLVMBuildOr(builder, result, lower, "");
+      } else if (db > src_bits) {
+         /* Need to repeatedly copy src bits to fill remainder in dst */
+         unsigned n;
+
+         for (n = src_bits; n < dst_bits; n *= 2) {
+            LLVMValueRef shuv = lp_build_const_int_vec(gallivm, src_type, n);
+
+            result = LLVMBuildOr(builder,
+                                 result,
+                                 LLVMBuildLShr(builder, result, shuv, ""),
+                                 "");
+         }
+      }
+   } else {
+      assert (dst_bits == src_bits);
+   }
+
+   return result;
+}
+a158 1
+   LLVMTypeRef vec32_type;
+a173 2
+   vec32_type = LLVMVectorType(LLVMInt32TypeInContext(gallivm->context), 4);
+
+d178 3
+a180 1
+   packed = LLVMBuildInsertElement(builder, LLVMGetUndef(vec32_type), packed,
+d183 4
+a186 2
+   packed = LLVMBuildShuffleVector(builder, packed, LLVMGetUndef(vec32_type),
+                                   LLVMConstNull(vec32_type),
+d227 2
+a228 34
+   if (desc->block.bits < 32 && normalized) {
+      /*
+       * Note: we cannot do the shift below on x86 natively until AVX2.
+       *
+       * Old llvm versions will resort to scalar extract/shift insert,
+       * which is definitely terrible, new versions will just do
+       * several vector shifts and shuffle/blend results together.
+       * We could turn this into a variable left shift plus a constant
+       * right shift, and llvm would then turn the variable left shift
+       * into a mul for us (albeit without sse41 the mul needs emulation
+       * too...). However, since we're going to do a float mul
+       * anyway, we just adjust that mul instead (plus the mask), skipping
+       * the shift completely.
+       * We could also use a extra mul when the format isn't normalized and
+       * we don't have AVX2 support, but don't bother for now. Unfortunately,
+       * this strategy doesn't work for 32bit formats (such as rgb10a2 or even
+       * rgba8 if it ends up here), as that would require UIToFP, albeit that
+       * would be fixable with easy 16bit shuffle (unless there's channels
+       * crossing 16bit boundaries).
+       */
+      for (i = 0; i < 4; ++i) {
+         if (desc->channel[i].type != UTIL_FORMAT_TYPE_VOID) {
+            unsigned bits = desc->channel[i].size;
+            unsigned shift = desc->channel[i].shift;
+            unsigned long long mask = ((1ULL << bits) - 1) << shift;
+            scales[i] = lp_build_const_float(gallivm, 1.0 / mask);
+            masks[i] = lp_build_const_int32(gallivm, mask);
+         }
+      }
+      masked = LLVMBuildAnd(builder, packed, LLVMConstVector(masks, 4), "");
+   } else {
+      shifted = LLVMBuildLShr(builder, packed, LLVMConstVector(shifts, 4), "");
+      masked = LLVMBuildAnd(builder, shifted, LLVMConstVector(masks, 4), "");
+   }
+d237 2
+a238 4
+   /*
+    * At this point 'casted' may be a vector of floats such as
+    * {255.0, 255.0, 255.0, 255.0}. (Normalized values may be multiplied
+    * by powers of two). Next, if the pixel values are normalized
+a393 1
+       /* XXX this shouldn't be needed */
+a396 1
+      struct lp_type fetch_type;
+a403 1
+      fetch_type = lp_type_uint(type.width*4);
+d405 1
+a405 1
+                               format_desc->block.bits, fetch_type,
+a415 80
+    * Bit arithmetic for converting small_unorm to unorm8.
+    *
+    * This misses some opportunities for optimizations (like skipping mask
+    * for the highest channel for instance, or doing bit scaling in parallel
+    * for channels with the same bit width) but it should be passable for
+    * all arithmetic formats.
+    */
+   if (format_desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+       format_desc->colorspace == UTIL_FORMAT_COLORSPACE_RGB &&
+       util_format_fits_8unorm(format_desc) &&
+       type.width == 8 && type.norm == 1 && type.sign == 0 &&
+       type.fixed == 0 && type.floating == 0) {
+      LLVMValueRef packed, res, chans[4], rgba[4];
+      LLVMTypeRef dst_vec_type, conv_vec_type;
+      struct lp_type fetch_type, conv_type;
+      struct lp_build_context bld_conv;
+      unsigned j;
+
+      fetch_type = lp_type_uint(type.width*4);
+      conv_type = lp_type_int_vec(type.width*4, type.width * type.length);
+      dst_vec_type = lp_build_vec_type(gallivm, type);
+      conv_vec_type = lp_build_vec_type(gallivm, conv_type);
+      lp_build_context_init(&bld_conv, gallivm, conv_type);
+
+      packed = lp_build_gather(gallivm, type.length/4,
+                               format_desc->block.bits, fetch_type,
+                               aligned, base_ptr, offset, TRUE);
+
+      assert(format_desc->block.bits * type.length / 4 <=
+             type.width * type.length);
+
+      packed = LLVMBuildBitCast(gallivm->builder, packed, conv_vec_type, "");
+
+      for (j = 0; j < format_desc->nr_channels; ++j) {
+         unsigned mask = 0;
+         unsigned sa = format_desc->channel[j].shift;
+
+         mask = (1 << format_desc->channel[j].size) - 1;
+
+         /* Extract bits from source */
+         chans[j] = LLVMBuildLShr(builder, packed,
+                                  lp_build_const_int_vec(gallivm, conv_type, sa),
+                                  "");
+
+         chans[j] = LLVMBuildAnd(builder, chans[j],
+                                 lp_build_const_int_vec(gallivm, conv_type, mask),
+                                 "");
+
+         /* Scale bits */
+         if (type.norm) {
+            chans[j] = scale_bits_up(gallivm, format_desc->channel[j].size,
+                                     type.width, chans[j], conv_type);
+         }
+      }
+      /*
+       * This is a hacked lp_build_format_swizzle_soa() since we need a
+       * normalized 1 but only 8 bits in a 32bit vector...
+       */
+      for (j = 0; j < 4; ++j) {
+         enum pipe_swizzle swizzle = format_desc->swizzle[j];
+         if (swizzle == PIPE_SWIZZLE_1) {
+            rgba[j] = lp_build_const_int_vec(gallivm, conv_type, (1 << type.width) - 1);
+         } else {
+            rgba[j] = lp_build_swizzle_soa_channel(&bld_conv, chans, swizzle);
+         }
+         if (j == 0) {
+            res = rgba[j];
+         } else {
+            rgba[j] = LLVMBuildShl(builder, rgba[j],
+                                   lp_build_const_int_vec(gallivm, conv_type,
+                                                          j * type.width), "");
+            res = LLVMBuildOr(builder, res, rgba[j], "");
+         }
+      }
+      res = LLVMBuildBitCast(gallivm->builder, res, dst_vec_type, "");
+
+      return res;
+   }
+
+   /*
+a423 1
+       /* XXX this shouldn't be needed */
+d433 2
+a434 9
+      LLVMValueRef res[LP_MAX_VECTOR_WIDTH / 128];
+      struct lp_type conv_type;
+      unsigned k, num_conv_src, num_conv_dst;
+
+      /*
+       * Note this path is generally terrible for fetching multiple pixels.
+       * We should make sure we cannot hit this code path for anything but
+       * single pixels.
+       */
+d464 4
+a467 30
+      conv_type = lp_float32_vec4_type();
+      num_conv_src = num_pixels;
+      num_conv_dst = 1;
+
+      if (num_pixels % 8 == 0) {
+         lp_build_concat_n(gallivm, lp_float32_vec4_type(),
+                           tmps, num_pixels, tmps, num_pixels / 2);
+         conv_type.length *= num_pixels / 4;
+         num_conv_src = 4 * num_pixels / 8;
+         if (type.width == 8 && type.floating == 0 && type.fixed == 0) {
+            /*
+             * FIXME: The fast float->unorm path (which is basically
+             * skipping the MIN/MAX which are extremely pointless in any
+             * case) requires that there's 2 destinations...
+             * In any case, we really should make sure we don't hit this
+             * code with multiple pixels for unorm8 dst types, it's
+             * completely hopeless even if we do hit the right conversion.
+             */
+            type.length /= num_pixels / 4;
+            num_conv_dst = num_pixels / 4;
+         }
+      }
+
+      lp_build_conv(gallivm, conv_type, type,
+                    tmps, num_conv_src, res, num_conv_dst);
+
+      if (num_pixels % 8 == 0 &&
+          (type.width == 8 && type.floating == 0 && type.fixed == 0)) {
+         lp_build_concat_n(gallivm, type, res, num_conv_dst, res, 1);
+      }
+d469 1
+a469 1
+      return lp_build_format_swizzle_aos(format_desc, &bld, res[0]);
 @
 
 

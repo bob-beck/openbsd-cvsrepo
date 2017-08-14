@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	mesa-17_1_6:1.1.1.2
 	OPENBSD_6_1:1.1.1.1.0.2
 	OPENBSD_6_1_BASE:1.1.1.1
 	mesa-13_0_6:1.1.1.1
@@ -24,8 +25,14 @@ commitid	uuv5VTS15jglEDZU;
 1.1.1.1
 date	2016.12.11.08.36.34;	author jsg;	state Exp;
 branches;
-next	;
+next	1.1.1.2;
 commitid	uuv5VTS15jglEDZU;
+
+1.1.1.2
+date	2017.08.14.09.42.12;	author jsg;	state Exp;
+branches;
+next	;
+commitid	enNyoMGkcgwM3Ww6;
 
 
 desc
@@ -346,3 +353,341 @@ log
 @
 text
 @@
+
+
+1.1.1.2
+log
+@Import Mesa 17.1.6
+@
+text
+@a40 2
+#include <libsync.h> /* Requires Android or libdrm-2.4.72 */
+
+d48 2
+a49 15
+
+   enum brw_fence_type {
+      /** The fence waits for completion of brw_fence::batch_bo. */
+      BRW_FENCE_TYPE_BO_WAIT,
+
+      /** The fence waits for brw_fence::sync_fd to signal. */
+      BRW_FENCE_TYPE_SYNC_FD,
+   } type;
+
+   union {
+      struct brw_bo *batch_bo;
+
+      /* This struct owns the fd. */
+      int sync_fd;
+   };
+d61 1
+a61 2
+brw_fence_init(struct brw_context *brw, struct brw_fence *fence,
+               enum brw_fence_type type)
+d64 1
+a64 1
+   fence->type = type;
+a65 9
+
+   switch (type) {
+   case BRW_FENCE_TYPE_BO_WAIT:
+      fence->batch_bo = NULL;
+      break;
+    case BRW_FENCE_TYPE_SYNC_FD:
+      fence->sync_fd = -1;
+      break;
+   }
+d71 2
+a72 10
+   switch (fence->type) {
+   case BRW_FENCE_TYPE_BO_WAIT:
+      if (fence->batch_bo)
+         brw_bo_unreference(fence->batch_bo);
+      break;
+   case BRW_FENCE_TYPE_SYNC_FD:
+      if (fence->sync_fd != -1)
+         close(fence->sync_fd);
+      break;
+   }
+d77 2
+a78 2
+static bool MUST_CHECK
+brw_fence_insert_locked(struct brw_context *brw, struct brw_fence *fence)
+d80 2
+a81 2
+   __DRIcontext *driContext = brw->driContext;
+   __DRIdrawable *driDrawable = driContext->driDrawablePriv;
+a82 26
+   /*
+    * From KHR_fence_sync:
+    *
+    *   When the condition of the sync object is satisfied by the fence
+    *   command, the sync is signaled by the associated client API context,
+    *   causing any eglClientWaitSyncKHR commands (see below) blocking on
+    *   <sync> to unblock. The only condition currently supported is
+    *   EGL_SYNC_PRIOR_COMMANDS_COMPLETE_KHR, which is satisfied by
+    *   completion of the fence command corresponding to the sync object,
+    *   and all preceding commands in the associated client API context's
+    *   command stream. The sync object will not be signaled until all
+    *   effects from these commands on the client API's internal and
+    *   framebuffer state are fully realized. No other state is affected by
+    *   execution of the fence command.
+    *
+    * Note the emphasis there on ensuring that the framebuffer is fully
+    * realised before the fence is signaled. We cannot just flush the batch,
+    * but must also resolve the drawable first. The importance of this is,
+    * for example, in creating a fence for a frame to be passed to a
+    * remote compositor. Without us flushing the drawable explicitly, the
+    * resolve will be in a following batch (when the client finally calls
+    * SwapBuffers, or triggers a resolve via some other path) and so the
+    * compositor may read the incomplete framebuffer instead.
+    */
+   if (driDrawable)
+      intel_resolve_for_dri2_flush(brw, driDrawable);
+d84 3
+a86 53
+
+   switch (fence->type) {
+   case BRW_FENCE_TYPE_BO_WAIT:
+      assert(!fence->batch_bo);
+      assert(!fence->signalled);
+
+      fence->batch_bo = brw->batch.bo;
+      brw_bo_reference(fence->batch_bo);
+
+      if (intel_batchbuffer_flush(brw) < 0) {
+         brw_bo_unreference(fence->batch_bo);
+         fence->batch_bo = NULL;
+         return false;
+      }
+      break;
+   case BRW_FENCE_TYPE_SYNC_FD:
+      assert(!fence->signalled);
+
+      if (fence->sync_fd == -1) {
+         /* Create an out-fence that signals after all pending commands
+          * complete.
+          */
+         if (intel_batchbuffer_flush_fence(brw, -1, &fence->sync_fd) < 0)
+            return false;
+         assert(fence->sync_fd != -1);
+      } else {
+         /* Wait on the in-fence before executing any subsequently submitted
+          * commands.
+          */
+         if (intel_batchbuffer_flush(brw) < 0)
+            return false;
+
+         /* Emit a dummy batch just for the fence. */
+         brw_emit_mi_flush(brw);
+         if (intel_batchbuffer_flush_fence(brw, fence->sync_fd, NULL) < 0)
+            return false;
+      }
+      break;
+   }
+
+   return true;
+}
+
+static bool MUST_CHECK
+brw_fence_insert(struct brw_context *brw, struct brw_fence *fence)
+{
+   bool ret;
+
+   mtx_lock(&fence->mutex);
+   ret = brw_fence_insert_locked(brw, fence);
+   mtx_unlock(&fence->mutex);
+
+   return ret;
+d95 2
+a96 11
+   switch (fence->type) {
+   case BRW_FENCE_TYPE_BO_WAIT:
+      if (!fence->batch_bo) {
+         /* There may be no batch if intel_batchbuffer_flush() failed. */
+         return false;
+      }
+
+      if (brw_bo_busy(fence->batch_bo))
+         return false;
+
+      brw_bo_unreference(fence->batch_bo);
+a98 11
+
+      return true;
+
+   case BRW_FENCE_TYPE_SYNC_FD:
+      assert(fence->sync_fd != -1);
+
+      if (sync_wait(fence->sync_fd, 0) == -1)
+         return false;
+
+      fence->signalled = true;
+
+a120 2
+   int32_t timeout_i32;
+
+d124 1
+a124 14
+   switch (fence->type) {
+   case BRW_FENCE_TYPE_BO_WAIT:
+      if (!fence->batch_bo) {
+         /* There may be no batch if intel_batchbuffer_flush() failed. */
+         return false;
+      }
+
+      /* DRM_IOCTL_I915_GEM_WAIT uses a signed 64 bit timeout and returns
+       * immediately for timeouts <= 0.  The best we can do is to clamp the
+       * timeout to INT64_MAX.  This limits the maximum timeout from 584 years to
+       * 292 years - likely not a big deal.
+       */
+      if (timeout > INT64_MAX)
+         timeout = INT64_MAX;
+d126 7
+a132 6
+      if (brw_bo_wait(fence->batch_bo, timeout) != 0)
+         return false;
+
+      fence->signalled = true;
+      brw_bo_unreference(fence->batch_bo);
+      fence->batch_bo = NULL;
+d134 2
+a135 9
+      return true;
+   case BRW_FENCE_TYPE_SYNC_FD:
+      if (fence->sync_fd == -1)
+         return false;
+
+      if (timeout > INT32_MAX)
+         timeout_i32 = -1;
+      else
+         timeout_i32 = timeout;
+d137 3
+a139 2
+      if (sync_wait(fence->sync_fd, timeout_i32) == -1)
+         return false;
+d141 1
+a141 6
+      fence->signalled = true;
+      return true;
+   }
+
+   assert(!"bad enum brw_fence_type");
+   return false;
+d164 5
+a168 19
+   switch (fence->type) {
+   case BRW_FENCE_TYPE_BO_WAIT:
+      /* We have nothing to do for WaitSync.  Our GL command stream is sequential,
+       * so given that the sync object has already flushed the batchbuffer, any
+       * batchbuffers coming after this waitsync will naturally not occur until
+       * the previous one is done.
+       */
+      break;
+   case BRW_FENCE_TYPE_SYNC_FD:
+      assert(fence->sync_fd != -1);
+
+      /* The user wants explicit synchronization, so give them what they want. */
+      if (!brw_fence_insert(brw, fence)) {
+         /* FIXME: There exists no way yet to report an error here. If an error
+          * occurs, continue silently and hope for the best.
+          */
+      }
+      break;
+   }
+d199 2
+a200 10
+   /* brw_fence_insert_locked() assumes it must do a complete flush */
+   assert(condition == GL_SYNC_GPU_COMMANDS_COMPLETE);
+
+   brw_fence_init(brw, &sync->fence, BRW_FENCE_TYPE_BO_WAIT);
+
+   if (!brw_fence_insert_locked(brw, &sync->fence)) {
+      /* FIXME: There exists no way to report a GL error here. If an error
+       * occurs, continue silently and hope for the best.
+       */
+   }
+d254 2
+a255 7
+   brw_fence_init(brw, fence, BRW_FENCE_TYPE_BO_WAIT);
+
+   if (!brw_fence_insert_locked(brw, fence)) {
+      brw_fence_finish(fence);
+      free(fence);
+      return NULL;
+   }
+a291 65
+static unsigned
+brw_dri_get_capabilities(__DRIscreen *dri_screen)
+{
+   struct intel_screen *screen = dri_screen->driverPrivate;
+   unsigned caps = 0;
+
+   if (screen->has_exec_fence)
+      caps |=  __DRI_FENCE_CAP_NATIVE_FD;
+
+   return caps;
+}
+
+static void *
+brw_dri_create_fence_fd(__DRIcontext *dri_ctx, int fd)
+{
+   struct brw_context *brw = dri_ctx->driverPrivate;
+   struct brw_fence *fence;
+
+   assert(brw->screen->has_exec_fence);
+
+   fence = calloc(1, sizeof(*fence));
+   if (!fence)
+      return NULL;
+
+   brw_fence_init(brw, fence, BRW_FENCE_TYPE_SYNC_FD);
+
+   if (fd == -1) {
+      /* Create an out-fence fd */
+      if (!brw_fence_insert_locked(brw, fence))
+         goto fail;
+   } else {
+      /* Import the sync fd as an in-fence. */
+      fence->sync_fd = dup(fd);
+   }
+
+   assert(fence->sync_fd != -1);
+
+   return fence;
+
+fail:
+   brw_fence_finish(fence);
+   free(fence);
+   return NULL;
+}
+
+static int
+brw_dri_get_fence_fd_locked(struct brw_fence *fence)
+{
+   assert(fence->type == BRW_FENCE_TYPE_SYNC_FD);
+   return dup(fence->sync_fd);
+}
+
+static int
+brw_dri_get_fence_fd(__DRIscreen *dri_screen, void *_fence)
+{
+   struct brw_fence *fence = _fence;
+   int fd;
+
+   mtx_lock(&fence->mutex);
+   fd = brw_dri_get_fence_fd_locked(fence);
+   mtx_unlock(&fence->mutex);
+
+   return fd;
+}
+
+d293 1
+a293 1
+   .base = { __DRI2_FENCE, 2 },
+a299 3
+   .get_capabilities = brw_dri_get_capabilities,
+   .create_fence_fd = brw_dri_create_fence_fd,
+   .get_fence_fd = brw_dri_get_fence_fd,
+@
+

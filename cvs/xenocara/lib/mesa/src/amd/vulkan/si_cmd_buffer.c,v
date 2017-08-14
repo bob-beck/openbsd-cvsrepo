@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	mesa-17_1_6:1.1.1.4
 	OPENBSD_6_1:1.1.1.3.0.2
 	OPENBSD_6_1_BASE:1.1.1.3
 	mesa-13_0_6:1.1.1.3
@@ -36,8 +37,14 @@ commitid	xZcdklZavddTKAf1;
 1.1.1.3
 date	2017.03.25.00.15.52;	author jsg;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	YgkKuQ9hssScckR1;
+
+1.1.1.4
+date	2017.08.14.09.41.58;	author jsg;	state Exp;
+branches;
+next	;
+commitid	enNyoMGkcgwM3Ww6;
 
 
 desc
@@ -1209,6 +1216,474 @@ text
 a917 2
 
 	si_emit_cache_flush(cmd_buffer);
+@
+
+
+1.1.1.4
+log
+@Import Mesa 17.1.6
+@
+text
+@d174 1
+a174 1
+si_emit_compute(struct radv_physical_device *physical_device,
+a211 6
+void
+si_init_compute(struct radv_cmd_buffer *cmd_buffer)
+{
+	struct radv_physical_device *physical_device = cmd_buffer->device->physical_device;
+	si_emit_compute(physical_device, cmd_buffer->cs);
+}
+d213 2
+a214 3
+static void
+si_emit_config(struct radv_physical_device *physical_device,
+	       struct radeon_winsys_cs *cs)
+d220 1
+a220 1
+
+a292 1
+	case CHIP_POLARIS12:
+d357 5
+a410 1
+		uint32_t vgt_tess_distribution;
+d414 1
+a414 2
+		if (physical_device->rad_info.family < CHIP_POLARIS10)
+			radeon_set_context_reg(cs, R_028C58_VGT_VERTEX_REUSE_BLOCK_CNTL, 30);
+a415 10
+
+		vgt_tess_distribution = S_028B50_ACCUM_ISOLINE(32) |
+			S_028B50_ACCUM_TRI(11) |
+			S_028B50_ACCUM_QUAD(11) |
+			S_028B50_DONUT_SPLIT(16);
+
+		if (physical_device->rad_info.family == CHIP_FIJI ||
+		    physical_device->rad_info.family >= CHIP_POLARIS10)
+			vgt_tess_distribution |= S_028B50_TRAP_SPLIT(3);
+
+d417 4
+a420 1
+				       vgt_tess_distribution);
+d429 1
+a429 45
+	si_emit_compute(physical_device, cs);
+}
+
+void si_init_config(struct radv_cmd_buffer *cmd_buffer)
+{
+	struct radv_physical_device *physical_device = cmd_buffer->device->physical_device;
+
+	si_emit_config(physical_device, cmd_buffer->cs);
+}
+
+void
+cik_create_gfx_config(struct radv_device *device)
+{
+	struct radeon_winsys_cs *cs = device->ws->cs_create(device->ws, RING_GFX);
+	if (!cs)
+		return;
+
+	si_emit_config(device->physical_device, cs);
+
+	while (cs->cdw & 7) {
+		if (device->physical_device->rad_info.gfx_ib_pad_with_type2)
+			radeon_emit(cs, 0x80000000);
+		else
+			radeon_emit(cs, 0xffff1000);
+	}
+
+	device->gfx_init = device->ws->buffer_create(device->ws,
+						     cs->cdw * 4, 4096,
+						     RADEON_DOMAIN_GTT,
+						     RADEON_FLAG_CPU_ACCESS);
+	if (!device->gfx_init)
+		goto fail;
+
+	void *map = device->ws->buffer_map(device->gfx_init);
+	if (!map) {
+		device->ws->buffer_destroy(device->gfx_init);
+		device->gfx_init = NULL;
+		goto fail;
+	}
+	memcpy(map, cs->buf, cs->cdw * 4);
+
+	device->ws->buffer_unmap(device->gfx_init);
+	device->gfx_init_size_dw = cs->cdw;
+fail:
+	device->ws->cs_destroy(cs);
+d458 15
+a472 1
+	assert(count);
+a488 2
+	radeon_set_context_reg_seq(cs, R_0282D0_PA_SC_VPORT_ZMIN_0 +
+				   first_vp * 4 * 2, count * 2);
+d492 2
+a498 26
+static VkRect2D si_scissor_from_viewport(const VkViewport *viewport)
+{
+	float scale[3], translate[3];
+	VkRect2D rect;
+
+	get_viewport_xform(viewport, scale, translate);
+
+	rect.offset.x = translate[0] - abs(scale[0]);
+	rect.offset.y = translate[1] - abs(scale[1]);
+	rect.extent.width = ceilf(translate[0] + abs(scale[0])) - rect.offset.x;
+	rect.extent.height = ceilf(translate[1] + abs(scale[1])) - rect.offset.y;
+
+	return rect;
+}
+
+static VkRect2D si_intersect_scissor(const VkRect2D *a, const VkRect2D *b) {
+	VkRect2D ret;
+	ret.offset.x = MAX2(a->offset.x, b->offset.x);
+	ret.offset.y = MAX2(a->offset.y, b->offset.y);
+	ret.extent.width = MIN2(a->offset.x + a->extent.width,
+	                        b->offset.x + b->extent.width) - ret.offset.x;
+	ret.extent.height = MIN2(a->offset.y + a->extent.height,
+	                         b->offset.y + b->extent.height) - ret.offset.y;
+	return ret;
+}
+
+d501 1
+a501 2
+                  int count, const VkRect2D *scissors,
+                  const VkViewport *viewports, bool can_use_guardband)
+d504 2
+a505 3
+	float scale[3], translate[3], guardband_x = INFINITY, guardband_y = INFINITY;
+	const float max_range = 32767.0f;
+	assert(count);
+d509 2
+a510 17
+		VkRect2D viewport_scissor = si_scissor_from_viewport(viewports + i);
+		VkRect2D scissor = si_intersect_scissor(&scissors[i], &viewport_scissor);
+
+		get_viewport_xform(viewports + i, scale, translate);
+		scale[0] = abs(scale[0]);
+		scale[1] = abs(scale[1]);
+
+		if (scale[0] < 0.5)
+			scale[0] = 0.5;
+		if (scale[1] < 0.5)
+			scale[1] = 0.5;
+
+		guardband_x = MIN2(guardband_x, (max_range - abs(translate[0])) / scale[0]);
+		guardband_y = MIN2(guardband_y, (max_range - abs(translate[1])) / scale[1]);
+
+		radeon_emit(cs, S_028250_TL_X(scissor.offset.x) |
+			    S_028250_TL_Y(scissor.offset.y) |
+d512 2
+a513 6
+		radeon_emit(cs, S_028254_BR_X(scissor.offset.x + scissor.extent.width) |
+			    S_028254_BR_Y(scissor.offset.y + scissor.extent.height));
+	}
+	if (!can_use_guardband) {
+		guardband_x = 1.0;
+		guardband_y = 1.0;
+a514 6
+
+	radeon_set_context_reg_seq(cs, R_028BE8_PA_CL_GB_VERT_CLIP_ADJ, 4);
+	radeon_emit(cs, fui(guardband_y));
+	radeon_emit(cs, fui(1.0));
+	radeon_emit(cs, fui(guardband_x));
+	radeon_emit(cs, fui(1.0));
+d517 2
+a518 2
+static inline unsigned
+radv_prims_for_vertices(struct radv_prim_vertex_count *info, unsigned num)
+d520 2
+a521 20
+	if (num == 0)
+		return 0;
+
+	if (info->incr == 0)
+		return 0;
+
+	if (num < info->min)
+		return 0;
+
+	return 1 + ((num - info->min) / info->incr);
+}
+
+uint32_t
+si_get_ia_multi_vgt_param(struct radv_cmd_buffer *cmd_buffer,
+			  bool instanced_draw, bool indirect_draw,
+			  uint32_t draw_vertex_count)
+{
+	enum chip_class chip_class = cmd_buffer->device->physical_device->rad_info.chip_class;
+	enum radeon_family family = cmd_buffer->device->physical_device->rad_info.family;
+	struct radeon_info *info = &cmd_buffer->device->physical_device->rad_info;
+a530 2
+	uint32_t num_prims = radv_prims_for_vertices(&cmd_buffer->state.pipeline->graphics.prim_vertex_count, draw_vertex_count);
+	bool multi_instances_smaller_than_primgroup;
+d532 1
+a532 12
+	if (radv_pipeline_has_tess(cmd_buffer->state.pipeline))
+		primgroup_size = cmd_buffer->state.pipeline->graphics.tess.num_patches;
+	else if (radv_pipeline_has_gs(cmd_buffer->state.pipeline))
+		primgroup_size = 64;  /* recommended with a GS */
+
+	multi_instances_smaller_than_primgroup = indirect_draw || (instanced_draw &&
+								   num_prims < primgroup_size);
+	if (radv_pipeline_has_tess(cmd_buffer->state.pipeline)) {
+		/* SWITCH_ON_EOI must be set if PrimID is used. */
+		if (cmd_buffer->state.pipeline->shaders[MESA_SHADER_TESS_CTRL]->info.tcs.uses_prim_id ||
+		    cmd_buffer->state.pipeline->shaders[MESA_SHADER_TESS_EVAL]->info.tes.uses_prim_id)
+			ia_switch_on_eoi = true;
+d534 1
+a534 6
+		/* Bug with tessellation and GS on Bonaire and older 2 SE chips. */
+		if ((family == CHIP_TAHITI ||
+		     family == CHIP_PITCAIRN ||
+		     family == CHIP_BONAIRE) &&
+		    radv_pipeline_has_gs(cmd_buffer->state.pipeline))
+			partial_vs_wave = true;
+a535 16
+		/* Needed for 028B6C_DISTRIBUTION_MODE != 0 */
+		if (cmd_buffer->device->has_distributed_tess) {
+			if (radv_pipeline_has_gs(cmd_buffer->state.pipeline)) {
+				partial_es_wave = true;
+
+				if (family == CHIP_TONGA ||
+				    family == CHIP_FIJI ||
+				    family == CHIP_POLARIS10 ||
+				    family == CHIP_POLARIS11 ||
+				    family == CHIP_POLARIS12)
+					partial_vs_wave = true;
+			} else {
+				partial_vs_wave = true;
+			}
+		}
+	}
+d546 3
+a548 13
+		    prim == V_008958_DI_PT_TRISTRIP_ADJ ||
+		    (cmd_buffer->state.pipeline->graphics.prim_restart_enable &&
+		     (family < CHIP_POLARIS10 ||
+		      (prim != V_008958_DI_PT_POINTLIST &&
+		      prim != V_008958_DI_PT_LINESTRIP &&
+		       prim != V_008958_DI_PT_TRISTRIP))))
+			wd_switch_on_eop = true;
+
+		/* Hawaii hangs if instancing is enabled and WD_SWITCH_ON_EOP is 0.
+		 * We don't know that for indirect drawing, so treat it as
+		 * always problematic. */
+		if (family == CHIP_HAWAII &&
+		    (instanced_draw || indirect_draw))
+d551 1
+a551 9
+		/* Performance recommendation for 4 SE Gfx7-8 parts if
+		 * instances are smaller than a primgroup.
+		 * Assume indirect draws always use small instances.
+		 * This is needed for good VS wave utilization.
+		 */
+		if (chip_class <= VI &&
+		    info->max_se == 4 &&
+		    multi_instances_smaller_than_primgroup)
+			wd_switch_on_eop = true;
+d558 1
+d560 3
+a562 3
+		    (family == CHIP_HAWAII ||
+		     (chip_class == VI &&
+		      (radv_pipeline_has_gs(cmd_buffer->state.pipeline) || max_primgroup_in_wave != 2))))
+d564 1
+d566 1
+d568 2
+a569 2
+		if (family == CHIP_BONAIRE && ia_switch_on_eoi &&
+		    (instanced_draw || indirect_draw))
+d571 1
+a571 1
+
+d579 5
+a583 12
+	if (radv_pipeline_has_gs(cmd_buffer->state.pipeline)) {
+		/* GS requirement. */
+		if (SI_GS_PER_ES / primgroup_size >= cmd_buffer->device->gs_table_depth - 3)
+			partial_es_wave = true;
+
+		/* Hw bug with single-primitive instances and SWITCH_ON_EOI
+		 * on multi-SE chips. */
+		if (info->max_se >= 2 && ia_switch_on_eoi &&
+		    ((instanced_draw || indirect_draw) &&
+		     num_prims <= 1))
+			cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VGT_FLUSH;
+	}
+d585 9
+a604 24
+static void
+si_emit_acquire_mem(struct radeon_winsys_cs *cs,
+                    bool is_mec,
+                    unsigned cp_coher_cntl)
+{
+	if (is_mec) {
+		radeon_emit(cs, PKT3(PKT3_ACQUIRE_MEM, 5, 0) |
+		                            PKT3_SHADER_TYPE_S(1));
+		radeon_emit(cs, cp_coher_cntl);   /* CP_COHER_CNTL */
+		radeon_emit(cs, 0xffffffff);      /* CP_COHER_SIZE */
+		radeon_emit(cs, 0xff);            /* CP_COHER_SIZE_HI */
+		radeon_emit(cs, 0);               /* CP_COHER_BASE */
+		radeon_emit(cs, 0);               /* CP_COHER_BASE_HI */
+		radeon_emit(cs, 0x0000000A);      /* POLL_INTERVAL */
+	} else {
+		/* ACQUIRE_MEM is only required on a compute ring. */
+		radeon_emit(cs, PKT3(PKT3_SURFACE_SYNC, 3, 0));
+		radeon_emit(cs, cp_coher_cntl);   /* CP_COHER_CNTL */
+		radeon_emit(cs, 0xffffffff);      /* CP_COHER_SIZE */
+		radeon_emit(cs, 0);               /* CP_COHER_BASE */
+		radeon_emit(cs, 0x0000000A);      /* POLL_INTERVAL */
+	}
+}
+
+d606 1
+a606 4
+si_cs_emit_cache_flush(struct radeon_winsys_cs *cs,
+                       enum chip_class chip_class,
+                       bool is_mec,
+                       enum radv_cmd_flush_bits flush_bits)
+d608 1
+d611 3
+a613 1
+	if (flush_bits & RADV_CMD_FLAG_INV_ICACHE)
+d615 1
+a615 1
+	if (flush_bits & RADV_CMD_FLAG_INV_SMEM_L1)
+d617 7
+d625 1
+a625 1
+	if (flush_bits & RADV_CMD_FLAG_FLUSH_AND_INV_CB) {
+d637 3
+a639 3
+		if (chip_class >= VI) {
+			radeon_emit(cs, PKT3(PKT3_EVENT_WRITE_EOP, 4, 0));
+			radeon_emit(cs, EVENT_TYPE(V_028A90_FLUSH_AND_INV_CB_DATA_TS) |
+d641 4
+a644 4
+			radeon_emit(cs, 0);
+			radeon_emit(cs, 0);
+			radeon_emit(cs, 0);
+			radeon_emit(cs, 0);
+d648 1
+a648 1
+	if (flush_bits & RADV_CMD_FLAG_FLUSH_AND_INV_DB) {
+d653 3
+a655 3
+	if (flush_bits & RADV_CMD_FLAG_FLUSH_AND_INV_CB_META) {
+		radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
+		radeon_emit(cs, EVENT_TYPE(V_028A90_FLUSH_AND_INV_CB_META) | EVENT_INDEX(0));
+d658 3
+a660 3
+	if (flush_bits & RADV_CMD_FLAG_FLUSH_AND_INV_DB_META) {
+		radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
+		radeon_emit(cs, EVENT_TYPE(V_028A90_FLUSH_AND_INV_DB_META) | EVENT_INDEX(0));
+d663 1
+a663 1
+	if (!(flush_bits & (RADV_CMD_FLAG_FLUSH_AND_INV_CB |
+d665 6
+a670 6
+		if (flush_bits & RADV_CMD_FLAG_PS_PARTIAL_FLUSH) {
+			radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
+			radeon_emit(cs, EVENT_TYPE(V_028A90_PS_PARTIAL_FLUSH) | EVENT_INDEX(4));
+		} else if (flush_bits & RADV_CMD_FLAG_VS_PARTIAL_FLUSH) {
+			radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
+			radeon_emit(cs, EVENT_TYPE(V_028A90_VS_PARTIAL_FLUSH) | EVENT_INDEX(4));
+d674 3
+a676 3
+	if (flush_bits & RADV_CMD_FLAG_CS_PARTIAL_FLUSH) {
+		radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
+		radeon_emit(cs, EVENT_TYPE(V_028A90_CS_PARTIAL_FLUSH) | EVENT_INDEX(4));
+d680 3
+a682 3
+	if (flush_bits & RADV_CMD_FLAG_VGT_FLUSH) {
+		radeon_emit(cs, PKT3(PKT3_EVENT_WRITE, 0, 0));
+		radeon_emit(cs, EVENT_TYPE(V_028A90_VGT_FLUSH) | EVENT_INDEX(0));
+d688 3
+a690 4
+	if ((cp_coher_cntl || (flush_bits & RADV_CMD_FLAG_CS_PARTIAL_FLUSH)) &&
+	    !is_mec) {
+		radeon_emit(cs, PKT3(PKT3_PFP_SYNC_ME, 0, 0));
+		radeon_emit(cs, 0);
+a692 18
+	if ((flush_bits & RADV_CMD_FLAG_INV_GLOBAL_L2) ||
+	    (chip_class <= CIK && (flush_bits & RADV_CMD_FLAG_WRITEBACK_GLOBAL_L2))) {
+		cp_coher_cntl |= S_0085F0_TC_ACTION_ENA(1);
+		if (chip_class >= VI)
+			cp_coher_cntl |= S_0301F0_TC_WB_ACTION_ENA(1);
+	} else	if(flush_bits & RADV_CMD_FLAG_WRITEBACK_GLOBAL_L2) {
+		cp_coher_cntl |= S_0301F0_TC_WB_ACTION_ENA(1) |
+		                 S_0301F0_TC_NC_ACTION_ENA(1);
+
+		/* L2 writeback doesn't combine with L1 invalidate */
+		si_emit_acquire_mem(cs, is_mec, cp_coher_cntl);
+
+		cp_coher_cntl = 0;
+	}
+
+	if (flush_bits & RADV_CMD_FLAG_INV_VMEM_L1)
+		cp_coher_cntl |= S_0085F0_TCL1_ACTION_ENA(1);
+
+d696 8
+a703 3
+	if (cp_coher_cntl)
+		si_emit_acquire_mem(cs, is_mec, cp_coher_cntl);
+}
+a704 24
+void
+si_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer)
+{
+	bool is_compute = cmd_buffer->queue_family_index == RADV_QUEUE_COMPUTE;
+
+	if (is_compute)
+		cmd_buffer->state.flush_bits &= ~(RADV_CMD_FLAG_FLUSH_AND_INV_CB |
+	                                          RADV_CMD_FLAG_FLUSH_AND_INV_CB_META |
+	                                          RADV_CMD_FLAG_FLUSH_AND_INV_DB |
+	                                          RADV_CMD_FLAG_FLUSH_AND_INV_DB_META |
+	                                          RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
+	                                          RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
+	                                          RADV_CMD_FLAG_VGT_FLUSH);
+
+	radeon_check_space(cmd_buffer->device->ws, cmd_buffer->cs, 128);
+
+	si_cs_emit_cache_flush(cmd_buffer->cs,
+	                       cmd_buffer->device->physical_device->rad_info.chip_class,
+	                       radv_cmd_buffer_uses_mec(cmd_buffer),
+	                       cmd_buffer->state.flush_bits);
+
+
+	if (cmd_buffer->state.flush_bits)
+		radv_cmd_buffer_trace_emit(cmd_buffer);
+d730 1
+a730 1
+	uint32_t wr_confirm = !(flags & R600_CP_DMA_SYNC) ? S_414_DISABLE_WR_CONFIRM_GFX6(1) : 0;
+d741 1
+a741 1
+	if (cmd_buffer->device->physical_device->rad_info.chip_class >= CIK) {
+d763 1
+a763 1
+	if (sync_flag && cmd_buffer->queue_family_index == RADV_QUEUE_GENERAL) {
+a766 2
+
+	radv_cmd_buffer_trace_emit(cmd_buffer);
+d776 1
+a776 1
+	uint32_t wr_confirm = !(flags & R600_CP_DMA_SYNC) ? S_414_DISABLE_WR_CONFIRM_GFX6(1) : 0;
+d785 1
+a785 1
+	if (cmd_buffer->device->physical_device->rad_info.chip_class >= CIK) {
+d803 1
+a803 1
+	if (sync_flag && cmd_buffer->queue_family_index == RADV_QUEUE_GENERAL) {
+a806 1
+	radv_cmd_buffer_trace_emit(cmd_buffer);
+d856 1
+d858 2
+a859 2
+	if (cmd_buffer->device->physical_device->rad_info.family <= CHIP_CARRIZO ||
+	    cmd_buffer->device->physical_device->rad_info.family == CHIP_STONEY) {
+d919 2
 @
 
 

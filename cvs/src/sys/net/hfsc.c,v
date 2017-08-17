@@ -1,4 +1,4 @@
-head	1.44;
+head	1.46;
 access;
 symbols
 	OPENBSD_6_1:1.36.0.4
@@ -18,6 +18,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.46
+date	2017.08.17.18.22.43;	author mikeb;	state Exp;
+branches;
+next	1.45;
+commitid	CekJ0UWwrhXy7hmb;
+
+1.45
+date	2017.08.17.18.14.39;	author mikeb;	state Exp;
+branches;
+next	1.44;
+commitid	dVN1KPZznAOSRbJY;
 
 1.44
 date	2017.07.24.15.20.46;	author mikeb;	state Exp;
@@ -279,19 +291,22 @@ desc
 @@
 
 
-1.44
+1.46
 log
-@Don't attempt to deactivate a class that doesn't have any packets in it
+@Remove a class from parent's active list when queue is empty
 
-Classes are considered "active" when they have packets assigned to them.
-Active classes are tracked on various lists and during the purge operation
-must be dissociated from them.  During factoring out of the HFSC internal
-FIFO operations, the check for whether the class is empty got lost.
+When hfsc_deq_begin can't obtain an mbuf from the queue which can
+happen with fq_codel, the hfsc_deq_commit isn't called and HFSC
+doesn't get to update the active queue list of the parent class.
+To successfully purge and destroy such class, we need to make
+sure to run the service curve update routine even if we haven't
+dequeued anything so that the parent class doesn't accumulate
+stale child classes on its active list.
 
-Issue reported and fix tested by abieber@@ and myself.
+Reported by Atanas Vladimirov, OK visa
 @
 text
-@/*	$OpenBSD: hfsc.c,v 1.43 2017/07/19 13:41:20 mikeb Exp $	*/
+@/*	$OpenBSD: hfsc.c,v 1.45 2017/08/17 18:14:39 mikeb Exp $	*/
 
 /*
  * Copyright (c) 2012-2013 Henning Brauer <henning@@openbsd.org>
@@ -501,6 +516,7 @@ struct hfsc_class	*hfsc_nextclass(struct hfsc_class *);
 void		 hfsc_cl_purge(struct hfsc_if *, struct hfsc_class *,
 		     struct mbuf_list *);
 
+void		 hfsc_update_sc(struct hfsc_if *, struct hfsc_class *, int);
 void		 hfsc_deferred(void *);
 void		 hfsc_update_cfmin(struct hfsc_class *);
 void		 hfsc_set_active(struct hfsc_if *, struct hfsc_class *, int);
@@ -879,10 +895,9 @@ void *
 hfsc_alloc(unsigned int idx, void *q)
 {
 	struct hfsc_if *hif = q;
+
 	KASSERT(idx == 0); /* when hfsc is enabled we only use the first ifq */
 	KASSERT(hif != NULL);
-
-	timeout_add(&hif->hif_defer, 1);
 	return (hif);
 }
 
@@ -1120,8 +1135,11 @@ hfsc_enq(struct ifqueue *ifq, struct mbuf *m)
 	dm = hfsc_class_enqueue(cl, m);
 
 	/* successfully queued. */
-	if (dm != m && hfsc_class_qlength(cl) == 1)
+	if (dm != m && hfsc_class_qlength(cl) == 1) {
 		hfsc_set_active(hif, cl, m->m_pkthdr.len);
+		if (!timeout_pending(&hif->hif_defer))
+			timeout_add(&hif->hif_defer, 1);
+	}
 
 	/* drop occurred. */
 	if (dm != NULL)
@@ -1177,8 +1195,7 @@ hfsc_deq_begin(struct ifqueue *ifq, void **cookiep)
 	m = hfsc_class_deq_begin(cl, &free_ml);
 	ifq_mfreeml(ifq, &free_ml);
 	if (m == NULL) {
-		/* the class becomes passive */
-		hfsc_set_passive(hif, cl);
+		hfsc_update_sc(hif, cl, 0);
 		return (NULL);
 	}
 
@@ -1190,10 +1207,18 @@ hfsc_deq_begin(struct ifqueue *ifq, void **cookiep)
 void
 hfsc_deq_commit(struct ifqueue *ifq, struct mbuf *m, void *cookie)
 {
-	struct mbuf_list free_ml = MBUF_LIST_INITIALIZER();
 	struct hfsc_if *hif = ifq->ifq_q;
 	struct hfsc_class *cl = cookie;
-	struct mbuf *m0;
+
+	hfsc_class_deq_commit(cl, m);
+	hfsc_update_sc(hif, cl, m->m_pkthdr.len);
+
+	PKTCNTR_INC(&cl->cl_stats.xmit_cnt, m->m_pkthdr.len);
+}
+
+void
+hfsc_update_sc(struct hfsc_if *hif, struct hfsc_class *cl, int len)
+{
 	int next_len, realtime = 0;
 	u_int64_t cur_time = hif->hif_microtime;
 
@@ -1201,13 +1226,9 @@ hfsc_deq_commit(struct ifqueue *ifq, struct mbuf *m, void *cookie)
 	if (cl->cl_rsc != NULL)
 		realtime = (cl->cl_e <= cur_time);
 
-	hfsc_class_deq_commit(cl, m);
-
-	PKTCNTR_INC(&cl->cl_stats.xmit_cnt, m->m_pkthdr.len);
-
-	hfsc_update_vf(cl, m->m_pkthdr.len, cur_time);
+	hfsc_update_vf(cl, len, cur_time);
 	if (realtime)
-		cl->cl_cumul += m->m_pkthdr.len;
+		cl->cl_cumul += len;
 
 	if (hfsc_class_qlength(cl) > 0) {
 		/*
@@ -1216,9 +1237,11 @@ hfsc_deq_commit(struct ifqueue *ifq, struct mbuf *m, void *cookie)
 		 * be used with an external queue manager.
 		 */
 		if (cl->cl_rsc != NULL) {
+			struct mbuf *m0;
+
 			/* update ed */
-			m0 = hfsc_class_deq_begin(cl, &free_ml);
-			ifq_mfreeml(ifq, &free_ml);
+			KASSERT(cl->cl_qops == pfq_hfsc_ops);
+			m0 = MBUF_LIST_FIRST(&cl->cl_q.q);
 			next_len = m0->m_pkthdr.len;
 
 			if (realtime)
@@ -1239,16 +1262,18 @@ hfsc_deferred(void *arg)
 	struct ifqueue *ifq = &ifp->if_snd;
 	struct hfsc_if *hif;
 
-	KERNEL_ASSERT_LOCKED();
-	KASSERT(HFSC_ENABLED(ifq));
+	if (!HFSC_ENABLED(ifq))
+		return;
 
 	if (!ifq_empty(ifq))
 		ifq_start(ifq);
 
-	hif = ifq->ifq_q;
-
+	hif = ifq_q_enter(&ifp->if_snd, ifq_hfsc_ops);
+	if (hif == NULL)
+		return;
 	/* XXX HRTIMER nearest virtual/fit time is likely less than 1/HZ. */
 	timeout_add(&hif->hif_defer, 1);
+	ifq_q_leave(&ifp->if_snd, hif);
 }
 
 void
@@ -2022,6 +2047,93 @@ hfsc_clh2cph(struct hfsc_if *hif, u_int32_t chandle)
 			return (cl);
 	return (NULL);
 }
+@
+
+
+1.45
+log
+@Resolve races with the hfsc_deferred timeout
+
+Since NET_LOCK no longer protects the ioctl path from timeouts
+running while ifq configuration is happening, the hfsc_deferred
+timeout needs to make sure that the underlying HFSC object is
+locked before attempting to reference it. This prevents the race
+happening after we release the ifq mutex in ifq_attach but before
+hfsc_free disables the timeout.
+
+The second race is possible after hfsc_alloc but before the ifq
+mutex gets locked in ifq_attach and a new set of ifq operations
+is installed. If hfsc_deferred fires in between, it wouldn't be
+able to reschedule itself and will no longer be executed. To
+prevent this, the timeout can be established when packets are
+enqueued instead of the moment the queue is created.
+
+With input and OK visa
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hfsc.c,v 1.44 2017/07/24 15:20:46 mikeb Exp $	*/
+d211 1
+d890 1
+a890 2
+		/* the class becomes passive */
+		hfsc_set_passive(hif, cl);
+a901 1
+	struct mbuf_list free_ml = MBUF_LIST_INITIALIZER();
+d904 10
+a913 1
+	struct mbuf *m0;
+d921 1
+a921 5
+	hfsc_class_deq_commit(cl, m);
+
+	PKTCNTR_INC(&cl->cl_stats.xmit_cnt, m->m_pkthdr.len);
+
+	hfsc_update_vf(cl, m->m_pkthdr.len, cur_time);
+d923 1
+a923 1
+		cl->cl_cumul += m->m_pkthdr.len;
+d932 2
+d935 2
+a936 2
+			m0 = hfsc_class_deq_begin(cl, &free_ml);
+			ifq_mfreeml(ifq, &free_ml);
+@
+
+
+1.44
+log
+@Don't attempt to deactivate a class that doesn't have any packets in it
+
+Classes are considered "active" when they have packets assigned to them.
+Active classes are tracked on various lists and during the purge operation
+must be dissociated from them.  During factoring out of the HFSC internal
+FIFO operations, the check for whether the class is empty got lost.
+
+Issue reported and fix tested by abieber@@ and myself.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: hfsc.c,v 1.43 2017/07/19 13:41:20 mikeb Exp $	*/
+d589 1
+a591 2
+
+	timeout_add(&hif->hif_defer, 1);
+d829 1
+a829 1
+	if (dm != m && hfsc_class_qlength(cl) == 1)
+d831 3
+d951 2
+a952 2
+	KERNEL_ASSERT_LOCKED();
+	KASSERT(HFSC_ENABLED(ifq));
+d957 3
+a959 2
+	hif = ifq->ifq_q;
+
+d962 1
 @
 
 

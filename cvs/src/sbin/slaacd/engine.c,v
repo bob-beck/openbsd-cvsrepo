@@ -1,9 +1,27 @@
-head	1.13;
+head	1.16;
 access;
 symbols;
 locks; strict;
 comment	@ * @;
 
+
+1.16
+date	2017.08.23.10.48.01;	author florian;	state Exp;
+branches;
+next	1.15;
+commitid	JEJ3ePwebV4hmXKV;
+
+1.15
+date	2017.08.23.10.46.40;	author florian;	state Exp;
+branches;
+next	1.14;
+commitid	n3AAID16l0pYiLWt;
+
+1.14
+date	2017.08.23.10.45.35;	author florian;	state Exp;
+branches;
+next	1.13;
+commitid	JDBFHXhdslgZB59T;
 
 1.13
 date	2017.08.21.14.44.26;	author florian;	state Exp;
@@ -88,13 +106,15 @@ desc
 @@
 
 
-1.13
+1.16
 log
-@Move sin6_to_str() to slaacd.c so that it can be used in more
-places. While here do not compile it for the ramdisk.
+@When starting up or when the autoconf6 flag is set on an interface
+collect already configured autoconf addresses and track them in the
+engine.
+That way we are not adding a new privacy address on every restart.
 @
 text
-@/*	$OpenBSD: engine.c,v 1.12 2017/08/18 07:45:03 florian Exp $	*/
+@/*	$OpenBSD: engine.c,v 1.15 2017/08/23 10:46:40 florian Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@@openbsd.org>
@@ -316,6 +336,8 @@ void			 engine_dispatch_main(int, short, void *);
 #ifndef	SMALL
 void			 send_interface_info(struct slaacd_iface *, pid_t);
 void			 engine_showinfo_ctl(struct imsg *, uint32_t);
+void			 debug_log_ra(struct imsg_ra *);
+int			 in6_mask2prefixlen(struct in6_addr *);
 #endif	/* SMALL */
 struct slaacd_iface	*get_slaacd_iface_by_id(uint32_t);
 void			 remove_slaacd_iface(uint32_t);
@@ -326,6 +348,7 @@ void			 gen_addr(struct slaacd_iface *, struct radv_prefix *,
 void			 gen_address_proposal(struct slaacd_iface *, struct
 			     radv *, struct radv_prefix *, int);
 void			 free_address_proposal(struct address_proposal *);
+void			 timeout_from_lifetime(struct address_proposal *);
 void			 configure_address(struct address_proposal *);
 void			 in6_prefixlen2mask(struct in6_addr *, int len);
 void			 gen_dfr_proposal(struct slaacd_iface *, struct
@@ -333,7 +356,6 @@ void			 gen_dfr_proposal(struct slaacd_iface *, struct
 void			 configure_dfr(struct dfr_proposal *);
 void			 free_dfr_proposal(struct dfr_proposal *);
 void			 withdraw_dfr(struct dfr_proposal *);
-void			 debug_log_ra(struct imsg_ra *);
 char			*parse_dnssl(char *, int);
 void			 update_iface_ra(struct slaacd_iface *, struct radv *);
 void			 send_proposal(struct imsg_proposal *);
@@ -636,6 +658,11 @@ engine_dispatch_main(int fd, short event, void *bula)
 	struct slaacd_iface	*iface;
 	ssize_t			 n;
 	int			 shut = 0;
+#ifndef	SMALL
+	struct imsg_addrinfo	 imsg_addrinfo;
+	struct address_proposal	*addr_proposal = NULL;
+	size_t			 i;
+#endif	/* SMALL */
 
 	if (event & EV_READ) {
 		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
@@ -756,6 +783,67 @@ engine_dispatch_main(int fd, short event, void *bula)
 				    sizeof(struct sockaddr_in6));
 			}
 			break;
+#ifndef	SMALL
+		case IMSG_UPDATE_ADDRESS:
+			if (imsg.hdr.len != IMSG_HEADER_SIZE +
+			    sizeof(imsg_addrinfo))
+				fatal("%s: IMSG_UPDATE_ADDRESS wrong length: "
+				    "%d", __func__, imsg.hdr.len);
+
+			memcpy(&imsg_addrinfo, imsg.data,
+			    sizeof(imsg_addrinfo));
+
+			iface = get_slaacd_iface_by_id(imsg_addrinfo.if_index);
+			if (iface == NULL)
+				break;
+
+			log_debug("%s: IMSG_UPDATE_ADDRESS", __func__);
+
+			addr_proposal = find_address_proposal_by_addr(iface,
+			    &imsg_addrinfo.addr);
+			if (addr_proposal)
+				break;
+
+			if ((addr_proposal = calloc(1,
+			    sizeof(*addr_proposal))) == NULL)
+				fatal("calloc");
+			evtimer_set(&addr_proposal->timer,
+			    address_proposal_timeout, addr_proposal);
+			addr_proposal->id = ++proposal_id;
+			addr_proposal->state = PROPOSAL_CONFIGURED;
+			addr_proposal->vltime = imsg_addrinfo.vltime;
+			addr_proposal->pltime = imsg_addrinfo.pltime;
+			addr_proposal->timeout_count = 0;
+
+			timeout_from_lifetime(addr_proposal);
+
+			if (clock_gettime(CLOCK_REALTIME, &addr_proposal->when))
+				fatal("clock_gettime");
+			if (clock_gettime(CLOCK_MONOTONIC,
+			    &addr_proposal->uptime))
+				fatal("clock_gettime");
+			addr_proposal->if_index = imsg_addrinfo.if_index;
+			memcpy(&addr_proposal->hw_address,
+			    &imsg_addrinfo.hw_address,
+			    sizeof(addr_proposal->hw_address));
+			addr_proposal->addr = imsg_addrinfo.addr;
+			addr_proposal->mask = imsg_addrinfo.mask;
+			addr_proposal->prefix = addr_proposal->addr.sin6_addr;
+
+			for (i = 0; i < sizeof(addr_proposal->prefix.s6_addr) /
+			    sizeof(addr_proposal->prefix.s6_addr[0]); i++)
+				addr_proposal->prefix.s6_addr[i] &=
+				    addr_proposal->mask.s6_addr[i];
+
+			addr_proposal->privacy = imsg_addrinfo.privacy;
+			addr_proposal->prefix_len =
+			    in6_mask2prefixlen(&addr_proposal->mask);
+
+			LIST_INSERT_HEAD(&iface->addr_proposals,
+			    addr_proposal, entries);
+
+			break;
+#endif	/* SMALL */
 		default:
 			log_debug("%s: unexpected imsg %d", __func__,
 			    imsg.hdr.type);
@@ -1323,6 +1411,32 @@ in6_prefixlen2mask(struct in6_addr *maskp, int len)
 		maskp->s6_addr[bytelen] = maskarray[bitlen - 1];
 }
 
+#ifndef	SMALL
+/* from kame via ifconfig, where it's called prefix() */
+int
+in6_mask2prefixlen(struct in6_addr *in6)
+{
+	u_char *nam = (u_char *)in6;
+	int byte, bit, plen = 0, size = sizeof(struct in6_addr);
+
+	for (byte = 0; byte < size; byte++, plen += 8)
+		if (nam[byte] != 0xff)
+			break;
+	if (byte == size)
+		return (plen);
+	for (bit = 7; bit != 0; bit--, plen++)
+		if (!(nam[byte] & (1 << bit)))
+			break;
+	for (; bit != 0; bit--)
+		if (nam[byte] & (1 << bit))
+			return (0);
+	byte++;
+	for (; byte < size; byte++)
+		if (nam[byte])
+			return (0);
+	return (plen);
+}
+
 void
 debug_log_ra(struct imsg_ra *ra)
 {
@@ -1515,6 +1629,7 @@ debug_log_ra(struct imsg_ra *ra)
 		p += nd_opt_hdr->nd_opt_len * 8 - 2;
 	}
 }
+#endif	/* SMALL */
 
 char*
 parse_dnssl(char* data, int datalen)
@@ -1734,11 +1849,12 @@ void update_iface_ra(struct slaacd_iface *iface, struct radv *ra)
 }
 
 void
-configure_address(struct address_proposal *addr_proposal)
+timeout_from_lifetime(struct address_proposal *addr_proposal)
 {
-	struct imsg_configure_address	 address;
-	struct timeval			 tv;
-	time_t				 lifetime;
+	struct timeval	 tv;
+	time_t		 lifetime;
+
+	addr_proposal->next_timeout = 0;
 
 	if (addr_proposal->pltime > MAX_RTR_SOLICITATIONS *
 	    (RTR_SOLICITATION_INTERVAL + 1))
@@ -1755,8 +1871,13 @@ configure_address(struct address_proposal *addr_proposal)
 		evtimer_add(&addr_proposal->timer, &tv);
 		log_debug("%s: %d, scheduling new timeout in %llds.%06ld",
 		    __func__, addr_proposal->if_index, tv.tv_sec, tv.tv_usec);
-	} else
-		addr_proposal->next_timeout = 0;
+	}
+}
+
+void
+configure_address(struct address_proposal *addr_proposal)
+{
+	struct imsg_configure_address	 address;
 
 	addr_proposal->state = PROPOSAL_CONFIGURED;
 
@@ -2284,6 +2405,62 @@ real_lifetime(struct timespec *received_uptime, uint32_t ltime)
 
 	return (remaining);
 }
+@
+
+
+1.15
+log
+@We will never need this on the ramdisk.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: engine.c,v 1.14 2017/08/23 10:45:35 florian Exp $	*/
+d224 1
+d545 5
+d670 61
+d1299 25
+@
+
+
+1.14
+log
+@Extract timeout_from_lifetime(); to be used in more places.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: engine.c,v 1.13 2017/08/21 14:44:26 florian Exp $	*/
+d223 1
+a241 1
+void			 debug_log_ra(struct imsg_ra *);
+d1231 1
+d1424 1
+@
+
+
+1.13
+log
+@Move sin6_to_str() to slaacd.c so that it can be used in more
+places. While here do not compile it for the ramdisk.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: engine.c,v 1.12 2017/08/18 07:45:03 florian Exp $	*/
+d233 1
+d1642 1
+a1642 1
+configure_address(struct address_proposal *addr_proposal)
+d1644 4
+a1647 3
+	struct imsg_configure_address	 address;
+	struct timeval			 tv;
+	time_t				 lifetime;
+d1664 7
+a1670 2
+	} else
+		addr_proposal->next_timeout = 0;
 @
 
 

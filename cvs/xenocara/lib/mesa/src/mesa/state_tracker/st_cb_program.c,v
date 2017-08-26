@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.40;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.38.18;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/**************************************************************************
@@ -111,6 +117,273 @@ text
 #include "st_mesa_to_tgsi.h"
 #include "st_cb_program.h"
 #include "st_glsl_to_tgsi.h"
+#include "st_atifs_to_tgsi.h"
+
+
+/**
+ * Called via ctx->Driver.NewProgram() to allocate a new vertex or
+ * fragment program.
+ */
+static struct gl_program *
+st_new_program(struct gl_context *ctx, GLenum target, GLuint id)
+{
+   switch (target) {
+   case GL_VERTEX_PROGRAM_ARB: {
+      struct st_vertex_program *prog = ST_CALLOC_STRUCT(st_vertex_program);
+      return _mesa_init_gl_program(&prog->Base.Base, target, id);
+   }
+   case GL_FRAGMENT_PROGRAM_ARB: {
+      struct st_fragment_program *prog = ST_CALLOC_STRUCT(st_fragment_program);
+      return _mesa_init_gl_program(&prog->Base.Base, target, id);
+   }
+   case GL_GEOMETRY_PROGRAM_NV: {
+      struct st_geometry_program *prog = ST_CALLOC_STRUCT(st_geometry_program);
+      return _mesa_init_gl_program(&prog->Base.Base, target, id);
+   }
+   case GL_TESS_CONTROL_PROGRAM_NV: {
+      struct st_tessctrl_program *prog = ST_CALLOC_STRUCT(st_tessctrl_program);
+      return _mesa_init_gl_program(&prog->Base.Base, target, id);
+   }
+   case GL_TESS_EVALUATION_PROGRAM_NV: {
+      struct st_tesseval_program *prog = ST_CALLOC_STRUCT(st_tesseval_program);
+      return _mesa_init_gl_program(&prog->Base.Base, target, id);
+   }
+   case GL_COMPUTE_PROGRAM_NV: {
+      struct st_compute_program *prog = ST_CALLOC_STRUCT(st_compute_program);
+      return _mesa_init_gl_program(&prog->Base.Base, target, id);
+   }
+   default:
+      assert(0);
+      return NULL;
+   }
+}
+
+
+/**
+ * Called via ctx->Driver.DeleteProgram()
+ */
+static void
+st_delete_program(struct gl_context *ctx, struct gl_program *prog)
+{
+   struct st_context *st = st_context(ctx);
+
+   switch( prog->Target ) {
+   case GL_VERTEX_PROGRAM_ARB:
+      {
+         struct st_vertex_program *stvp = (struct st_vertex_program *) prog;
+         st_release_vp_variants( st, stvp );
+         
+         if (stvp->glsl_to_tgsi)
+            free_glsl_to_tgsi_visitor(stvp->glsl_to_tgsi);
+      }
+      break;
+   case GL_GEOMETRY_PROGRAM_NV:
+      {
+         struct st_geometry_program *stgp =
+            (struct st_geometry_program *) prog;
+
+         st_release_basic_variants(st, stgp->Base.Base.Target,
+                                   &stgp->variants, &stgp->tgsi);
+         
+         if (stgp->glsl_to_tgsi)
+            free_glsl_to_tgsi_visitor(stgp->glsl_to_tgsi);
+      }
+      break;
+   case GL_FRAGMENT_PROGRAM_ARB:
+      {
+         struct st_fragment_program *stfp =
+            (struct st_fragment_program *) prog;
+
+         st_release_fp_variants(st, stfp);
+         
+         if (stfp->glsl_to_tgsi)
+            free_glsl_to_tgsi_visitor(stfp->glsl_to_tgsi);
+      }
+      break;
+   case GL_TESS_CONTROL_PROGRAM_NV:
+      {
+         struct st_tessctrl_program *sttcp =
+            (struct st_tessctrl_program *) prog;
+
+         st_release_basic_variants(st, sttcp->Base.Base.Target,
+                                   &sttcp->variants, &sttcp->tgsi);
+
+         if (sttcp->glsl_to_tgsi)
+            free_glsl_to_tgsi_visitor(sttcp->glsl_to_tgsi);
+      }
+      break;
+   case GL_TESS_EVALUATION_PROGRAM_NV:
+      {
+         struct st_tesseval_program *sttep =
+            (struct st_tesseval_program *) prog;
+
+         st_release_basic_variants(st, sttep->Base.Base.Target,
+                                   &sttep->variants, &sttep->tgsi);
+
+         if (sttep->glsl_to_tgsi)
+            free_glsl_to_tgsi_visitor(sttep->glsl_to_tgsi);
+      }
+      break;
+   case GL_COMPUTE_PROGRAM_NV:
+      {
+         struct st_compute_program *stcp =
+            (struct st_compute_program *) prog;
+
+         st_release_cp_variants(st, stcp);
+
+         if (stcp->glsl_to_tgsi)
+            free_glsl_to_tgsi_visitor(stcp->glsl_to_tgsi);
+      }
+      break;
+   default:
+      assert(0); /* problem */
+   }
+
+   /* delete base class */
+   _mesa_delete_program( ctx, prog );
+}
+
+
+/**
+ * Called via ctx->Driver.ProgramStringNotify()
+ * Called when the program's text/code is changed.  We have to free
+ * all shader variants and corresponding gallium shaders when this happens.
+ */
+static GLboolean
+st_program_string_notify( struct gl_context *ctx,
+                                           GLenum target,
+                                           struct gl_program *prog )
+{
+   struct st_context *st = st_context(ctx);
+   gl_shader_stage stage = _mesa_program_enum_to_shader_stage(target);
+
+   if (target == GL_FRAGMENT_PROGRAM_ARB) {
+      struct st_fragment_program *stfp = (struct st_fragment_program *) prog;
+
+      st_release_fp_variants(st, stfp);
+      if (!st_translate_fragment_program(st, stfp))
+         return false;
+
+      if (st->fp == stfp)
+	 st->dirty |= stfp->affected_states;
+   }
+   else if (target == GL_GEOMETRY_PROGRAM_NV) {
+      struct st_geometry_program *stgp = (struct st_geometry_program *) prog;
+
+      st_release_basic_variants(st, stgp->Base.Base.Target,
+                                &stgp->variants, &stgp->tgsi);
+      if (!st_translate_geometry_program(st, stgp))
+         return false;
+
+      if (st->gp == stgp)
+	 st->dirty |= stgp->affected_states;
+   }
+   else if (target == GL_VERTEX_PROGRAM_ARB) {
+      struct st_vertex_program *stvp = (struct st_vertex_program *) prog;
+
+      st_release_vp_variants(st, stvp);
+      if (!st_translate_vertex_program(st, stvp))
+         return false;
+
+      if (st->vp == stvp)
+	 st->dirty |= ST_NEW_VERTEX_PROGRAM(st, stvp);
+   }
+   else if (target == GL_TESS_CONTROL_PROGRAM_NV) {
+      struct st_tessctrl_program *sttcp =
+         (struct st_tessctrl_program *) prog;
+
+      st_release_basic_variants(st, sttcp->Base.Base.Target,
+                                &sttcp->variants, &sttcp->tgsi);
+      if (!st_translate_tessctrl_program(st, sttcp))
+         return false;
+
+      if (st->tcp == sttcp)
+         st->dirty |= sttcp->affected_states;
+   }
+   else if (target == GL_TESS_EVALUATION_PROGRAM_NV) {
+      struct st_tesseval_program *sttep =
+         (struct st_tesseval_program *) prog;
+
+      st_release_basic_variants(st, sttep->Base.Base.Target,
+                                &sttep->variants, &sttep->tgsi);
+      if (!st_translate_tesseval_program(st, sttep))
+         return false;
+
+      if (st->tep == sttep)
+         st->dirty |= sttep->affected_states;
+   }
+   else if (target == GL_COMPUTE_PROGRAM_NV) {
+      struct st_compute_program *stcp =
+         (struct st_compute_program *) prog;
+
+      st_release_cp_variants(st, stcp);
+      if (!st_translate_compute_program(st, stcp))
+         return false;
+
+      if (st->cp == stcp)
+         st->dirty |= stcp->affected_states;
+   }
+   else if (target == GL_FRAGMENT_SHADER_ATI) {
+      assert(prog);
+
+      struct st_fragment_program *stfp = (struct st_fragment_program *) prog;
+      assert(stfp->ati_fs);
+      assert(stfp->ati_fs->Program == prog);
+
+      st_init_atifs_prog(ctx, prog);
+
+      st_release_fp_variants(st, stfp);
+      if (!st_translate_fragment_program(st, stfp))
+         return false;
+
+      if (st->fp == stfp)
+         st->dirty |= stfp->affected_states;
+   }
+
+   if (ST_DEBUG & DEBUG_PRECOMPILE ||
+       st->shader_has_one_variant[stage])
+      st_precompile_shader_variant(st, prog);
+
+   return GL_TRUE;
+}
+
+/**
+ * Called via ctx->Driver.NewATIfs()
+ * Called in glEndFragmentShaderATI()
+ */
+static struct gl_program *
+st_new_ati_fs(struct gl_context *ctx, struct ati_fragment_shader *curProg)
+{
+   struct gl_program *prog = ctx->Driver.NewProgram(ctx, GL_FRAGMENT_PROGRAM_ARB,
+         curProg->Id);
+   struct st_fragment_program *stfp = (struct st_fragment_program *)prog;
+   stfp->ati_fs = curProg;
+   return prog;
+}
+
+/**
+ * Plug in the program and shader-related device driver functions.
+ */
+void
+st_init_program_functions(struct dd_function_table *functions)
+{
+   functions->NewProgram = st_new_program;
+   functions->DeleteProgram = st_delete_program;
+   functions->ProgramStringNotify = st_program_string_notify;
+   functions->NewATIfs = st_new_ati_fs;
+   
+   functions->LinkShader = st_link_shader;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d49 1
+a49 47
 
 
 
@@ -158,120 +431,42 @@ st_use_program(struct gl_context *ctx, struct gl_shader_program *shProg)
    st->dirty.st |= ST_NEW_TESSCTRL_PROGRAM;
    st->dirty.st |= ST_NEW_TESSEVAL_PROGRAM;
 }
-
-
-/**
- * Called via ctx->Driver.NewProgram() to allocate a new vertex or
- * fragment program.
- */
-static struct gl_program *
-st_new_program(struct gl_context *ctx, GLenum target, GLuint id)
-{
-   switch (target) {
-   case GL_VERTEX_PROGRAM_ARB: {
-      struct st_vertex_program *prog = ST_CALLOC_STRUCT(st_vertex_program);
+d62 1
+a62 1
       return _mesa_init_vertex_program(ctx, &prog->Base, target, id);
-   }
+a63 1
 
-   case GL_FRAGMENT_PROGRAM_ARB: {
-      struct st_fragment_program *prog = ST_CALLOC_STRUCT(st_fragment_program);
+d66 1
+a66 1
       return _mesa_init_fragment_program(ctx, &prog->Base, target, id);
-   }
+a67 1
 
-   case GL_GEOMETRY_PROGRAM_NV: {
-      struct st_geometry_program *prog = ST_CALLOC_STRUCT(st_geometry_program);
+d70 1
+a70 1
       return _mesa_init_geometry_program(ctx, &prog->Base, target, id);
-   }
+a71 1
 
-   case GL_TESS_CONTROL_PROGRAM_NV: {
-      struct st_tessctrl_program *prog = ST_CALLOC_STRUCT(st_tessctrl_program);
+d74 1
+a74 1
       return _mesa_init_tess_ctrl_program(ctx, &prog->Base, target, id);
-   }
+a75 1
 
-   case GL_TESS_EVALUATION_PROGRAM_NV: {
-      struct st_tesseval_program *prog = ST_CALLOC_STRUCT(st_tesseval_program);
+d78 5
+a82 1
       return _mesa_init_tess_eval_program(ctx, &prog->Base, target, id);
-   }
+a83 1
 
-   default:
-      assert(0);
-      return NULL;
-   }
-}
-
-
-/**
- * Called via ctx->Driver.DeleteProgram()
- */
-static void
-st_delete_program(struct gl_context *ctx, struct gl_program *prog)
-{
-   struct st_context *st = st_context(ctx);
-
-   switch( prog->Target ) {
-   case GL_VERTEX_PROGRAM_ARB:
-      {
-         struct st_vertex_program *stvp = (struct st_vertex_program *) prog;
-         st_release_vp_variants( st, stvp );
-         
-         if (stvp->glsl_to_tgsi)
-            free_glsl_to_tgsi_visitor(stvp->glsl_to_tgsi);
-      }
-      break;
-   case GL_GEOMETRY_PROGRAM_NV:
-      {
-         struct st_geometry_program *stgp =
-            (struct st_geometry_program *) prog;
-
+d114 2
+a115 1
          st_release_gp_variants(st, stgp);
-         
-         if (stgp->glsl_to_tgsi)
-            free_glsl_to_tgsi_visitor(stgp->glsl_to_tgsi);
-      }
-      break;
-   case GL_FRAGMENT_PROGRAM_ARB:
-      {
-         struct st_fragment_program *stfp =
-            (struct st_fragment_program *) prog;
-
-         st_release_fp_variants(st, stfp);
-         
-         if (stfp->glsl_to_tgsi)
-            free_glsl_to_tgsi_visitor(stfp->glsl_to_tgsi);
-      }
-      break;
-   case GL_TESS_CONTROL_PROGRAM_NV:
-      {
-         struct st_tessctrl_program *sttcp =
-            (struct st_tessctrl_program *) prog;
-
+d137 2
+a138 1
          st_release_tcp_variants(st, sttcp);
-
-         if (sttcp->glsl_to_tgsi)
-            free_glsl_to_tgsi_visitor(sttcp->glsl_to_tgsi);
-      }
-      break;
-   case GL_TESS_EVALUATION_PROGRAM_NV:
-      {
-         struct st_tesseval_program *sttep =
-            (struct st_tesseval_program *) prog;
-
+d149 2
+a150 1
          st_release_tep_variants(st, sttep);
-
-         if (sttep->glsl_to_tgsi)
-            free_glsl_to_tgsi_visitor(sttep->glsl_to_tgsi);
-      }
-      break;
-   default:
-      assert(0); /* problem */
-   }
-
-   /* delete base class */
-   _mesa_delete_program( ctx, prog );
-}
-
-
-/**
+d156 11
+a176 12
  * Called via ctx->Driver.IsProgramNative()
  */
 static GLboolean
@@ -284,83 +479,48 @@ st_is_program_native(struct gl_context *ctx,
 
 
 /**
- * Called via ctx->Driver.ProgramStringNotify()
- * Called when the program's text/code is changed.  We have to free
- * all shader variants and corresponding gallium shaders when this happens.
- */
-static GLboolean
-st_program_string_notify( struct gl_context *ctx,
-                                           GLenum target,
-                                           struct gl_program *prog )
-{
-   struct st_context *st = st_context(ctx);
-
-   if (target == GL_FRAGMENT_PROGRAM_ARB) {
-      struct st_fragment_program *stfp = (struct st_fragment_program *) prog;
-
-      st_release_fp_variants(st, stfp);
-
-      if (st->fp == stfp)
+d187 1
+d193 2
+d197 1
+a197 1
 	 st->dirty.st |= ST_NEW_FRAGMENT_PROGRAM;
-   }
-   else if (target == GL_GEOMETRY_PROGRAM_NV) {
-      struct st_geometry_program *stgp = (struct st_geometry_program *) prog;
-
+d202 4
+a205 1
       st_release_gp_variants(st, stgp);
-
-      if (st->gp == stgp)
+d208 1
+a208 1
 	 st->dirty.st |= ST_NEW_GEOMETRY_PROGRAM;
-   }
-   else if (target == GL_VERTEX_PROGRAM_ARB) {
-      struct st_vertex_program *stvp = (struct st_vertex_program *) prog;
-
+d213 3
+a215 1
       st_release_vp_variants( st, stvp );
-
-      if (st->vp == stvp)
+d218 1
+a218 1
 	 st->dirty.st |= ST_NEW_VERTEX_PROGRAM;
-   }
-   else if (target == GL_TESS_CONTROL_PROGRAM_NV) {
-      struct st_tessctrl_program *sttcp =
-         (struct st_tessctrl_program *) prog;
-
+d224 4
+a227 1
       st_release_tcp_variants(st, sttcp);
-
-      if (st->tcp == sttcp)
+d230 1
+a230 1
          st->dirty.st |= ST_NEW_TESSCTRL_PROGRAM;
-   }
-   else if (target == GL_TESS_EVALUATION_PROGRAM_NV) {
-      struct st_tesseval_program *sttep =
-         (struct st_tesseval_program *) prog;
-
+d236 4
+a239 1
       st_release_tep_variants(st, sttep);
-
-      if (st->tep == sttep)
+d242 1
+a242 1
          st->dirty.st |= ST_NEW_TESSEVAL_PROGRAM;
-   }
-
+d244 3
+d248 26
+a273 1
    if (ST_DEBUG & DEBUG_PRECOMPILE)
-      st_precompile_shader_variant(st, prog);
-
+a275 1
    /* XXX check if program is legal, within limits */
-   return GL_TRUE;
-}
-
-
-/**
- * Plug in the program and shader-related device driver functions.
- */
-void
-st_init_program_functions(struct dd_function_table *functions)
-{
+d279 13
+a298 2
    functions->BindProgram = st_bind_program;
    functions->UseProgram = st_use_program;
-   functions->NewProgram = st_new_program;
-   functions->DeleteProgram = st_delete_program;
+a300 1
    functions->IsProgramNative = st_is_program_native;
-   functions->ProgramStringNotify = st_program_string_notify;
-   
-   functions->LinkShader = st_link_shader;
-}
+d302 1
 @
 
 

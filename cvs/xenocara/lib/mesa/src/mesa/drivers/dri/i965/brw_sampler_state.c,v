@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.5
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.37;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.40.20;	author jsg;	state Exp;
@@ -64,9 +69,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -115,6 +121,7 @@ text
 
 #include "main/macros.h"
 #include "main/samplerobj.h"
+#include "util/half_float.h"
 
 /**
  * Emit a 3DSTATE_SAMPLER_STATE_POINTERS_{VS,HS,GS,DS,PS} packet.
@@ -125,6 +132,8 @@ gen7_emit_sampler_state_pointers_xs(struct brw_context *brw,
 {
    static const uint16_t packet_headers[] = {
       [MESA_SHADER_VERTEX] = _3DSTATE_SAMPLER_STATE_POINTERS_VS,
+      [MESA_SHADER_TESS_CTRL] = _3DSTATE_SAMPLER_STATE_POINTERS_HS,
+      [MESA_SHADER_TESS_EVAL] = _3DSTATE_SAMPLER_STATE_POINTERS_DS,
       [MESA_SHADER_GEOMETRY] = _3DSTATE_SAMPLER_STATE_POINTERS_GS,
       [MESA_SHADER_FRAGMENT] = _3DSTATE_SAMPLER_STATE_POINTERS_PS,
    };
@@ -156,16 +165,15 @@ brw_emit_sampler_state(struct brw_context *brw,
                        unsigned wrap_s,
                        unsigned wrap_t,
                        unsigned wrap_r,
+                       unsigned base_level,
                        unsigned min_lod,
                        unsigned max_lod,
                        int lod_bias,
-                       unsigned base_level,
                        unsigned shadow_function,
                        bool non_normalized_coordinates,
                        uint32_t border_color_offset)
 {
    ss[0] = BRW_SAMPLER_LOD_PRECLAMP_ENABLE |
-           SET_FIELD(base_level, BRW_SAMPLER_BASE_MIPLEVEL) |
            SET_FIELD(mip_filter, BRW_SAMPLER_MIP_FILTER) |
            SET_FIELD(mag_filter, BRW_SAMPLER_MAG_FILTER) |
            SET_FIELD(min_filter, BRW_SAMPLER_MIN_FILTER);
@@ -201,6 +209,21 @@ brw_emit_sampler_state(struct brw_context *brw,
    } else {
       ss[0] |= SET_FIELD(lod_bias & 0x7ff, GEN4_SAMPLER_LOD_BIAS) |
                SET_FIELD(shadow_function, GEN4_SAMPLER_SHADOW_FUNCTION);
+
+      /* This field has existed since the original i965, but is declared MBZ
+       * until Sandy Bridge.  According to the PRM:
+       *
+       *    "This was added to match OpenGL semantics"
+       *
+       * In particular, OpenGL allowed you to offset by 0.5 in certain cases
+       * to get slightly better filtering.  On Ivy Bridge and above, it
+       * appears that this is added to RENDER_SURFACE_STATE::SurfaceMinLOD so
+       * the right value is 0.0 or 0.5 (if you want the wacky behavior).  On
+       * Sandy Bridge, however, this sum does not seem to occur and you have
+       * to set it to the actual base level of the texture.
+       */
+      if (brw->gen == 6)
+         ss[0] |= SET_FIELD(base_level, BRW_SAMPLER_BASE_MIPLEVEL);
 
       if (brw->gen == 6 && min_filter != mag_filter)
          ss[0] |= GEN6_SAMPLER_MIN_MAG_NOT_EQUAL;
@@ -266,6 +289,16 @@ wrap_mode_needs_border_color(unsigned wrap_mode)
           wrap_mode == GEN8_TEXCOORDMODE_HALF_BORDER;
 }
 
+static bool
+has_component(mesa_format format, int i)
+{
+   if (_mesa_is_format_color_format(format))
+      return _mesa_format_has_color_component(format, i);
+
+   /* depth and stencil have only one component */
+   return i == 0;
+}
+
 /**
  * Upload SAMPLER_BORDER_COLOR_STATE.
  */
@@ -273,7 +306,7 @@ static void
 upload_default_color(struct brw_context *brw,
                      const struct gl_sampler_object *sampler,
                      mesa_format format, GLenum base_format,
-                     bool is_integer_format,
+                     bool is_integer_format, bool is_stencil_sampling,
                      uint32_t *sdc_offset)
 {
    union gl_color_union color;
@@ -337,7 +370,7 @@ upload_default_color(struct brw_context *brw,
       uint32_t *sdc = brw_state_batch(brw, AUB_TRACE_SAMPLER_DEFAULT_COLOR,
                                       4 * 4, 64, sdc_offset);
       memcpy(sdc, color.ui, 4 * 4);
-   } else if (brw->is_haswell && is_integer_format) {
+   } else if (brw->is_haswell && (is_integer_format || is_stencil_sampling)) {
       /* Haswell's integer border color support is completely insane:
        * SAMPLER_BORDER_COLOR_STATE is 20 DWords.  The first four are
        * for float colors.  The next 12 DWords are MBZ and only exist to
@@ -351,7 +384,9 @@ upload_default_color(struct brw_context *brw,
       memset(sdc, 0, 20 * 4);
       sdc = &sdc[16];
 
-      int bits_per_channel = _mesa_get_format_bits(format, GL_RED_BITS);
+      bool stencil = format == MESA_FORMAT_S_UINT8 || is_stencil_sampling;
+      const int bits_per_channel =
+         _mesa_get_format_bits(format, stencil ? GL_STENCIL_BITS : GL_RED_BITS);
 
       /* From the Haswell PRM, "Command Reference: Structures", Page 36:
        * "If any color channel is missing from the surface format,
@@ -361,7 +396,7 @@ upload_default_color(struct brw_context *brw,
        */
       unsigned c[4] = { 0, 0, 0, 1 };
       for (int i = 0; i < 4; i++) {
-         if (_mesa_format_has_color_component(format, i))
+         if (has_component(format, i))
             c[i] = color.ui[i];
       }
 
@@ -446,12 +481,12 @@ upload_default_color(struct brw_context *brw,
  * Sets the sampler state for a single unit based off of the sampler key
  * entry.
  */
-void
+static void
 brw_update_sampler_state(struct brw_context *brw,
                          GLenum target, bool tex_cube_map_seamless,
                          GLfloat tex_unit_lod_bias,
                          mesa_format format, GLenum base_format,
-                         bool is_integer_format,
+                         const struct gl_texture_object *texObj,
                          const struct gl_sampler_object *sampler,
                          uint32_t *sampler_state,
                          uint32_t batch_offset_for_sampler_state)
@@ -529,10 +564,12 @@ brw_update_sampler_state(struct brw_context *brw,
        target == GL_TEXTURE_CUBE_MAP_ARRAY) {
       /* Cube maps must use the same wrap mode for all three coordinate
        * dimensions.  Prior to Haswell, only CUBE and CLAMP are valid.
+       *
+       * Ivybridge and Baytrail seem to have problems with CUBE mode and
+       * integer formats.  Fall back to CLAMP for now.
        */
       if ((tex_cube_map_seamless || sampler->CubeMapSeamless) &&
-         (sampler->MinFilter != GL_NEAREST ||
-          sampler->MagFilter != GL_NEAREST)) {
+          !(brw->gen == 7 && !brw->is_haswell && texObj->_IsIntegerFormat)) {
 	 wrap_s = BRW_TEXCOORDMODE_CUBE;
 	 wrap_t = BRW_TEXCOORDMODE_CUBE;
 	 wrap_r = BRW_TEXCOORDMODE_CUBE;
@@ -560,9 +597,10 @@ brw_update_sampler_state(struct brw_context *brw,
    const int lod_bits = brw->gen >= 7 ? 8 : 6;
    const unsigned min_lod = U_FIXED(CLAMP(sampler->MinLod, 0, 13), lod_bits);
    const unsigned max_lod = U_FIXED(CLAMP(sampler->MaxLod, 0, 13), lod_bits);
+   const unsigned base_level =
+      U_FIXED(CLAMP(texObj->MinLevel + texObj->BaseLevel, 0, max_lod), 1);
    const int lod_bias =
       S_FIXED(CLAMP(tex_unit_lod_bias + sampler->LodBias, -16, 15), lod_bits);
-   const unsigned base_level = U_FIXED(0, 1);
 
    /* Upload the border color if necessary.  If not, just point it at
     * offset 0 (the start of the batch) - the color should be ignored,
@@ -572,8 +610,8 @@ brw_update_sampler_state(struct brw_context *brw,
    if (wrap_mode_needs_border_color(wrap_s) ||
        wrap_mode_needs_border_color(wrap_t) ||
        wrap_mode_needs_border_color(wrap_r)) {
-      upload_default_color(brw, sampler,
-                           format, base_format, is_integer_format,
+      upload_default_color(brw, sampler, format, base_format,
+                           texObj->_IsIntegerFormat, texObj->StencilSampling,
                            &border_color_offset);
    }
 
@@ -586,7 +624,7 @@ brw_update_sampler_state(struct brw_context *brw,
                           max_anisotropy,
                           address_rounding,
                           wrap_s, wrap_t, wrap_r,
-                          min_lod, max_lod, lod_bias, base_level,
+                          base_level, min_lod, max_lod, lod_bias,
                           shadow_function,
                           non_normalized_coords,
                           border_color_offset);
@@ -611,8 +649,7 @@ update_sampler_state(struct brw_context *brw,
    brw_update_sampler_state(brw, texObj->Target, ctx->Texture.CubeMapSeamless,
                             texUnit->LodBias,
                             firstImage->TexFormat, firstImage->_BaseFormat,
-                            texObj->_IsIntegerFormat,
-                            sampler,
+                            texObj, sampler,
                             sampler_state, batch_offset_for_sampler_state);
 }
 
@@ -653,7 +690,7 @@ brw_upload_sampler_state_table(struct brw_context *brw,
       batch_offset_for_sampler_state += size_in_bytes;
    }
 
-   if (brw->gen >= 7) {
+   if (brw->gen >= 7 && stage_state->stage != MESA_SHADER_COMPUTE) {
       /* Emit a 3DSTATE_SAMPLER_STATE_POINTERS_XS packet. */
       gen7_emit_sampler_state_pointers_xs(brw, stage_state);
    } else {
@@ -676,6 +713,7 @@ const struct brw_tracked_state brw_fs_samplers = {
    .dirty = {
       .mesa = _NEW_TEXTURE,
       .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
              BRW_NEW_FRAGMENT_PROGRAM,
    },
    .emit = brw_upload_fs_samplers,
@@ -694,6 +732,7 @@ const struct brw_tracked_state brw_vs_samplers = {
    .dirty = {
       .mesa = _NEW_TEXTURE,
       .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
              BRW_NEW_VERTEX_PROGRAM,
    },
    .emit = brw_upload_vs_samplers,
@@ -716,10 +755,139 @@ const struct brw_tracked_state brw_gs_samplers = {
    .dirty = {
       .mesa = _NEW_TEXTURE,
       .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
              BRW_NEW_GEOMETRY_PROGRAM,
    },
    .emit = brw_upload_gs_samplers,
 };
+
+
+static void
+brw_upload_tcs_samplers(struct brw_context *brw)
+{
+   /* BRW_NEW_TESS_PROGRAMS */
+   struct gl_program *tcs = (struct gl_program *) brw->tess_ctrl_program;
+   if (!tcs)
+      return;
+
+   brw_upload_sampler_state_table(brw, tcs, &brw->tcs.base);
+}
+
+
+const struct brw_tracked_state brw_tcs_samplers = {
+   .dirty = {
+      .mesa = _NEW_TEXTURE,
+      .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
+             BRW_NEW_TESS_PROGRAMS,
+   },
+   .emit = brw_upload_tcs_samplers,
+};
+
+
+static void
+brw_upload_tes_samplers(struct brw_context *brw)
+{
+   /* BRW_NEW_TESS_PROGRAMS */
+   struct gl_program *tes = (struct gl_program *) brw->tess_eval_program;
+   if (!tes)
+      return;
+
+   brw_upload_sampler_state_table(brw, tes, &brw->tes.base);
+}
+
+
+const struct brw_tracked_state brw_tes_samplers = {
+   .dirty = {
+      .mesa = _NEW_TEXTURE,
+      .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
+             BRW_NEW_TESS_PROGRAMS,
+   },
+   .emit = brw_upload_tes_samplers,
+};
+
+static void
+brw_upload_cs_samplers(struct brw_context *brw)
+{
+   /* BRW_NEW_COMPUTE_PROGRAM */
+   struct gl_program *cs = (struct gl_program *) brw->compute_program;
+   if (!cs)
+      return;
+
+   brw_upload_sampler_state_table(brw, cs, &brw->cs.base);
+}
+
+const struct brw_tracked_state brw_cs_samplers = {
+   .dirty = {
+      .mesa = _NEW_TEXTURE,
+      .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
+             BRW_NEW_COMPUTE_PROGRAM,
+   },
+   .emit = brw_upload_cs_samplers,
+};
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d47 1
+d58 2
+d91 1
+a94 1
+                       unsigned base_level,
+a99 1
+           SET_FIELD(base_level, BRW_SAMPLER_BASE_MIPLEVEL) |
+d136 15
+d215 10
+d232 1
+a232 1
+                     bool is_integer_format,
+d296 1
+a296 1
+   } else if (brw->is_haswell && is_integer_format) {
+d310 3
+a312 1
+      int bits_per_channel = _mesa_get_format_bits(format, GL_RED_BITS);
+d322 1
+a322 1
+         if (_mesa_format_has_color_component(format, i))
+d407 1
+a407 1
+void
+d412 1
+a412 1
+                         bool is_integer_format,
+d490 3
+d495 1
+a495 2
+         (sampler->MinFilter != GL_NEAREST ||
+          sampler->MagFilter != GL_NEAREST)) {
+d523 2
+a526 1
+   const unsigned base_level = U_FIXED(0, 1);
+d536 2
+a537 2
+      upload_default_color(brw, sampler,
+                           format, base_format, is_integer_format,
+d550 1
+a550 1
+                          min_lod, max_lod, lod_bias, base_level,
+d575 1
+a575 2
+                            texObj->_IsIntegerFormat,
+                            sampler,
+d616 1
+a616 1
+   if (brw->gen >= 7) {
+d639 1
+d658 1
+d681 1
+d685 67
 @
 
 

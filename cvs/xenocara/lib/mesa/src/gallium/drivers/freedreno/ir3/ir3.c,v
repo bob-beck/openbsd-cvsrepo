@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.24;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.45.17;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -95,48 +101,23 @@ text
 #include <stdbool.h>
 #include <errno.h>
 
+#include "util/ralloc.h"
+
 #include "freedreno_util.h"
 #include "instr-a3xx.h"
-
-#define CHUNK_SZ 1020
-
-struct ir3_heap_chunk {
-	struct ir3_heap_chunk *next;
-	uint32_t heap[CHUNK_SZ];
-};
-
-static void grow_heap(struct ir3 *shader)
-{
-	struct ir3_heap_chunk *chunk = calloc(1, sizeof(*chunk));
-	chunk->next = shader->chunk;
-	shader->chunk = chunk;
-	shader->heap_idx = 0;
-}
 
 /* simple allocator to carve allocations out of an up-front allocated heap,
  * so that we can free everything easily in one shot.
  */
 void * ir3_alloc(struct ir3 *shader, int sz)
 {
-	void *ptr;
-
-	sz = align(sz, 4) / 4;
-
-	if ((shader->heap_idx + sz) > CHUNK_SZ)
-		grow_heap(shader);
-
-	ptr = &shader->chunk->heap[shader->heap_idx];
-	shader->heap_idx += sz;
-
-	return ptr;
+	return ralloc_size(shader, sz);
 }
 
 struct ir3 * ir3_create(struct ir3_compiler *compiler,
 		unsigned nin, unsigned nout)
 {
-	struct ir3 *shader = calloc(1, sizeof(struct ir3));
-
-	grow_heap(shader);
+	struct ir3 *shader = ralloc(compiler, struct ir3);
 
 	shader->compiler = compiler;
 	shader->ninputs = nin;
@@ -146,21 +127,20 @@ struct ir3 * ir3_create(struct ir3_compiler *compiler,
 	shader->outputs = ir3_alloc(shader, sizeof(shader->outputs[0]) * nout);
 
 	list_inithead(&shader->block_list);
+	list_inithead(&shader->array_list);
 
 	return shader;
 }
 
 void ir3_destroy(struct ir3 *shader)
 {
-	while (shader->chunk) {
-		struct ir3_heap_chunk *chunk = shader->chunk;
-		shader->chunk = chunk->next;
-		free(chunk);
-	}
+	/* TODO convert the dynamic array to ralloc too: */
 	free(shader->indirects);
 	free(shader->predicates);
 	free(shader->baryfs);
-	free(shader);
+	free(shader->keeps);
+	free(shader->astc_srgb);
+	ralloc_free(shader);
 }
 
 #define iassert(cond) do { \
@@ -186,17 +166,18 @@ static uint32_t reg(struct ir3_register *reg, struct ir3_info *info,
 		val.iim_val = reg->iim_val;
 	} else {
 		unsigned components;
+		int16_t max;
 
 		if (reg->flags & IR3_REG_RELATIV) {
 			components = reg->size;
-			val.dummy10 = reg->offset;
+			val.idummy10 = reg->array.offset;
+			max = (reg->array.offset + repeat + components - 1) >> 2;
 		} else {
 			components = util_last_bit(reg->wrmask);
 			val.comp = reg->num & 0x3;
 			val.num  = reg->num >> 2;
+			max = (reg->num + repeat + components - 1) >> 2;
 		}
-
-		int16_t max = (reg->num + repeat + components - 1) >> 2;
 
 		if (reg->flags & IR3_REG_CONST) {
 			info->max_const = MAX2(info->max_const, max);
@@ -298,7 +279,7 @@ static int emit_cat2(struct ir3_instruction *instr, void *ptr,
 	iassert((instr->regs_count == 2) || (instr->regs_count == 3));
 
 	if (src1->flags & IR3_REG_RELATIV) {
-		iassert(src1->num < (1 << 10));
+		iassert(src1->array.offset < (1 << 10));
 		cat2->rel1.src1      = reg(src1, info, instr->repeat,
 				IR3_REG_RELATIV | IR3_REG_CONST | IR3_REG_R |
 				IR3_REG_HALF | absneg);
@@ -325,7 +306,7 @@ static int emit_cat2(struct ir3_instruction *instr, void *ptr,
 				!((src1->flags ^ src2->flags) & IR3_REG_HALF));
 
 		if (src2->flags & IR3_REG_RELATIV) {
-			iassert(src2->num < (1 << 10));
+			iassert(src2->array.offset < (1 << 10));
 			cat2->rel2.src2      = reg(src2, info, instr->repeat,
 					IR3_REG_RELATIV | IR3_REG_CONST | IR3_REG_R |
 					IR3_REG_HALF | absneg);
@@ -398,7 +379,7 @@ static int emit_cat3(struct ir3_instruction *instr, void *ptr,
 	iassert(!((src3->flags ^ src_flags) & IR3_REG_HALF));
 
 	if (src1->flags & IR3_REG_RELATIV) {
-		iassert(src1->num < (1 << 10));
+		iassert(src1->array.offset < (1 << 10));
 		cat3->rel1.src1      = reg(src1, info, instr->repeat,
 				IR3_REG_RELATIV | IR3_REG_CONST | IR3_REG_R |
 				IR3_REG_HALF | absneg);
@@ -426,7 +407,7 @@ static int emit_cat3(struct ir3_instruction *instr, void *ptr,
 
 
 	if (src3->flags & IR3_REG_RELATIV) {
-		iassert(src3->num < (1 << 10));
+		iassert(src3->array.offset < (1 << 10));
 		cat3->rel2.src3      = reg(src3, info, instr->repeat,
 				IR3_REG_RELATIV | IR3_REG_CONST | IR3_REG_R |
 				IR3_REG_HALF | absneg);
@@ -469,7 +450,7 @@ static int emit_cat4(struct ir3_instruction *instr, void *ptr,
 	iassert(instr->regs_count == 2);
 
 	if (src->flags & IR3_REG_RELATIV) {
-		iassert(src->num < (1 << 10));
+		iassert(src->array.offset < (1 << 10));
 		cat4->rel.src      = reg(src, info, instr->repeat,
 				IR3_REG_RELATIV | IR3_REG_CONST | IR3_REG_FNEG |
 				IR3_REG_FABS | IR3_REG_R | IR3_REG_HALF);
@@ -518,11 +499,13 @@ static int emit_cat5(struct ir3_instruction *instr, void *ptr,
 
 	iassert(!((dst->flags ^ type_flags(instr->cat5.type)) & IR3_REG_HALF));
 
+	assume(src1 || !src2);
+	assume(src2 || !src3);
+
 	if (src1) {
 		cat5->full = ! (src1->flags & IR3_REG_HALF);
 		cat5->src1 = reg(src1, info, instr->repeat, IR3_REG_HALF);
 	}
-
 
 	if (instr->flags & IR3_INSTR_S2EN) {
 		if (src2) {
@@ -661,7 +644,7 @@ void * ir3_assemble(struct ir3 *shader, struct ir3_info *info,
 		}
 	}
 
-	/* need a integer number of instruction "groups" (sets of 16
+	/* need an integer number of instruction "groups" (sets of 16
 	 * instructions on a4xx or sets of 4 instructions on a3xx),
 	 * so pad out w/ NOPs if needed: (NOTE each instruction is 64bits)
 	 */
@@ -675,7 +658,7 @@ void * ir3_assemble(struct ir3 *shader, struct ir3_info *info,
 
 	list_for_each_entry (struct ir3_block, block, &shader->block_list, node) {
 		list_for_each_entry (struct ir3_instruction, instr, &block->instr_list, node) {
-			int ret = emit[instr->category](instr, dwords, info);
+			int ret = emit[opc_cat(instr->opc)](instr, dwords, info);
 			if (ret)
 				goto fail;
 			info->instrs_count += 1 + instr->repeat;
@@ -746,23 +729,21 @@ static struct ir3_instruction *instr_create(struct ir3_block *block, int nreg)
 }
 
 struct ir3_instruction * ir3_instr_create2(struct ir3_block *block,
-		int category, opc_t opc, int nreg)
+		opc_t opc, int nreg)
 {
 	struct ir3_instruction *instr = instr_create(block, nreg);
 	instr->block = block;
-	instr->category = category;
 	instr->opc = opc;
 	insert_instr(block, instr);
 	return instr;
 }
 
-struct ir3_instruction * ir3_instr_create(struct ir3_block *block,
-		int category, opc_t opc)
+struct ir3_instruction * ir3_instr_create(struct ir3_block *block, opc_t opc)
 {
 	/* NOTE: we could be slightly more clever, at least for non-meta,
 	 * and choose # of regs based on category.
 	 */
-	return ir3_instr_create2(block, category, opc, 4);
+	return ir3_instr_create2(block, opc, 4);
 }
 
 struct ir3_instruction * ir3_instr_clone(struct ir3_instruction *instr)
@@ -800,6 +781,14 @@ struct ir3_register * ir3_reg_create(struct ir3_instruction *instr,
 #endif
 	instr->regs[instr->regs_count++] = reg;
 	return reg;
+}
+
+struct ir3_register * ir3_reg_clone(struct ir3 *shader,
+		struct ir3_register *reg)
+{
+	struct ir3_register *new_reg = reg_create(shader, 0, 0);
+	*new_reg = *reg;
+	return new_reg;
 }
 
 void
@@ -842,6 +831,115 @@ ir3_count_instructions(struct ir3 *ir)
 	}
 	return cnt;
 }
+
+struct ir3_array *
+ir3_lookup_array(struct ir3 *ir, unsigned id)
+{
+	list_for_each_entry (struct ir3_array, arr, &ir->array_list, node)
+		if (arr->id == id)
+			return arr;
+	return NULL;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d33 2
+a37 15
+#define CHUNK_SZ 1020
+
+struct ir3_heap_chunk {
+	struct ir3_heap_chunk *next;
+	uint32_t heap[CHUNK_SZ];
+};
+
+static void grow_heap(struct ir3 *shader)
+{
+	struct ir3_heap_chunk *chunk = calloc(1, sizeof(*chunk));
+	chunk->next = shader->chunk;
+	shader->chunk = chunk;
+	shader->heap_idx = 0;
+}
+
+d43 1
+a43 11
+	void *ptr;
+
+	sz = align(sz, 4) / 4;
+
+	if ((shader->heap_idx + sz) > CHUNK_SZ)
+		grow_heap(shader);
+
+	ptr = &shader->chunk->heap[shader->heap_idx];
+	shader->heap_idx += sz;
+
+	return ptr;
+d49 1
+a49 3
+	struct ir3 *shader = calloc(1, sizeof(struct ir3));
+
+	grow_heap(shader);
+d59 1
+d66 1
+a66 5
+	while (shader->chunk) {
+		struct ir3_heap_chunk *chunk = shader->chunk;
+		shader->chunk = chunk->next;
+		free(chunk);
+	}
+d70 3
+a72 1
+	free(shader);
+d98 1
+d102 2
+a103 1
+			val.dummy10 = reg->offset;
+d108 1
+a110 2
+		int16_t max = (reg->num + repeat + components - 1) >> 2;
+
+d211 1
+a211 1
+		iassert(src1->num < (1 << 10));
+d238 1
+a238 1
+			iassert(src2->num < (1 << 10));
+d311 1
+a311 1
+		iassert(src1->num < (1 << 10));
+d339 1
+a339 1
+		iassert(src3->num < (1 << 10));
+d382 1
+a382 1
+		iassert(src->num < (1 << 10));
+d431 3
+a438 1
+
+d576 1
+a576 1
+	/* need a integer number of instruction "groups" (sets of 16
+d590 1
+a590 1
+			int ret = emit[instr->category](instr, dwords, info);
+d661 1
+a661 1
+		int category, opc_t opc, int nreg)
+a664 1
+	instr->category = category;
+d670 1
+a670 2
+struct ir3_instruction * ir3_instr_create(struct ir3_block *block,
+		int category, opc_t opc)
+d675 1
+a675 1
+	return ir3_instr_create2(block, category, opc, 4);
+d715 8
+d762 9
 @
 
 

@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@// @;
 
+
+1.2
+date	2017.08.26.16.59.38;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.39.09;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/**************************************************************************
@@ -92,29 +98,29 @@ text
  * 
  **************************************************************************/
 
-#include "glheader.h"
-#include "imports.h"
-#include "mtypes.h"
+#include "main/glheader.h"
 #include "main/context.h"
+#include "main/imports.h"
 #include "main/macros.h"
 #include "main/samplerobj.h"
+#include "main/shaderobj.h"
 #include "main/texenvprogram.h"
 #include "main/texobj.h"
 #include "main/uniforms.h"
+#include "compiler/glsl/ir_builder.h"
+#include "compiler/glsl/ir_optimization.h"
+#include "compiler/glsl/glsl_parser_extras.h"
+#include "compiler/glsl/glsl_symbol_table.h"
+#include "compiler/glsl_types.h"
+#include "program/ir_to_mesa.h"
 #include "program/program.h"
-#include "program/prog_parameter.h"
+#include "program/programopt.h"
 #include "program/prog_cache.h"
 #include "program/prog_instruction.h"
+#include "program/prog_parameter.h"
 #include "program/prog_print.h"
 #include "program/prog_statevars.h"
-#include "program/programopt.h"
-#include "../glsl/glsl_types.h"
-#include "../glsl/ir.h"
-#include "../glsl/ir_builder.h"
-#include "../glsl/glsl_symbol_table.h"
-#include "../glsl/glsl_parser_extras.h"
-#include "../glsl/ir_optimization.h"
-#include "../program/ir_to_mesa.h"
+#include "util/bitscan.h"
 
 using namespace ir_builder;
 
@@ -168,7 +174,6 @@ struct state_key {
    GLuint nr_enabled_units:8;
    GLuint enabled_units:8;
    GLuint separate_specular:1;
-   GLuint fog_enabled:1;
    GLuint fog_mode:2;          /**< FOG_x */
    GLuint inputs_available:12;
    GLuint num_draw_buffers:4;
@@ -192,10 +197,10 @@ struct state_key {
    } unit[MAX_TEXTURE_UNITS];
 };
 
-#define FOG_LINEAR  0
-#define FOG_EXP     1
-#define FOG_EXP2    2
-#define FOG_UNKNOWN 3
+#define FOG_NONE    0
+#define FOG_LINEAR  1
+#define FOG_EXP     2
+#define FOG_EXP2    3
 
 static GLuint translate_fog_mode( GLenum mode )
 {
@@ -203,7 +208,7 @@ static GLuint translate_fog_mode( GLenum mode )
    case GL_LINEAR: return FOG_LINEAR;
    case GL_EXP: return FOG_EXP;
    case GL_EXP2: return FOG_EXP2;
-   default: return FOG_UNKNOWN;
+   default: return FOG_NONE;
    }
 }
 
@@ -464,22 +469,25 @@ static GLbitfield get_fp_input_mask( struct gl_context *ctx )
  */
 static GLuint make_state_key( struct gl_context *ctx,  struct state_key *key )
 {
-   GLuint i, j;
+   GLuint j;
    GLbitfield inputs_referenced = VARYING_BIT_COL0;
    const GLbitfield inputs_available = get_fp_input_mask( ctx );
+   GLbitfield mask;
    GLuint keySize;
 
    memset(key, 0, sizeof(*key));
 
    /* _NEW_TEXTURE */
-   for (i = 0; i < ctx->Const.MaxTextureUnits; i++) {
+   mask = ctx->Texture._EnabledCoordUnits;
+   while (mask) {
+      const int i = u_bit_scan(&mask);
       const struct gl_texture_unit *texUnit = &ctx->Texture.Unit[i];
       const struct gl_texture_object *texObj = texUnit->_Current;
       const struct gl_tex_env_combine_state *comb = texUnit->_CurrentCombine;
       const struct gl_sampler_object *samp;
       GLenum format;
 
-      if (!texUnit->_Current || !texUnit->Enabled)
+      if (!texObj)
          continue;
 
       samp = _mesa_get_samplerobj(ctx, i);
@@ -525,7 +533,6 @@ static GLuint make_state_key( struct gl_context *ctx,  struct state_key *key )
 
    /* _NEW_FOG */
    if (ctx->Fog.Enabled) {
-      key->fog_enabled = 1;
       key->fog_mode = translate_fog_mode(ctx->Fog.Mode);
       inputs_referenced |= VARYING_BIT_FOGC; /* maybe */
    }
@@ -583,7 +590,7 @@ get_current_attrib(texenv_fragment_program *p, GLuint attrib)
 
    current = p->shader->symbols->get_variable("gl_CurrentAttribFragMESA");
    assert(current);
-   current->data.max_array_access = MAX2(current->data.max_array_access, attrib);
+   current->data.max_array_access = MAX2(current->data.max_array_access, (int)attrib);
    val = new(p->mem_ctx) ir_dereference_variable(current);
    ir_rvalue *index = new(p->mem_ctx) ir_constant(attrib);
    return new(p->mem_ctx) ir_dereference_array(val, index);
@@ -627,7 +634,7 @@ get_source(texenv_fragment_program *p,
       var = p->shader->symbols->get_variable("gl_TextureEnvColor");
       assert(var);
       deref = new(p->mem_ctx) ir_dereference_variable(var);
-      var->data.max_array_access = MAX2(var->data.max_array_access, unit);
+      var->data.max_array_access = MAX2(var->data.max_array_access, (int)unit);
       return new(p->mem_ctx) ir_dereference_array(deref,
 						  new(p->mem_ctx) ir_constant(unit));
 
@@ -959,7 +966,7 @@ static void load_texture( texenv_fragment_program *p, GLuint unit )
       texcoord = new(p->mem_ctx) ir_dereference_variable(tc_array);
       ir_rvalue *index = new(p->mem_ctx) ir_constant(unit);
       texcoord = new(p->mem_ctx) ir_dereference_array(texcoord, index);
-      tc_array->data.max_array_access = MAX2(tc_array->data.max_array_access, unit);
+      tc_array->data.max_array_access = MAX2(tc_array->data.max_array_access, (int)unit);
    }
 
    if (!p->state->unit[unit].enabled) {
@@ -1244,7 +1251,7 @@ emit_instructions(texenv_fragment_program *p)
       cf = new(p->mem_ctx) ir_dereference_variable(spec_result);
    }
 
-   if (key->fog_enabled) {
+   if (key->fog_mode) {
       cf = emit_fog_instructions(p, cf);
    }
 
@@ -1265,7 +1272,7 @@ create_new_program(struct gl_context *ctx, struct state_key *key)
    _mesa_glsl_parse_state *state;
 
    p.mem_ctx = ralloc_context(NULL);
-   p.shader = ctx->Driver.NewShader(ctx, 0, GL_FRAGMENT_SHADER);
+   p.shader = _mesa_new_shader(0, MESA_SHADER_FRAGMENT);
    p.shader->ir = new(p.shader) exec_list;
    state = new(p.shader) _mesa_glsl_parse_state(ctx, MESA_SHADER_FRAGMENT,
 						p.shader);
@@ -1273,7 +1280,7 @@ create_new_program(struct gl_context *ctx, struct state_key *key)
    p.top_instructions = p.shader->ir;
    p.instructions = p.shader->ir;
    p.state = key;
-   p.shader_program = ctx->Driver.NewShaderProgram(0);
+   p.shader_program = _mesa_new_shader_program(0);
 
    /* Tell the linker to ignore the fact that we're building a
     * separate shader, in case we're in a GLES2 context that would
@@ -1322,7 +1329,7 @@ create_new_program(struct gl_context *ctx, struct state_key *key)
 
    p.shader->CompileStatus = true;
    p.shader->Version = state->language_version;
-   p.shader->uses_builtin_functions = state->uses_builtin_functions;
+   p.shader->info.uses_builtin_functions = state->uses_builtin_functions;
    p.shader_program->Shaders =
       (gl_shader **)malloc(sizeof(*p.shader_program->Shaders));
    p.shader_program->Shaders[0] = p.shader;
@@ -1368,6 +1375,80 @@ _mesa_get_fixed_func_fragment_program(struct gl_context *ctx)
 }
 
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d30 1
+a30 3
+#include "glheader.h"
+#include "imports.h"
+#include "mtypes.h"
+d32 1
+d35 1
+d39 6
+d46 1
+a46 1
+#include "program/prog_parameter.h"
+d49 1
+d52 1
+a52 8
+#include "program/programopt.h"
+#include "../glsl/glsl_types.h"
+#include "../glsl/ir.h"
+#include "../glsl/ir_builder.h"
+#include "../glsl/glsl_symbol_table.h"
+#include "../glsl/glsl_parser_extras.h"
+#include "../glsl/ir_optimization.h"
+#include "../program/ir_to_mesa.h"
+a105 1
+   GLuint fog_enabled:1;
+d129 4
+a132 4
+#define FOG_LINEAR  0
+#define FOG_EXP     1
+#define FOG_EXP2    2
+#define FOG_UNKNOWN 3
+d140 1
+a140 1
+   default: return FOG_UNKNOWN;
+d401 1
+a401 1
+   GLuint i, j;
+d404 1
+d410 3
+a412 1
+   for (i = 0; i < ctx->Const.MaxTextureUnits; i++) {
+d419 1
+a419 1
+      if (!texUnit->_Current || !texUnit->Enabled)
+a464 1
+      key->fog_enabled = 1;
+d522 1
+a522 1
+   current->data.max_array_access = MAX2(current->data.max_array_access, attrib);
+d566 1
+a566 1
+      var->data.max_array_access = MAX2(var->data.max_array_access, unit);
+d898 1
+a898 1
+      tc_array->data.max_array_access = MAX2(tc_array->data.max_array_access, unit);
+d1183 1
+a1183 1
+   if (key->fog_enabled) {
+d1204 1
+a1204 1
+   p.shader = ctx->Driver.NewShader(ctx, 0, GL_FRAGMENT_SHADER);
+d1212 1
+a1212 1
+   p.shader_program = ctx->Driver.NewShaderProgram(0);
+d1261 1
+a1261 1
+   p.shader->uses_builtin_functions = state->uses_builtin_functions;
 @
 
 

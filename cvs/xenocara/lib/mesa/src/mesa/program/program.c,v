@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.40;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.38.23;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -96,6 +102,7 @@ text
 
 #include "main/glheader.h"
 #include "main/context.h"
+#include "main/framebuffer.h"
 #include "main/hash.h"
 #include "main/macros.h"
 #include "program.h"
@@ -238,6 +245,389 @@ _mesa_set_program_error(struct gl_context *ctx, GLint pos, const char *string)
 
 
 /**
+ * Initialize a new gl_program object.
+ */
+struct gl_program *
+_mesa_init_gl_program(struct gl_program *prog, GLenum target, GLuint id)
+{
+   GLuint i;
+
+   if (!prog)
+      return NULL;
+
+   memset(prog, 0, sizeof(*prog));
+   mtx_init(&prog->Mutex, mtx_plain);
+   prog->Id = id;
+   prog->Target = target;
+   prog->RefCount = 1;
+   prog->Format = GL_PROGRAM_FORMAT_ASCII_ARB;
+
+   /* default mapping from samplers to texture units */
+   for (i = 0; i < MAX_SAMPLERS; i++)
+      prog->SamplerUnits[i] = i;
+
+   return prog;
+}
+
+
+/**
+ * Allocate and initialize a new fragment/vertex program object but
+ * don't put it into the program hash table.  Called via
+ * ctx->Driver.NewProgram.  May be overridden (ie. replaced) by a
+ * device driver function to implement OO deriviation with additional
+ * types not understood by this function.
+ *
+ * \param ctx  context
+ * \param id   program id/number
+ * \param target  program target/type
+ * \return  pointer to new program object
+ */
+struct gl_program *
+_mesa_new_program(struct gl_context *ctx, GLenum target, GLuint id)
+{
+   switch (target) {
+   case GL_VERTEX_PROGRAM_ARB: { /* == GL_VERTEX_PROGRAM_NV */
+      struct gl_vertex_program *prog = CALLOC_STRUCT(gl_vertex_program);
+      return _mesa_init_gl_program(&prog->Base, target, id);
+   }
+   case GL_FRAGMENT_PROGRAM_ARB: {
+      struct gl_fragment_program *prog = CALLOC_STRUCT(gl_fragment_program);
+      return _mesa_init_gl_program(&prog->Base, target, id);
+   }
+   case GL_GEOMETRY_PROGRAM_NV: {
+      struct gl_geometry_program *prog = CALLOC_STRUCT(gl_geometry_program);
+      return _mesa_init_gl_program(&prog->Base, target, id);
+   }
+   case GL_TESS_CONTROL_PROGRAM_NV: {
+      struct gl_tess_ctrl_program *prog = CALLOC_STRUCT(gl_tess_ctrl_program);
+      return _mesa_init_gl_program(&prog->Base, target, id);
+   }
+   case GL_TESS_EVALUATION_PROGRAM_NV: {
+      struct gl_tess_eval_program *prog = CALLOC_STRUCT(gl_tess_eval_program);
+      return _mesa_init_gl_program(&prog->Base, target, id);
+   }
+   case GL_COMPUTE_PROGRAM_NV: {
+      struct gl_compute_program *prog = CALLOC_STRUCT(gl_compute_program);
+      return _mesa_init_gl_program(&prog->Base, target, id);
+   }
+   default:
+      _mesa_problem(ctx, "bad target in _mesa_new_program");
+      return NULL;
+   }
+}
+
+
+/**
+ * Delete a program and remove it from the hash table, ignoring the
+ * reference count.
+ * Called via ctx->Driver.DeleteProgram.  May be wrapped (OO deriviation)
+ * by a device driver function.
+ */
+void
+_mesa_delete_program(struct gl_context *ctx, struct gl_program *prog)
+{
+   (void) ctx;
+   assert(prog);
+   assert(prog->RefCount==0);
+
+   if (prog == &_mesa_DummyProgram)
+      return;
+
+   free(prog->String);
+   free(prog->LocalParams);
+
+   if (prog->Instructions) {
+      _mesa_free_instructions(prog->Instructions, prog->NumInstructions);
+   }
+   if (prog->Parameters) {
+      _mesa_free_parameter_list(prog->Parameters);
+   }
+
+   if (prog->nir) {
+      ralloc_free(prog->nir);
+   }
+
+   mtx_destroy(&prog->Mutex);
+   free(prog);
+}
+
+
+/**
+ * Return the gl_program object for a given ID.
+ * Basically just a wrapper for _mesa_HashLookup() to avoid a lot of
+ * casts elsewhere.
+ */
+struct gl_program *
+_mesa_lookup_program(struct gl_context *ctx, GLuint id)
+{
+   if (id)
+      return (struct gl_program *) _mesa_HashLookup(ctx->Shared->Programs, id);
+   else
+      return NULL;
+}
+
+
+/**
+ * Reference counting for vertex/fragment programs
+ * This is normally only called from the _mesa_reference_program() macro
+ * when there's a real pointer change.
+ */
+void
+_mesa_reference_program_(struct gl_context *ctx,
+                         struct gl_program **ptr,
+                         struct gl_program *prog)
+{
+#ifndef NDEBUG
+   assert(ptr);
+   if (*ptr && prog) {
+      /* sanity check */
+      if ((*ptr)->Target == GL_VERTEX_PROGRAM_ARB)
+         assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
+      else if ((*ptr)->Target == GL_FRAGMENT_PROGRAM_ARB)
+         assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB ||
+                prog->Target == GL_FRAGMENT_PROGRAM_NV);
+      else if ((*ptr)->Target == GL_GEOMETRY_PROGRAM_NV)
+         assert(prog->Target == GL_GEOMETRY_PROGRAM_NV);
+   }
+#endif
+
+   if (*ptr) {
+      GLboolean deleteFlag;
+      struct gl_program *oldProg = *ptr;
+
+      mtx_lock(&oldProg->Mutex);
+      assert(oldProg->RefCount > 0);
+      oldProg->RefCount--;
+
+      deleteFlag = (oldProg->RefCount == 0);
+      mtx_unlock(&oldProg->Mutex);
+
+      if (deleteFlag) {
+         assert(ctx);
+         ctx->Driver.DeleteProgram(ctx, oldProg);
+      }
+
+      *ptr = NULL;
+   }
+
+   assert(!*ptr);
+   if (prog) {
+      mtx_lock(&prog->Mutex);
+      prog->RefCount++;
+      mtx_unlock(&prog->Mutex);
+   }
+
+   *ptr = prog;
+}
+
+
+/**
+ * Insert 'count' NOP instructions at 'start' in the given program.
+ * Adjust branch targets accordingly.
+ */
+GLboolean
+_mesa_insert_instructions(struct gl_program *prog, GLuint start, GLuint count)
+{
+   const GLuint origLen = prog->NumInstructions;
+   const GLuint newLen = origLen + count;
+   struct prog_instruction *newInst;
+   GLuint i;
+
+   /* adjust branches */
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      if (inst->BranchTarget > 0) {
+         if ((GLuint)inst->BranchTarget >= start) {
+            inst->BranchTarget += count;
+         }
+      }
+   }
+
+   /* Alloc storage for new instructions */
+   newInst = _mesa_alloc_instructions(newLen);
+   if (!newInst) {
+      return GL_FALSE;
+   }
+
+   /* Copy 'start' instructions into new instruction buffer */
+   _mesa_copy_instructions(newInst, prog->Instructions, start);
+
+   /* init the new instructions */
+   _mesa_init_instructions(newInst + start, count);
+
+   /* Copy the remaining/tail instructions to new inst buffer */
+   _mesa_copy_instructions(newInst + start + count,
+                           prog->Instructions + start,
+                           origLen - start);
+
+   /* free old instructions */
+   _mesa_free_instructions(prog->Instructions, origLen);
+
+   /* install new instructions */
+   prog->Instructions = newInst;
+   prog->NumInstructions = newLen;
+
+   return GL_TRUE;
+}
+
+/**
+ * Delete 'count' instructions at 'start' in the given program.
+ * Adjust branch targets accordingly.
+ */
+GLboolean
+_mesa_delete_instructions(struct gl_program *prog, GLuint start, GLuint count)
+{
+   const GLuint origLen = prog->NumInstructions;
+   const GLuint newLen = origLen - count;
+   struct prog_instruction *newInst;
+   GLuint i;
+
+   /* adjust branches */
+   for (i = 0; i < prog->NumInstructions; i++) {
+      struct prog_instruction *inst = prog->Instructions + i;
+      if (inst->BranchTarget > 0) {
+         if (inst->BranchTarget > (GLint) start) {
+            inst->BranchTarget -= count;
+         }
+      }
+   }
+
+   /* Alloc storage for new instructions */
+   newInst = _mesa_alloc_instructions(newLen);
+   if (!newInst) {
+      return GL_FALSE;
+   }
+
+   /* Copy 'start' instructions into new instruction buffer */
+   _mesa_copy_instructions(newInst, prog->Instructions, start);
+
+   /* Copy the remaining/tail instructions to new inst buffer */
+   _mesa_copy_instructions(newInst + start,
+                           prog->Instructions + start + count,
+                           newLen - start);
+
+   /* free old instructions */
+   _mesa_free_instructions(prog->Instructions, origLen);
+
+   /* install new instructions */
+   prog->Instructions = newInst;
+   prog->NumInstructions = newLen;
+
+   return GL_TRUE;
+}
+
+
+/**
+ * Populate the 'used' array with flags indicating which registers (TEMPs,
+ * INPUTs, OUTPUTs, etc, are used by the given program.
+ * \param file  type of register to scan for
+ * \param used  returns true/false flags for in use / free
+ * \param usedSize  size of the 'used' array
+ */
+void
+_mesa_find_used_registers(const struct gl_program *prog,
+                          gl_register_file file,
+                          GLboolean used[], GLuint usedSize)
+{
+   GLuint i, j;
+
+   memset(used, 0, usedSize);
+
+   for (i = 0; i < prog->NumInstructions; i++) {
+      const struct prog_instruction *inst = prog->Instructions + i;
+      const GLuint n = _mesa_num_inst_src_regs(inst->Opcode);
+
+      if (inst->DstReg.File == file) {
+         assert(inst->DstReg.Index < usedSize);
+         if(inst->DstReg.Index < usedSize)
+            used[inst->DstReg.Index] = GL_TRUE;
+      }
+
+      for (j = 0; j < n; j++) {
+         if (inst->SrcReg[j].File == file) {
+            assert(inst->SrcReg[j].Index < (GLint) usedSize);
+            if (inst->SrcReg[j].Index < (GLint) usedSize)
+               used[inst->SrcReg[j].Index] = GL_TRUE;
+         }
+      }
+   }
+}
+
+
+/**
+ * Scan the given 'used' register flag array for the first entry
+ * that's >= firstReg.
+ * \param used  vector of flags indicating registers in use (as returned
+ *              by _mesa_find_used_registers())
+ * \param usedSize  size of the 'used' array
+ * \param firstReg  first register to start searching at
+ * \return index of unused register, or -1 if none.
+ */
+GLint
+_mesa_find_free_register(const GLboolean used[],
+                         GLuint usedSize, GLuint firstReg)
+{
+   GLuint i;
+
+   assert(firstReg < usedSize);
+
+   for (i = firstReg; i < usedSize; i++)
+      if (!used[i])
+         return i;
+
+   return -1;
+}
+
+
+/* Gets the minimum number of shader invocations per fragment.
+ * This function is useful to determine if we need to do per
+ * sample shading or per fragment shading.
+ */
+GLint
+_mesa_get_min_invocations_per_fragment(struct gl_context *ctx,
+                                       const struct gl_fragment_program *prog,
+                                       bool ignore_sample_qualifier)
+{
+   /* From ARB_sample_shading specification:
+    * "Using gl_SampleID in a fragment shader causes the entire shader
+    *  to be evaluated per-sample."
+    *
+    * "Using gl_SamplePosition in a fragment shader causes the entire
+    *  shader to be evaluated per-sample."
+    *
+    * "If MULTISAMPLE or SAMPLE_SHADING_ARB is disabled, sample shading
+    *  has no effect."
+    */
+   if (ctx->Multisample.Enabled) {
+      /* The ARB_gpu_shader5 specification says:
+       *
+       * "Use of the "sample" qualifier on a fragment shader input
+       *  forces per-sample shading"
+       */
+      if (prog->IsSample && !ignore_sample_qualifier)
+         return MAX2(_mesa_geometric_samples(ctx->DrawBuffer), 1);
+
+      if (prog->Base.SystemValuesRead & (SYSTEM_BIT_SAMPLE_ID |
+                                         SYSTEM_BIT_SAMPLE_POS))
+         return MAX2(_mesa_geometric_samples(ctx->DrawBuffer), 1);
+      else if (ctx->Multisample.SampleShading)
+         return MAX2(ceil(ctx->Multisample.MinSampleShadingValue *
+                          _mesa_geometric_samples(ctx->DrawBuffer)), 1);
+      else
+         return 1;
+   }
+   return 1;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d34 1
+a176 43
  * Find the line number and column for 'pos' within 'string'.
  * Return a copy of the line which contains 'pos'.  Free the line with
  * free().
@@ -281,26 +671,18 @@ _mesa_find_line_column(const GLubyte *string, const GLubyte *pos,
 
 
 /**
- * Initialize a new gl_program object.
- */
+d179 2
+a180 2
 static void
 init_program_struct(struct gl_program *prog, GLenum target, GLuint id)
-{
-   GLuint i;
-
+d184 2
+a185 1
    assert(prog);
-
-   memset(prog, 0, sizeof(*prog));
-   prog->Id = id;
-   prog->Target = target;
-   prog->RefCount = 1;
-   prog->Format = GL_PROGRAM_FORMAT_ASCII_ARB;
-
-   /* default mapping from samplers to texture units */
-   for (i = 0; i < MAX_SAMPLERS; i++)
-      prog->SamplerUnits[i] = i;
+d188 1
+a196 1
 }
-
+d198 1
+a198 94
 
 /**
  * Initialize a new fragment program object.
@@ -395,26 +777,10 @@ _mesa_init_geometry_program(struct gl_context *ctx,
       return &prog->Base;
    }
    return NULL;
-}
-
-
-/**
- * Allocate and initialize a new fragment/vertex program object but
- * don't put it into the program hash table.  Called via
- * ctx->Driver.NewProgram.  May be overridden (ie. replaced) by a
- * device driver function to implement OO deriviation with additional
- * types not understood by this function.
- *
- * \param ctx  context
- * \param id   program id/number
- * \param target  program target/type
- * \return  pointer to new program object
- */
-struct gl_program *
-_mesa_new_program(struct gl_context *ctx, GLenum target, GLuint id)
-{
+a216 1
    struct gl_program *prog;
-   switch (target) {
+d218 24
+a241 30
    case GL_VERTEX_PROGRAM_ARB: /* == GL_VERTEX_PROGRAM_NV */
       prog = _mesa_init_vertex_program(ctx, CALLOC_STRUCT(gl_vertex_program),
                                        target, id );
@@ -445,90 +811,15 @@ _mesa_new_program(struct gl_context *ctx, GLenum target, GLuint id)
                                         CALLOC_STRUCT(gl_compute_program),
                                         target, id);
       break;
-   default:
-      _mesa_problem(ctx, "bad target in _mesa_new_program");
+d244 1
+a244 1
       prog = NULL;
-   }
+a245 1
    return prog;
-}
-
-
-/**
- * Delete a program and remove it from the hash table, ignoring the
- * reference count.
- * Called via ctx->Driver.DeleteProgram.  May be wrapped (OO deriviation)
- * by a device driver function.
- */
-void
-_mesa_delete_program(struct gl_context *ctx, struct gl_program *prog)
-{
-   (void) ctx;
-   assert(prog);
-   assert(prog->RefCount==0);
-
-   if (prog == &_mesa_DummyProgram)
-      return;
-
-   free(prog->String);
-   free(prog->LocalParams);
-
-   if (prog->Instructions) {
-      _mesa_free_instructions(prog->Instructions, prog->NumInstructions);
-   }
-   if (prog->Parameters) {
-      _mesa_free_parameter_list(prog->Parameters);
-   }
-
-   if (prog->nir) {
-      ralloc_free(prog->nir);
-   }
-
-   free(prog);
-}
-
-
-/**
- * Return the gl_program object for a given ID.
- * Basically just a wrapper for _mesa_HashLookup() to avoid a lot of
- * casts elsewhere.
- */
-struct gl_program *
-_mesa_lookup_program(struct gl_context *ctx, GLuint id)
-{
-   if (id)
-      return (struct gl_program *) _mesa_HashLookup(ctx->Shared->Programs, id);
-   else
-      return NULL;
-}
-
-
-/**
- * Reference counting for vertex/fragment programs
- * This is normally only called from the _mesa_reference_program() macro
- * when there's a real pointer change.
- */
-void
-_mesa_reference_program_(struct gl_context *ctx,
-                         struct gl_program **ptr,
-                         struct gl_program *prog)
-{
-#ifndef NDEBUG
-   assert(ptr);
-   if (*ptr && prog) {
-      /* sanity check */
-      if ((*ptr)->Target == GL_VERTEX_PROGRAM_ARB)
-         assert(prog->Target == GL_VERTEX_PROGRAM_ARB);
-      else if ((*ptr)->Target == GL_FRAGMENT_PROGRAM_ARB)
-         assert(prog->Target == GL_FRAGMENT_PROGRAM_ARB ||
-                prog->Target == GL_FRAGMENT_PROGRAM_NV);
-      else if ((*ptr)->Target == GL_GEOMETRY_PROGRAM_NV)
-         assert(prog->Target == GL_GEOMETRY_PROGRAM_NV);
-   }
-#endif
-
-   if (*ptr) {
-      GLboolean deleteFlag;
-
+d279 1
+d325 1
+d327 3
+a329 10
       /*mtx_lock(&(*ptr)->Mutex);*/
 #if 0
       printf("Program %p ID=%u Target=%s  Refcount-- to %d\n",
@@ -539,22 +830,18 @@ _mesa_reference_program_(struct gl_context *ctx,
 #endif
       assert((*ptr)->RefCount > 0);
       (*ptr)->RefCount--;
-
+d331 2
+a332 2
       deleteFlag = ((*ptr)->RefCount == 0);
       /*mtx_lock(&(*ptr)->Mutex);*/
-
-      if (deleteFlag) {
-         assert(ctx);
+d336 1
+a336 1
          ctx->Driver.DeleteProgram(ctx, *ptr);
-      }
-
-      *ptr = NULL;
-   }
-
-   assert(!*ptr);
-   if (prog) {
+d344 1
+a344 1
       /*mtx_lock(&prog->Mutex);*/
-      prog->RefCount++;
+d346 1
+a346 8
 #if 0
       printf("Program %p ID=%u Target=%s  Refcount++ to %d\n",
              prog, prog->Id,
@@ -563,13 +850,7 @@ _mesa_reference_program_(struct gl_context *ctx,
              prog->RefCount);
 #endif
       /*mtx_unlock(&prog->Mutex);*/
-   }
-
-   *ptr = prog;
-}
-
-
-/**
+a353 117
  * Return a copy of a program.
  * XXX Problem here if the program object is actually OO-derivation
  * made by a device driver.
@@ -687,102 +968,7 @@ _mesa_clone_program(struct gl_context *ctx, const struct gl_program *prog)
 
 
 /**
- * Insert 'count' NOP instructions at 'start' in the given program.
- * Adjust branch targets accordingly.
- */
-GLboolean
-_mesa_insert_instructions(struct gl_program *prog, GLuint start, GLuint count)
-{
-   const GLuint origLen = prog->NumInstructions;
-   const GLuint newLen = origLen + count;
-   struct prog_instruction *newInst;
-   GLuint i;
-
-   /* adjust branches */
-   for (i = 0; i < prog->NumInstructions; i++) {
-      struct prog_instruction *inst = prog->Instructions + i;
-      if (inst->BranchTarget > 0) {
-         if ((GLuint)inst->BranchTarget >= start) {
-            inst->BranchTarget += count;
-         }
-      }
-   }
-
-   /* Alloc storage for new instructions */
-   newInst = _mesa_alloc_instructions(newLen);
-   if (!newInst) {
-      return GL_FALSE;
-   }
-
-   /* Copy 'start' instructions into new instruction buffer */
-   _mesa_copy_instructions(newInst, prog->Instructions, start);
-
-   /* init the new instructions */
-   _mesa_init_instructions(newInst + start, count);
-
-   /* Copy the remaining/tail instructions to new inst buffer */
-   _mesa_copy_instructions(newInst + start + count,
-                           prog->Instructions + start,
-                           origLen - start);
-
-   /* free old instructions */
-   _mesa_free_instructions(prog->Instructions, origLen);
-
-   /* install new instructions */
-   prog->Instructions = newInst;
-   prog->NumInstructions = newLen;
-
-   return GL_TRUE;
-}
-
-/**
- * Delete 'count' instructions at 'start' in the given program.
- * Adjust branch targets accordingly.
- */
-GLboolean
-_mesa_delete_instructions(struct gl_program *prog, GLuint start, GLuint count)
-{
-   const GLuint origLen = prog->NumInstructions;
-   const GLuint newLen = origLen - count;
-   struct prog_instruction *newInst;
-   GLuint i;
-
-   /* adjust branches */
-   for (i = 0; i < prog->NumInstructions; i++) {
-      struct prog_instruction *inst = prog->Instructions + i;
-      if (inst->BranchTarget > 0) {
-         if (inst->BranchTarget > (GLint) start) {
-            inst->BranchTarget -= count;
-         }
-      }
-   }
-
-   /* Alloc storage for new instructions */
-   newInst = _mesa_alloc_instructions(newLen);
-   if (!newInst) {
-      return GL_FALSE;
-   }
-
-   /* Copy 'start' instructions into new instruction buffer */
-   _mesa_copy_instructions(newInst, prog->Instructions, start);
-
-   /* Copy the remaining/tail instructions to new inst buffer */
-   _mesa_copy_instructions(newInst + start,
-                           prog->Instructions + start + count,
-                           newLen - start);
-
-   /* free old instructions */
-   _mesa_free_instructions(prog->Instructions, origLen);
-
-   /* install new instructions */
-   prog->Instructions = newInst;
-   prog->NumInstructions = newLen;
-
-   return GL_TRUE;
-}
-
-
-/**
+a449 184
  * Search instructions for registers that match (oldFile, oldIndex),
  * replacing them with (newFile, newIndex).
  */
@@ -967,67 +1153,7 @@ _mesa_combine_programs(struct gl_context *ctx,
 
 
 /**
- * Populate the 'used' array with flags indicating which registers (TEMPs,
- * INPUTs, OUTPUTs, etc, are used by the given program.
- * \param file  type of register to scan for
- * \param used  returns true/false flags for in use / free
- * \param usedSize  size of the 'used' array
- */
-void
-_mesa_find_used_registers(const struct gl_program *prog,
-                          gl_register_file file,
-                          GLboolean used[], GLuint usedSize)
-{
-   GLuint i, j;
-
-   memset(used, 0, usedSize);
-
-   for (i = 0; i < prog->NumInstructions; i++) {
-      const struct prog_instruction *inst = prog->Instructions + i;
-      const GLuint n = _mesa_num_inst_src_regs(inst->Opcode);
-
-      if (inst->DstReg.File == file) {
-         assert(inst->DstReg.Index < usedSize);
-         if(inst->DstReg.Index < usedSize)
-            used[inst->DstReg.Index] = GL_TRUE;
-      }
-
-      for (j = 0; j < n; j++) {
-         if (inst->SrcReg[j].File == file) {
-            assert(inst->SrcReg[j].Index < (GLint) usedSize);
-            if (inst->SrcReg[j].Index < (GLint) usedSize)
-               used[inst->SrcReg[j].Index] = GL_TRUE;
-         }
-      }
-   }
-}
-
-
-/**
- * Scan the given 'used' register flag array for the first entry
- * that's >= firstReg.
- * \param used  vector of flags indicating registers in use (as returned
- *              by _mesa_find_used_registers())
- * \param usedSize  size of the 'used' array
- * \param firstReg  first register to start searching at
- * \return index of unused register, or -1 if none.
- */
-GLint
-_mesa_find_free_register(const GLboolean used[],
-                         GLuint usedSize, GLuint firstReg)
-{
-   GLuint i;
-
-   assert(firstReg < usedSize);
-
-   for (i = firstReg; i < usedSize; i++)
-      if (!used[i])
-         return i;
-
-   return -1;
-}
-
-
+a510 134
 
 /**
  * Check if the given register index is valid (doesn't exceed implementation-
@@ -1162,45 +1288,15 @@ _mesa_postprocess_program(struct gl_context *ctx, struct gl_program *prog)
    }
 }
 
-/* Gets the minimum number of shader invocations per fragment.
- * This function is useful to determine if we need to do per
- * sample shading or per fragment shading.
- */
-GLint
-_mesa_get_min_invocations_per_fragment(struct gl_context *ctx,
-                                       const struct gl_fragment_program *prog,
-                                       bool ignore_sample_qualifier)
-{
-   /* From ARB_sample_shading specification:
-    * "Using gl_SampleID in a fragment shader causes the entire shader
-    *  to be evaluated per-sample."
-    *
-    * "Using gl_SamplePosition in a fragment shader causes the entire
-    *  shader to be evaluated per-sample."
-    *
-    * "If MULTISAMPLE or SAMPLE_SHADING_ARB is disabled, sample shading
-    *  has no effect."
-    */
-   if (ctx->Multisample.Enabled) {
-      /* The ARB_gpu_shader5 specification says:
-       *
-       * "Use of the "sample" qualifier on a fragment shader input
-       *  forces per-sample shading"
-       */
-      if (prog->IsSample && !ignore_sample_qualifier)
+d537 1
+a537 1
          return MAX2(ctx->DrawBuffer->Visual.samples, 1);
-
-      if (prog->Base.SystemValuesRead & (SYSTEM_BIT_SAMPLE_ID |
-                                         SYSTEM_BIT_SAMPLE_POS))
+d541 1
+a541 1
          return MAX2(ctx->DrawBuffer->Visual.samples, 1);
-      else if (ctx->Multisample.SampleShading)
-         return MAX2(ceil(ctx->Multisample.MinSampleShadingValue *
+d544 1
+a544 1
                           ctx->DrawBuffer->Visual.samples), 1);
-      else
-         return 1;
-   }
-   return 1;
-}
 @
 
 

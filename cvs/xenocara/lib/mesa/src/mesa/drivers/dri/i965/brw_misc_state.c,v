@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.37;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.40.06;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -128,7 +134,8 @@ upload_drawing_rect(struct brw_context *brw)
 const struct brw_tracked_state brw_drawing_rect = {
    .dirty = {
       .mesa = _NEW_BUFFERS,
-      .brw = BRW_NEW_CONTEXT,
+      .brw = BRW_NEW_BLORP |
+             BRW_NEW_CONTEXT,
    },
    .emit = upload_drawing_rect
 };
@@ -183,6 +190,7 @@ const struct brw_tracked_state brw_psp_urb_cbs = {
    .dirty = {
       .mesa = 0,
       .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP |
              BRW_NEW_FF_GS_PROG_DATA |
              BRW_NEW_GEN4_UNIT_STATE |
              BRW_NEW_STATE_BASE_ADDRESS |
@@ -239,13 +247,17 @@ brw_get_depthstencil_tile_masks(struct intel_mipmap_tree *depth_mt,
    uint32_t tile_mask_x = 0, tile_mask_y = 0;
 
    if (depth_mt) {
-      intel_miptree_get_tile_masks(depth_mt, &tile_mask_x, &tile_mask_y, false);
+      intel_get_tile_masks(depth_mt->tiling, depth_mt->tr_mode,
+                           depth_mt->cpp,
+                           &tile_mask_x, &tile_mask_y);
 
       if (intel_miptree_level_has_hiz(depth_mt, depth_level)) {
          uint32_t hiz_tile_mask_x, hiz_tile_mask_y;
-         intel_miptree_get_tile_masks(depth_mt->hiz_buf->mt,
-                                      &hiz_tile_mask_x, &hiz_tile_mask_y,
-                                      false);
+         intel_get_tile_masks(depth_mt->hiz_buf->mt->tiling,
+                              depth_mt->hiz_buf->mt->tr_mode,
+                              depth_mt->hiz_buf->mt->cpp,
+                              &hiz_tile_mask_x,
+                              &hiz_tile_mask_y);
 
          /* Each HiZ row represents 2 rows of pixels */
          hiz_tile_mask_y = hiz_tile_mask_y << 1 | 1;
@@ -265,9 +277,11 @@ brw_get_depthstencil_tile_masks(struct intel_mipmap_tree *depth_mt,
          tile_mask_y |= 63;
       } else {
          uint32_t stencil_tile_mask_x, stencil_tile_mask_y;
-         intel_miptree_get_tile_masks(stencil_mt,
-                                      &stencil_tile_mask_x,
-                                      &stencil_tile_mask_y, false);
+         intel_get_tile_masks(stencil_mt->tiling,
+                              stencil_mt->tr_mode,
+                              stencil_mt->cpp,
+                              &stencil_tile_mask_x,
+                              &stencil_tile_mask_y);
 
          tile_mask_x |= stencil_tile_mask_x;
          tile_mask_y |= stencil_tile_mask_y;
@@ -703,6 +717,7 @@ brw_emit_depth_stencil_hiz(struct brw_context *brw,
 
       /* Emit hiz buffer. */
       if (hiz) {
+         assert(depth_mt);
          struct intel_mipmap_tree *hiz_mt = depth_mt->hiz_buf->mt;
 	 BEGIN_BATCH(3);
 	 OUT_BATCH((_3DSTATE_HIER_DEPTH_BUFFER << 16) | (3 - 2));
@@ -763,7 +778,8 @@ brw_emit_depth_stencil_hiz(struct brw_context *brw,
 const struct brw_tracked_state brw_depthbuffer = {
    .dirty = {
       .mesa = _NEW_BUFFERS,
-      .brw = BRW_NEW_BATCH,
+      .brw = BRW_NEW_BATCH |
+             BRW_NEW_BLORP,
    },
    .emit = brw_emit_depthbuffer,
 };
@@ -927,12 +943,137 @@ brw_emit_select_pipeline(struct brw_context *brw, enum brw_pipeline pipeline)
    const uint32_t _3DSTATE_PIPELINE_SELECT =
       is_965 ? CMD_PIPELINE_SELECT_965 : CMD_PIPELINE_SELECT_GM45;
 
+   if (brw->use_resource_streamer && pipeline != BRW_RENDER_PIPELINE) {
+      /* From "BXML » GT » MI » vol1a GPU Overview » [Instruction]
+       * PIPELINE_SELECT [DevBWR+]":
+       *
+       *   Project: HSW, BDW, CHV, SKL, BXT
+       *
+       *   Hardware Binding Tables are only supported for 3D
+       *   workloads. Resource streamer must be enabled only for 3D
+       *   workloads. Resource streamer must be disabled for Media and GPGPU
+       *   workloads.
+       */
+      BEGIN_BATCH(1);
+      OUT_BATCH(MI_RS_CONTROL | 0);
+      ADVANCE_BATCH();
+
+      gen7_disable_hw_binding_tables(brw);
+
+      /* XXX - Disable gather constant pool too when we start using it. */
+   }
+
+   if (brw->gen >= 8 && brw->gen < 10) {
+      /* From the Broadwell PRM, Volume 2a: Instructions, PIPELINE_SELECT:
+       *
+       *   Software must clear the COLOR_CALC_STATE Valid field in
+       *   3DSTATE_CC_STATE_POINTERS command prior to send a PIPELINE_SELECT
+       *   with Pipeline Select set to GPGPU.
+       *
+       * The internal hardware docs recommend the same workaround for Gen9
+       * hardware too.
+       */
+      if (pipeline == BRW_COMPUTE_PIPELINE) {
+         BEGIN_BATCH(2);
+         OUT_BATCH(_3DSTATE_CC_STATE_POINTERS << 16 | (2 - 2));
+         OUT_BATCH(0);
+         ADVANCE_BATCH();
+
+         brw->ctx.NewDriverState |= BRW_NEW_CC_STATE;
+      }
+
+   } else if (brw->gen >= 6) {
+      /* From "BXML » GT » MI » vol1a GPU Overview » [Instruction]
+       * PIPELINE_SELECT [DevBWR+]":
+       *
+       *   Project: DEVSNB+
+       *
+       *   Software must ensure all the write caches are flushed through a
+       *   stalling PIPE_CONTROL command followed by another PIPE_CONTROL
+       *   command to invalidate read only caches prior to programming
+       *   MI_PIPELINE_SELECT command to change the Pipeline Select Mode.
+       */
+      const unsigned dc_flush =
+         brw->gen >= 7 ? PIPE_CONTROL_DATA_CACHE_FLUSH : 0;
+
+      brw_emit_pipe_control_flush(brw,
+                                  PIPE_CONTROL_RENDER_TARGET_FLUSH |
+                                  PIPE_CONTROL_DEPTH_CACHE_FLUSH |
+                                  dc_flush |
+                                  PIPE_CONTROL_NO_WRITE |
+                                  PIPE_CONTROL_CS_STALL);
+
+      brw_emit_pipe_control_flush(brw,
+                                  PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE |
+                                  PIPE_CONTROL_CONST_CACHE_INVALIDATE |
+                                  PIPE_CONTROL_STATE_CACHE_INVALIDATE |
+                                  PIPE_CONTROL_INSTRUCTION_INVALIDATE |
+                                  PIPE_CONTROL_NO_WRITE);
+
+   } else {
+      /* From "BXML » GT » MI » vol1a GPU Overview » [Instruction]
+       * PIPELINE_SELECT [DevBWR+]":
+       *
+       *   Project: PRE-DEVSNB
+       *
+       *   Software must ensure the current pipeline is flushed via an
+       *   MI_FLUSH or PIPE_CONTROL prior to the execution of PIPELINE_SELECT.
+       */
+      BEGIN_BATCH(1);
+      OUT_BATCH(MI_FLUSH);
+      ADVANCE_BATCH();
+   }
+
    /* Select the pipeline */
    BEGIN_BATCH(1);
    OUT_BATCH(_3DSTATE_PIPELINE_SELECT << 16 |
              (brw->gen >= 9 ? (3 << 8) : 0) |
              (pipeline == BRW_COMPUTE_PIPELINE ? 2 : 0));
    ADVANCE_BATCH();
+
+   if (brw->gen == 7 && !brw->is_haswell &&
+       pipeline == BRW_RENDER_PIPELINE) {
+      /* From "BXML » GT » MI » vol1a GPU Overview » [Instruction]
+       * PIPELINE_SELECT [DevBWR+]":
+       *
+       *   Project: DEVIVB, DEVHSW:GT3:A0
+       *
+       *   Software must send a pipe_control with a CS stall and a post sync
+       *   operation and then a dummy DRAW after every MI_SET_CONTEXT and
+       *   after any PIPELINE_SELECT that is enabling 3D mode.
+       */
+      gen7_emit_cs_stall_flush(brw);
+
+      BEGIN_BATCH(7);
+      OUT_BATCH(CMD_3D_PRIM << 16 | (7 - 2));
+      OUT_BATCH(_3DPRIM_POINTLIST);
+      OUT_BATCH(0);
+      OUT_BATCH(0);
+      OUT_BATCH(0);
+      OUT_BATCH(0);
+      OUT_BATCH(0);
+      ADVANCE_BATCH();
+   }
+
+   if (brw->use_resource_streamer && pipeline == BRW_RENDER_PIPELINE) {
+      /* From "BXML » GT » MI » vol1a GPU Overview » [Instruction]
+       * PIPELINE_SELECT [DevBWR+]":
+       *
+       *   Project: HSW, BDW, CHV, SKL, BXT
+       *
+       *   Hardware Binding Tables are only supported for 3D
+       *   workloads. Resource streamer must be enabled only for 3D
+       *   workloads. Resource streamer must be disabled for Media and GPGPU
+       *   workloads.
+       */
+      BEGIN_BATCH(1);
+      OUT_BATCH(MI_RS_CONTROL | 1);
+      ADVANCE_BATCH();
+
+      gen7_enable_hw_binding_tables(brw);
+
+      /* XXX - Re-enable gather constant pool here. */
+   }
 }
 
 /**
@@ -945,14 +1086,6 @@ brw_upload_invariant_state(struct brw_context *brw)
 
    brw_emit_select_pipeline(brw, BRW_RENDER_PIPELINE);
    brw->last_pipeline = BRW_RENDER_PIPELINE;
-
-   if (brw->gen < 6) {
-      /* Disable depth offset clamping. */
-      BEGIN_BATCH(2);
-      OUT_BATCH(_3DSTATE_GLOBAL_DEPTH_OFFSET_CLAMP << 16 | (2 - 2));
-      OUT_BATCH_F(0.0);
-      ADVANCE_BATCH();
-   }
 
    if (brw->gen >= 8) {
       BEGIN_BATCH(3);
@@ -977,7 +1110,8 @@ brw_upload_invariant_state(struct brw_context *brw)
 const struct brw_tracked_state brw_invariant_state = {
    .dirty = {
       .mesa = 0,
-      .brw = BRW_NEW_CONTEXT,
+      .brw = BRW_NEW_BLORP |
+             BRW_NEW_CONTEXT,
    },
    .emit = brw_upload_invariant_state
 };
@@ -992,9 +1126,12 @@ const struct brw_tracked_state brw_invariant_state = {
  * surface state objects, but not the surfaces that the surface state
  * objects point to.
  */
-static void
-upload_state_base_address(struct brw_context *brw)
+void
+brw_upload_state_base_address(struct brw_context *brw)
 {
+   if (brw->batch.state_base_address_emitted)
+      return;
+
    /* FINISHME: According to section 3.6.1 "STATE_BASE_ADDRESS" of
     * vol1a of the G45 PRM, MI_FLUSH with the ISC invalidate should be
     * programmed prior to STATE_BASE_ADDRESS.
@@ -1004,7 +1141,45 @@ upload_state_base_address(struct brw_context *brw)
     * maybe this isn't required for us in particular.
     */
 
-   if (brw->gen >= 6) {
+   if (brw->gen >= 8) {
+      uint32_t mocs_wb = brw->gen >= 9 ? SKL_MOCS_WB : BDW_MOCS_WB;
+      int pkt_len = brw->gen >= 9 ? 19 : 16;
+
+      BEGIN_BATCH(pkt_len);
+      OUT_BATCH(CMD_STATE_BASE_ADDRESS << 16 | (pkt_len - 2));
+      /* General state base address: stateless DP read/write requests */
+      OUT_BATCH(mocs_wb << 4 | 1);
+      OUT_BATCH(0);
+      OUT_BATCH(mocs_wb << 16);
+      /* Surface state base address: */
+      OUT_RELOC64(brw->batch.bo, I915_GEM_DOMAIN_SAMPLER, 0,
+                  mocs_wb << 4 | 1);
+      /* Dynamic state base address: */
+      OUT_RELOC64(brw->batch.bo,
+                  I915_GEM_DOMAIN_RENDER | I915_GEM_DOMAIN_INSTRUCTION, 0,
+                  mocs_wb << 4 | 1);
+      /* Indirect object base address: MEDIA_OBJECT data */
+      OUT_BATCH(mocs_wb << 4 | 1);
+      OUT_BATCH(0);
+      /* Instruction base address: shader kernels (incl. SIP) */
+      OUT_RELOC64(brw->cache.bo, I915_GEM_DOMAIN_INSTRUCTION, 0,
+                  mocs_wb << 4 | 1);
+
+      /* General state buffer size */
+      OUT_BATCH(0xfffff001);
+      /* Dynamic state buffer size */
+      OUT_BATCH(ALIGN(brw->batch.bo->size, 4096) | 1);
+      /* Indirect object upper bound */
+      OUT_BATCH(0xfffff001);
+      /* Instruction access upper bound */
+      OUT_BATCH(ALIGN(brw->cache.bo->size, 4096) | 1);
+      if (brw->gen >= 9) {
+         OUT_BATCH(1);
+         OUT_BATCH(0);
+         OUT_BATCH(0);
+      }
+      ADVANCE_BATCH();
+   } else if (brw->gen >= 6) {
       uint8_t mocs = brw->gen == 7 ? GEN7_MOCS_L3 : 0;
 
        BEGIN_BATCH(10);
@@ -1092,7 +1267,61 @@ upload_state_base_address(struct brw_context *brw)
     */
 
    brw->ctx.NewDriverState |= BRW_NEW_STATE_BASE_ADDRESS;
+   brw->batch.state_base_address_emitted = true;
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d66 2
+a67 1
+      .brw = BRW_NEW_CONTEXT,
+d122 1
+d179 3
+a181 1
+      intel_miptree_get_tile_masks(depth_mt, &tile_mask_x, &tile_mask_y, false);
+d185 5
+a189 3
+         intel_miptree_get_tile_masks(depth_mt->hiz_buf->mt,
+                                      &hiz_tile_mask_x, &hiz_tile_mask_y,
+                                      false);
+d209 5
+a213 3
+         intel_miptree_get_tile_masks(stencil_mt,
+                                      &stencil_tile_mask_x,
+                                      &stencil_tile_mask_y, false);
+d649 1
+d710 2
+a711 1
+      .brw = BRW_NEW_BATCH,
+d875 81
+d962 44
+a1018 8
+   if (brw->gen < 6) {
+      /* Disable depth offset clamping. */
+      BEGIN_BATCH(2);
+      OUT_BATCH(_3DSTATE_GLOBAL_DEPTH_OFFSET_CLAMP << 16 | (2 - 2));
+      OUT_BATCH_F(0.0);
+      ADVANCE_BATCH();
+   }
+
+d1042 2
+a1043 1
+      .brw = BRW_NEW_CONTEXT,
+d1058 2
+a1059 2
+static void
+upload_state_base_address(struct brw_context *brw)
+d1061 3
+d1073 39
+a1111 1
+   if (brw->gen >= 6) {
+d1199 1
+a1200 9
 
 const struct brw_tracked_state brw_state_base_address = {
    .dirty = {

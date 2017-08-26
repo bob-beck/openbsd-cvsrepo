@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.22;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.42.29;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/**************************************************************************
@@ -98,6 +104,7 @@ text
  * Set GALLIUM_HUD=help for more info.
  */
 
+#include <signal.h>
 #include <stdio.h>
 
 #include "hud/hud_context.h"
@@ -106,6 +113,7 @@ text
 
 #include "cso_cache/cso_context.h"
 #include "util/u_draw_quad.h"
+#include "util/u_format.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_math.h"
@@ -116,19 +124,22 @@ text
 #include "tgsi/tgsi_text.h"
 #include "tgsi/tgsi_dump.h"
 
+/* Control the visibility of all HUD contexts */
+static boolean huds_visible = TRUE;
 
 struct hud_context {
    struct pipe_context *pipe;
    struct cso_context *cso;
    struct u_upload_mgr *uploader;
 
+   struct hud_batch_query_context *batch_query;
    struct list_head pane_list;
 
    /* states */
-   struct pipe_blend_state alpha_blend;
+   struct pipe_blend_state no_blend, alpha_blend;
    struct pipe_depth_stencil_alpha_state dsa;
    void *fs_color, *fs_text;
-   struct pipe_rasterizer_state rasterizer;
+   struct pipe_rasterizer_state rasterizer, rasterizer_aa_lines;
    void *vs;
    struct pipe_vertex_element velems[2];
 
@@ -158,8 +169,17 @@ struct hud_context {
       unsigned max_num_vertices;
       unsigned num_vertices;
    } text, bg, whitelines;
+
+   bool has_srgb;
 };
 
+#ifdef PIPE_OS_UNIX
+static void
+signal_visible_handler(int sig, siginfo_t *siginfo, void *context)
+{
+   huds_visible = !huds_visible;
+}
+#endif
 
 static void
 hud_draw_colored_prims(struct hud_context *hud, unsigned prim,
@@ -296,8 +316,8 @@ hud_draw_string(struct hud_context *hud, unsigned x, unsigned y,
 }
 
 static void
-number_to_human_readable(uint64_t num, uint64_t max_value,
-                         enum pipe_driver_query_type type, char *out)
+number_to_human_readable(uint64_t num, enum pipe_driver_query_type type,
+                         char *out)
 {
    static const char *byte_units[] =
       {" B", " KB", " MB", " GB", " TB", " PB", " EB"};
@@ -308,6 +328,11 @@ number_to_human_readable(uint64_t num, uint64_t max_value,
    static const char *hz_units[] =
       {" Hz", " KHz", " MHz", " GHz"};
    static const char *percent_units[] = {"%"};
+   static const char *dbm_units[] = {" (-dBm)"};
+   static const char *temperature_units[] = {" C"};
+   static const char *volt_units[] = {" mV", " V"};
+   static const char *amp_units[] = {" mA", " A"};
+   static const char *watt_units[] = {" mW", " W"};
 
    const char **units;
    unsigned max_unit;
@@ -319,6 +344,22 @@ number_to_human_readable(uint64_t num, uint64_t max_value,
    case PIPE_DRIVER_QUERY_TYPE_MICROSECONDS:
       max_unit = ARRAY_SIZE(time_units)-1;
       units = time_units;
+      break;
+   case PIPE_DRIVER_QUERY_TYPE_VOLTS:
+      max_unit = ARRAY_SIZE(volt_units)-1;
+      units = volt_units;
+      break;
+   case PIPE_DRIVER_QUERY_TYPE_AMPS:
+      max_unit = ARRAY_SIZE(amp_units)-1;
+      units = amp_units;
+      break;
+   case PIPE_DRIVER_QUERY_TYPE_DBM:
+      max_unit = ARRAY_SIZE(dbm_units)-1;
+      units = dbm_units;
+      break;
+   case PIPE_DRIVER_QUERY_TYPE_TEMPERATURE:
+      max_unit = ARRAY_SIZE(temperature_units)-1;
+      units = temperature_units;
       break;
    case PIPE_DRIVER_QUERY_TYPE_PERCENTAGE:
       max_unit = ARRAY_SIZE(percent_units)-1;
@@ -332,14 +373,13 @@ number_to_human_readable(uint64_t num, uint64_t max_value,
       max_unit = ARRAY_SIZE(hz_units)-1;
       units = hz_units;
       break;
+   case PIPE_DRIVER_QUERY_TYPE_WATTS:
+      max_unit = ARRAY_SIZE(watt_units)-1;
+      units = watt_units;
+      break;
    default:
-      if (max_value == 100) {
-         max_unit = ARRAY_SIZE(percent_units)-1;
-         units = percent_units;
-      } else {
-         max_unit = ARRAY_SIZE(metric_units)-1;
-         units = metric_units;
-      }
+      max_unit = ARRAY_SIZE(metric_units)-1;
+      units = metric_units;
    }
 
    while (d > divisor && unit < max_unit) {
@@ -347,12 +387,19 @@ number_to_human_readable(uint64_t num, uint64_t max_value,
       unit++;
    }
 
-   if (d >= 100 || d == (int)d)
+   /* Round to 3 decimal places so as not to print trailing zeros. */
+   if (d*1000 != (int)(d*1000))
+      d = round(d * 1000) / 1000;
+
+   /* Show at least 4 digits with at most 3 decimal places, but not zeros. */
+   if (d >= 1000 || d == (int)d)
       sprintf(out, "%.0f%s", d, units[unit]);
-   else if (d >= 10 || d*10 == (int)(d*10))
+   else if (d >= 100 || d*10 == (int)(d*10))
       sprintf(out, "%.1f%s", d, units[unit]);
-   else
+   else if (d >= 10 || d*100 == (int)(d*100))
       sprintf(out, "%.2f%s", d, units[unit]);
+   else
+      sprintf(out, "%.3f%s", d, units[unit]);
 }
 
 static void
@@ -388,6 +435,7 @@ hud_pane_accumulate_vertices(struct hud_context *hud,
    float *line_verts = hud->whitelines.vertices + hud->whitelines.num_vertices*2;
    unsigned i, num = 0;
    char str[32];
+   const unsigned last_line = pane->last_line;
 
    /* draw background */
    hud_draw_background_quad(hud,
@@ -395,12 +443,13 @@ hud_pane_accumulate_vertices(struct hud_context *hud,
                             pane->x2, pane->y2);
 
    /* draw numbers on the right-hand side */
-   for (i = 0; i < 6; i++) {
+   for (i = 0; i <= last_line; i++) {
       unsigned x = pane->x2 + 2;
-      unsigned y = pane->inner_y1 + pane->inner_height * (5 - i) / 5 -
+      unsigned y = pane->inner_y1 +
+                   pane->inner_height * (last_line - i) / last_line -
                    hud->font.glyph_height / 2;
 
-      number_to_human_readable(pane->max_value * i / 5, pane->max_value,
+      number_to_human_readable(pane->max_value * i / last_line,
                                pane->type, str);
       hud_draw_string(hud, x, y, "%s", str);
    }
@@ -411,8 +460,7 @@ hud_pane_accumulate_vertices(struct hud_context *hud,
       unsigned x = pane->x1 + 2;
       unsigned y = pane->y2 + 2 + i*hud->font.glyph_height;
 
-      number_to_human_readable(gr->current_value, pane->max_value,
-                               pane->type, str);
+      number_to_human_readable(gr->current_value, pane->type, str);
       hud_draw_string(hud, x, y, "  %s: %s", gr->name, str);
       i++;
    }
@@ -440,8 +488,9 @@ hud_pane_accumulate_vertices(struct hud_context *hud,
    line_verts[num++] = (float) pane->y2;
 
    /* draw horizontal lines inside the graph */
-   for (i = 0; i <= 5; i++) {
-      float y = round((pane->max_value * i / 5.0) * pane->yscale + pane->inner_y2);
+   for (i = 0; i <= last_line; i++) {
+      float y = round((pane->max_value * i / (double)last_line) *
+                      pane->yscale + pane->inner_y2);
 
       assert(hud->whitelines.num_vertices + num/2 + 2 <= hud->whitelines.max_num_vertices);
       line_verts[num++] = pane->x1;
@@ -485,7 +534,7 @@ hud_alloc_vertices(struct hud_context *hud, struct vertex_queue *v,
    v->max_num_vertices = num_vertices;
    v->vbuf.stride = stride;
    u_upload_alloc(hud->uploader, 0, v->vbuf.stride * v->max_num_vertices,
-                  &v->vbuf.buffer_offset, &v->vbuf.buffer,
+                  16, &v->vbuf.buffer_offset, &v->vbuf.buffer,
                   (void**)&v->vertices);
 }
 
@@ -506,34 +555,50 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    struct hud_pane *pane;
    struct hud_graph *gr;
 
+   if (!huds_visible)
+      return;
+
    hud->fb_width = tex->width0;
    hud->fb_height = tex->height0;
    hud->constants.two_div_fb_width = 2.0f / hud->fb_width;
    hud->constants.two_div_fb_height = 2.0f / hud->fb_height;
 
-   cso_save_framebuffer(cso);
-   cso_save_sample_mask(cso);
-   cso_save_min_samples(cso);
-   cso_save_blend(cso);
-   cso_save_depth_stencil_alpha(cso);
-   cso_save_fragment_shader(cso);
-   cso_save_fragment_sampler_views(cso);
-   cso_save_fragment_samplers(cso);
-   cso_save_rasterizer(cso);
-   cso_save_viewport(cso);
-   cso_save_stream_outputs(cso);
-   cso_save_geometry_shader(cso);
-   cso_save_tessctrl_shader(cso);
-   cso_save_tesseval_shader(cso);
-   cso_save_vertex_shader(cso);
-   cso_save_vertex_elements(cso);
-   cso_save_aux_vertex_buffer_slot(cso);
+   cso_save_state(cso, (CSO_BIT_FRAMEBUFFER |
+                        CSO_BIT_SAMPLE_MASK |
+                        CSO_BIT_MIN_SAMPLES |
+                        CSO_BIT_BLEND |
+                        CSO_BIT_DEPTH_STENCIL_ALPHA |
+                        CSO_BIT_FRAGMENT_SHADER |
+                        CSO_BIT_FRAGMENT_SAMPLER_VIEWS |
+                        CSO_BIT_FRAGMENT_SAMPLERS |
+                        CSO_BIT_RASTERIZER |
+                        CSO_BIT_VIEWPORT |
+                        CSO_BIT_STREAM_OUTPUTS |
+                        CSO_BIT_GEOMETRY_SHADER |
+                        CSO_BIT_TESSCTRL_SHADER |
+                        CSO_BIT_TESSEVAL_SHADER |
+                        CSO_BIT_VERTEX_SHADER |
+                        CSO_BIT_VERTEX_ELEMENTS |
+                        CSO_BIT_AUX_VERTEX_BUFFER_SLOT |
+                        CSO_BIT_PAUSE_QUERIES |
+                        CSO_BIT_RENDER_CONDITION));
    cso_save_constant_buffer_slot0(cso, PIPE_SHADER_VERTEX);
-   cso_save_render_condition(cso);
 
    /* set states */
    memset(&surf_templ, 0, sizeof(surf_templ));
    surf_templ.format = tex->format;
+
+   /* Without this, AA lines look thinner if they are between 2 pixels
+    * because the alpha is 0.5 on both pixels. (it's ugly)
+    *
+    * sRGB makes the width of all AA lines look the same.
+    */
+   if (hud->has_srgb) {
+      enum pipe_format srgb_format = util_format_srgb(tex->format);
+
+      if (srgb_format != PIPE_FORMAT_NONE)
+         surf_templ.format = srgb_format;
+   }
    surf = pipe->create_surface(pipe, tex, &surf_templ);
 
    memset(&fb, 0, sizeof(fb));
@@ -553,7 +618,6 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    cso_set_framebuffer(cso, &fb);
    cso_set_sample_mask(cso, ~0);
    cso_set_min_samples(cso, 1);
-   cso_set_blend(cso, &hud->alpha_blend);
    cso_set_depth_stencil_alpha(cso, &hud->dsa);
    cso_set_rasterizer(cso, &hud->rasterizer);
    cso_set_viewport(cso, &viewport);
@@ -570,11 +634,13 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    cso_set_constant_buffer(cso, PIPE_SHADER_VERTEX, 0, &hud->constbuf);
 
    /* prepare vertex buffers */
-   hud_alloc_vertices(hud, &hud->bg, 4 * 128, 2 * sizeof(float));
+   hud_alloc_vertices(hud, &hud->bg, 4 * 256, 2 * sizeof(float));
    hud_alloc_vertices(hud, &hud->whitelines, 4 * 256, 2 * sizeof(float));
-   hud_alloc_vertices(hud, &hud->text, 4 * 512, 4 * sizeof(float));
+   hud_alloc_vertices(hud, &hud->text, 4 * 1024, 4 * sizeof(float));
 
    /* prepare all graphs */
+   hud_batch_query_update(hud->batch_query);
+
    LIST_FOR_EACH_ENTRY(pane, &hud->pane_list, head) {
       LIST_FOR_EACH_ENTRY(gr, &pane->graph_list, head) {
          gr->query_new_value(gr);
@@ -587,6 +653,7 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    u_upload_unmap(hud->uploader);
 
    /* draw accumulated vertices for background quads */
+   cso_set_blend(cso, &hud->alpha_blend);
    cso_set_fragment_shader_handle(hud->cso, hud->fs_color);
 
    if (hud->bg.num_vertices) {
@@ -607,6 +674,8 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    pipe_resource_reference(&hud->bg.vbuf.buffer, NULL);
 
    /* draw accumulated vertices for white lines */
+   cso_set_blend(cso, &hud->no_blend);
+
    hud->constants.color[0] = 1;
    hud->constants.color[1] = 1;
    hud->constants.color[2] = 1;
@@ -626,6 +695,7 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    pipe_resource_reference(&hud->whitelines.vbuf.buffer, NULL);
 
    /* draw accumulated vertices for text */
+   cso_set_blend(cso, &hud->alpha_blend);
    if (hud->text.num_vertices) {
       cso_set_vertex_buffers(cso, cso_get_aux_vertex_buffer_slot(cso), 1,
                              &hud->text.vbuf);
@@ -635,33 +705,23 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
    pipe_resource_reference(&hud->text.vbuf.buffer, NULL);
 
    /* draw the rest */
+   cso_set_rasterizer(cso, &hud->rasterizer_aa_lines);
    LIST_FOR_EACH_ENTRY(pane, &hud->pane_list, head) {
       if (pane)
          hud_pane_draw_colored_objects(hud, pane);
    }
 
-   /* restore states */
-   cso_restore_framebuffer(cso);
-   cso_restore_sample_mask(cso);
-   cso_restore_min_samples(cso);
-   cso_restore_blend(cso);
-   cso_restore_depth_stencil_alpha(cso);
-   cso_restore_fragment_shader(cso);
-   cso_restore_fragment_sampler_views(cso);
-   cso_restore_fragment_samplers(cso);
-   cso_restore_rasterizer(cso);
-   cso_restore_viewport(cso);
-   cso_restore_stream_outputs(cso);
-   cso_restore_tessctrl_shader(cso);
-   cso_restore_tesseval_shader(cso);
-   cso_restore_geometry_shader(cso);
-   cso_restore_vertex_shader(cso);
-   cso_restore_vertex_elements(cso);
-   cso_restore_aux_vertex_buffer_slot(cso);
+   cso_restore_state(cso);
    cso_restore_constant_buffer_slot0(cso, PIPE_SHADER_VERTEX);
-   cso_restore_render_condition(cso);
 
    pipe_surface_reference(&surf, NULL);
+}
+
+static void
+fixup_bytes(enum pipe_driver_query_type type, int position, uint64_t *exp10)
+{
+   if (type == PIPE_DRIVER_QUERY_TYPE_BYTES && position % 3 == 0)
+      *exp10 = (*exp10 / 1000) * 1024;
 }
 
 /**
@@ -671,7 +731,74 @@ hud_draw(struct hud_context *hud, struct pipe_resource *tex)
 void
 hud_pane_set_max_value(struct hud_pane *pane, uint64_t value)
 {
-   pane->max_value = value;
+   double leftmost_digit;
+   uint64_t exp10;
+   int i;
+
+   /* The following code determines the max_value in the graph as well as
+    * how many describing lines are drawn. The max_value is rounded up,
+    * so that all drawn numbers are rounded for readability.
+    * We want to print multiples of a simple number instead of multiples of
+    * hard-to-read numbers like 1.753.
+    */
+
+   /* Find the left-most digit. */
+   exp10 = 1;
+   for (i = 0; value > 9 * exp10; i++) {
+      exp10 *= 10;
+      fixup_bytes(pane->type, i + 1, &exp10);
+   }
+
+   leftmost_digit = DIV_ROUND_UP(value, exp10);
+
+   /* Round 9 to 10. */
+   if (leftmost_digit == 9) {
+      leftmost_digit = 1;
+      exp10 *= 10;
+      fixup_bytes(pane->type, i + 1, &exp10);
+   }
+
+   switch ((unsigned)leftmost_digit) {
+   case 1:
+      pane->last_line = 5; /* lines in +1/5 increments */
+      break;
+   case 2:
+      pane->last_line = 8; /* lines in +1/4 increments. */
+      break;
+   case 3:
+   case 4:
+      pane->last_line = leftmost_digit * 2; /* lines in +1/2 increments */
+      break;
+   case 5:
+   case 6:
+   case 7:
+   case 8:
+      pane->last_line = leftmost_digit; /* lines in +1 increments */
+      break;
+   default:
+      assert(0);
+   }
+
+   /* Truncate {3,4} to {2.5, 3.5} if possible. */
+   for (i = 3; i <= 4; i++) {
+      if (leftmost_digit == i && value <= (i - 0.5) * exp10) {
+         leftmost_digit = i - 0.5;
+         pane->last_line = leftmost_digit * 2; /* lines in +1/2 increments. */
+      }
+   }
+
+   /* Truncate 2 to a multiple of 0.2 in (1, 1.6] if possible. */
+   if (leftmost_digit == 2) {
+      for (i = 1; i <= 3; i++) {
+         if (value <= (1 + i*0.2) * exp10) {
+            leftmost_digit = 1 + i*0.2;
+            pane->last_line = 5 + i; /* lines in +1/5 increments. */
+            break;
+         }
+      }
+   }
+
+   pane->max_value = leftmost_digit * exp10;
    pane->yscale = -(int)pane->inner_height / (float)pane->max_value;
 }
 
@@ -757,7 +884,7 @@ hud_pane_add_graph(struct hud_pane *pane, struct hud_graph *gr)
       name++;
    }
 
-   assert(pane->num_graphs < Elements(colors));
+   assert(pane->num_graphs < ARRAY_SIZE(colors));
    gr->vertices = MALLOC(pane->max_num_vertices * sizeof(float) * 2);
    gr->color[0] = colors[pane->num_graphs][0];
    gr->color[1] = colors[pane->num_graphs][1];
@@ -956,6 +1083,9 @@ hud_parse_env_var(struct hud_context *hud, const char *env)
       }
 
       /* Add a graph. */
+#if HAVE_GALLIUM_EXTRA_HUD || HAVE_LIBSENSORS
+      char arg_name[64];
+#endif
       /* IF YOU CHANGE THIS, UPDATE print_help! */
       if (strcmp(name, "fps") == 0) {
          hud_fps_graph_install(pane);
@@ -966,19 +1096,82 @@ hud_parse_env_var(struct hud_context *hud, const char *env)
       else if (sscanf(name, "cpu%u%s", &i, s) == 1) {
          hud_cpu_graph_install(pane, i);
       }
+#if HAVE_GALLIUM_EXTRA_HUD
+      else if (sscanf(name, "nic-rx-%s", arg_name) == 1) {
+         hud_nic_graph_install(pane, arg_name, NIC_DIRECTION_RX);
+      }
+      else if (sscanf(name, "nic-tx-%s", arg_name) == 1) {
+         hud_nic_graph_install(pane, arg_name, NIC_DIRECTION_TX);
+      }
+      else if (sscanf(name, "nic-rssi-%s", arg_name) == 1) {
+         hud_nic_graph_install(pane, arg_name, NIC_RSSI_DBM);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_DBM;
+      }
+      else if (sscanf(name, "diskstat-rd-%s", arg_name) == 1) {
+         hud_diskstat_graph_install(pane, arg_name, DISKSTAT_RD);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_BYTES;
+      }
+      else if (sscanf(name, "diskstat-wr-%s", arg_name) == 1) {
+         hud_diskstat_graph_install(pane, arg_name, DISKSTAT_WR);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_BYTES;
+      }
+      else if (sscanf(name, "cpufreq-min-cpu%u", &i) == 1) {
+         hud_cpufreq_graph_install(pane, i, CPUFREQ_MINIMUM);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_HZ;
+      }
+      else if (sscanf(name, "cpufreq-cur-cpu%u", &i) == 1) {
+         hud_cpufreq_graph_install(pane, i, CPUFREQ_CURRENT);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_HZ;
+      }
+      else if (sscanf(name, "cpufreq-max-cpu%u", &i) == 1) {
+         hud_cpufreq_graph_install(pane, i, CPUFREQ_MAXIMUM);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_HZ;
+      }
+#endif
+#if HAVE_LIBSENSORS
+      else if (sscanf(name, "sensors_temp_cu-%s", arg_name) == 1) {
+         hud_sensors_temp_graph_install(pane, arg_name,
+                                        SENSORS_TEMP_CURRENT);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_TEMPERATURE;
+      }
+      else if (sscanf(name, "sensors_temp_cr-%s", arg_name) == 1) {
+         hud_sensors_temp_graph_install(pane, arg_name,
+                                        SENSORS_TEMP_CRITICAL);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_TEMPERATURE;
+      }
+      else if (sscanf(name, "sensors_volt_cu-%s", arg_name) == 1) {
+         hud_sensors_temp_graph_install(pane, arg_name,
+                                        SENSORS_VOLTAGE_CURRENT);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_VOLTS;
+      }
+      else if (sscanf(name, "sensors_curr_cu-%s", arg_name) == 1) {
+         hud_sensors_temp_graph_install(pane, arg_name,
+                                        SENSORS_CURRENT_CURRENT);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_AMPS;
+      }
+      else if (sscanf(name, "sensors_pow_cu-%s", arg_name) == 1) {
+         hud_sensors_temp_graph_install(pane, arg_name,
+                                        SENSORS_POWER_CURRENT);
+         pane->type = PIPE_DRIVER_QUERY_TYPE_WATTS;
+      }
+#endif
       else if (strcmp(name, "samples-passed") == 0 &&
                has_occlusion_query(hud->pipe->screen)) {
-         hud_pipe_query_install(pane, hud->pipe, "samples-passed",
+         hud_pipe_query_install(&hud->batch_query, pane, hud->pipe,
+                                "samples-passed",
                                 PIPE_QUERY_OCCLUSION_COUNTER, 0, 0,
                                 PIPE_DRIVER_QUERY_TYPE_UINT64,
-                                PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE);
+                                PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE,
+                                0);
       }
       else if (strcmp(name, "primitives-generated") == 0 &&
                has_streamout(hud->pipe->screen)) {
-         hud_pipe_query_install(pane, hud->pipe, "primitives-generated",
+         hud_pipe_query_install(&hud->batch_query, pane, hud->pipe,
+                                "primitives-generated",
                                 PIPE_QUERY_PRIMITIVES_GENERATED, 0, 0,
                                 PIPE_DRIVER_QUERY_TYPE_UINT64,
-                                PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE);
+                                PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE,
+                                0);
       }
       else {
          boolean processed = FALSE;
@@ -999,21 +1192,23 @@ hud_parse_env_var(struct hud_context *hud, const char *env)
                "ds-invocations",
                "cs-invocations"
             };
-            for (i = 0; i < Elements(pipeline_statistics_names); ++i)
+            for (i = 0; i < ARRAY_SIZE(pipeline_statistics_names); ++i)
                if (strcmp(name, pipeline_statistics_names[i]) == 0)
                   break;
-            if (i < Elements(pipeline_statistics_names)) {
-               hud_pipe_query_install(pane, hud->pipe, name,
+            if (i < ARRAY_SIZE(pipeline_statistics_names)) {
+               hud_pipe_query_install(&hud->batch_query, pane, hud->pipe, name,
                                       PIPE_QUERY_PIPELINE_STATISTICS, i,
                                       0, PIPE_DRIVER_QUERY_TYPE_UINT64,
-                                      PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE);
+                                      PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE,
+                                      0);
                processed = TRUE;
             }
          }
 
          /* driver queries */
          if (!processed) {
-            if (!hud_driver_query_install(pane, hud->pipe, name)){
+            if (!hud_driver_query_install(&hud->batch_query, pane, hud->pipe,
+                                          name)) {
                fprintf(stderr, "gallium_hud: unknown driver query '%s'\n", name);
             }
          }
@@ -1052,6 +1247,9 @@ hud_parse_env_var(struct hud_context *hud, const char *env)
 
       case ',':
          env++;
+         if (!pane)
+            break;
+
          y += height + hud->font.glyph_height * (pane->num_graphs + 2);
          height = 100;
 
@@ -1064,7 +1262,7 @@ hud_parse_env_var(struct hud_context *hud, const char *env)
       case ';':
          env++;
          y = 10;
-         x += column_width + hud->font.glyph_width * 7;
+         x += column_width + hud->font.glyph_width * 9;
          height = 100;
 
          if (pane && pane->num_graphs) {
@@ -1166,13 +1364,30 @@ print_help(struct pipe_screen *screen)
       puts("    cs-invocations");
    }
 
+#if HAVE_GALLIUM_EXTRA_HUD
+   hud_get_num_disks(1);
+   hud_get_num_nics(1);
+   hud_get_num_cpufreq(1);
+#endif
+#if HAVE_LIBSENSORS
+   hud_get_num_sensors(1);
+#endif
+
    if (screen->get_driver_query_info){
+      boolean skipping = false;
       struct pipe_driver_query_info info;
       num_queries = screen->get_driver_query_info(screen, 0, NULL);
 
       for (i = 0; i < num_queries; i++){
          screen->get_driver_query_info(screen, i, &info);
-         printf("    %s\n", info.name);
+         if (info.flags & PIPE_DRIVER_QUERY_FLAG_DONT_LIST) {
+            if (!skipping)
+               puts("    ...");
+            skipping = true;
+         } else {
+            printf("    %s\n", info.name);
+            skipping = false;
+         }
       }
    }
 
@@ -1183,10 +1398,17 @@ print_help(struct pipe_screen *screen)
 struct hud_context *
 hud_create(struct pipe_context *pipe, struct cso_context *cso)
 {
+   struct pipe_screen *screen = pipe->screen;
    struct hud_context *hud;
    struct pipe_sampler_view view_templ;
    unsigned i;
    const char *env = debug_get_option("GALLIUM_HUD", NULL);
+#ifdef PIPE_OS_UNIX
+   unsigned signo = debug_get_num_option("GALLIUM_HUD_TOGGLE_SIGNAL", 0);
+   static boolean sig_handled = FALSE;
+   struct sigaction action = {};
+#endif
+   huds_visible = debug_get_bool_option("GALLIUM_HUD_VISIBLE", TRUE);
 
    if (!env || !*env)
       return NULL;
@@ -1202,8 +1424,8 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
 
    hud->pipe = pipe;
    hud->cso = cso;
-   hud->uploader = u_upload_create(pipe, 256 * 1024, 16,
-                                   PIPE_BIND_VERTEX_BUFFER);
+   hud->uploader = u_upload_create(pipe, 256 * 1024,
+                                   PIPE_BIND_VERTEX_BUFFER, PIPE_USAGE_STREAM);
 
    /* font */
    if (!util_font_create(pipe, UTIL_FONT_FIXED_8X13, &hud->font)) {
@@ -1212,7 +1434,14 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
       return NULL;
    }
 
+   hud->has_srgb = screen->is_format_supported(screen,
+                                               PIPE_FORMAT_B8G8R8A8_SRGB,
+                                               PIPE_TEXTURE_2D, 0,
+                                               PIPE_BIND_RENDER_TARGET) != 0;
+
    /* blend state */
+   hud->no_blend.rt[0].colormask = PIPE_MASK_RGBA;
+
    hud->alpha_blend.rt[0].colormask = PIPE_MASK_RGBA;
    hud->alpha_blend.rt[0].blend_enable = 1;
    hud->alpha_blend.rt[0].rgb_func = PIPE_BLEND_ADD;
@@ -1235,6 +1464,7 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
          "FRAG\n"
          "DCL IN[0], GENERIC[0], LINEAR\n"
          "DCL SAMP[0]\n"
+         "DCL SVIEW[0], RECT, FLOAT\n"
          "DCL OUT[0], COLOR[0]\n"
          "DCL TEMP[0]\n"
 
@@ -1244,16 +1474,16 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
       };
 
       struct tgsi_token tokens[1000];
-      struct pipe_shader_state state = {tokens};
+      struct pipe_shader_state state;
 
-      if (!tgsi_text_translate(fragment_shader_text, tokens, Elements(tokens))) {
+      if (!tgsi_text_translate(fragment_shader_text, tokens, ARRAY_SIZE(tokens))) {
          assert(0);
          pipe_resource_reference(&hud->font.texture, NULL);
          u_upload_destroy(hud->uploader);
          FREE(hud);
          return NULL;
       }
-
+      pipe_shader_state_from_tgsi(&state, tokens);
       hud->fs_text = pipe->create_fs_state(pipe, &state);
    }
 
@@ -1263,6 +1493,9 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
    hud->rasterizer.depth_clip = 1;
    hud->rasterizer.line_width = 1;
    hud->rasterizer.line_last_pixel = 1;
+
+   hud->rasterizer_aa_lines = hud->rasterizer;
+   hud->rasterizer_aa_lines.line_smooth = 1;
 
    /* vertex shader */
    {
@@ -1291,16 +1524,15 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
       };
 
       struct tgsi_token tokens[1000];
-      struct pipe_shader_state state = {tokens};
-
-      if (!tgsi_text_translate(vertex_shader_text, tokens, Elements(tokens))) {
+      struct pipe_shader_state state;
+      if (!tgsi_text_translate(vertex_shader_text, tokens, ARRAY_SIZE(tokens))) {
          assert(0);
          pipe_resource_reference(&hud->font.texture, NULL);
          u_upload_destroy(hud->uploader);
          FREE(hud);
          return NULL;
       }
-
+      pipe_shader_state_from_tgsi(&state, tokens);
       hud->vs = pipe->create_vs_state(pipe, &state);
    }
 
@@ -1329,6 +1561,22 @@ hud_create(struct pipe_context *pipe, struct cso_context *cso)
 
    LIST_INITHEAD(&hud->pane_list);
 
+   /* setup sig handler once for all hud contexts */
+#ifdef PIPE_OS_UNIX
+   if (!sig_handled && signo != 0) {
+      action.sa_sigaction = &signal_visible_handler;
+      action.sa_flags = SA_SIGINFO;
+
+      if (signo >= NSIG)
+         fprintf(stderr, "gallium_hud: invalid signal %u\n", signo);
+      else if (sigaction(signo, &action, NULL) < 0)
+         fprintf(stderr, "gallium_hud: unable to set handler for signal %u\n", signo);
+      fflush(stderr);
+
+      sig_handled = TRUE;
+   }
+#endif
+
    hud_parse_env_var(hud, env);
    return hud;
 }
@@ -1349,6 +1597,7 @@ hud_destroy(struct hud_context *hud)
       FREE(pane);
    }
 
+   hud_batch_query_cleanup(&hud->batch_query);
    pipe->delete_fs_state(pipe, hud->fs_color);
    pipe->delete_fs_state(pipe, hud->fs_text);
    pipe->delete_vs_state(pipe, hud->vs);
@@ -1357,6 +1606,203 @@ hud_destroy(struct hud_context *hud)
    u_upload_destroy(hud->uploader);
    FREE(hud);
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d36 1
+d45 1
+d56 2
+d64 1
+d68 1
+a68 1
+   struct pipe_blend_state alpha_blend;
+d71 1
+a71 1
+   struct pipe_rasterizer_state rasterizer;
+d101 2
+d105 7
+d248 2
+a249 2
+number_to_human_readable(uint64_t num, uint64_t max_value,
+                         enum pipe_driver_query_type type, char *out)
+d260 5
+d277 16
+d305 4
+d310 2
+a311 7
+      if (max_value == 100) {
+         max_unit = ARRAY_SIZE(percent_units)-1;
+         units = percent_units;
+      } else {
+         max_unit = ARRAY_SIZE(metric_units)-1;
+         units = metric_units;
+      }
+d319 6
+a324 1
+   if (d >= 100 || d == (int)d)
+d326 1
+a326 1
+   else if (d >= 10 || d*10 == (int)(d*10))
+d328 2
+d331 1
+a331 1
+      sprintf(out, "%.2f%s", d, units[unit]);
+d367 1
+d375 1
+a375 1
+   for (i = 0; i < 6; i++) {
+d377 2
+a378 1
+      unsigned y = pane->inner_y1 + pane->inner_height * (5 - i) / 5 -
+d381 1
+a381 1
+      number_to_human_readable(pane->max_value * i / 5, pane->max_value,
+d392 1
+a392 2
+      number_to_human_readable(gr->current_value, pane->max_value,
+                               pane->type, str);
+d420 3
+a422 2
+   for (i = 0; i <= 5; i++) {
+      float y = round((pane->max_value * i / 5.0) * pane->yscale + pane->inner_y2);
+d466 1
+a466 1
+                  &v->vbuf.buffer_offset, &v->vbuf.buffer,
+d487 3
+d495 19
+a513 17
+   cso_save_framebuffer(cso);
+   cso_save_sample_mask(cso);
+   cso_save_min_samples(cso);
+   cso_save_blend(cso);
+   cso_save_depth_stencil_alpha(cso);
+   cso_save_fragment_shader(cso);
+   cso_save_fragment_sampler_views(cso);
+   cso_save_fragment_samplers(cso);
+   cso_save_rasterizer(cso);
+   cso_save_viewport(cso);
+   cso_save_stream_outputs(cso);
+   cso_save_geometry_shader(cso);
+   cso_save_tessctrl_shader(cso);
+   cso_save_tesseval_shader(cso);
+   cso_save_vertex_shader(cso);
+   cso_save_vertex_elements(cso);
+   cso_save_aux_vertex_buffer_slot(cso);
+a514 1
+   cso_save_render_condition(cso);
+d519 12
+a549 1
+   cso_set_blend(cso, &hud->alpha_blend);
+d566 1
+a566 1
+   hud_alloc_vertices(hud, &hud->bg, 4 * 128, 2 * sizeof(float));
+d568 1
+a568 1
+   hud_alloc_vertices(hud, &hud->text, 4 * 512, 4 * sizeof(float));
+d571 2
+d585 1
+d606 2
+d627 1
+d637 1
+d643 1
+a643 18
+   /* restore states */
+   cso_restore_framebuffer(cso);
+   cso_restore_sample_mask(cso);
+   cso_restore_min_samples(cso);
+   cso_restore_blend(cso);
+   cso_restore_depth_stencil_alpha(cso);
+   cso_restore_fragment_shader(cso);
+   cso_restore_fragment_sampler_views(cso);
+   cso_restore_fragment_samplers(cso);
+   cso_restore_rasterizer(cso);
+   cso_restore_viewport(cso);
+   cso_restore_stream_outputs(cso);
+   cso_restore_tessctrl_shader(cso);
+   cso_restore_tesseval_shader(cso);
+   cso_restore_geometry_shader(cso);
+   cso_restore_vertex_shader(cso);
+   cso_restore_vertex_elements(cso);
+   cso_restore_aux_vertex_buffer_slot(cso);
+a644 1
+   cso_restore_render_condition(cso);
+d649 7
+d663 68
+a730 1
+   pane->max_value = value;
+d816 1
+a816 1
+   assert(pane->num_graphs < Elements(colors));
+d1015 3
+d1028 59
+d1089 2
+a1090 1
+         hud_pipe_query_install(pane, hud->pipe, "samples-passed",
+d1093 2
+a1094 1
+                                PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE);
+d1098 2
+a1099 1
+         hud_pipe_query_install(pane, hud->pipe, "primitives-generated",
+d1102 2
+a1103 1
+                                PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE);
+d1124 1
+a1124 1
+            for (i = 0; i < Elements(pipeline_statistics_names); ++i)
+d1127 2
+a1128 2
+            if (i < Elements(pipeline_statistics_names)) {
+               hud_pipe_query_install(pane, hud->pipe, name,
+d1131 2
+a1132 1
+                                      PIPE_DRIVER_QUERY_RESULT_TYPE_AVERAGE);
+d1139 2
+a1140 1
+            if (!hud_driver_query_install(pane, hud->pipe, name)){
+d1179 3
+d1194 1
+a1194 1
+         x += column_width + hud->font.glyph_width * 7;
+d1296 9
+d1306 1
+d1312 8
+a1319 1
+         printf("    %s\n", info.name);
+d1330 1
+d1335 6
+d1356 2
+a1357 2
+   hud->uploader = u_upload_create(pipe, 256 * 1024, 16,
+                                   PIPE_BIND_VERTEX_BUFFER);
+d1366 5
+d1372 2
+d1396 1
+d1406 1
+a1406 1
+      struct pipe_shader_state state = {tokens};
+d1408 1
+a1408 1
+      if (!tgsi_text_translate(fragment_shader_text, tokens, Elements(tokens))) {
+d1415 1
+a1415 1
+
+d1426 3
+d1456 2
+a1457 3
+      struct pipe_shader_state state = {tokens};
+
+      if (!tgsi_text_translate(vertex_shader_text, tokens, Elements(tokens))) {
+d1464 1
+a1464 1
+
+d1493 16
+d1529 1
 @
 
 

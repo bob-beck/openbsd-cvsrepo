@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.6
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@// @;
 
+
+1.2
+date	2017.08.26.16.59.22;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.42.44;	author jsg;	state Exp;
@@ -70,9 +75,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/**************************************************************************
@@ -138,6 +144,11 @@ text
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/ADT/Triple.h>
+#if HAVE_LLVM >= 0x0307
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#else
+#include <llvm/Target/TargetLibraryInfo.h>
+#endif
 #if HAVE_LLVM < 0x0306
 #include <llvm/ExecutionEngine/JITMemoryManager.h>
 #else
@@ -153,6 +164,11 @@ text
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CBindingWrapping.h>
 
+#include <llvm/Config/llvm-config.h>
+#if LLVM_USE_INTEL_JITEVENTS
+#include <llvm/ExecutionEngine/JITEventListener.h>
+#endif
+
 // Workaround http://llvm.org/PR23628
 #if HAVE_LLVM >= 0x0307
 #  pragma pop_macro("DEBUG")
@@ -165,6 +181,7 @@ text
 #include "util/u_cpu_detect.h"
 
 #include "lp_bld_misc.h"
+#include "lp_bld_debug.h"
 
 namespace {
 
@@ -182,7 +199,7 @@ static LLVMEnsureMultithreaded lLVMEnsureMultithreaded;
 
 }
 
-static once_flag init_native_targets_once_flag;
+static once_flag init_native_targets_once_flag = ONCE_FLAG_INIT;
 
 static void init_native_targets()
 {
@@ -224,31 +241,54 @@ lp_set_target_options(void)
    gallivm_init_llvm_targets();
 }
 
-
 extern "C"
-LLVMValueRef
-lp_build_load_volatile(LLVMBuilderRef B, LLVMValueRef PointerVal,
-                       const char *Name)
+LLVMTargetLibraryInfoRef
+gallivm_create_target_library_info(const char *triple)
 {
-   return llvm::wrap(llvm::unwrap(B)->CreateLoad(llvm::unwrap(PointerVal), true, Name));
-}
-
-
-extern "C"
-void
-lp_set_load_alignment(LLVMValueRef Inst,
-                       unsigned Align)
-{
-   llvm::unwrap<llvm::LoadInst>(Inst)->setAlignment(Align);
+   return reinterpret_cast<LLVMTargetLibraryInfoRef>(
+#if HAVE_LLVM < 0x0307
+   new llvm::TargetLibraryInfo(
+#else
+   new llvm::TargetLibraryInfoImpl(
+#endif
+   llvm::Triple(triple)));
 }
 
 extern "C"
 void
-lp_set_store_alignment(LLVMValueRef Inst,
-                       unsigned Align)
+gallivm_dispose_target_library_info(LLVMTargetLibraryInfoRef library_info)
 {
-   llvm::unwrap<llvm::StoreInst>(Inst)->setAlignment(Align);
+   delete reinterpret_cast<
+#if HAVE_LLVM < 0x0307
+   llvm::TargetLibraryInfo
+#else
+   llvm::TargetLibraryInfoImpl
+#endif
+   *>(library_info);
 }
+
+
+#if HAVE_LLVM < 0x0304
+
+extern "C"
+void
+LLVMSetAlignmentBackport(LLVMValueRef V,
+                         unsigned Bytes)
+{
+   switch (LLVMGetInstructionOpcode(V)) {
+   case LLVMLoad:
+      llvm::unwrap<llvm::LoadInst>(V)->setAlignment(Bytes);
+      break;
+   case LLVMStore:
+      llvm::unwrap<llvm::StoreInst>(V)->setAlignment(Bytes);
+      break;
+   default:
+      assert(0);
+      break;
+   }
+}
+
+#endif
 
 
 #if HAVE_LLVM < 0x0306
@@ -567,10 +607,16 @@ lp_build_create_jit_compiler_for_module(LLVMExecutionEngineRef *OutJIT,
 #ifdef _WIN32
        /*
         * MCJIT works on Windows, but currently only through ELF object format.
+        *
+        * XXX: We could use `LLVM_HOST_TRIPLE "-elf"` but LLVM_HOST_TRIPLE has
+        * different strings for MinGW/MSVC, so better play it safe and be
+        * explicit.
         */
-       std::string targetTriple = llvm::sys::getProcessTriple();
-       targetTriple.append("-elf");
-       unwrap(M)->setTargetTriple(targetTriple);
+#  ifdef _WIN64
+       LLVMSetTarget(M, "x86_64-pc-win32-elf");
+#  else
+       LLVMSetTarget(M, "i686-pc-win32-elf");
+#  endif
 #endif
    }
 
@@ -608,14 +654,66 @@ lp_build_create_jit_compiler_for_module(LLVMExecutionEngineRef *OutJIT,
     */
    MAttrs.push_back(util_cpu_caps.has_avx  ? "+avx"  : "-avx");
    MAttrs.push_back(util_cpu_caps.has_f16c ? "+f16c" : "-f16c");
+   if (HAVE_LLVM >= 0x0304) {
+      MAttrs.push_back(util_cpu_caps.has_fma  ? "+fma"  : "-fma");
+   } else {
+      /*
+       * The old JIT in LLVM 3.3 has a bug encoding llvm.fmuladd.f32 and
+       * llvm.fmuladd.v2f32 intrinsics when FMA is available.
+       */
+      MAttrs.push_back("-fma");
+   }
    MAttrs.push_back(util_cpu_caps.has_avx2 ? "+avx2" : "-avx2");
+   /* disable avx512 and all subvariants */
+#if HAVE_LLVM >= 0x0304
+   MAttrs.push_back("-avx512cd");
+   MAttrs.push_back("-avx512er");
+   MAttrs.push_back("-avx512f");
+   MAttrs.push_back("-avx512pf");
+#endif
+#if HAVE_LLVM >= 0x0305
+   MAttrs.push_back("-avx512bw");
+   MAttrs.push_back("-avx512dq");
+   MAttrs.push_back("-avx512vl");
+#endif
 #endif
 
 #if defined(PIPE_ARCH_PPC)
    MAttrs.push_back(util_cpu_caps.has_altivec ? "+altivec" : "-altivec");
+#if (HAVE_LLVM >= 0x0304)
+#if (HAVE_LLVM <= 0x0307) || (HAVE_LLVM == 0x0308 && MESA_LLVM_VERSION_PATCH == 0)
+   /*
+    * Make sure VSX instructions are disabled
+    * See LLVM bug https://llvm.org/bugs/show_bug.cgi?id=25503#c7
+    */
+   if (util_cpu_caps.has_altivec) {
+      MAttrs.push_back("-vsx");
+   }
+#else
+   /*
+    * However, bug 25503 is fixed, by the same fix that fixed
+    * bug 26775, in versions of LLVM later than 3.8 (starting with 3.8.1):
+    * Make sure VSX instructions are ENABLED
+    * See LLVM bug https://llvm.org/bugs/show_bug.cgi?id=26775
+    */
+   if (util_cpu_caps.has_altivec) {
+      MAttrs.push_back("+vsx");
+   }
+#endif
+#endif
 #endif
 
    builder.setMAttrs(MAttrs);
+
+   if (gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
+      int n = MAttrs.size();
+      if (n > 0) {
+         debug_printf("llc -mattr option(s): ");
+         for (int i = 0; i < n; i++)
+            debug_printf("%s%s", MAttrs[i].c_str(), (i < n - 1) ? "," : "");
+         debug_printf("\n");
+      }
+   }
 
 #if HAVE_LLVM >= 0x0305
    StringRef MCPU = llvm::sys::getHostCPUName();
@@ -631,12 +729,27 @@ lp_build_create_jit_compiler_for_module(LLVMExecutionEngineRef *OutJIT,
     * when not using MCJIT so no instructions are generated which the old JIT
     * can't handle. Not entirely sure if we really need to do anything yet.
     */
+#if defined(PIPE_ARCH_LITTLE_ENDIAN)  && defined(PIPE_ARCH_PPC_64)
+   /*
+    * Versions of LLVM prior to 4.0 lacked a table entry for "POWER8NVL",
+    * resulting in (big-endian) "generic" being returned on
+    * little-endian Power8NVL systems.  The result was that code that
+    * attempted to load the least significant 32 bits of a 64-bit quantity
+    * from memory loaded the wrong half.  This resulted in failures in some
+    * Piglit tests, e.g.
+    * .../arb_gpu_shader_fp64/execution/conversion/frag-conversion-explicit-double-uint
+    */
+   if (MCPU == "generic")
+      MCPU = "pwr8";
+#endif
    builder.setMCPU(MCPU);
+   if (gallivm_debug & (GALLIVM_DEBUG_IR | GALLIVM_DEBUG_ASM | GALLIVM_DEBUG_DUMP_BC)) {
+      debug_printf("llc -mcpu option: %s\n", MCPU.str().c_str());
+   }
 #endif
 
    ShaderMemoryManager *MM = NULL;
    if (useMCJIT) {
-#if HAVE_LLVM > 0x0303
        BaseMemoryManager* JMM = reinterpret_cast<BaseMemoryManager*>(CMM);
        MM = new ShaderMemoryManager(JMM);
        *OutCode = MM->getGeneratedCode();
@@ -644,9 +757,10 @@ lp_build_create_jit_compiler_for_module(LLVMExecutionEngineRef *OutJIT,
 #if HAVE_LLVM >= 0x0306
        builder.setMCJITMemoryManager(std::unique_ptr<RTDyldMemoryManager>(MM));
        MM = NULL; // ownership taken by std::unique_ptr
-#else
+#elif HAVE_LLVM > 0x0303
        builder.setMCJITMemoryManager(MM);
-#endif
+#else
+       builder.setJITMemoryManager(MM);
 #endif
    } else {
 #if HAVE_LLVM < 0x0306
@@ -663,6 +777,10 @@ lp_build_create_jit_compiler_for_module(LLVMExecutionEngineRef *OutJIT,
    ExecutionEngine *JIT;
 
    JIT = builder.create();
+#if LLVM_USE_INTEL_JITEVENTS
+   JITEventListener *JEL = JITEventListener::createIntelJITEventListener();
+   JIT->RegisterJITEventListener(JEL);
+#endif
    if (JIT) {
       *OutJIT = wrap(JIT);
       return 0;
@@ -701,6 +819,80 @@ lp_free_memory_manager(LLVMMCJITMemoryManagerRef memorymgr)
 {
    delete reinterpret_cast<BaseMemoryManager*>(memorymgr);
 }
+
+extern "C" void
+lp_add_attr_dereferenceable(LLVMValueRef val, uint64_t bytes)
+{
+#if HAVE_LLVM >= 0x0306
+   llvm::Argument *A = llvm::unwrap<llvm::Argument>(val);
+   llvm::AttrBuilder B;
+   B.addDereferenceableAttr(bytes);
+   A->addAttr(llvm::AttributeSet::get(A->getContext(), A->getArgNo() + 1,  B));
+#endif
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d64 5
+d84 5
+d101 1
+d119 1
+a119 1
+static once_flag init_native_targets_once_flag;
+a160 1
+
+d162 2
+a163 3
+LLVMValueRef
+lp_build_load_volatile(LLVMBuilderRef B, LLVMValueRef PointerVal,
+                       const char *Name)
+d165 7
+a171 1
+   return llvm::wrap(llvm::unwrap(B)->CreateLoad(llvm::unwrap(PointerVal), true, Name));
+a173 1
+
+d176 1
+a176 2
+lp_set_load_alignment(LLVMValueRef Inst,
+                       unsigned Align)
+d178 7
+a184 1
+   llvm::unwrap<llvm::LoadInst>(Inst)->setAlignment(Align);
+d187 3
+d192 2
+a193 2
+lp_set_store_alignment(LLVMValueRef Inst,
+                       unsigned Align)
+d195 11
+a205 1
+   llvm::unwrap<llvm::StoreInst>(Inst)->setAlignment(Align);
+d208 2
+d527 4
+d532 5
+a536 3
+       std::string targetTriple = llvm::sys::getProcessTriple();
+       targetTriple.append("-elf");
+       unwrap(M)->setTargetTriple(targetTriple);
+d574 9
+d584 12
+d600 21
+d625 10
+d649 13
+d663 3
+a669 1
+#if HAVE_LLVM > 0x0303
+d677 2
+d680 1
+a680 2
+       builder.setMCJITMemoryManager(MM);
+#endif
+d697 4
+d738 11
 @
 
 

@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.3
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.34;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.41.37;	author jsg;	state Exp;
@@ -52,13 +57,420 @@ desc
 @@
 
 
+1.2
+log
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
+@
+text
+@/*
+ * Copyright (C) 2013 Rob Clark <robclark@@freedesktop.org>
+ * Copyright (C) 2014-2016 Emil Velikov <emil.l.velikov@@gmail.com>
+ * Copyright (C) 2016 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * Authors:
+ *    Rob Clark <robclark@@freedesktop.org>
+ */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#ifdef MAJOR_IN_MKDEV
+#include <sys/mkdev.h>
+#endif
+#ifdef MAJOR_IN_SYSMACROS
+#include <sys/sysmacros.h>
+#endif
+#include "loader.h"
+
+#ifdef HAVE_LIBDRM
+#include <stdlib.h>
+#include <unistd.h>
+#include <xf86drm.h>
+#ifdef USE_DRICONF
+#include "xmlconfig.h"
+#include "xmlpool.h"
+#endif
+#endif
+
+#define __IS_LOADER
+#include "pci_id_driver_map.h"
+
+static void default_logger(int level, const char *fmt, ...)
+{
+   if (level <= _LOADER_WARNING) {
+      va_list args;
+      va_start(args, fmt);
+      vfprintf(stderr, fmt, args);
+      va_end(args);
+   }
+}
+
+static void (*log_)(int level, const char *fmt, ...) = default_logger;
+
+int
+loader_open_device(const char *device_name)
+{
+   int fd;
+#ifdef O_CLOEXEC
+   fd = open(device_name, O_RDWR | O_CLOEXEC);
+   if (fd == -1 && errno == EINVAL)
+#endif
+   {
+      fd = open(device_name, O_RDWR);
+      if (fd != -1)
+         fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+   }
+   return fd;
+}
+
+#if defined(HAVE_LIBDRM)
+#ifdef USE_DRICONF
+static const char __driConfigOptionsLoader[] =
+DRI_CONF_BEGIN
+    DRI_CONF_SECTION_INITIALIZATION
+        DRI_CONF_DEVICE_ID_PATH_TAG()
+    DRI_CONF_SECTION_END
+DRI_CONF_END;
+
+static char *loader_get_dri_config_device_id(void)
+{
+   driOptionCache defaultInitOptions;
+   driOptionCache userInitOptions;
+   char *prime = NULL;
+
+   driParseOptionInfo(&defaultInitOptions, __driConfigOptionsLoader);
+   driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0, "loader");
+   if (driCheckOption(&userInitOptions, "device_id", DRI_STRING))
+      prime = strdup(driQueryOptionstr(&userInitOptions, "device_id"));
+   driDestroyOptionCache(&userInitOptions);
+   driDestroyOptionInfo(&defaultInitOptions);
+
+   return prime;
+}
+#endif
+
+static char *drm_construct_id_path_tag(drmDevicePtr device)
+{
+/* Length of "pci-xxxx_xx_xx_x\0" */
+#define PCI_ID_PATH_TAG_LENGTH 17
+   char *tag = NULL;
+
+   if (device->bustype == DRM_BUS_PCI) {
+        tag = calloc(PCI_ID_PATH_TAG_LENGTH, sizeof(char));
+        if (tag == NULL)
+            return NULL;
+
+        snprintf(tag, PCI_ID_PATH_TAG_LENGTH, "pci-%04x_%02x_%02x_%1u",
+                 device->businfo.pci->domain, device->businfo.pci->bus,
+                 device->businfo.pci->dev, device->businfo.pci->func);
+   }
+   return tag;
+}
+
+static bool drm_device_matches_tag(drmDevicePtr device, const char *prime_tag)
+{
+   char *tag = drm_construct_id_path_tag(device);
+   int ret;
+
+   if (tag == NULL)
+      return false;
+
+   ret = strcmp(tag, prime_tag);
+
+   free(tag);
+   return ret == 0;
+}
+
+static char *drm_get_id_path_tag_for_fd(int fd)
+{
+   drmDevicePtr device;
+   char *tag;
+
+   if (drmGetDevice(fd, &device) != 0)
+       return NULL;
+
+   tag = drm_construct_id_path_tag(device);
+   drmFreeDevice(&device);
+   return tag;
+}
+
+int loader_get_user_preferred_fd(int default_fd, int *different_device)
+{
+/* Arbitrary "maximum" value of drm devices. */
+#define MAX_DRM_DEVICES 32
+   const char *dri_prime = getenv("DRI_PRIME");
+   char *default_tag, *prime = NULL;
+   drmDevicePtr devices[MAX_DRM_DEVICES];
+   int i, num_devices, fd;
+   bool found = false;
+
+   if (dri_prime)
+      prime = strdup(dri_prime);
+#ifdef USE_DRICONF
+   else
+      prime = loader_get_dri_config_device_id();
+#endif
+
+   if (prime == NULL) {
+      *different_device = 0;
+      return default_fd;
+   }
+
+   default_tag = drm_get_id_path_tag_for_fd(default_fd);
+   if (default_tag == NULL)
+      goto err;
+
+   num_devices = drmGetDevices(devices, MAX_DRM_DEVICES);
+   if (num_devices < 0)
+      goto err;
+
+   /* two format are supported:
+    * "1": choose any other card than the card used by default.
+    * id_path_tag: (for example "pci-0000_02_00_0") choose the card
+    * with this id_path_tag.
+    */
+   if (!strcmp(prime,"1")) {
+      /* Hmm... detection for 2-7 seems to be broken. Oh well ...
+       * Pick the first render device that is not our own.
+       */
+      for (i = 0; i < num_devices; i++) {
+         if (devices[i]->available_nodes & 1 << DRM_NODE_RENDER &&
+             !drm_device_matches_tag(devices[i], default_tag)) {
+
+            found = true;
+            break;
+         }
+      }
+   } else {
+      for (i = 0; i < num_devices; i++) {
+         if (devices[i]->available_nodes & 1 << DRM_NODE_RENDER &&
+            drm_device_matches_tag(devices[i], prime)) {
+
+            found = true;
+            break;
+         }
+      }
+   }
+
+   if (!found) {
+      drmFreeDevices(devices, num_devices);
+      goto err;
+   }
+
+   fd = loader_open_device(devices[i]->nodes[DRM_NODE_RENDER]);
+   drmFreeDevices(devices, num_devices);
+   if (fd < 0)
+      goto err;
+
+   close(default_fd);
+
+   *different_device = !!strcmp(default_tag, prime);
+
+   free(default_tag);
+   free(prime);
+   return fd;
+
+ err:
+   *different_device = 0;
+
+   free(default_tag);
+   free(prime);
+   return default_fd;
+}
+#else
+int loader_get_user_preferred_fd(int default_fd, int *different_device)
+{
+   *different_device = 0;
+   return default_fd;
+}
+#endif
+
+#if defined(HAVE_LIBDRM)
+static int
+dev_node_from_fd(int fd, unsigned int *maj, unsigned int *min)
+{
+   struct stat buf;
+
+   if (fstat(fd, &buf) < 0) {
+      log_(_LOADER_WARNING, "MESA-LOADER: failed to stat fd %d\n", fd);
+      return -1;
+   }
+
+   if (!S_ISCHR(buf.st_mode)) {
+      log_(_LOADER_WARNING, "MESA-LOADER: fd %d not a character device\n", fd);
+      return -1;
+   }
+
+   *maj = major(buf.st_rdev);
+   *min = minor(buf.st_rdev);
+
+   return 0;
+}
+#endif
+
+#if defined(HAVE_LIBDRM)
+
+static int
+drm_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
+{
+   drmDevicePtr device;
+   int ret;
+
+   if (drmGetDevice(fd, &device) == 0) {
+      if (device->bustype == DRM_BUS_PCI) {
+         *vendor_id = device->deviceinfo.pci->vendor_id;
+         *chip_id = device->deviceinfo.pci->device_id;
+         ret = 1;
+      }
+      else {
+         log_(_LOADER_WARNING, "MESA-LOADER: device is not located on the PCI bus\n");
+         ret = 0;
+      }
+      drmFreeDevice(&device);
+   }
+   else {
+      log_(_LOADER_WARNING, "MESA-LOADER: failed to retrieve device information\n");
+      ret = 0;
+   }
+
+   return ret;
+}
+#endif
+
+
+int
+loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
+{
+#if HAVE_LIBDRM
+   if (drm_get_pci_id_for_fd(fd, vendor_id, chip_id))
+      return 1;
+#endif
+   return 0;
+}
+
+
+#if defined(HAVE_LIBDRM)
+static char *
+drm_get_device_name_for_fd(int fd)
+{
+   unsigned int maj, min;
+   char buf[0x40];
+   int n;
+
+   if (dev_node_from_fd(fd, &maj, &min) < 0)
+      return NULL;
+
+   n = snprintf(buf, sizeof(buf), DRM_DEV_NAME, DRM_DIR_NAME, min);
+   if (n == -1 || n >= sizeof(buf))
+      return NULL;
+
+   return strdup(buf);
+}
+#endif
+
+char *
+loader_get_device_name_for_fd(int fd)
+{
+   char *result = NULL;
+
+#if HAVE_LIBDRM
+   if ((result = drm_get_device_name_for_fd(fd)))
+      return result;
+#endif
+   return result;
+}
+
+char *
+loader_get_driver_for_fd(int fd)
+{
+   int vendor_id, chip_id, i, j;
+   char *driver = NULL;
+
+   if (!loader_get_pci_id_for_fd(fd, &vendor_id, &chip_id)) {
+
+#if HAVE_LIBDRM
+      /* fallback to drmGetVersion(): */
+      drmVersionPtr version = drmGetVersion(fd);
+
+      if (!version) {
+         log_(_LOADER_WARNING, "failed to get driver name for fd %d\n", fd);
+         return NULL;
+      }
+
+      driver = strndup(version->name, version->name_len);
+      log_(_LOADER_INFO, "using driver %s for %d\n", driver, fd);
+
+      drmFreeVersion(version);
+#endif
+
+      return driver;
+   }
+
+   for (i = 0; driver_map[i].driver; i++) {
+      if (vendor_id != driver_map[i].vendor_id)
+         continue;
+
+      if (driver_map[i].predicate && !driver_map[i].predicate(fd))
+         continue;
+
+      if (driver_map[i].num_chips_ids == -1) {
+         driver = strdup(driver_map[i].driver);
+         goto out;
+      }
+
+      for (j = 0; j < driver_map[i].num_chips_ids; j++)
+         if (driver_map[i].chip_ids[j] == chip_id) {
+            driver = strdup(driver_map[i].driver);
+            goto out;
+         }
+   }
+
+out:
+   log_(driver ? _LOADER_DEBUG : _LOADER_WARNING,
+         "pci id for fd %d: %04x:%04x, driver %s\n",
+         fd, vendor_id, chip_id, driver);
+   return driver;
+}
+
+void
+loader_set_logger(void (*logger)(int level, const char *fmt, ...))
+{
+   log_ = logger;
+}
+@
+
+
 1.1
 log
 @Initial revision
 @
 text
-@/*
- * Copyright (C) 2013 Rob Clark <robclark@@freedesktop.org>
+@d3 2
+a4 40
  *
  * This code is derived from the following files.
  *
@@ -99,36 +511,9 @@ text
  * Authors:
  *    Kristian Høgsberg <krh@@bitplanet.net>
  *    Benjamin Franzke <benjaminfranzke@@googlemail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
- * Authors:
- *    Rob Clark <robclark@@freedesktop.org>
- */
-
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
+d34 1
+d36 2
+a37 9
 #ifdef HAVE_LIBUDEV
 #include <assert.h>
 #include <dlfcn.h>
@@ -138,55 +523,24 @@ text
 #include "xmlconfig.h"
 #include "xmlpool.h"
 #endif
-#endif
+d39 2
+a40 2
 #ifdef HAVE_SYSFS
 #include <sys/types.h>
-#endif
-#include "loader.h"
-
-#ifdef HAVE_LIBDRM
-#include <xf86drm.h>
-#endif
-
-#define __IS_LOADER
-#include "pci_id_driver_map.h"
-
-static void default_logger(int level, const char *fmt, ...)
-{
-   if (level <= _LOADER_WARNING) {
-      va_list args;
-      va_start(args, fmt);
-      vfprintf(stderr, fmt, args);
-      va_end(args);
-   }
-}
-
-static void (*log_)(int level, const char *fmt, ...) = default_logger;
-
-int
-loader_open_device(const char *device_name)
-{
-   int fd;
-#ifdef O_CLOEXEC
-   fd = open(device_name, O_RDWR | O_CLOEXEC);
-   if (fd == -1 && errno == EINVAL)
-#endif
-   {
-      fd = open(device_name, O_RDWR);
-      if (fd != -1)
-         fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-   }
-   return fd;
-}
-
+d45 2
+d48 4
+d85 8
+a92 2
 #ifdef HAVE_LIBUDEV
 #include <libudev.h>
-
+d94 1
+a94 4
 static void *udev_handle = NULL;
 
 static void *
 udev_dlopen_handle(void)
-{
+d96 3
+a98 10
    char name[80];
    unsigned flags = RTLD_NOLOAD | RTLD_LOCAL | RTLD_LAZY;
    int version;
@@ -197,7 +551,8 @@ udev_dlopen_handle(void)
     * a function with a void * return that actually only returns void)
     * might be ia64.
     */
-
+d100 6
+a105 14
    /* First try opening an already linked libudev, then try loading one */
    do {
       for (version = 1; version >= 0; version--) {
@@ -212,13 +567,15 @@ udev_dlopen_handle(void)
 
       flags &= ~RTLD_NOLOAD;
    } while (1);
-
+d107 1
+a107 4
    log_(_LOADER_WARNING,
         "Couldn't dlopen libudev.so.1 or "
         "libudev.so.0, driver detection may be broken.\n");
    return NULL;
-}
-
+d109 1
+d111 1
+a111 17
 static int dlsym_failed = 0;
 
 static void *
@@ -236,12 +593,14 @@ checked_dlsym(void *dlopen_handle, const char *name)
 
 static inline struct udev_device *
 udev_device_new_from_fd(struct udev *udev, int fd)
-{
+d113 3
+a115 4
    struct udev_device *device;
    struct stat buf;
    UDEV_SYMBOL(struct udev_device *, udev_device_new_from_devnum,
                (struct udev *udev, char type, dev_t devnum));
-
+d117 4
+a120 7
    if (dlsym_failed)
       return NULL;
 
@@ -249,20 +608,23 @@ udev_device_new_from_fd(struct udev *udev, int fd)
       log_(_LOADER_WARNING, "MESA-LOADER: failed to stat fd %d\n", fd);
       return NULL;
    }
-
+d122 3
+a124 5
    device = udev_device_new_from_devnum(udev, 'c', buf.st_rdev);
    if (device == NULL) {
       log_(_LOADER_WARNING,
               "MESA-LOADER: could not create udev device for fd %d\n", fd);
       return NULL;
-   }
+d126 1
+a126 2
 
    return device;
-}
-
+d129 1
+a129 2
 static int
 libudev_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
-{
+d131 2
+a132 47
    struct udev *udev = NULL;
    struct udev_device *device = NULL, *parent;
    const char *pci_id;
@@ -310,7 +672,8 @@ out:
 
    return (*chip_id >= 0);
 }
-
+d134 2
+a135 56
 static char *
 get_render_node_from_id_path_tag(struct udev *udev,
                                  char *id_path_tag,
@@ -367,20 +730,23 @@ get_render_node_from_id_path_tag(struct udev *udev,
       }
       udev_device_unref(device);
    }
-
+d137 1
+a137 1
    udev_enumerate_unref(e);
-
+d139 2
+a140 6
    if (found) {
       path_res = strdup(udev_device_get_devnode(device));
       udev_device_unref(device);
       return path_res;
    }
    return NULL;
-}
-
+d143 1
+a143 2
 static char *
 get_id_path_tag_from_fd(struct udev *udev, int fd)
-{
+d145 2
+a146 7
    struct udev_device *device;
    const char *id_path_tag_tmp;
    char *id_path_tag;
@@ -388,7 +754,8 @@ get_id_path_tag_from_fd(struct udev *udev, int fd)
                (struct udev_device *, const char *));
    UDEV_SYMBOL(struct udev_device *, udev_device_unref,
                (struct udev_device *));
-
+d148 2
+a149 9
    device = udev_device_new_from_fd(udev, fd);
    if (!device)
       return NULL;
@@ -398,11 +765,11 @@ get_id_path_tag_from_fd(struct udev *udev, int fd)
       return NULL;
 
    id_path_tag = strdup(id_path_tag_tmp);
-
+d151 3
+a153 2
    udev_device_unref(device);
    return id_path_tag;
-}
-
+a155 9
 #ifdef USE_DRICONF
 const char __driConfigOptionsLoader[] =
 DRI_CONF_BEGIN
@@ -412,14 +779,15 @@ DRI_CONF_BEGIN
 DRI_CONF_END;
 #endif
 
-int loader_get_user_preferred_fd(int default_fd, int *different_device)
-{
+d158 2
+a159 5
    struct udev *udev;
 #ifdef USE_DRICONF
    driOptionCache defaultInitOptions;
    driOptionCache userInitOptions;
 #endif
-   const char *dri_prime = getenv("DRI_PRIME");
+d161 4
+a164 7
    char *prime = NULL;
    int is_different_device = 0, fd = default_fd;
    char *default_device_id_path_tag;
@@ -427,10 +795,8 @@ int loader_get_user_preferred_fd(int default_fd, int *different_device)
    char another_tag = 0;
    UDEV_SYMBOL(struct udev *, udev_new, (void));
    UDEV_SYMBOL(struct udev *, udev_unref, (struct udev *));
-
-   if (dri_prime)
-      prime = strdup(dri_prime);
-#ifdef USE_DRICONF
+d169 2
+a170 8
    else {
       driParseOptionInfo(&defaultInitOptions, __driConfigOptionsLoader);
       driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0, "loader");
@@ -439,13 +805,8 @@ int loader_get_user_preferred_fd(int default_fd, int *different_device)
       driDestroyOptionCache(&userInitOptions);
       driDestroyOptionInfo(&defaultInitOptions);
    }
-#endif
-
-   if (prime == NULL) {
-      *different_device = 0;
-      return default_fd;
-   }
-
+d178 7
+a184 7
    udev = udev_new();
    if (!udev)
       goto prime_clean;
@@ -453,14 +814,10 @@ int loader_get_user_preferred_fd(int default_fd, int *different_device)
    default_device_id_path_tag = get_id_path_tag_from_fd(udev, default_fd);
    if (!default_device_id_path_tag)
       goto udev_clean;
-
+a185 1
    is_different_device = 1;
-   /* two format are supported:
-    * "1": choose any other card than the card used by default.
-    * id_path_tag: (for example "pci-0000_02_00_0") choose the card
-    * with this id_path_tag.
-    */
-   if (!strcmp(prime,"1")) {
+d192 11
+a202 19
       free(prime);
       prime = strdup(default_device_id_path_tag);
       /* request a card with a different card than the default card */
@@ -480,51 +837,28 @@ int loader_get_user_preferred_fd(int default_fd, int *different_device)
    fd = loader_open_device(device_name);
    if (fd >= 0) {
       close(default_fd);
-   } else {
+d204 8
+a211 2
       fd = default_fd;
       is_different_device = 0;
-   }
+a212 1
    free(device_name);
-
+d214 15
+a228 5
  default_device_clean:
    free(default_device_id_path_tag);
  udev_clean:
    udev_unref(udev);
  prime_clean:
-   free(prime);
-
+d230 1
+d232 6
+a237 2
    *different_device = is_different_device;
    return fd;
-}
-#else
-int loader_get_user_preferred_fd(int default_fd, int *different_device)
-{
-   *different_device = 0;
-   return default_fd;
-}
-#endif
-
+d247 1
+a247 1
 #if defined(HAVE_SYSFS)
-static int
-dev_node_from_fd(int fd, unsigned int *maj, unsigned int *min)
-{
-   struct stat buf;
-
-   if (fstat(fd, &buf) < 0) {
-      log_(_LOADER_WARNING, "MESA-LOADER: failed to stat fd %d\n", fd);
-      return -1;
-   }
-
-   if (!S_ISCHR(buf.st_mode)) {
-      log_(_LOADER_WARNING, "MESA-LOADER: fd %d not a character device\n", fd);
-      return -1;
-   }
-
-   *maj = major(buf.st_rdev);
-   *min = minor(buf.st_rdev);
-
-   return 0;
-}
+a267 37
 
 static int
 sysfs_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
@@ -562,19 +896,16 @@ sysfs_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
    fclose(f);
    return 1;
 }
-#endif
-
-#if defined(HAVE_LIBDRM)
+a270 4
 /* for i915 */
 #include <i915_drm.h>
 /* for radeon */
 #include <radeon_drm.h>
-
-static int
-drm_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
-{
+d275 2
+a276 1
    drmVersionPtr version;
-
+d278 5
+a282 26
    *chip_id = -1;
 
    version = drmGetVersion(fd);
@@ -601,7 +932,8 @@ drm_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
       if (ret) {
          log_(_LOADER_WARNING, "MESA-LOADER: failed to get param for i915\n");
 	 *chip_id = -1;
-      }
+d284 3
+a286 14
    }
    else if (strcmp(version->name, "radeon") == 0) {
       struct drm_radeon_info info;
@@ -616,8 +948,9 @@ drm_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
       if (ret) {
          log_(_LOADER_WARNING, "MESA-LOADER: failed to get info for radeon\n");
 	 *chip_id = -1;
-      }
-   }
+d288 1
+d290 3
+a292 9
    else if (strcmp(version->name, "nouveau") == 0) {
       *vendor_id = 0x10de;
       /* not used */
@@ -627,18 +960,12 @@ drm_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
       *vendor_id = 0x15ad;
       /* assume SVGA II */
       *chip_id = 0x0405;
-   }
-
+d295 1
+a295 3
    drmFreeVersion(version);
 
    return (*chip_id >= 0);
-}
-#endif
-
-
-int
-loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
-{
+a302 8
 #if HAVE_LIBUDEV
    if (libudev_get_pci_id_for_fd(fd, vendor_id, chip_id))
       return 1;
@@ -647,18 +974,13 @@ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id)
    if (sysfs_get_pci_id_for_fd(fd, vendor_id, chip_id))
       return 1;
 #endif
-#if HAVE_LIBDRM
-   if (drm_get_pci_id_for_fd(fd, vendor_id, chip_id))
-      return 1;
-#endif
-   return 0;
-}
-
-
+d311 1
+a311 1
 #ifdef HAVE_LIBUDEV
-static char *
+d313 1
+a313 1
 libudev_get_device_name_for_fd(int fd)
-{
+a314 37
    char *device_name = NULL;
    struct udev *udev;
    struct udev_device *device;
@@ -696,19 +1018,19 @@ static char *
 sysfs_get_device_name_for_fd(int fd)
 {
    char *device_name = NULL;
-   unsigned int maj, min;
+a315 1
    FILE *f;
-   char buf[0x40];
+d317 1
+a317 2
    static const char match[9] = "\0DEVNAME=";
    int expected = 1;
-
-   if (dev_node_from_fd(fd, &maj, &min) < 0)
-      return NULL;
-
+d322 3
+a324 3
    snprintf(buf, sizeof(buf), "/sys/dev/char/%d:%d/uevent", maj, min);
    if (!(f = fopen(buf, "r")))
        return NULL;
-
+d326 1
+a326 18
    while (expected < sizeof(match)) {
       int c = getc(f);
 
@@ -727,89 +1049,27 @@ sysfs_get_device_name_for_fd(int fd)
 
    fclose(f);
    return device_name;
-}
-#endif
+a329 1
 
-
-char *
-loader_get_device_name_for_fd(int fd)
-{
-   char *result = NULL;
-
+d335 2
+a336 6
 #if HAVE_LIBUDEV
    if ((result = libudev_get_device_name_for_fd(fd)))
       return result;
 #endif
 #if HAVE_SYSFS
    if ((result = sysfs_get_device_name_for_fd(fd)))
-      return result;
-#endif
-   return result;
-}
-
-char *
+d343 1
+a343 1
 loader_get_driver_for_fd(int fd, unsigned driver_types)
-{
-   int vendor_id, chip_id, i, j;
-   char *driver = NULL;
-
+a347 3
    if (!driver_types)
       driver_types = _LOADER_GALLIUM | _LOADER_DRI;
 
-   if (!loader_get_pci_id_for_fd(fd, &vendor_id, &chip_id)) {
-
-#if HAVE_LIBDRM
-      /* fallback to drmGetVersion(): */
-      drmVersionPtr version = drmGetVersion(fd);
-
-      if (!version) {
-         log_(_LOADER_WARNING, "failed to get driver name for fd %d\n", fd);
-         return NULL;
-      }
-
-      driver = strndup(version->name, version->name_len);
-      log_(_LOADER_INFO, "using driver %s for %d\n", driver, fd);
-
-      drmFreeVersion(version);
-#endif
-
-      return driver;
-   }
-
-   for (i = 0; driver_map[i].driver; i++) {
-      if (vendor_id != driver_map[i].vendor_id)
+a369 3
          continue;
 
       if (!(driver_types & driver_map[i].driver_types))
-         continue;
-
-      if (driver_map[i].predicate && !driver_map[i].predicate(fd))
-         continue;
-
-      if (driver_map[i].num_chips_ids == -1) {
-         driver = strdup(driver_map[i].driver);
-         goto out;
-      }
-
-      for (j = 0; j < driver_map[i].num_chips_ids; j++)
-         if (driver_map[i].chip_ids[j] == chip_id) {
-            driver = strdup(driver_map[i].driver);
-            goto out;
-         }
-   }
-
-out:
-   log_(driver ? _LOADER_DEBUG : _LOADER_WARNING,
-         "pci id for fd %d: %04x:%04x, driver %s\n",
-         fd, vendor_id, chip_id, driver);
-   return driver;
-}
-
-void
-loader_set_logger(void (*logger)(int level, const char *fmt, ...))
-{
-   log_ = logger;
-}
 @
 
 

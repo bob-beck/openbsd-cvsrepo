@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.5
@@ -14,6 +13,12 @@ locks; strict;
 comment	@ * @;
 expand	@o@;
 
+
+1.2
+date	2017.08.26.16.59.19;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2016.12.11.08.36.08;	author jsg;	state Exp;
@@ -57,9 +62,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -1365,6 +1371,9 @@ static void visit_alu(struct nir_to_llvm_context *ctx, nir_alu_instr *instr)
 		src[1] = to_float(ctx, src[1]);
 		result = LLVMBuildFRem(ctx->builder, src[0], src[1], "");
 		break;
+	case nir_op_irem:
+		result = LLVMBuildSRem(ctx->builder, src[0], src[1], "");
+		break;
 	case nir_op_idiv:
 		result = LLVMBuildSDiv(ctx->builder, src[0], src[1], "");
 		break;
@@ -1846,15 +1855,17 @@ static LLVMValueRef visit_vulkan_resource_index(struct nir_to_llvm_context *ctx,
 	unsigned desc_set = nir_intrinsic_desc_set(instr);
 	unsigned binding = nir_intrinsic_binding(instr);
 	LLVMValueRef desc_ptr = ctx->descriptor_sets[desc_set];
-	struct radv_descriptor_set_layout *layout = ctx->options->layout->set[desc_set].layout;
+	struct radv_pipeline_layout *pipeline_layout = ctx->options->layout;
+	struct radv_descriptor_set_layout *layout = pipeline_layout->set[desc_set].layout;
 	unsigned base_offset = layout->binding[binding].offset;
 	LLVMValueRef offset, stride;
 
 	if (layout->binding[binding].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
 	    layout->binding[binding].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+		unsigned idx = pipeline_layout->set[desc_set].dynamic_offset_start +
+			layout->binding[binding].dynamic_offset_offset;
 		desc_ptr = ctx->push_constants;
-		base_offset = ctx->options->layout->push_constant_size;
-		base_offset +=  16 * layout->binding[binding].dynamic_offset_offset;
+		base_offset = pipeline_layout->push_constant_size + 16 * idx;
 		stride = LLVMConstInt(ctx->i32, 16, false);
 	} else
 		stride = LLVMConstInt(ctx->i32, layout->binding[binding].size, false);
@@ -3362,6 +3373,11 @@ static void visit_tex(struct nir_to_llvm_context *ctx, nir_tex_instr *instr)
 		}
 	}
 
+	if (instr->op == nir_texop_txs && instr->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+		result = get_buffer_size(ctx, res_ptr, true);
+		goto write_result;
+	}
+
 	if (instr->op == nir_texop_texture_samples) {
 		LLVMValueRef res, samples, is_msaa;
 		res = LLVMBuildBitCast(ctx->builder, res_ptr, ctx->v8i32, "");
@@ -3526,7 +3542,8 @@ static void visit_tex(struct nir_to_llvm_context *ctx, nir_tex_instr *instr)
 	 * The sample index should be adjusted as follows:
 	 *   sample_index = (fmask >> (sample_index * 4)) & 0xF;
 	 */
-	if (instr->sampler_dim == GLSL_SAMPLER_DIM_MS) {
+	if (instr->sampler_dim == GLSL_SAMPLER_DIM_MS &&
+	    instr->op != nir_texop_txs) {
 		LLVMValueRef txf_address[4];
 		struct ac_tex_info txf_info = { 0 };
 		unsigned txf_count = count;
@@ -3609,7 +3626,7 @@ static void visit_tex(struct nir_to_llvm_context *ctx, nir_tex_instr *instr)
 
 	if (instr->op == nir_texop_query_levels)
 		result = LLVMBuildExtractElement(ctx->builder, result, LLVMConstInt(ctx->i32, 3, false), "");
-	else if (instr->is_shadow && instr->op != nir_texop_txs && instr->op != nir_texop_lod)
+	else if (instr->is_shadow && instr->op != nir_texop_txs && instr->op != nir_texop_lod && instr->op != nir_texop_tg4)
 		result = LLVMBuildExtractElement(ctx->builder, result, ctx->i32zero, "");
 	else if (instr->op == nir_texop_txs &&
 		 instr->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
@@ -4010,7 +4027,7 @@ static void
 handle_shader_output_decl(struct nir_to_llvm_context *ctx,
 			  struct nir_variable *variable)
 {
-	int idx = variable->data.location;
+	int idx = variable->data.location + variable->data.index;
 	unsigned attrib_count = glsl_count_attribute_slots(variable->type, false);
 
 	variable->data.driver_location = idx * 4;
@@ -4040,7 +4057,7 @@ handle_shader_output_decl(struct nir_to_llvm_context *ctx,
 		                       si_build_alloca_undef(ctx, ctx->f32, "");
 		}
 	}
-	ctx->output_mask |= ((1ull << attrib_count) - 1) << variable->data.location;
+	ctx->output_mask |= ((1ull << attrib_count) - 1) << idx;
 }
 
 static void
@@ -4552,6 +4569,13 @@ LLVMModuleRef ac_translate_nir_to_llvm(LLVMTargetMachineRef tm,
 	memset(shader_info, 0, sizeof(*shader_info));
 
 	LLVMSetTarget(ctx.module, "amdgcn--");
+
+	LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(tm);
+	char *data_layout_str = LLVMCopyStringRepOfTargetData(data_layout);
+	LLVMSetDataLayout(ctx.module, data_layout_str);
+	LLVMDisposeTargetData(data_layout);
+	LLVMDisposeMessage(data_layout_str);
+
 	setup_types(&ctx);
 
 	ctx.builder = LLVMCreateBuilderInContext(ctx.context);
@@ -4573,7 +4597,7 @@ LLVMModuleRef ac_translate_nir_to_llvm(LLVMTargetMachineRef tm,
 				idx++;
 			}
 
-			shared_size *= 4;
+			shared_size *= 16;
 			var = LLVMAddGlobalInAddressSpace(ctx.module,
 							  LLVMArrayType(ctx.i8, shared_size),
 							  "compute_lds",
@@ -4750,6 +4774,40 @@ void ac_compile_nir_shader(LLVMTargetMachineRef tm,
 	if (nir->stage == MESA_SHADER_FRAGMENT)
 		shader_info->fs.early_fragment_test = nir->info.fs.early_fragment_tests;
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d1304 3
+d1788 2
+a1789 1
+	struct radv_descriptor_set_layout *layout = ctx->options->layout->set[desc_set].layout;
+d1795 2
+d1798 1
+a1798 2
+		base_offset = ctx->options->layout->push_constant_size;
+		base_offset +=  16 * layout->binding[binding].dynamic_offset_offset;
+d3306 5
+d3475 2
+a3476 1
+	if (instr->sampler_dim == GLSL_SAMPLER_DIM_MS) {
+d3559 1
+a3559 1
+	else if (instr->is_shadow && instr->op != nir_texop_txs && instr->op != nir_texop_lod)
+d3960 1
+a3960 1
+	int idx = variable->data.location;
+d3990 1
+a3990 1
+	ctx->output_mask |= ((1ull << attrib_count) - 1) << variable->data.location;
+d4502 7
+d4530 1
+a4530 1
+			shared_size *= 4;
 @
 
 

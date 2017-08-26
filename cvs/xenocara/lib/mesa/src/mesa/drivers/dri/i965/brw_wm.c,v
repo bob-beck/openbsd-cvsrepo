@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.37;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.39.58;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -91,6 +97,7 @@ text
 #include "brw_context.h"
 #include "brw_wm.h"
 #include "brw_state.h"
+#include "brw_shader.h"
 #include "main/enums.h"
 #include "main/formats.h"
 #include "main/fbobject.h"
@@ -99,9 +106,631 @@ text
 #include "program/prog_parameter.h"
 #include "program/program.h"
 #include "intel_mipmap_tree.h"
+#include "intel_image.h"
+#include "brw_nir.h"
+#include "brw_program.h"
 
 #include "util/ralloc.h"
 
+static void
+assign_fs_binding_table_offsets(const struct gen_device_info *devinfo,
+                                const struct gl_shader_program *shader_prog,
+                                const struct gl_program *prog,
+                                const struct brw_wm_prog_key *key,
+                                struct brw_wm_prog_data *prog_data)
+{
+   uint32_t next_binding_table_offset = 0;
+
+   /* If there are no color regions, we still perform an FB write to a null
+    * renderbuffer, which we place at surface index 0.
+    */
+   prog_data->binding_table.render_target_start = next_binding_table_offset;
+   next_binding_table_offset += MAX2(key->nr_color_regions, 1);
+
+   next_binding_table_offset =
+      brw_assign_common_binding_table_offsets(MESA_SHADER_FRAGMENT, devinfo,
+                                              shader_prog, prog, &prog_data->base,
+                                              next_binding_table_offset);
+
+   if (prog->nir->info.outputs_read && !key->coherent_fb_fetch) {
+      prog_data->binding_table.render_target_read_start =
+         next_binding_table_offset;
+      next_binding_table_offset += key->nr_color_regions;
+   }
+}
+
+/**
+ * All Mesa program -> GPU code generation goes through this function.
+ * Depending on the instructions used (i.e. flow control instructions)
+ * we'll use one of two code generators.
+ */
+bool
+brw_codegen_wm_prog(struct brw_context *brw,
+                    struct gl_shader_program *prog,
+                    struct brw_fragment_program *fp,
+                    struct brw_wm_prog_key *key)
+{
+   const struct gen_device_info *devinfo = &brw->screen->devinfo;
+   struct gl_context *ctx = &brw->ctx;
+   void *mem_ctx = ralloc_context(NULL);
+   struct brw_wm_prog_data prog_data;
+   const GLuint *program;
+   struct brw_shader *fs = NULL;
+   GLuint program_size;
+   bool start_busy = false;
+   double start_time = 0;
+
+   if (prog)
+      fs = (struct brw_shader *)prog->_LinkedShaders[MESA_SHADER_FRAGMENT];
+
+   memset(&prog_data, 0, sizeof(prog_data));
+
+   /* Use ALT floating point mode for ARB programs so that 0^0 == 1. */
+   if (!prog)
+      prog_data.base.use_alt_mode = true;
+
+   assign_fs_binding_table_offsets(devinfo, prog,
+                                   &fp->program.Base, key, &prog_data);
+
+   /* Allocate the references to the uniforms that will end up in the
+    * prog_data associated with the compiled program, and which will be freed
+    * by the state cache.
+    */
+   int param_count = fp->program.Base.nir->num_uniforms / 4;
+   if (fs)
+      prog_data.base.nr_image_params = fs->base.NumImages;
+   /* The backend also sometimes adds params for texture size. */
+   param_count += 2 * ctx->Const.Program[MESA_SHADER_FRAGMENT].MaxTextureImageUnits;
+   prog_data.base.param =
+      rzalloc_array(NULL, const gl_constant_value *, param_count);
+   prog_data.base.pull_param =
+      rzalloc_array(NULL, const gl_constant_value *, param_count);
+   prog_data.base.image_param =
+      rzalloc_array(NULL, struct brw_image_param,
+                    prog_data.base.nr_image_params);
+   prog_data.base.nr_params = param_count;
+
+   if (prog) {
+      brw_nir_setup_glsl_uniforms(fp->program.Base.nir, prog, &fp->program.Base,
+                                  &prog_data.base, true);
+   } else {
+      brw_nir_setup_arb_uniforms(fp->program.Base.nir, &fp->program.Base,
+                                 &prog_data.base);
+   }
+
+   if (unlikely(brw->perf_debug)) {
+      start_busy = (brw->batch.last_bo &&
+                    drm_intel_bo_busy(brw->batch.last_bo));
+      start_time = get_time();
+   }
+
+   if (unlikely(INTEL_DEBUG & DEBUG_WM))
+      brw_dump_ir("fragment", prog, fs ? &fs->base : NULL, &fp->program.Base);
+
+   int st_index8 = -1, st_index16 = -1;
+   if (INTEL_DEBUG & DEBUG_SHADER_TIME) {
+      st_index8 = brw_get_shader_time_index(brw, prog, &fp->program.Base, ST_FS8);
+      st_index16 = brw_get_shader_time_index(brw, prog, &fp->program.Base, ST_FS16);
+   }
+
+   char *error_str = NULL;
+   program = brw_compile_fs(brw->screen->compiler, brw, mem_ctx,
+                            key, &prog_data, fp->program.Base.nir,
+                            &fp->program.Base, st_index8, st_index16,
+                            true, brw->use_rep_send,
+                            &program_size, &error_str);
+   if (program == NULL) {
+      if (prog) {
+         prog->LinkStatus = false;
+         ralloc_strcat(&prog->InfoLog, error_str);
+      }
+
+      _mesa_problem(NULL, "Failed to compile fragment shader: %s\n", error_str);
+
+      ralloc_free(mem_ctx);
+      return false;
+   }
+
+   if (unlikely(brw->perf_debug) && fs) {
+      if (fs->compiled_once)
+         brw_wm_debug_recompile(brw, prog, key);
+      fs->compiled_once = true;
+
+      if (start_busy && !drm_intel_bo_busy(brw->batch.last_bo)) {
+         perf_debug("FS compile took %.03f ms and stalled the GPU\n",
+                    (get_time() - start_time) * 1000);
+      }
+   }
+
+   brw_alloc_stage_scratch(brw, &brw->wm.base,
+                           prog_data.base.total_scratch,
+                           devinfo->max_wm_threads);
+
+   if (unlikely(INTEL_DEBUG & DEBUG_WM))
+      fprintf(stderr, "\n");
+
+   brw_upload_cache(&brw->cache, BRW_CACHE_FS_PROG,
+                    key, sizeof(struct brw_wm_prog_key),
+                    program, program_size,
+                    &prog_data, sizeof(prog_data),
+                    &brw->wm.base.prog_offset, &brw->wm.base.prog_data);
+
+   ralloc_free(mem_ctx);
+
+   return true;
+}
+
+bool
+brw_debug_recompile_sampler_key(struct brw_context *brw,
+                                const struct brw_sampler_prog_key_data *old_key,
+                                const struct brw_sampler_prog_key_data *key)
+{
+   bool found = false;
+
+   for (unsigned int i = 0; i < MAX_SAMPLERS; i++) {
+      found |= key_debug(brw, "EXT_texture_swizzle or DEPTH_TEXTURE_MODE",
+                         old_key->swizzles[i], key->swizzles[i]);
+   }
+   found |= key_debug(brw, "GL_CLAMP enabled on any texture unit's 1st coordinate",
+                      old_key->gl_clamp_mask[0], key->gl_clamp_mask[0]);
+   found |= key_debug(brw, "GL_CLAMP enabled on any texture unit's 2nd coordinate",
+                      old_key->gl_clamp_mask[1], key->gl_clamp_mask[1]);
+   found |= key_debug(brw, "GL_CLAMP enabled on any texture unit's 3rd coordinate",
+                      old_key->gl_clamp_mask[2], key->gl_clamp_mask[2]);
+   found |= key_debug(brw, "gather channel quirk on any texture unit",
+                      old_key->gather_channel_quirk_mask, key->gather_channel_quirk_mask);
+   found |= key_debug(brw, "compressed multisample layout",
+                      old_key->compressed_multisample_layout_mask,
+                      key->compressed_multisample_layout_mask);
+   found |= key_debug(brw, "16x msaa",
+                      old_key->msaa_16,
+                      key->msaa_16);
+
+   found |= key_debug(brw, "y_uv image bound",
+                      old_key->y_uv_image_mask,
+                      key->y_uv_image_mask);
+   found |= key_debug(brw, "y_u_v image bound",
+                      old_key->y_u_v_image_mask,
+                      key->y_u_v_image_mask);
+   found |= key_debug(brw, "yx_xuxv image bound",
+                      old_key->yx_xuxv_image_mask,
+                      key->yx_xuxv_image_mask);
+
+   for (unsigned int i = 0; i < MAX_SAMPLERS; i++) {
+      found |= key_debug(brw, "textureGather workarounds",
+                         old_key->gen6_gather_wa[i], key->gen6_gather_wa[i]);
+   }
+
+   return found;
+}
+
+void
+brw_wm_debug_recompile(struct brw_context *brw,
+                       struct gl_shader_program *prog,
+                       const struct brw_wm_prog_key *key)
+{
+   struct brw_cache_item *c = NULL;
+   const struct brw_wm_prog_key *old_key = NULL;
+   bool found = false;
+
+   perf_debug("Recompiling fragment shader for program %d\n", prog->Name);
+
+   for (unsigned int i = 0; i < brw->cache.size; i++) {
+      for (c = brw->cache.items[i]; c; c = c->next) {
+         if (c->cache_id == BRW_CACHE_FS_PROG) {
+            old_key = c->key;
+
+            if (old_key->program_string_id == key->program_string_id)
+               break;
+         }
+      }
+      if (c)
+         break;
+   }
+
+   if (!c) {
+      perf_debug("  Didn't find previous compile in the shader cache for debug\n");
+      return;
+   }
+
+   found |= key_debug(brw, "alphatest, computed depth, depth test, or "
+                      "depth write",
+                      old_key->iz_lookup, key->iz_lookup);
+   found |= key_debug(brw, "depth statistics",
+                      old_key->stats_wm, key->stats_wm);
+   found |= key_debug(brw, "flat shading",
+                      old_key->flat_shade, key->flat_shade);
+   found |= key_debug(brw, "per-sample interpolation",
+                      old_key->persample_interp, key->persample_interp);
+   found |= key_debug(brw, "number of color buffers",
+                      old_key->nr_color_regions, key->nr_color_regions);
+   found |= key_debug(brw, "MRT alpha test or alpha-to-coverage",
+                      old_key->replicate_alpha, key->replicate_alpha);
+   found |= key_debug(brw, "fragment color clamping",
+                      old_key->clamp_fragment_color, key->clamp_fragment_color);
+   found |= key_debug(brw, "multisampled FBO",
+                      old_key->multisample_fbo, key->multisample_fbo);
+   found |= key_debug(brw, "line smoothing",
+                      old_key->line_aa, key->line_aa);
+   found |= key_debug(brw, "input slots valid",
+                      old_key->input_slots_valid, key->input_slots_valid);
+   found |= key_debug(brw, "mrt alpha test function",
+                      old_key->alpha_test_func, key->alpha_test_func);
+   found |= key_debug(brw, "mrt alpha test reference value",
+                      old_key->alpha_test_ref, key->alpha_test_ref);
+
+   found |= brw_debug_recompile_sampler_key(brw, &old_key->tex, &key->tex);
+
+   if (!found) {
+      perf_debug("  Something else\n");
+   }
+}
+
+static uint8_t
+gen6_gather_workaround(GLenum internalformat)
+{
+   switch (internalformat) {
+   case GL_R8I: return WA_SIGN | WA_8BIT;
+   case GL_R8UI: return WA_8BIT;
+   case GL_R16I: return WA_SIGN | WA_16BIT;
+   case GL_R16UI: return WA_16BIT;
+   default:
+      /* Note that even though GL_R32I and GL_R32UI have format overrides in
+       * the surface state, there is no shader w/a required.
+       */
+      return 0;
+   }
+}
+
+void
+brw_populate_sampler_prog_key_data(struct gl_context *ctx,
+                                   const struct gl_program *prog,
+                                   struct brw_sampler_prog_key_data *key)
+{
+   struct brw_context *brw = brw_context(ctx);
+   GLbitfield mask = prog->SamplersUsed;
+
+   while (mask) {
+      const int s = u_bit_scan(&mask);
+
+      key->swizzles[s] = SWIZZLE_NOOP;
+
+      int unit_id = prog->SamplerUnits[s];
+      const struct gl_texture_unit *unit = &ctx->Texture.Unit[unit_id];
+
+      if (unit->_Current && unit->_Current->Target != GL_TEXTURE_BUFFER) {
+         const struct gl_texture_object *t = unit->_Current;
+         const struct gl_texture_image *img = t->Image[0][t->BaseLevel];
+         struct gl_sampler_object *sampler = _mesa_get_samplerobj(ctx, unit_id);
+
+         const bool alpha_depth = t->DepthMode == GL_ALPHA &&
+            (img->_BaseFormat == GL_DEPTH_COMPONENT ||
+             img->_BaseFormat == GL_DEPTH_STENCIL);
+
+         /* Haswell handles texture swizzling as surface format overrides
+          * (except for GL_ALPHA); all other platforms need MOVs in the shader.
+          */
+         if (alpha_depth || (brw->gen < 8 && !brw->is_haswell))
+            key->swizzles[s] = brw_get_texture_swizzle(ctx, t);
+
+         if (brw->gen < 8 &&
+             sampler->MinFilter != GL_NEAREST &&
+             sampler->MagFilter != GL_NEAREST) {
+            if (sampler->WrapS == GL_CLAMP)
+               key->gl_clamp_mask[0] |= 1 << s;
+            if (sampler->WrapT == GL_CLAMP)
+               key->gl_clamp_mask[1] |= 1 << s;
+            if (sampler->WrapR == GL_CLAMP)
+               key->gl_clamp_mask[2] |= 1 << s;
+         }
+
+         /* gather4's channel select for green from RG32F is broken; requires
+          * a shader w/a on IVB; fixable with just SCS on HSW.
+          */
+         if (brw->gen == 7 && !brw->is_haswell &&
+             prog->nir->info.uses_texture_gather) {
+            if (img->InternalFormat == GL_RG32F)
+               key->gather_channel_quirk_mask |= 1 << s;
+         }
+
+         /* Gen6's gather4 is broken for UINT/SINT; we treat them as
+          * UNORM/FLOAT instead and fix it in the shader.
+          */
+         if (brw->gen == 6 && prog->nir->info.uses_texture_gather) {
+            key->gen6_gather_wa[s] = gen6_gather_workaround(img->InternalFormat);
+         }
+
+         /* If this is a multisample sampler, and uses the CMS MSAA layout,
+          * then we need to emit slightly different code to first sample the
+          * MCS surface.
+          */
+         struct intel_texture_object *intel_tex =
+            intel_texture_object((struct gl_texture_object *)t);
+
+         /* From gen9 onwards some single sampled buffers can also be
+          * compressed. These don't need ld2dms sampling along with mcs fetch.
+          */
+         if (brw->gen >= 7 &&
+             intel_tex->mt->msaa_layout == INTEL_MSAA_LAYOUT_CMS &&
+             intel_tex->mt->num_samples > 1) {
+            key->compressed_multisample_layout_mask |= 1 << s;
+
+            if (intel_tex->mt->num_samples >= 16) {
+               assert(brw->gen >= 9);
+               key->msaa_16 |= 1 << s;
+            }
+         }
+
+         if (t->Target == GL_TEXTURE_EXTERNAL_OES && intel_tex->planar_format) {
+            switch (intel_tex->planar_format->components) {
+            case __DRI_IMAGE_COMPONENTS_Y_UV:
+               key->y_uv_image_mask |= 1 << s;
+               break;
+            case __DRI_IMAGE_COMPONENTS_Y_U_V:
+               key->y_u_v_image_mask |= 1 << s;
+               break;
+            case __DRI_IMAGE_COMPONENTS_Y_XUXV:
+               key->yx_xuxv_image_mask |= 1 << s;
+               break;
+            default:
+               break;
+            }
+         }
+
+      }
+   }
+}
+
+static bool
+brw_wm_state_dirty(const struct brw_context *brw)
+{
+   return brw_state_dirty(brw,
+                          _NEW_BUFFERS |
+                          _NEW_COLOR |
+                          _NEW_DEPTH |
+                          _NEW_FRAG_CLAMP |
+                          _NEW_HINT |
+                          _NEW_LIGHT |
+                          _NEW_LINE |
+                          _NEW_MULTISAMPLE |
+                          _NEW_POLYGON |
+                          _NEW_STENCIL |
+                          _NEW_TEXTURE,
+                          BRW_NEW_FRAGMENT_PROGRAM |
+                          BRW_NEW_REDUCED_PRIMITIVE |
+                          BRW_NEW_STATS_WM |
+                          BRW_NEW_VUE_MAP_GEOM_OUT);
+}
+
+void
+brw_wm_populate_key(struct brw_context *brw, struct brw_wm_prog_key *key)
+{
+   struct gl_context *ctx = &brw->ctx;
+   /* BRW_NEW_FRAGMENT_PROGRAM */
+   const struct brw_fragment_program *fp =
+      (struct brw_fragment_program *) brw->fragment_program;
+   const struct gl_program *prog = (struct gl_program *) brw->fragment_program;
+   GLuint lookup = 0;
+   GLuint line_aa;
+
+   memset(key, 0, sizeof(*key));
+
+   /* Build the index for table lookup
+    */
+   if (brw->gen < 6) {
+      /* _NEW_COLOR */
+      if (fp->program.Base.nir->info.fs.uses_discard ||
+          ctx->Color.AlphaEnabled) {
+         lookup |= IZ_PS_KILL_ALPHATEST_BIT;
+      }
+
+      if (fp->program.Base.nir->info.outputs_written &
+          BITFIELD64_BIT(FRAG_RESULT_DEPTH)) {
+         lookup |= IZ_PS_COMPUTES_DEPTH_BIT;
+      }
+
+      /* _NEW_DEPTH */
+      if (ctx->Depth.Test)
+         lookup |= IZ_DEPTH_TEST_ENABLE_BIT;
+
+      if (ctx->Depth.Test && ctx->Depth.Mask) /* ?? */
+         lookup |= IZ_DEPTH_WRITE_ENABLE_BIT;
+
+      /* _NEW_STENCIL | _NEW_BUFFERS */
+      if (ctx->Stencil._Enabled) {
+         lookup |= IZ_STENCIL_TEST_ENABLE_BIT;
+
+         if (ctx->Stencil.WriteMask[0] ||
+             ctx->Stencil.WriteMask[ctx->Stencil._BackFace])
+            lookup |= IZ_STENCIL_WRITE_ENABLE_BIT;
+      }
+      key->iz_lookup = lookup;
+   }
+
+   line_aa = AA_NEVER;
+
+   /* _NEW_LINE, _NEW_POLYGON, BRW_NEW_REDUCED_PRIMITIVE */
+   if (ctx->Line.SmoothFlag) {
+      if (brw->reduced_primitive == GL_LINES) {
+         line_aa = AA_ALWAYS;
+      }
+      else if (brw->reduced_primitive == GL_TRIANGLES) {
+         if (ctx->Polygon.FrontMode == GL_LINE) {
+            line_aa = AA_SOMETIMES;
+
+            if (ctx->Polygon.BackMode == GL_LINE ||
+                (ctx->Polygon.CullFlag &&
+                 ctx->Polygon.CullFaceMode == GL_BACK))
+               line_aa = AA_ALWAYS;
+         }
+         else if (ctx->Polygon.BackMode == GL_LINE) {
+            line_aa = AA_SOMETIMES;
+
+            if ((ctx->Polygon.CullFlag &&
+                 ctx->Polygon.CullFaceMode == GL_FRONT))
+               line_aa = AA_ALWAYS;
+         }
+      }
+   }
+
+   key->line_aa = line_aa;
+
+   /* _NEW_HINT */
+   key->high_quality_derivatives =
+      ctx->Hint.FragmentShaderDerivative == GL_NICEST;
+
+   if (brw->gen < 6)
+      key->stats_wm = brw->stats_wm;
+
+   /* _NEW_LIGHT */
+   key->flat_shade = (ctx->Light.ShadeModel == GL_FLAT);
+
+   /* _NEW_FRAG_CLAMP | _NEW_BUFFERS */
+   key->clamp_fragment_color = ctx->Color._ClampFragmentColor;
+
+   /* _NEW_TEXTURE */
+   brw_populate_sampler_prog_key_data(ctx, prog, &key->tex);
+
+   /* _NEW_BUFFERS */
+   key->nr_color_regions = ctx->DrawBuffer->_NumColorDrawBuffers;
+
+   /* _NEW_COLOR */
+   key->force_dual_color_blend = brw->dual_color_blend_by_location &&
+      (ctx->Color.BlendEnabled & 1) && ctx->Color.Blend[0]._UsesDualSrc;
+
+   /* _NEW_MULTISAMPLE, _NEW_COLOR, _NEW_BUFFERS */
+   key->replicate_alpha = ctx->DrawBuffer->_NumColorDrawBuffers > 1 &&
+      (ctx->Multisample.SampleAlphaToCoverage || ctx->Color.AlphaEnabled);
+
+   /* _NEW_BUFFERS _NEW_MULTISAMPLE */
+   /* Ignore sample qualifier while computing this flag. */
+   if (ctx->Multisample.Enabled) {
+      key->persample_interp =
+         ctx->Multisample.SampleShading &&
+         (ctx->Multisample.MinSampleShadingValue *
+          _mesa_geometric_samples(ctx->DrawBuffer) > 1);
+
+      key->multisample_fbo = _mesa_geometric_samples(ctx->DrawBuffer) > 1;
+   }
+
+   /* BRW_NEW_VUE_MAP_GEOM_OUT */
+   if (brw->gen < 6 ||
+       _mesa_bitcount_64(fp->program.Base.nir->info.inputs_read &
+                         BRW_FS_VARYING_INPUT_MASK) > 16) {
+      key->input_slots_valid = brw->vue_map_geom_out.slots_valid;
+   }
+
+
+   /* _NEW_COLOR | _NEW_BUFFERS */
+   /* Pre-gen6, the hardware alpha test always used each render
+    * target's alpha to do alpha test, as opposed to render target 0's alpha
+    * like GL requires.  Fix that by building the alpha test into the
+    * shader, and we'll skip enabling the fixed function alpha test.
+    */
+   if (brw->gen < 6 && ctx->DrawBuffer->_NumColorDrawBuffers > 1 &&
+       ctx->Color.AlphaEnabled) {
+      key->alpha_test_func = ctx->Color.AlphaFunc;
+      key->alpha_test_ref = ctx->Color.AlphaRef;
+   }
+
+   /* The unique fragment program ID */
+   key->program_string_id = fp->id;
+
+   /* Whether reads from the framebuffer should behave coherently. */
+   key->coherent_fb_fetch = ctx->Extensions.MESA_shader_framebuffer_fetch;
+}
+
+void
+brw_upload_wm_prog(struct brw_context *brw)
+{
+   struct gl_context *ctx = &brw->ctx;
+   struct gl_shader_program *current = ctx->_Shader->_CurrentFragmentProgram;
+   struct brw_wm_prog_key key;
+   struct brw_fragment_program *fp = (struct brw_fragment_program *)
+      brw->fragment_program;
+
+   if (!brw_wm_state_dirty(brw))
+      return;
+
+   brw_wm_populate_key(brw, &key);
+
+   if (!brw_search_cache(&brw->cache, BRW_CACHE_FS_PROG,
+                         &key, sizeof(key),
+                         &brw->wm.base.prog_offset,
+                         &brw->wm.base.prog_data)) {
+      bool success = brw_codegen_wm_prog(brw, current, fp, &key);
+      (void) success;
+      assert(success);
+   }
+}
+
+bool
+brw_fs_precompile(struct gl_context *ctx,
+                  struct gl_shader_program *shader_prog,
+                  struct gl_program *prog)
+{
+   struct brw_context *brw = brw_context(ctx);
+   struct brw_wm_prog_key key;
+
+   struct gl_fragment_program *fp = (struct gl_fragment_program *) prog;
+   struct brw_fragment_program *bfp = brw_fragment_program(fp);
+
+   memset(&key, 0, sizeof(key));
+
+   uint64_t outputs_written = fp->Base.nir->info.outputs_written;
+
+   if (brw->gen < 6) {
+      if (fp->Base.nir->info.fs.uses_discard)
+         key.iz_lookup |= IZ_PS_KILL_ALPHATEST_BIT;
+
+      if (outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH))
+         key.iz_lookup |= IZ_PS_COMPUTES_DEPTH_BIT;
+
+      /* Just assume depth testing. */
+      key.iz_lookup |= IZ_DEPTH_TEST_ENABLE_BIT;
+      key.iz_lookup |= IZ_DEPTH_WRITE_ENABLE_BIT;
+   }
+
+   if (brw->gen < 6 || _mesa_bitcount_64(fp->Base.nir->info.inputs_read &
+                                         BRW_FS_VARYING_INPUT_MASK) > 16) {
+      key.input_slots_valid =
+         fp->Base.nir->info.inputs_read | VARYING_BIT_POS;
+   }
+
+   brw_setup_tex_for_precompile(brw, &key.tex, &fp->Base);
+
+   key.nr_color_regions = _mesa_bitcount_64(outputs_written &
+         ~(BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+           BITFIELD64_BIT(FRAG_RESULT_STENCIL) |
+           BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)));
+
+   key.program_string_id = bfp->id;
+
+   /* Whether reads from the framebuffer should behave coherently. */
+   key.coherent_fb_fetch = ctx->Extensions.MESA_shader_framebuffer_fetch;
+
+   uint32_t old_prog_offset = brw->wm.base.prog_offset;
+   struct brw_stage_prog_data *old_prog_data = brw->wm.base.prog_data;
+
+   bool success = brw_codegen_wm_prog(brw, shader_prog, bfp, &key);
+
+   brw->wm.base.prog_offset = old_prog_offset;
+   brw->wm.base.prog_data = old_prog_data;
+
+   return success;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d29 1
+d38 3
+d44 6
+a49 9
 /**
  * Return a bitfield where bit n is set if barycentric interpolation mode n
  * (see enum brw_wm_barycentric_interp_mode) is needed by the fragment shader.
@@ -111,14 +740,17 @@ brw_compute_barycentric_interp_modes(struct brw_context *brw,
                                      bool shade_model_flat,
                                      bool persample_shading,
                                      const struct gl_fragment_program *fprog)
-{
+d51 1
+a51 2
    unsigned barycentric_interp_modes = 0;
    int attr;
-
+d53 2
+a54 3
    /* Loop through all fragment shader inputs to figure out what interpolation
     * modes are in use, and set the appropriate bits in
     * barycentric_interp_modes.
-    */
+d56 2
+a57 53
    for (attr = 0; attr < VARYING_SLOT_MAX; ++attr) {
       enum glsl_interp_qualifier interp_qualifier =
          fprog->InterpQualifier[attr];
@@ -172,7 +804,8 @@ brw_compute_barycentric_interp_modes(struct brw_context *brw,
          }
       }
    }
-
+d59 9
+a67 18
    return barycentric_interp_modes;
 }
 
@@ -191,7 +824,7 @@ computed_depth_mode(struct gl_fragment_program *fp)
       case FRAG_DEPTH_LAYOUT_UNCHANGED:
          return BRW_PSCDEPTH_OFF;
       }
-   }
+a68 20
    return BRW_PSCDEPTH_OFF;
 }
 
@@ -212,30 +845,15 @@ brw_wm_prog_data_compare(const void *in_a, const void *in_b)
       return false;
 
    return true;
-}
-
-/**
- * All Mesa program -> GPU code generation goes through this function.
- * Depending on the instructions used (i.e. flow control instructions)
- * we'll use one of two code generators.
- */
-bool
-brw_codegen_wm_prog(struct brw_context *brw,
-                    struct gl_shader_program *prog,
-                    struct brw_fragment_program *fp,
-                    struct brw_wm_prog_key *key)
-{
-   struct gl_context *ctx = &brw->ctx;
-   void *mem_ctx = ralloc_context(NULL);
-   struct brw_wm_prog_data prog_data;
-   const GLuint *program;
+d82 1
+d87 1
+a87 1
    struct gl_shader *fs = NULL;
-   GLuint program_size;
-
-   if (prog)
+d89 2
+d93 1
+a93 1
       fs = prog->_LinkedShaders[MESA_SHADER_FRAGMENT];
-
-   memset(&prog_data, 0, sizeof(prog_data));
+a95 9
    /* key->alpha_test_func means simulating alpha testing via discards,
     * so the shader definitely kills pixels.
     */
@@ -245,15 +863,9 @@ brw_codegen_wm_prog(struct brw_context *brw,
    prog_data.computed_depth_mode = computed_depth_mode(&fp->program);
 
    prog_data.early_fragment_tests = fs && fs->EarlyFragmentTests;
-
-   /* Use ALT floating point mode for ARB programs so that 0^0 == 1. */
-   if (!prog)
-      prog_data.base.use_alt_mode = true;
-
-   /* Allocate the references to the uniforms that will end up in the
-    * prog_data associated with the compiled program, and which will be freed
-    * by the state cache.
-    */
+d101 3
+d108 3
+a110 8
    int param_count;
    if (fs) {
       param_count = fs->num_uniform_components +
@@ -262,48 +874,30 @@ brw_codegen_wm_prog(struct brw_context *brw,
    } else {
       param_count = fp->program.Base.Parameters->NumParameters * 4;
    }
-   /* The backend also sometimes adds params for texture size. */
-   param_count += 2 * ctx->Const.Program[MESA_SHADER_FRAGMENT].MaxTextureImageUnits;
-   prog_data.base.param =
-      rzalloc_array(NULL, const gl_constant_value *, param_count);
-   prog_data.base.pull_param =
-      rzalloc_array(NULL, const gl_constant_value *, param_count);
-   prog_data.base.image_param =
-      rzalloc_array(NULL, struct brw_image_param,
-                    prog_data.base.nr_image_params);
-   prog_data.base.nr_params = param_count;
-
+d122 7
+a128 4
    prog_data.barycentric_interp_modes =
       brw_compute_barycentric_interp_modes(brw, key->flat_shade,
                                            key->persample_shading,
                                            &fp->program);
-
+d130 21
+a150 2
    program = brw_wm_fs_emit(brw, mem_ctx, key, &prog_data,
                             &fp->program, prog, &program_size);
-   if (program == NULL) {
-      ralloc_free(mem_ctx);
-      return false;
-   }
-
+d152 7
+d163 9
+a171 3
    if (prog_data.base.total_scratch) {
       brw_get_scratch_bo(brw, &brw->wm.base.scratch_bo,
 			 prog_data.base.total_scratch * brw->max_wm_threads);
-   }
-
-   if (unlikely(INTEL_DEBUG & DEBUG_WM))
-      fprintf(stderr, "\n");
-
-   brw_upload_cache(&brw->cache, BRW_CACHE_FS_PROG,
+d174 4
+d182 4
+a185 4
 		    key, sizeof(struct brw_wm_prog_key),
 		    program, program_size,
 		    &prog_data, sizeof(prog_data),
 		    &brw->wm.base.prog_offset, &brw->wm.prog_data);
-
-   ralloc_free(mem_ctx);
-
-   return true;
-}
-
+a191 11
 static bool
 key_debug(struct brw_context *brw, const char *name, int a, int b)
 {
@@ -315,153 +909,42 @@ key_debug(struct brw_context *brw, const char *name, int a, int b)
    }
 }
 
-bool
-brw_debug_recompile_sampler_key(struct brw_context *brw,
-                                const struct brw_sampler_prog_key_data *old_key,
-                                const struct brw_sampler_prog_key_data *key)
-{
-   bool found = false;
-
-   for (unsigned int i = 0; i < MAX_SAMPLERS; i++) {
-      found |= key_debug(brw, "EXT_texture_swizzle or DEPTH_TEXTURE_MODE",
-                         old_key->swizzles[i], key->swizzles[i]);
-   }
-   found |= key_debug(brw, "GL_CLAMP enabled on any texture unit's 1st coordinate",
-                      old_key->gl_clamp_mask[0], key->gl_clamp_mask[0]);
-   found |= key_debug(brw, "GL_CLAMP enabled on any texture unit's 2nd coordinate",
-                      old_key->gl_clamp_mask[1], key->gl_clamp_mask[1]);
-   found |= key_debug(brw, "GL_CLAMP enabled on any texture unit's 3rd coordinate",
-                      old_key->gl_clamp_mask[2], key->gl_clamp_mask[2]);
-   found |= key_debug(brw, "gather channel quirk on any texture unit",
-                      old_key->gather_channel_quirk_mask, key->gather_channel_quirk_mask);
-   found |= key_debug(brw, "compressed multisample layout",
-                      old_key->compressed_multisample_layout_mask,
-                      key->compressed_multisample_layout_mask);
-
-   for (unsigned int i = 0; i < MAX_SAMPLERS; i++) {
-      found |= key_debug(brw, "textureGather workarounds",
-                         old_key->gen6_gather_wa[i], key->gen6_gather_wa[i]);
-   }
-
-   return found;
-}
-
-void
-brw_wm_debug_recompile(struct brw_context *brw,
-                       struct gl_shader_program *prog,
-                       const struct brw_wm_prog_key *key)
-{
-   struct brw_cache_item *c = NULL;
-   const struct brw_wm_prog_key *old_key = NULL;
-   bool found = false;
-
-   perf_debug("Recompiling fragment shader for program %d\n", prog->Name);
-
-   for (unsigned int i = 0; i < brw->cache.size; i++) {
-      for (c = brw->cache.items[i]; c; c = c->next) {
-         if (c->cache_id == BRW_CACHE_FS_PROG) {
-            old_key = c->key;
-
-            if (old_key->program_string_id == key->program_string_id)
-               break;
-         }
-      }
-      if (c)
-         break;
-   }
-
-   if (!c) {
-      perf_debug("  Didn't find previous compile in the shader cache for debug\n");
-      return;
-   }
-
-   found |= key_debug(brw, "alphatest, computed depth, depth test, or "
-                      "depth write",
-                      old_key->iz_lookup, key->iz_lookup);
-   found |= key_debug(brw, "depth statistics",
-                      old_key->stats_wm, key->stats_wm);
-   found |= key_debug(brw, "flat shading",
-                      old_key->flat_shade, key->flat_shade);
+d214 13
+d272 2
+a273 4
    found |= key_debug(brw, "per-sample shading",
                       old_key->persample_shading, key->persample_shading);
    found |= key_debug(brw, "per-sample shading and 2x MSAA",
                       old_key->persample_2x, key->persample_2x);
-   found |= key_debug(brw, "number of color buffers",
-                      old_key->nr_color_regions, key->nr_color_regions);
-   found |= key_debug(brw, "MRT alpha test or alpha-to-coverage",
-                      old_key->replicate_alpha, key->replicate_alpha);
+a277 2
    found |= key_debug(brw, "rendering to FBO",
                       old_key->render_to_fbo, key->render_to_fbo);
-   found |= key_debug(brw, "fragment color clamping",
-                      old_key->clamp_fragment_color, key->clamp_fragment_color);
-   found |= key_debug(brw, "line smoothing",
-                      old_key->line_aa, key->line_aa);
+d280 2
+a283 2
    found |= key_debug(brw, "renderbuffer height",
                       old_key->drawable_height, key->drawable_height);
-   found |= key_debug(brw, "input slots valid",
-                      old_key->input_slots_valid, key->input_slots_valid);
-   found |= key_debug(brw, "mrt alpha test function",
-                      old_key->alpha_test_func, key->alpha_test_func);
-   found |= key_debug(brw, "mrt alpha test reference value",
-                      old_key->alpha_test_ref, key->alpha_test_ref);
-
-   found |= brw_debug_recompile_sampler_key(brw, &old_key->tex, &key->tex);
-
-   if (!found) {
-      perf_debug("  Something else\n");
-   }
-}
-
-static uint8_t
-gen6_gather_workaround(GLenum internalformat)
-{
-   switch (internalformat) {
-   case GL_R8I: return WA_SIGN | WA_8BIT;
-   case GL_R8UI: return WA_8BIT;
-   case GL_R16I: return WA_SIGN | WA_16BIT;
-   case GL_R16UI: return WA_16BIT;
-   default:
-      /* Note that even though GL_R32I and GL_R32UI have format overrides in
-       * the surface state, there is no shader w/a required.
-       */
-      return 0;
-   }
-}
-
-void
-brw_populate_sampler_prog_key_data(struct gl_context *ctx,
+d316 2
+a317 3
 				   const struct gl_program *prog,
                                    unsigned sampler_count,
 				   struct brw_sampler_prog_key_data *key)
-{
-   struct brw_context *brw = brw_context(ctx);
-
+d320 4
+a324 1
    for (int s = 0; s < sampler_count; s++) {
-      key->swizzles[s] = SWIZZLE_NOOP;
-
+a326 3
       if (!(prog->SamplersUsed & (1 << s)))
 	 continue;
 
-      int unit_id = prog->SamplerUnits[s];
-      const struct gl_texture_unit *unit = &ctx->Texture.Unit[unit_id];
-
-      if (unit->_Current && unit->_Current->Target != GL_TEXTURE_BUFFER) {
+d331 3
+a333 3
 	 const struct gl_texture_object *t = unit->_Current;
 	 const struct gl_texture_image *img = t->Image[0][t->BaseLevel];
 	 struct gl_sampler_object *sampler = _mesa_get_samplerobj(ctx, unit_id);
-
-         const bool alpha_depth = t->DepthMode == GL_ALPHA &&
-            (img->_BaseFormat == GL_DEPTH_COMPONENT ||
-             img->_BaseFormat == GL_DEPTH_STENCIL);
-
-         /* Haswell handles texture swizzling as surface format overrides
-          * (except for GL_ALPHA); all other platforms need MOVs in the shader.
-          */
-         if (alpha_depth || (brw->gen < 8 && !brw->is_haswell))
-            key->swizzles[s] = brw_get_texture_swizzle(ctx, t);
-
+d345 1
+a345 1
 	 if (brw->gen < 8 &&
-             sampler->MinFilter != GL_NEAREST &&
+d347 8
+a354 8
 	     sampler->MagFilter != GL_NEAREST) {
 	    if (sampler->WrapS == GL_CLAMP)
 	       key->gl_clamp_mask[0] |= 1 << s;
@@ -470,112 +953,58 @@ brw_populate_sampler_prog_key_data(struct gl_context *ctx,
 	    if (sampler->WrapR == GL_CLAMP)
 	       key->gl_clamp_mask[2] |= 1 << s;
 	 }
-
-         /* gather4's channel select for green from RG32F is broken; requires
-          * a shader w/a on IVB; fixable with just SCS on HSW.
-          */
+d359 2
+a360 1
          if (brw->gen == 7 && !brw->is_haswell && prog->UsesGather) {
-            if (img->InternalFormat == GL_RG32F)
-               key->gather_channel_quirk_mask |= 1 << s;
-         }
-
-         /* Gen6's gather4 is broken for UINT/SINT; we treat them as
-          * UNORM/FLOAT instead and fix it in the shader.
-          */
+d368 1
+a368 1
          if (brw->gen == 6 && prog->UsesGather) {
-            key->gen6_gather_wa[s] = gen6_gather_workaround(img->InternalFormat);
-         }
-
-         /* If this is a multisample sampler, and uses the CMS MSAA layout,
-          * then we need to emit slightly different code to first sample the
-          * MCS surface.
-          */
-         struct intel_texture_object *intel_tex =
-            intel_texture_object((struct gl_texture_object *)t);
-
-         if (brw->gen >= 7 &&
+d379 3
+d383 2
+a384 1
              intel_tex->mt->msaa_layout == INTEL_MSAA_LAYOUT_CMS) {
-            key->compressed_multisample_layout_mask |= 1 << s;
-         }
-      }
-   }
-}
-
-static bool
+d386 5
+d392 17
+d414 1
+a414 1
 brw_wm_state_dirty (struct brw_context *brw)
-{
-   return brw_state_dirty(brw,
-                          _NEW_BUFFERS |
-                          _NEW_COLOR |
-                          _NEW_DEPTH |
-                          _NEW_FRAG_CLAMP |
-                          _NEW_HINT |
-                          _NEW_LIGHT |
-                          _NEW_LINE |
-                          _NEW_MULTISAMPLE |
-                          _NEW_POLYGON |
-                          _NEW_STENCIL |
-                          _NEW_TEXTURE,
-                          BRW_NEW_FRAGMENT_PROGRAM |
-                          BRW_NEW_REDUCED_PRIMITIVE |
-                          BRW_NEW_STATS_WM |
-                          BRW_NEW_VUE_MAP_GEOM_OUT);
-}
-
+d434 1
+a434 1
 static void
-brw_wm_populate_key(struct brw_context *brw, struct brw_wm_prog_key *key)
-{
-   struct gl_context *ctx = &brw->ctx;
-   /* BRW_NEW_FRAGMENT_PROGRAM */
-   const struct brw_fragment_program *fp =
-      (struct brw_fragment_program *) brw->fragment_program;
-   const struct gl_program *prog = (struct gl_program *) brw->fragment_program;
-   GLuint lookup = 0;
-   GLuint line_aa;
+a443 2
    bool program_uses_dfdy = fp->program.UsesDFdy;
    const bool multisample_fbo = _mesa_geometric_samples(ctx->DrawBuffer) > 1;
-
-   memset(key, 0, sizeof(*key));
-
-   /* Build the index for table lookup
-    */
-   if (brw->gen < 6) {
-      /* _NEW_COLOR */
+d451 4
+a454 2
       if (fp->program.UsesKill || ctx->Color.AlphaEnabled)
 	 lookup |= IZ_PS_KILL_ALPHATEST_BIT;
-
+d456 4
+a459 2
       if (fp->program.Base.OutputsWritten & BITFIELD64_BIT(FRAG_RESULT_DEPTH))
 	 lookup |= IZ_PS_COMPUTES_DEPTH_BIT;
-
-      /* _NEW_DEPTH */
-      if (ctx->Depth.Test)
+d463 1
+a463 1
 	 lookup |= IZ_DEPTH_TEST_ENABLE_BIT;
-
-      if (ctx->Depth.Test && ctx->Depth.Mask) /* ?? */
+d466 1
+a466 1
 	 lookup |= IZ_DEPTH_WRITE_ENABLE_BIT;
-
-      /* _NEW_STENCIL | _NEW_BUFFERS */
-      if (ctx->Stencil._Enabled) {
+d470 1
+a470 1
 	 lookup |= IZ_STENCIL_TEST_ENABLE_BIT;
-
+d472 3
+a474 3
 	 if (ctx->Stencil.WriteMask[0] ||
 	     ctx->Stencil.WriteMask[ctx->Stencil._BackFace])
 	    lookup |= IZ_STENCIL_WRITE_ENABLE_BIT;
-      }
-      key->iz_lookup = lookup;
-   }
-
-   line_aa = AA_NEVER;
-
-   /* _NEW_LINE, _NEW_POLYGON, BRW_NEW_REDUCED_PRIMITIVE */
-   if (ctx->Line.SmoothFlag) {
-      if (brw->reduced_primitive == GL_LINES) {
+d484 1
+a484 1
 	 line_aa = AA_ALWAYS;
-      }
-      else if (brw->reduced_primitive == GL_TRIANGLES) {
+d487 10
+a496 2
 	 if (ctx->Polygon.FrontMode == GL_LINE) {
 	    line_aa = AA_SOMETIMES;
-
+d498 4
+a501 12
 	    if (ctx->Polygon.BackMode == GL_LINE ||
 		(ctx->Polygon.CullFlag &&
 		 ctx->Polygon.CullFaceMode == GL_BACK))
@@ -588,29 +1017,12 @@ brw_wm_populate_key(struct brw_context *brw, struct brw_wm_prog_key *key)
 		 ctx->Polygon.CullFaceMode == GL_FRONT))
 	       line_aa = AA_ALWAYS;
 	 }
-      }
-   }
-
-   key->line_aa = line_aa;
-
-   /* _NEW_HINT */
-   key->high_quality_derivatives =
-      ctx->Hint.FragmentShaderDerivative == GL_NICEST;
-
-   if (brw->gen < 6)
-      key->stats_wm = brw->stats_wm;
-
-   /* _NEW_LIGHT */
-   key->flat_shade = (ctx->Light.ShadeModel == GL_FLAT);
-
-   /* _NEW_FRAG_CLAMP | _NEW_BUFFERS */
-   key->clamp_fragment_color = ctx->Color._ClampFragmentColor;
-
-   /* _NEW_TEXTURE */
+d521 1
+a521 2
    brw_populate_sampler_prog_key_data(ctx, prog, brw->wm.base.sampler_count,
                                       &key->tex);
-
-   /* _NEW_BUFFERS */
+d524 1
+a524 23
    /*
     * Include the draw buffer origin and height so that we can calculate
     * fragment position values relative to the bottom left of the drawable,
@@ -634,20 +1046,16 @@ brw_wm_populate_key(struct brw_context *brw, struct brw_wm_prog_key *key)
    if (fp->program.Base.InputsRead & VARYING_BIT_POS) {
       key->drawable_height = _mesa_geometric_height(ctx->DrawBuffer);
    }
-
+d526 3
+a528 6
    if ((fp->program.Base.InputsRead & VARYING_BIT_POS) || program_uses_dfdy) {
       key->render_to_fbo = _mesa_is_user_fbo(ctx->DrawBuffer);
    }
 
    /* _NEW_BUFFERS */
    key->nr_color_regions = ctx->DrawBuffer->_NumColorDrawBuffers;
-
-   /* _NEW_MULTISAMPLE, _NEW_COLOR, _NEW_BUFFERS */
-   key->replicate_alpha = ctx->DrawBuffer->_NumColorDrawBuffers > 1 &&
-      (ctx->Multisample.SampleAlphaToCoverage || ctx->Color.AlphaEnabled);
-
-   /* _NEW_BUFFERS _NEW_MULTISAMPLE */
-   /* Ignore sample qualifier while computing this flag. */
+d536 8
+a543 13
    key->persample_shading =
       _mesa_get_min_invocations_per_fragment(ctx, &fp->program, true) > 1;
    if (key->persample_shading)
@@ -661,52 +1069,19 @@ brw_wm_populate_key(struct brw_context *brw, struct brw_wm_prog_key *key)
       multisample_fbo &&
       ctx->Multisample.Enabled &&
       (fp->program.Base.SystemValuesRead & SYSTEM_BIT_SAMPLE_ID);
-
-   /* BRW_NEW_VUE_MAP_GEOM_OUT */
+d546 3
+a548 2
    if (brw->gen < 6 || _mesa_bitcount_64(fp->program.Base.InputsRead &
                                          BRW_FS_VARYING_INPUT_MASK) > 16)
-      key->input_slots_valid = brw->vue_map_geom_out.slots_valid;
-
-
-   /* _NEW_COLOR | _NEW_BUFFERS */
-   /* Pre-gen6, the hardware alpha test always used each render
-    * target's alpha to do alpha test, as opposed to render target 0's alpha
-    * like GL requires.  Fix that by building the alpha test into the
-    * shader, and we'll skip enabling the fixed function alpha test.
-    */
-   if (brw->gen < 6 && ctx->DrawBuffer->_NumColorDrawBuffers > 1 &&
-       ctx->Color.AlphaEnabled) {
-      key->alpha_test_func = ctx->Color.AlphaFunc;
-      key->alpha_test_ref = ctx->Color.AlphaRef;
-   }
-
-   /* The unique fragment program ID */
-   key->program_string_id = fp->id;
-}
-
-void
-brw_upload_wm_prog(struct brw_context *brw)
-{
-   struct gl_context *ctx = &brw->ctx;
-   struct gl_shader_program *current = ctx->_Shader->_CurrentFragmentProgram;
-   struct brw_wm_prog_key key;
-   struct brw_fragment_program *fp = (struct brw_fragment_program *)
-      brw->fragment_program;
-
-   if (!brw_wm_state_dirty(brw))
-      return;
-
-   brw_wm_populate_key(brw, &key);
-
-   if (!brw_search_cache(&brw->cache, BRW_CACHE_FS_PROG,
+d550 1
+d567 3
+d587 3
+a589 2
 			 &key, sizeof(key),
 			 &brw->wm.base.prog_offset, &brw->wm.prog_data)) {
-      bool success = brw_codegen_wm_prog(brw, current, fp, &key);
-      (void) success;
-      assert(success);
-   }
+d594 56
+a649 1
    brw->wm.base.prog_data = &brw->wm.prog_data->base;
-}
 @
 
 

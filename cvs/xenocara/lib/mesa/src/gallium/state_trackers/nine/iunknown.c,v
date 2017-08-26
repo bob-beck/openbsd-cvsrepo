@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.29;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.42.16;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -87,7 +93,10 @@ text
 
 #include "iunknown.h"
 #include "util/u_atomic.h"
+#include "util/u_hash_table.h"
+
 #include "nine_helpers.h"
+#include "nine_pdata.h"
 
 #define DBG_CHANNEL DBG_UNKNOWN
 
@@ -104,8 +113,13 @@ NineUnknown_ctor( struct NineUnknown *This,
         NineUnknown_AddRef(NineUnknown(This->device));
 
     This->vtable = pParams->vtable;
+    This->vtable_internal = pParams->vtable;
     This->guids = pParams->guids;
     This->dtor = pParams->dtor;
+
+    This->pdata = util_hash_table_create(ht_guid_hash, ht_guid_compare);
+    if (!This->pdata)
+        return E_OUTOFMEMORY;
 
     return D3D_OK;
 }
@@ -113,24 +127,37 @@ NineUnknown_ctor( struct NineUnknown *This,
 void
 NineUnknown_dtor( struct NineUnknown *This )
 {
+    if (This->refs && This->device) /* Possible only if early exit after a ctor failed */
+        (void) NineUnknown_Release(NineUnknown(This->device));
+
+    if (This->pdata) {
+        util_hash_table_foreach(This->pdata, ht_guid_delete, NULL);
+        util_hash_table_destroy(This->pdata);
+    }
+
     FREE(This);
 }
 
-HRESULT WINAPI
+HRESULT NINE_WINAPI
 NineUnknown_QueryInterface( struct NineUnknown *This,
                             REFIID riid,
                             void **ppvObject )
 {
     unsigned i = 0;
+    char guid_str[64];
 
-    DBG("This=%p riid=%p ppvObject=%p\n", This, riid, ppvObject);
+    DBG("This=%p riid=%p id=%s ppvObject=%p\n",
+        This, riid, riid ? GUID_sprintf(guid_str, riid) : "", ppvObject);
 
     if (!ppvObject) return E_POINTER;
 
     do {
         if (GUID_equal(This->guids[i], riid)) {
             *ppvObject = This;
-            assert(This->refs);
+            /* Tests showed that this call succeeds even on objects with
+             * zero refcount. This can happen if the app released all references
+             * but the resource is still bound.
+             */
             NineUnknown_AddRef(This);
             return S_OK;
         }
@@ -140,7 +167,7 @@ NineUnknown_QueryInterface( struct NineUnknown *This,
     return E_NOINTERFACE;
 }
 
-ULONG WINAPI
+ULONG NINE_WINAPI
 NineUnknown_AddRef( struct NineUnknown *This )
 {
     ULONG r;
@@ -159,7 +186,7 @@ NineUnknown_AddRef( struct NineUnknown *This )
     return r;
 }
 
-ULONG WINAPI
+ULONG NINE_WINAPI
 NineUnknown_Release( struct NineUnknown *This )
 {
     if (This->forward)
@@ -182,7 +209,7 @@ NineUnknown_Release( struct NineUnknown *This )
     return r;
 }
 
-HRESULT WINAPI
+HRESULT NINE_WINAPI
 NineUnknown_GetDevice( struct NineUnknown *This,
                        IDirect3DDevice9 **ppDevice )
 {
@@ -191,6 +218,144 @@ NineUnknown_GetDevice( struct NineUnknown *This,
     *ppDevice = (IDirect3DDevice9 *)This->device;
     return D3D_OK;
 }
+
+HRESULT NINE_WINAPI
+NineUnknown_SetPrivateData( struct NineUnknown *This,
+                            REFGUID refguid,
+                            const void *pData,
+                            DWORD SizeOfData,
+                            DWORD Flags )
+{
+    enum pipe_error err;
+    struct pheader *header;
+    const void *user_data = pData;
+    char guid_str[64];
+    void *header_data;
+
+    DBG("This=%p GUID=%s pData=%p SizeOfData=%u Flags=%x\n",
+        This, GUID_sprintf(guid_str, refguid), pData, SizeOfData, Flags);
+
+    if (Flags & D3DSPD_IUNKNOWN)
+        user_assert(SizeOfData == sizeof(IUnknown *), D3DERR_INVALIDCALL);
+
+    /* data consists of a header and the actual data. avoiding 2 mallocs */
+    header = CALLOC_VARIANT_LENGTH_STRUCT(pheader, SizeOfData);
+    if (!header) { return E_OUTOFMEMORY; }
+    header->unknown = (Flags & D3DSPD_IUNKNOWN) ? TRUE : FALSE;
+
+    /* if the refguid already exists, delete it */
+    NineUnknown_FreePrivateData(This, refguid);
+
+    /* IUnknown special case */
+    if (header->unknown) {
+        /* here the pointer doesn't point to the data we want, so point at the
+         * pointer making what we eventually copy is the pointer itself */
+        user_data = &pData;
+    }
+
+    header->size = SizeOfData;
+    header_data = (void *)header + sizeof(*header);
+    memcpy(header_data, user_data, header->size);
+    memcpy(&header->guid, refguid, sizeof(header->guid));
+
+    err = util_hash_table_set(This->pdata, &header->guid, header);
+    if (err == PIPE_OK) {
+        if (header->unknown) { IUnknown_AddRef(*(IUnknown **)header_data); }
+        return D3D_OK;
+    }
+
+    FREE(header);
+    if (err == PIPE_ERROR_OUT_OF_MEMORY) { return E_OUTOFMEMORY; }
+
+    return D3DERR_DRIVERINTERNALERROR;
+}
+
+HRESULT NINE_WINAPI
+NineUnknown_GetPrivateData( struct NineUnknown *This,
+                            REFGUID refguid,
+                            void *pData,
+                            DWORD *pSizeOfData )
+{
+    struct pheader *header;
+    DWORD sizeofdata;
+    char guid_str[64];
+    void *header_data;
+
+    DBG("This=%p GUID=%s pData=%p pSizeOfData=%p\n",
+        This, GUID_sprintf(guid_str, refguid), pData, pSizeOfData);
+
+    header = util_hash_table_get(This->pdata, refguid);
+    if (!header) { return D3DERR_NOTFOUND; }
+
+    user_assert(pSizeOfData, E_POINTER);
+    sizeofdata = *pSizeOfData;
+    *pSizeOfData = header->size;
+
+    if (!pData) {
+        return D3D_OK;
+    }
+    if (sizeofdata < header->size) {
+        return D3DERR_MOREDATA;
+    }
+
+    header_data = (void *)header + sizeof(*header);
+    if (header->unknown) { IUnknown_AddRef(*(IUnknown **)header_data); }
+    memcpy(pData, header_data, header->size);
+
+    return D3D_OK;
+}
+
+HRESULT NINE_WINAPI
+NineUnknown_FreePrivateData( struct NineUnknown *This,
+                             REFGUID refguid )
+{
+    struct pheader *header;
+    char guid_str[64];
+
+    DBG("This=%p GUID=%s\n", This, GUID_sprintf(guid_str, refguid));
+
+    header = util_hash_table_get(This->pdata, refguid);
+    if (!header)
+        return D3DERR_NOTFOUND;
+
+    ht_guid_delete(NULL, header, NULL);
+    util_hash_table_remove(This->pdata, refguid);
+
+    return D3D_OK;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d25 2
+d28 1
+d45 1
+d49 4
+d59 8
+d70 1
+a70 1
+HRESULT WINAPI
+d76 1
+d78 2
+a79 1
+    DBG("This=%p riid=%p ppvObject=%p\n", This, riid, ppvObject);
+d86 4
+a89 1
+            assert(This->refs);
+d99 1
+a99 1
+ULONG WINAPI
+d118 1
+a118 1
+ULONG WINAPI
+d141 1
+a141 1
+HRESULT WINAPI
+d148 105
 @
 
 

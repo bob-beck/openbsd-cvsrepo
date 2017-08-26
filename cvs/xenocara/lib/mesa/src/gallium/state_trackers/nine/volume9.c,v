@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.30;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.42.13;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -93,10 +99,8 @@ text
 #include "nine_pipe.h"
 #include "nine_dump.h"
 
-#include "util/u_hash_table.h"
 #include "util/u_format.h"
 #include "util/u_surface.h"
-#include "nine_pdata.h"
 
 #define DBG_CHANNEL DBG_VOLUME
 
@@ -142,10 +146,6 @@ NineVolume9_ctor( struct NineVolume9 *This,
     if (FAILED(hr))
         return hr;
 
-    This->pdata = util_hash_table_create(ht_guid_hash, ht_guid_compare);
-    if (!This->pdata)
-        return E_OUTOFMEMORY;
-
     pipe_resource_reference(&This->resource, pResource);
 
     This->pipe = pParams->device->pipe;
@@ -171,7 +171,8 @@ NineVolume9_ctor( struct NineVolume9 *This,
                                                     pDesc->Format,
                                                     This->info.target,
                                                     This->info.nr_samples,
-                                                    This->info.bind, FALSE);
+                                                    This->info.bind, FALSE,
+                                                    pDesc->Pool == D3DPOOL_SCRATCH);
 
     if (This->info.format == PIPE_FORMAT_NONE)
         return D3DERR_DRIVERINTERNALERROR;
@@ -181,8 +182,24 @@ NineVolume9_ctor( struct NineVolume9 *This,
     This->layer_stride = util_format_get_2d_size(This->info.format,
                                                  This->stride, pDesc->Height);
 
-    if (pDesc->Pool == D3DPOOL_SYSTEMMEM)
-        This->info.usage = PIPE_USAGE_STAGING;
+    /* Get true format */
+    This->format_conversion = d3d9_to_pipe_format_checked(This->info.screen,
+                                                         pDesc->Format,
+                                                         This->info.target,
+                                                         This->info.nr_samples,
+                                                         This->info.bind, FALSE,
+                                                         TRUE);
+    if (This->info.format != This->format_conversion) {
+        This->stride_conversion = nine_format_get_stride(This->format_conversion,
+                                                         pDesc->Width);
+        This->layer_stride_conversion = util_format_get_2d_size(This->format_conversion,
+                                                                This->stride_conversion,
+                                                                pDesc->Height);
+        This->data_conversion = align_malloc(This->layer_stride_conversion *
+                                             This->desc.Depth, 32);
+        if (!This->data_conversion)
+            return E_OUTOFMEMORY;
+    }
 
     if (!This->resource) {
         hr = NineVolume9_AllocateData(This);
@@ -201,18 +218,25 @@ NineVolume9_dtor( struct NineVolume9 *This )
         NineVolume9_UnlockBox(This);
 
     if (This->data)
-           FREE(This->data);
+        align_free(This->data);
+    if (This->data_conversion)
+        align_free(This->data_conversion);
 
     pipe_resource_reference(&This->resource, NULL);
 
     NineUnknown_dtor(&This->base);
 }
 
-HRESULT WINAPI
+HRESULT NINE_WINAPI
 NineVolume9_GetContainer( struct NineVolume9 *This,
                           REFIID riid,
                           void **ppContainer )
 {
+    char guid_str[64];
+
+    DBG("This=%p riid=%p id=%s ppContainer=%p\n",
+        This, riid, riid ? GUID_sprintf(guid_str, riid) : "", ppContainer);
+
     if (!NineUnknown(This)->container)
         return E_NOINTERFACE;
     return NineUnknown_QueryInterface(NineUnknown(This)->container, riid, ppContainer);
@@ -239,7 +263,7 @@ NineVolume9_MarkContainerDirty( struct NineVolume9 *This )
     BASETEX_REGISTER_UPDATE(tex);
 }
 
-HRESULT WINAPI
+HRESULT NINE_WINAPI
 NineVolume9_GetDesc( struct NineVolume9 *This,
                      D3DVOLUME_DESC *pDesc )
 {
@@ -279,7 +303,7 @@ NineVolume9_GetSystemMemPointer(struct NineVolume9 *This, int x, int y, int z)
     return This->data + (z * This->layer_stride + y * This->stride + x_offset);
 }
 
-HRESULT WINAPI
+HRESULT NINE_WINAPI
 NineVolume9_LockBox( struct NineVolume9 *This,
                      D3DLOCKED_BOX *pLockedVolume,
                      const D3DBOX *pBox,
@@ -329,6 +353,13 @@ NineVolume9_LockBox( struct NineVolume9 *This,
         usage |= PIPE_TRANSFER_DONTBLOCK;
 
     if (pBox) {
+        user_assert(pBox->Right > pBox->Left, D3DERR_INVALIDCALL);
+        user_assert(pBox->Bottom > pBox->Top, D3DERR_INVALIDCALL);
+        user_assert(pBox->Back > pBox->Front, D3DERR_INVALIDCALL);
+        user_assert(pBox->Right <= This->desc.Width, D3DERR_INVALIDCALL);
+        user_assert(pBox->Bottom <= This->desc.Height, D3DERR_INVALIDCALL);
+        user_assert(pBox->Back <= This->desc.Depth, D3DERR_INVALIDCALL);
+
         d3dbox_to_pipe_box(&box, pBox);
         if (u_box_clip_2d(&box, &box, This->desc.Width, This->desc.Height) < 0) {
             DBG("Locked volume intersection empty.\n");
@@ -339,7 +370,14 @@ NineVolume9_LockBox( struct NineVolume9 *This,
                  &box);
     }
 
-    if (This->data) {
+    if (This->data_conversion) {
+        /* For now we only have uncompressed formats here */
+        pLockedVolume->RowPitch = This->stride_conversion;
+        pLockedVolume->SlicePitch = This->layer_stride_conversion;
+        pLockedVolume->pBits = This->data_conversion + box.z * This->layer_stride_conversion +
+                               box.y * This->stride_conversion +
+                               util_format_get_stride(This->format_conversion, box.x);
+    } else if (This->data) {
         pLockedVolume->RowPitch = This->stride;
         pLockedVolume->SlicePitch = This->layer_stride;
         pLockedVolume->pBits =
@@ -366,7 +404,7 @@ NineVolume9_LockBox( struct NineVolume9 *This,
     return D3D_OK;
 }
 
-HRESULT WINAPI
+HRESULT NINE_WINAPI
 NineVolume9_UnlockBox( struct NineVolume9 *This )
 {
     DBG("This=%p lock_count=%u\n", This, This->lock_count);
@@ -376,22 +414,59 @@ NineVolume9_UnlockBox( struct NineVolume9 *This )
         This->transfer = NULL;
     }
     --This->lock_count;
+
+    if (This->data_conversion) {
+        struct pipe_transfer *transfer;
+        uint8_t *dst = This->data;
+        struct pipe_box box;
+
+        u_box_3d(0, 0, 0, This->desc.Width, This->desc.Height, This->desc.Depth,
+                 &box);
+
+        if (!dst) {
+            dst = This->pipe->transfer_map(This->pipe,
+                                           This->resource,
+                                           This->level,
+                                           PIPE_TRANSFER_WRITE |
+                                           PIPE_TRANSFER_DISCARD_WHOLE_RESOURCE,
+                                           &box, &transfer);
+            if (!dst)
+                return D3D_OK;
+        }
+
+        (void) util_format_translate_3d(This->info.format,
+                                        dst, This->data ? This->stride : transfer->stride,
+                                        This->data ? This->layer_stride : transfer->layer_stride,
+                                        0, 0, 0,
+                                        This->format_conversion,
+                                        This->data_conversion,
+                                        This->stride_conversion,
+                                        This->layer_stride_conversion,
+                                        0, 0, 0,
+                                        This->desc.Width, This->desc.Height,
+                                        This->desc.Depth);
+
+        if (!This->data)
+            pipe_transfer_unmap(This->pipe, transfer);
+    }
+
     return D3D_OK;
 }
 
 /* When this function is called, we have already checked
  * The copy regions fit the volumes */
-HRESULT
+void
 NineVolume9_CopyMemToDefault( struct NineVolume9 *This,
                               struct NineVolume9 *From,
                               unsigned dstx, unsigned dsty, unsigned dstz,
                               struct pipe_box *pSrcBox )
 {
     struct pipe_context *pipe = This->pipe;
+    struct pipe_transfer *transfer = NULL;
     struct pipe_resource *r_dst = This->resource;
     struct pipe_box src_box;
     struct pipe_box dst_box;
-    const uint8_t *p_src;
+    uint8_t *map = NULL;
 
     DBG("This=%p From=%p dstx=%u dsty=%u dstz=%u pSrcBox=%p\n",
         This, From, dstx, dsty, dstz, pSrcBox);
@@ -418,17 +493,49 @@ NineVolume9_CopyMemToDefault( struct NineVolume9 *This,
     dst_box.height = src_box.height;
     dst_box.depth = src_box.depth;
 
-    p_src = NineVolume9_GetSystemMemPointer(From,
-         src_box.x, src_box.y, src_box.z);
+    map = pipe->transfer_map(pipe,
+                             r_dst,
+                             This->level,
+                             PIPE_TRANSFER_WRITE | PIPE_TRANSFER_DISCARD_RANGE,
+                             &dst_box, &transfer);
+    if (!map)
+        return;
 
-    pipe->transfer_inline_write(pipe, r_dst, This->level,
-                                0, /* WRITE|DISCARD are implicit */
-                                &dst_box, p_src,
-                                From->stride, From->layer_stride);
+    /* Note: if formats are the sames, it will revert
+     * to normal memcpy */
+    (void) util_format_translate_3d(r_dst->format,
+                                    map, transfer->stride,
+                                    transfer->layer_stride,
+                                    0, 0, 0,
+                                    From->info.format,
+                                    From->data, From->stride,
+                                    From->layer_stride,
+                                    src_box.x, src_box.y,
+                                    src_box.z,
+                                    src_box.width,
+                                    src_box.height,
+                                    src_box.depth);
+
+    pipe_transfer_unmap(pipe, transfer);
+
+    if (This->data_conversion)
+        (void) util_format_translate_3d(This->format_conversion,
+                                        This->data_conversion,
+                                        This->stride_conversion,
+                                        This->layer_stride_conversion,
+                                        dstx, dsty, dstz,
+                                        From->info.format,
+                                        From->data, From->stride,
+                                        From->layer_stride,
+                                        src_box.x, src_box.y,
+                                        src_box.z,
+                                        src_box.width,
+                                        src_box.height,
+                                        src_box.depth);
 
     NineVolume9_MarkContainerDirty(This);
 
-    return D3D_OK;
+    return;
 }
 
 HRESULT
@@ -459,8 +566,8 @@ NineVolume9_UploadSelf( struct NineVolume9 *This,
 
     ptr = NineVolume9_GetSystemMemPointer(This, box.x, box.y, box.z);
 
-    pipe->transfer_inline_write(pipe, res, This->level, 0, &box,
-                                ptr, This->stride, This->layer_stride);
+    pipe->texture_subdata(pipe, res, This->level, 0, &box,
+                          ptr, This->stride, This->layer_stride);
 
     return D3D_OK;
 }
@@ -471,9 +578,9 @@ IDirect3DVolume9Vtbl NineVolume9_vtable = {
     (void *)NineUnknown_AddRef,
     (void *)NineUnknown_Release,
     (void *)NineUnknown_GetDevice, /* actually part of Volume9 iface */
-    (void *)NineVolume9_SetPrivateData,
-    (void *)NineVolume9_GetPrivateData,
-    (void *)NineVolume9_FreePrivateData,
+    (void *)NineUnknown_SetPrivateData,
+    (void *)NineUnknown_GetPrivateData,
+    (void *)NineUnknown_FreePrivateData,
     (void *)NineVolume9_GetContainer,
     (void *)NineVolume9_GetDesc,
     (void *)NineVolume9_LockBox,
@@ -497,6 +604,80 @@ NineVolume9_new( struct NineDevice9 *pDevice,
     NINE_DEVICE_CHILD_NEW(Volume9, ppOut, pDevice, /* args */
                           pContainer, pResource, Level, pDesc);
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@a30 1
+#include "util/u_hash_table.h"
+a32 1
+#include "nine_pdata.h"
+a77 4
+    This->pdata = util_hash_table_create(ht_guid_hash, ht_guid_compare);
+    if (!This->pdata)
+        return E_OUTOFMEMORY;
+
+d103 2
+a104 1
+                                                    This->info.bind, FALSE);
+d114 18
+a131 2
+    if (pDesc->Pool == D3DPOOL_SYSTEMMEM)
+        This->info.usage = PIPE_USAGE_STAGING;
+d150 3
+a152 1
+           FREE(This->data);
+d159 1
+a159 1
+HRESULT WINAPI
+d164 5
+d195 1
+a195 1
+HRESULT WINAPI
+d235 1
+a235 1
+HRESULT WINAPI
+d285 7
+d302 8
+a309 1
+    if (This->data) {
+d336 1
+a336 1
+HRESULT WINAPI
+d346 36
+d387 1
+a387 1
+HRESULT
+d394 1
+d398 1
+a398 1
+    const uint8_t *p_src;
+d425 39
+a463 7
+    p_src = NineVolume9_GetSystemMemPointer(From,
+         src_box.x, src_box.y, src_box.z);
+
+    pipe->transfer_inline_write(pipe, r_dst, This->level,
+                                0, /* WRITE|DISCARD are implicit */
+                                &dst_box, p_src,
+                                From->stride, From->layer_stride);
+d467 1
+a467 1
+    return D3D_OK;
+d498 2
+a499 2
+    pipe->transfer_inline_write(pipe, res, This->level, 0, &box,
+                                ptr, This->stride, This->layer_stride);
+d510 3
+a512 3
+    (void *)NineVolume9_SetPrivateData,
+    (void *)NineVolume9_GetPrivateData,
+    (void *)NineVolume9_FreePrivateData,
+a535 95
 
 
 /*** The boring stuff. TODO: Unify with Resource. ***/

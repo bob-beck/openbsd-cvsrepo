@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.3
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.36;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.40.27;	author jsg;	state Exp;
@@ -52,9 +57,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -84,11 +90,11 @@ text
  *
  */
 
-/** @@file intel_syncobj.c
+/**
+ * \file
+ * \brief Support for GL_ARB_sync and EGL_KHR_fence_sync.
  *
- * Support for ARB_sync
- *
- * ARB_sync is implemented by flushing the current batchbuffer and keeping a
+ * GL_ARB_sync is implemented by flushing the current batchbuffer and keeping a
  * reference on it.  We can then check for completion or wait for completion
  * using the normal buffer object mechanisms.  This does mean that if an
  * application is using many sync objects, it will emit small batchbuffers
@@ -104,12 +110,127 @@ text
 #include "intel_batchbuffer.h"
 #include "intel_reg.h"
 
-static struct gl_sync_object *
-intel_new_sync_object(struct gl_context *ctx, GLuint id)
-{
-   struct intel_sync_object *sync;
+struct intel_fence {
+   struct intel_context *intel;
+   /** The fence waits for completion of this batch. */
+   drm_intel_bo *batch_bo;
 
-   sync = calloc(1, sizeof(struct intel_sync_object));
+   mtx_t mutex;
+   bool signalled;
+};
+
+struct intel_gl_sync_object {
+   struct gl_sync_object Base;
+   struct intel_fence fence;
+};
+
+static void
+intel_fence_finish(struct intel_fence *fence)
+{
+   if (fence->batch_bo)
+      drm_intel_bo_unreference(fence->batch_bo);
+}
+
+static void
+intel_fence_insert(struct intel_context *intel, struct intel_fence *fence)
+{
+   assert(!fence->batch_bo);
+   assert(!fence->signalled);
+
+   intel_batchbuffer_emit_mi_flush(intel);
+   fence->batch_bo = intel->batch.bo;
+   drm_intel_bo_reference(fence->batch_bo);
+   intel_batchbuffer_flush(intel);
+}
+
+static bool
+intel_fence_has_completed_locked(struct intel_fence *fence)
+{
+   if (fence->signalled)
+      return true;
+
+   if (fence->batch_bo && !drm_intel_bo_busy(fence->batch_bo)) {
+      drm_intel_bo_unreference(fence->batch_bo);
+      fence->batch_bo = NULL;
+      fence->signalled = true;
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+intel_fence_has_completed(struct intel_fence *fence)
+{
+   bool ret;
+
+   mtx_lock(&fence->mutex);
+   ret = intel_fence_has_completed_locked(fence);
+   mtx_unlock(&fence->mutex);
+
+   return ret;
+}
+
+static bool
+intel_fence_client_wait_locked(struct intel_context *intel, struct intel_fence *fence,
+                             uint64_t timeout)
+{
+   if (fence->signalled)
+      return true;
+
+   assert(fence->batch_bo);
+
+   /* DRM_IOCTL_I915_GEM_WAIT uses a signed 64 bit timeout and returns
+    * immediately for timeouts <= 0.  The best we can do is to clamp the
+    * timeout to INT64_MAX.  This limits the maximum timeout from 584 years to
+    * 292 years - likely not a big deal.
+    */
+   if (timeout > INT64_MAX)
+      timeout = INT64_MAX;
+
+   if (drm_intel_gem_bo_wait(fence->batch_bo, timeout) != 0)
+      return false;
+
+   fence->signalled = true;
+   drm_intel_bo_unreference(fence->batch_bo);
+   fence->batch_bo = NULL;
+
+   return true;
+}
+
+/**
+ * Return true if the function successfully signals or has already signalled.
+ * (This matches the behavior expected from __DRI2fence::client_wait_sync).
+ */
+static bool
+intel_fence_client_wait(struct intel_context *intel, struct intel_fence *fence,
+                      uint64_t timeout)
+{
+   bool ret;
+
+   mtx_lock(&fence->mutex);
+   ret = intel_fence_client_wait_locked(intel, fence, timeout);
+   mtx_unlock(&fence->mutex);
+
+   return ret;
+}
+
+static void
+intel_fence_server_wait(struct intel_context *intel, struct intel_fence *fence)
+{
+   /* We have nothing to do for WaitSync.  Our GL command stream is sequential,
+    * so given that the sync object has already flushed the batchbuffer, any
+    * batchbuffers coming after this waitsync will naturally not occur until
+    * the previous one is done.
+    */
+}
+
+static struct gl_sync_object *
+intel_gl_new_sync_object(struct gl_context *ctx, GLuint id)
+{
+   struct intel_gl_sync_object *sync;
+
+   sync = calloc(1, sizeof(*sync));
    if (!sync)
       return NULL;
 
@@ -117,44 +238,191 @@ intel_new_sync_object(struct gl_context *ctx, GLuint id)
 }
 
 static void
-intel_delete_sync_object(struct gl_context *ctx, struct gl_sync_object *s)
+intel_gl_delete_sync_object(struct gl_context *ctx, struct gl_sync_object *s)
 {
-   struct intel_sync_object *sync = (struct intel_sync_object *)s;
+   struct intel_gl_sync_object *sync = (struct intel_gl_sync_object *)s;
 
-   if (sync->bo)
-      drm_intel_bo_unreference(sync->bo);
-
+   intel_fence_finish(&sync->fence);
    free(sync);
 }
 
 static void
-intel_fence_sync(struct gl_context *ctx, struct gl_sync_object *s,
+intel_gl_fence_sync(struct gl_context *ctx, struct gl_sync_object *s,
 	       GLenum condition, GLbitfield flags)
 {
    struct intel_context *intel = intel_context(ctx);
-   struct intel_sync_object *sync = (struct intel_sync_object *)s;
+   struct intel_gl_sync_object *sync = (struct intel_gl_sync_object *)s;
 
-   assert(condition == GL_SYNC_GPU_COMMANDS_COMPLETE);
-   intel_batchbuffer_emit_mi_flush(intel);
-
-   sync->bo = intel->batch.bo;
-   drm_intel_bo_reference(sync->bo);
-
-   intel_flush(ctx);
+   intel_fence_insert(intel, &sync->fence);
 }
 
-static void intel_client_wait_sync(struct gl_context *ctx, struct gl_sync_object *s,
+static void
+intel_gl_client_wait_sync(struct gl_context *ctx, struct gl_sync_object *s,
 				 GLbitfield flags, GLuint64 timeout)
 {
+   struct intel_context *intel = intel_context(ctx);
+   struct intel_gl_sync_object *sync = (struct intel_gl_sync_object *)s;
+
+   if (intel_fence_client_wait(intel, &sync->fence, timeout))
+      s->StatusFlag = 1;
+}
+
+static void
+intel_gl_server_wait_sync(struct gl_context *ctx, struct gl_sync_object *s,
+				 GLbitfield flags, GLuint64 timeout)
+{
+   struct intel_context *intel = intel_context(ctx);
+   struct intel_gl_sync_object *sync = (struct intel_gl_sync_object *)s;
+
+   intel_fence_server_wait(intel, &sync->fence);
+}
+
+static void
+intel_gl_check_sync(struct gl_context *ctx, struct gl_sync_object *s)
+{
+   struct intel_gl_sync_object *sync = (struct intel_gl_sync_object *)s;
+
+   if (intel_fence_has_completed(&sync->fence))
+      s->StatusFlag = 1;
+}
+
+void
+intel_init_syncobj_functions(struct dd_function_table *functions)
+{
+   functions->NewSyncObject = intel_gl_new_sync_object;
+   functions->DeleteSyncObject = intel_gl_delete_sync_object;
+   functions->FenceSync = intel_gl_fence_sync;
+   functions->CheckSync = intel_gl_check_sync;
+   functions->ClientWaitSync = intel_gl_client_wait_sync;
+   functions->ServerWaitSync = intel_gl_server_wait_sync;
+}
+
+static void *
+intel_dri_create_fence(__DRIcontext *ctx)
+{
+   struct intel_context *intel = ctx->driverPrivate;
+   struct intel_fence *fence;
+
+   fence = calloc(1, sizeof(*fence));
+   if (!fence)
+      return NULL;
+
+   mtx_init(&fence->mutex, mtx_plain);
+   fence->intel = intel;
+   intel_fence_insert(intel, fence);
+
+   return fence;
+}
+
+static void
+intel_dri_destroy_fence(__DRIscreen *screen, void *driver_fence)
+{
+   struct intel_fence *fence = driver_fence;
+
+   intel_fence_finish(fence);
+   free(fence);
+}
+
+static GLboolean
+intel_dri_client_wait_sync(__DRIcontext *ctx, void *driver_fence, unsigned flags,
+                           uint64_t timeout)
+{
+   struct intel_fence *fence = driver_fence;
+
+   return intel_fence_client_wait(fence->intel, fence, timeout);
+}
+
+static void
+intel_dri_server_wait_sync(__DRIcontext *ctx, void *driver_fence, unsigned flags)
+{
+   struct intel_fence *fence = driver_fence;
+
+   /* We might be called here with a NULL fence as a result of WaitSyncKHR
+    * on a EGL_KHR_reusable_sync fence. Nothing to do here in such case.
+    */
+   if (!fence)
+      return;
+
+   intel_fence_server_wait(fence->intel, fence);
+}
+
+const __DRI2fenceExtension intelFenceExtension = {
+   .base = { __DRI2_FENCE, 1 },
+
+   .create_fence = intel_dri_create_fence,
+   .destroy_fence = intel_dri_destroy_fence,
+   .client_wait_sync = intel_dri_client_wait_sync,
+   .server_wait_sync = intel_dri_server_wait_sync,
+   .get_fence_from_cl_event = NULL,
+};
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d28 3
+a30 1
+/** @@file intel_syncobj.c
+d32 1
+a32 3
+ * Support for ARB_sync
+ *
+ * ARB_sync is implemented by flushing the current batchbuffer and keeping a
+d48 115
+d164 1
+a164 1
+intel_new_sync_object(struct gl_context *ctx, GLuint id)
+d166 1
+a166 1
+   struct intel_sync_object *sync;
+d168 1
+a168 1
+   sync = calloc(1, sizeof(struct intel_sync_object));
+d176 1
+a176 1
+intel_delete_sync_object(struct gl_context *ctx, struct gl_sync_object *s)
+d178 1
+a178 4
    struct intel_sync_object *sync = (struct intel_sync_object *)s;
 
+   if (sync->bo)
+      drm_intel_bo_unreference(sync->bo);
+d180 1
+d185 1
+a185 1
+intel_fence_sync(struct gl_context *ctx, struct gl_sync_object *s,
+d189 1
+a189 1
+   struct intel_sync_object *sync = (struct intel_sync_object *)s;
+d191 2
+a192 2
+   assert(condition == GL_SYNC_GPU_COMMANDS_COMPLETE);
+   intel_batchbuffer_emit_mi_flush(intel);
+d194 6
+a199 2
+   sync->bo = intel->batch.bo;
+   drm_intel_bo_reference(sync->bo);
+d201 2
+a202 1
+   intel_flush(ctx);
+d205 2
+a206 1
+static void intel_client_wait_sync(struct gl_context *ctx, struct gl_sync_object *s,
+d209 5
+a213 1
+   struct intel_sync_object *sync = (struct intel_sync_object *)s;
+d215 6
+a220 1
    if (sync->bo && drm_intel_gem_bo_wait(sync->bo, timeout) == 0) {
-      s->StatusFlag = 1;
+a221 3
       drm_intel_bo_unreference(sync->bo);
       sync->bo = NULL;
    }
-}
-
+d224 30
+a253 7
 /* We have nothing to do for WaitSync.  Our GL command stream is sequential,
  * so given that the sync object has already flushed the batchbuffer,
  * any batchbuffers coming after this waitsync will naturally not occur until
@@ -162,29 +430,32 @@ static void intel_client_wait_sync(struct gl_context *ctx, struct gl_sync_object
  */
 static void intel_server_wait_sync(struct gl_context *ctx, struct gl_sync_object *s,
 				 GLbitfield flags, GLuint64 timeout)
-{
-}
-
+d255 4
+d261 3
+a263 1
 static void intel_check_sync(struct gl_context *ctx, struct gl_sync_object *s)
-{
+d265 1
+a265 1
    struct intel_sync_object *sync = (struct intel_sync_object *)s;
-
+d267 1
+a267 5
    if (sync->bo && !drm_intel_bo_busy(sync->bo)) {
       drm_intel_bo_unreference(sync->bo);
       sync->bo = NULL;
       s->StatusFlag = 1;
    }
-}
-
+d270 2
+a271 1
 void intel_init_syncobj_functions(struct dd_function_table *functions)
-{
+d273 9
+a281 6
    functions->NewSyncObject = intel_new_sync_object;
    functions->DeleteSyncObject = intel_delete_sync_object;
    functions->FenceSync = intel_fence_sync;
    functions->CheckSync = intel_check_sync;
    functions->ClientWaitSync = intel_client_wait_sync;
    functions->ServerWaitSync = intel_server_wait_sync;
-}
+d283 10
 @
 
 

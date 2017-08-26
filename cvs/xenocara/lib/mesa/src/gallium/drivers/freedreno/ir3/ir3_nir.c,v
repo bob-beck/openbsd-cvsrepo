@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.3
@@ -17,6 +16,12 @@ locks; strict;
 comment	@ * @;
 expand	@o@;
 
+
+1.2
+date	2017.08.26.16.59.24;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2016.05.29.10.21.00;	author jsg;	state Exp;
@@ -48,9 +53,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/* -*- mode: C; c-file-style: "k&r"; tab-width 4; indent-tabs-mode: t; -*- */
@@ -90,18 +96,33 @@ text
 
 #include "nir/tgsi_to_nir.h"
 
+static const nir_shader_compiler_options options = {
+		.lower_fpow = true,
+		.lower_fsat = true,
+		.lower_scmp = true,
+		.lower_flrp32 = true,
+		.lower_flrp64 = true,
+		.lower_ffract = true,
+		.lower_fmod32 = true,
+		.lower_fmod64 = true,
+		.lower_fdiv = true,
+		.fuse_ffma = true,
+		.native_integers = true,
+		.vertex_id_zero_based = true,
+		.lower_extract_byte = true,
+		.lower_extract_word = true,
+};
+
 struct nir_shader *
 ir3_tgsi_to_nir(const struct tgsi_token *tokens)
 {
-	static const nir_shader_compiler_options options = {
-			.lower_fpow = true,
-			.lower_fsat = true,
-			.lower_scmp = true,
-			.lower_flrp = true,
-			.lower_ffract = true,
-			.native_integers = true,
-	};
 	return tgsi_to_nir(tokens, &options);
+}
+
+const nir_shader_compiler_options *
+ir3_get_compiler_options(void)
+{
+	return &options;
 }
 
 /* for given shader key, are any steps handled in nir? */
@@ -110,7 +131,8 @@ ir3_key_lowers_nir(const struct ir3_shader_key *key)
 {
 	return key->fsaturate_s | key->fsaturate_t | key->fsaturate_r |
 			key->vsaturate_s | key->vsaturate_t | key->vsaturate_r |
-			key->ucp_enables | key->color_two_side;
+			key->ucp_enables | key->color_two_side |
+			key->fclamp_color | key->vclamp_color;
 }
 
 #define OPT(nir, pass, ...) ({                             \
@@ -121,6 +143,27 @@ ir3_key_lowers_nir(const struct ir3_shader_key *key)
 
 #define OPT_V(nir, pass, ...) NIR_PASS_V(nir, pass, ##__VA_ARGS__)
 
+static void
+ir3_optimize_loop(nir_shader *s)
+{
+	bool progress;
+	do {
+		progress = false;
+
+		OPT_V(s, nir_lower_vars_to_ssa);
+		progress |= OPT(s, nir_lower_alu_to_scalar);
+		progress |= OPT(s, nir_lower_phis_to_scalar);
+
+		progress |= OPT(s, nir_copy_prop);
+		progress |= OPT(s, nir_opt_dce);
+		progress |= OPT(s, nir_opt_cse);
+		progress |= OPT(s, ir3_nir_lower_if_else);
+		progress |= OPT(s, nir_opt_algebraic);
+		progress |= OPT(s, nir_opt_constant_folding);
+
+	} while (progress);
+}
+
 struct nir_shader *
 ir3_optimize_nir(struct ir3_shader *shader, nir_shader *s,
 		const struct ir3_shader_key *key)
@@ -128,7 +171,6 @@ ir3_optimize_nir(struct ir3_shader *shader, nir_shader *s,
 	struct nir_lower_tex_options tex_options = {
 			.lower_rect = 0,
 	};
-	bool progress;
 
 	if (key) {
 		switch (shader->type) {
@@ -166,35 +208,35 @@ ir3_optimize_nir(struct ir3_shader *shader, nir_shader *s,
 	if (key) {
 		if (s->stage == MESA_SHADER_VERTEX) {
 			OPT_V(s, nir_lower_clip_vs, key->ucp_enables);
+			if (key->vclamp_color)
+				OPT_V(s, nir_lower_clamp_color_outputs);
 		} else if (s->stage == MESA_SHADER_FRAGMENT) {
 			OPT_V(s, nir_lower_clip_fs, key->ucp_enables);
+			if (key->fclamp_color)
+				OPT_V(s, nir_lower_clamp_color_outputs);
 		}
 		if (key->color_two_side) {
 			OPT_V(s, nir_lower_two_sided_color);
 		}
+	} else {
+		/* only want to do this the first time (when key is null)
+		 * and not again on any potential 2nd variant lowering pass:
+		 */
+		OPT_V(s, ir3_nir_apply_trig_workarounds);
 	}
 
 	OPT_V(s, nir_lower_tex, &tex_options);
-	OPT_V(s, nir_lower_idiv);
 	OPT_V(s, nir_lower_load_const_to_scalar);
 
-	do {
-		progress = false;
+	ir3_optimize_loop(s);
 
-		OPT_V(s, nir_lower_vars_to_ssa);
-		OPT_V(s, nir_lower_alu_to_scalar);
-		OPT_V(s, nir_lower_phis_to_scalar);
+	/* do idiv lowering after first opt loop to give a chance for
+	 * divide by immed power-of-two to be caught first:
+	 */
+	if (OPT(s, nir_lower_idiv))
+		ir3_optimize_loop(s);
 
-		progress |= OPT(s, nir_copy_prop);
-		progress |= OPT(s, nir_opt_dce);
-		progress |= OPT(s, nir_opt_cse);
-		progress |= OPT(s, ir3_nir_lower_if_else);
-		progress |= OPT(s, nir_opt_algebraic);
-		progress |= OPT(s, nir_opt_constant_folding);
-
-	} while (progress);
-
-	OPT_V(s, nir_remove_dead_variables);
+	OPT_V(s, nir_remove_dead_variables, nir_var_local);
 
 	if (fd_mesa_debug & FD_DBG_DISASM) {
 		debug_printf("----------------------\n");
@@ -206,6 +248,57 @@ ir3_optimize_nir(struct ir3_shader *shader, nir_shader *s,
 
 	return s;
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d38 17
+a57 8
+	static const nir_shader_compiler_options options = {
+			.lower_fpow = true,
+			.lower_fsat = true,
+			.lower_scmp = true,
+			.lower_flrp = true,
+			.lower_ffract = true,
+			.native_integers = true,
+	};
+d61 6
+d73 2
+a74 1
+			key->ucp_enables | key->color_two_side;
+d85 21
+a112 1
+	bool progress;
+d150 2
+d154 2
+d160 5
+a167 1
+	OPT_V(s, nir_lower_idiv);
+d170 1
+a170 6
+	do {
+		progress = false;
+
+		OPT_V(s, nir_lower_vars_to_ssa);
+		OPT_V(s, nir_lower_alu_to_scalar);
+		OPT_V(s, nir_lower_phis_to_scalar);
+d172 5
+a176 8
+		progress |= OPT(s, nir_copy_prop);
+		progress |= OPT(s, nir_opt_dce);
+		progress |= OPT(s, nir_opt_cse);
+		progress |= OPT(s, ir3_nir_lower_if_else);
+		progress |= OPT(s, nir_opt_algebraic);
+		progress |= OPT(s, nir_opt_constant_folding);
+
+	} while (progress);
+d178 1
+a178 1
+	OPT_V(s, nir_remove_dead_variables);
 @
 
 

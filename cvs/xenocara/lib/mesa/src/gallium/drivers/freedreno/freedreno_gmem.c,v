@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.5
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.24;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.45.13;	author jsg;	state Exp;
@@ -64,9 +69,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/* -*- mode: C; c-file-style: "k&r"; tab-width 4; indent-tabs-mode: t; -*- */
@@ -105,6 +111,7 @@ text
 
 #include "freedreno_gmem.h"
 #include "freedreno_context.h"
+#include "freedreno_fence.h"
 #include "freedreno_resource.h"
 #include "freedreno_query_hw.h"
 #include "freedreno_util.h"
@@ -138,11 +145,11 @@ text
  * resolve.
  */
 
-static uint32_t bin_width(struct fd_context *ctx)
+static uint32_t bin_width(struct fd_screen *screen)
 {
-	if (is_a4xx(ctx->screen))
+	if (is_a4xx(screen))
 		return 1024;
-	if (is_a3xx(ctx->screen))
+	if (is_a3xx(screen))
 		return 992;
 	return 512;
 }
@@ -174,20 +181,21 @@ total_size(uint8_t cbuf_cpp[], uint8_t zsbuf_cpp[2],
 }
 
 static void
-calculate_tiles(struct fd_context *ctx)
+calculate_tiles(struct fd_batch *batch)
 {
+	struct fd_context *ctx = batch->ctx;
 	struct fd_gmem_stateobj *gmem = &ctx->gmem;
-	struct pipe_scissor_state *scissor = &ctx->max_scissor;
-	struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
+	struct pipe_scissor_state *scissor = &batch->max_scissor;
+	struct pipe_framebuffer_state *pfb = &batch->framebuffer;
 	uint32_t gmem_size = ctx->screen->gmemsize_bytes;
 	uint32_t minx, miny, width, height;
 	uint32_t nbins_x = 1, nbins_y = 1;
 	uint32_t bin_w, bin_h;
-	uint32_t max_width = bin_width(ctx);
+	uint32_t max_width = bin_width(ctx->screen);
 	uint8_t cbuf_cpp[MAX_RENDER_TARGETS] = {0}, zsbuf_cpp[2] = {0};
 	uint32_t i, j, t, xoff, yoff;
 	uint32_t tpp_x, tpp_y;
-	bool has_zs = !!(ctx->resolve & (FD_BUFFER_DEPTH | FD_BUFFER_STENCIL));
+	bool has_zs = !!(batch->resolve & (FD_BUFFER_DEPTH | FD_BUFFER_STENCIL));
 	int tile_n[ARRAY_SIZE(ctx->pipe)];
 
 	if (has_zs) {
@@ -373,14 +381,15 @@ calculate_tiles(struct fd_context *ctx)
 }
 
 static void
-render_tiles(struct fd_context *ctx)
+render_tiles(struct fd_batch *batch)
 {
+	struct fd_context *ctx = batch->ctx;
 	struct fd_gmem_stateobj *gmem = &ctx->gmem;
 	int i;
 
-	ctx->emit_tile_init(ctx);
+	ctx->emit_tile_init(batch);
 
-	if (ctx->restore)
+	if (batch->restore)
 		ctx->stats.batch_restore++;
 
 	for (i = 0; i < (gmem->nbins_x * gmem->nbins_y); i++) {
@@ -389,101 +398,83 @@ render_tiles(struct fd_context *ctx)
 		DBG("bin_h=%d, yoff=%d, bin_w=%d, xoff=%d",
 			tile->bin_h, tile->yoff, tile->bin_w, tile->xoff);
 
-		ctx->emit_tile_prep(ctx, tile);
+		ctx->emit_tile_prep(batch, tile);
 
-		if (ctx->restore) {
-			fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_MEM2GMEM);
-			ctx->emit_tile_mem2gmem(ctx, tile);
-			fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_NULL);
+		if (batch->restore) {
+			ctx->emit_tile_mem2gmem(batch, tile);
 		}
 
-		ctx->emit_tile_renderprep(ctx, tile);
+		ctx->emit_tile_renderprep(batch, tile);
 
-		fd_hw_query_prepare_tile(ctx, i, ctx->ring);
+		fd_hw_query_prepare_tile(batch, i, batch->gmem);
 
 		/* emit IB to drawcmds: */
-		OUT_IB(ctx->ring, ctx->draw_start, ctx->draw_end);
-		fd_reset_wfi(ctx);
+		ctx->emit_ib(batch->gmem, batch->draw);
+		fd_reset_wfi(batch);
 
 		/* emit gmem2mem to transfer tile back to system memory: */
-		fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_GMEM2MEM);
-		ctx->emit_tile_gmem2mem(ctx, tile);
-		fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_NULL);
+		ctx->emit_tile_gmem2mem(batch, tile);
 	}
 }
 
 static void
-render_sysmem(struct fd_context *ctx)
+render_sysmem(struct fd_batch *batch)
 {
-	ctx->emit_sysmem_prep(ctx);
+	struct fd_context *ctx = batch->ctx;
 
-	fd_hw_query_prepare_tile(ctx, 0, ctx->ring);
+	ctx->emit_sysmem_prep(batch);
+
+	fd_hw_query_prepare_tile(batch, 0, batch->gmem);
 
 	/* emit IB to drawcmds: */
-	OUT_IB(ctx->ring, ctx->draw_start, ctx->draw_end);
-	fd_reset_wfi(ctx);
+	ctx->emit_ib(batch->gmem, batch->draw);
+	fd_reset_wfi(batch);
 }
 
 void
-fd_gmem_render_tiles(struct fd_context *ctx)
+fd_gmem_render_tiles(struct fd_batch *batch)
 {
-	struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
+	struct fd_context *ctx = batch->ctx;
+	struct pipe_framebuffer_state *pfb = &batch->framebuffer;
 	bool sysmem = false;
 
 	if (ctx->emit_sysmem_prep) {
-		if (ctx->cleared || ctx->gmem_reason || (ctx->num_draws > 5)) {
+		if (batch->cleared || batch->gmem_reason || (batch->num_draws > 5)) {
 			DBG("GMEM: cleared=%x, gmem_reason=%x, num_draws=%u",
-				ctx->cleared, ctx->gmem_reason, ctx->num_draws);
+				batch->cleared, batch->gmem_reason, batch->num_draws);
 		} else if (!(fd_mesa_debug & FD_DBG_NOBYPASS)) {
 			sysmem = true;
 		}
 	}
 
-	/* close out the draw cmds by making sure any active queries are
-	 * paused:
-	 */
-	fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_NULL);
-
-	/* mark the end of the clear/draw cmds before emitting per-tile cmds: */
-	fd_ringmarker_mark(ctx->draw_end);
-	fd_ringmarker_mark(ctx->binning_end);
-
-	fd_reset_wfi(ctx);
+	fd_reset_wfi(batch);
 
 	ctx->stats.batch_total++;
 
 	if (sysmem) {
-		DBG("rendering sysmem (%s/%s)",
+		DBG("%p: rendering sysmem %ux%u (%s/%s)",
+			batch, pfb->width, pfb->height,
 			util_format_short_name(pipe_surface_format(pfb->cbufs[0])),
 			util_format_short_name(pipe_surface_format(pfb->zsbuf)));
-		fd_hw_query_prepare(ctx, 1);
-		render_sysmem(ctx);
+		fd_hw_query_prepare(batch, 1);
+		render_sysmem(batch);
 		ctx->stats.batch_sysmem++;
 	} else {
 		struct fd_gmem_stateobj *gmem = &ctx->gmem;
-		calculate_tiles(ctx);
-		DBG("rendering %dx%d tiles (%s/%s)", gmem->nbins_x, gmem->nbins_y,
+		calculate_tiles(batch);
+		DBG("%p: rendering %dx%d tiles %ux%u (%s/%s)",
+			batch, pfb->width, pfb->height, gmem->nbins_x, gmem->nbins_y,
 			util_format_short_name(pipe_surface_format(pfb->cbufs[0])),
 			util_format_short_name(pipe_surface_format(pfb->zsbuf)));
-		fd_hw_query_prepare(ctx, gmem->nbins_x * gmem->nbins_y);
-		render_tiles(ctx);
+		fd_hw_query_prepare(batch, gmem->nbins_x * gmem->nbins_y);
+		render_tiles(batch);
 		ctx->stats.batch_gmem++;
 	}
 
-	/* GPU executes starting from tile cmds, which IB back to draw cmds: */
-	fd_ringmarker_flush(ctx->draw_end);
+	fd_ringbuffer_flush(batch->gmem);
 
-	/* mark start for next draw/binning cmds: */
-	fd_ringmarker_mark(ctx->draw_start);
-	fd_ringmarker_mark(ctx->binning_start);
-
-	fd_reset_wfi(ctx);
-
-	/* reset maximal bounds: */
-	ctx->max_scissor.minx = ctx->max_scissor.miny = ~0;
-	ctx->max_scissor.maxx = ctx->max_scissor.maxy = 0;
-
-	ctx->dirty = ~0;
+	fd_fence_ref(&ctx->screen->base, &ctx->last_fence, NULL);
+	ctx->last_fence = fd_fence_create(ctx, fd_ringbuffer_timestamp(batch->gmem));
 }
 
 /* tile needs restore if it isn't completely contained within the
@@ -506,30 +497,183 @@ skip_restore(struct pipe_scissor_state *scissor, struct fd_tile *tile)
  * case would be a single clear.
  */
 bool
-fd_gmem_needs_restore(struct fd_context *ctx, struct fd_tile *tile,
+fd_gmem_needs_restore(struct fd_batch *batch, struct fd_tile *tile,
 		uint32_t buffers)
 {
-	if (!(ctx->restore & buffers))
+	if (!(batch->restore & buffers))
 		return false;
 
 	/* if buffers partially cleared, then slow-path to figure out
 	 * if this particular tile needs restoring:
 	 */
 	if ((buffers & FD_BUFFER_COLOR) &&
-			(ctx->partial_cleared & FD_BUFFER_COLOR) &&
-			skip_restore(&ctx->cleared_scissor.color, tile))
+			(batch->partial_cleared & FD_BUFFER_COLOR) &&
+			skip_restore(&batch->cleared_scissor.color, tile))
 		return false;
 	if ((buffers & FD_BUFFER_DEPTH) &&
-			(ctx->partial_cleared & FD_BUFFER_DEPTH) &&
-			skip_restore(&ctx->cleared_scissor.depth, tile))
+			(batch->partial_cleared & FD_BUFFER_DEPTH) &&
+			skip_restore(&batch->cleared_scissor.depth, tile))
 		return false;
 	if ((buffers & FD_BUFFER_STENCIL) &&
-			(ctx->partial_cleared & FD_BUFFER_STENCIL) &&
-			skip_restore(&ctx->cleared_scissor.stencil, tile))
+			(batch->partial_cleared & FD_BUFFER_STENCIL) &&
+			skip_restore(&batch->cleared_scissor.stencil, tile))
 		return false;
 
 	return true;
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d37 1
+d71 1
+a71 1
+static uint32_t bin_width(struct fd_context *ctx)
+d73 1
+a73 1
+	if (is_a4xx(ctx->screen))
+d75 1
+a75 1
+	if (is_a3xx(ctx->screen))
+d107 1
+a107 1
+calculate_tiles(struct fd_context *ctx)
+d109 1
+d111 2
+a112 2
+	struct pipe_scissor_state *scissor = &ctx->max_scissor;
+	struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
+d117 1
+a117 1
+	uint32_t max_width = bin_width(ctx);
+d121 1
+a121 1
+	bool has_zs = !!(ctx->resolve & (FD_BUFFER_DEPTH | FD_BUFFER_STENCIL));
+d307 1
+a307 1
+render_tiles(struct fd_context *ctx)
+d309 1
+d313 1
+a313 1
+	ctx->emit_tile_init(ctx);
+d315 1
+a315 1
+	if (ctx->restore)
+d324 1
+a324 1
+		ctx->emit_tile_prep(ctx, tile);
+d326 2
+a327 4
+		if (ctx->restore) {
+			fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_MEM2GMEM);
+			ctx->emit_tile_mem2gmem(ctx, tile);
+			fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_NULL);
+d330 1
+a330 1
+		ctx->emit_tile_renderprep(ctx, tile);
+d332 1
+a332 1
+		fd_hw_query_prepare_tile(ctx, i, ctx->ring);
+d335 2
+a336 2
+		OUT_IB(ctx->ring, ctx->draw_start, ctx->draw_end);
+		fd_reset_wfi(ctx);
+d339 1
+a339 3
+		fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_GMEM2MEM);
+		ctx->emit_tile_gmem2mem(ctx, tile);
+		fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_NULL);
+d344 1
+a344 1
+render_sysmem(struct fd_context *ctx)
+d346 1
+a346 1
+	ctx->emit_sysmem_prep(ctx);
+d348 3
+a350 1
+	fd_hw_query_prepare_tile(ctx, 0, ctx->ring);
+d353 2
+a354 2
+	OUT_IB(ctx->ring, ctx->draw_start, ctx->draw_end);
+	fd_reset_wfi(ctx);
+d358 1
+a358 1
+fd_gmem_render_tiles(struct fd_context *ctx)
+d360 2
+a361 1
+	struct pipe_framebuffer_state *pfb = &ctx->framebuffer;
+d365 1
+a365 1
+		if (ctx->cleared || ctx->gmem_reason || (ctx->num_draws > 5)) {
+d367 1
+a367 1
+				ctx->cleared, ctx->gmem_reason, ctx->num_draws);
+d373 1
+a373 10
+	/* close out the draw cmds by making sure any active queries are
+	 * paused:
+	 */
+	fd_hw_query_set_stage(ctx, ctx->ring, FD_STAGE_NULL);
+
+	/* mark the end of the clear/draw cmds before emitting per-tile cmds: */
+	fd_ringmarker_mark(ctx->draw_end);
+	fd_ringmarker_mark(ctx->binning_end);
+
+	fd_reset_wfi(ctx);
+d378 2
+a379 1
+		DBG("rendering sysmem (%s/%s)",
+d382 2
+a383 2
+		fd_hw_query_prepare(ctx, 1);
+		render_sysmem(ctx);
+d387 3
+a389 2
+		calculate_tiles(ctx);
+		DBG("rendering %dx%d tiles (%s/%s)", gmem->nbins_x, gmem->nbins_y,
+d392 2
+a393 2
+		fd_hw_query_prepare(ctx, gmem->nbins_x * gmem->nbins_y);
+		render_tiles(ctx);
+d397 1
+a397 12
+	/* GPU executes starting from tile cmds, which IB back to draw cmds: */
+	fd_ringmarker_flush(ctx->draw_end);
+
+	/* mark start for next draw/binning cmds: */
+	fd_ringmarker_mark(ctx->draw_start);
+	fd_ringmarker_mark(ctx->binning_start);
+
+	fd_reset_wfi(ctx);
+
+	/* reset maximal bounds: */
+	ctx->max_scissor.minx = ctx->max_scissor.miny = ~0;
+	ctx->max_scissor.maxx = ctx->max_scissor.maxy = 0;
+d399 2
+a400 1
+	ctx->dirty = ~0;
+d423 1
+a423 1
+fd_gmem_needs_restore(struct fd_context *ctx, struct fd_tile *tile,
+d426 1
+a426 1
+	if (!(ctx->restore & buffers))
+d433 2
+a434 2
+			(ctx->partial_cleared & FD_BUFFER_COLOR) &&
+			skip_restore(&ctx->cleared_scissor.color, tile))
+d437 2
+a438 2
+			(ctx->partial_cleared & FD_BUFFER_DEPTH) &&
+			skip_restore(&ctx->cleared_scissor.depth, tile))
+d441 2
+a442 2
+			(ctx->partial_cleared & FD_BUFFER_STENCIL) &&
+			skip_restore(&ctx->cleared_scissor.stencil, tile))
 @
 
 

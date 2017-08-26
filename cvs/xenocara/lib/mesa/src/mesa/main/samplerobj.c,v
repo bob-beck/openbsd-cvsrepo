@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.39;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.39.30;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -115,6 +121,15 @@ _mesa_lookup_samplerobj(struct gl_context *ctx, GLuint name)
          _mesa_HashLookup(ctx->Shared->SamplerObjects, name);
 }
 
+static struct gl_sampler_object *
+_mesa_lookup_samplerobj_locked(struct gl_context *ctx, GLuint name)
+{
+   if (name == 0)
+      return NULL;
+   else
+      return (struct gl_sampler_object *)
+         _mesa_HashLookupLocked(ctx->Shared->SamplerObjects, name);
+}
 
 static inline void
 begin_samplerobj_lookups(struct gl_context *ctx)
@@ -137,6 +152,14 @@ lookup_samplerobj_locked(struct gl_context *ctx, GLuint name)
          _mesa_HashLookupLocked(ctx->Shared->SamplerObjects, name);
 }
 
+static void
+delete_sampler_object(struct gl_context *ctx,
+                      struct gl_sampler_object *sampObj)
+{
+   mtx_destroy(&sampObj->Mutex);
+   free(sampObj->Label);
+   free(sampObj);
+}
 
 /**
  * Handle reference counting.
@@ -153,20 +176,14 @@ _mesa_reference_sampler_object_(struct gl_context *ctx,
       GLboolean deleteFlag = GL_FALSE;
       struct gl_sampler_object *oldSamp = *ptr;
 
-      /*mtx_lock(&oldSamp->Mutex);*/
+      mtx_lock(&oldSamp->Mutex);
       assert(oldSamp->RefCount > 0);
       oldSamp->RefCount--;
-#if 0
-      printf("SamplerObj %p %d DECR to %d\n",
-             (void *) oldSamp, oldSamp->Name, oldSamp->RefCount);
-#endif
       deleteFlag = (oldSamp->RefCount == 0);
-      /*mtx_unlock(&oldSamp->Mutex);*/
+      mtx_unlock(&oldSamp->Mutex);
 
-      if (deleteFlag) {
-	 assert(ctx->Driver.DeleteSamplerObject);
-         ctx->Driver.DeleteSamplerObject(ctx, oldSamp);
-      }
+      if (deleteFlag)
+         delete_sampler_object(ctx, oldSamp);
 
       *ptr = NULL;
    }
@@ -174,7 +191,7 @@ _mesa_reference_sampler_object_(struct gl_context *ctx,
 
    if (samp) {
       /* reference new sampler */
-      /*mtx_lock(&samp->Mutex);*/
+      mtx_lock(&samp->Mutex);
       if (samp->RefCount == 0) {
          /* this sampler's being deleted (look just above) */
          /* Not sure this can every really happen.  Warn if it does. */
@@ -183,13 +200,9 @@ _mesa_reference_sampler_object_(struct gl_context *ctx,
       }
       else {
          samp->RefCount++;
-#if 0
-         printf("SamplerObj %p %d INCR to %d\n",
-                (void *) samp, samp->Name, samp->RefCount);
-#endif
          *ptr = samp;
       }
-      /*mtx_unlock(&samp->Mutex);*/
+      mtx_unlock(&samp->Mutex);
    }
 }
 
@@ -200,6 +213,7 @@ _mesa_reference_sampler_object_(struct gl_context *ctx,
 static void
 _mesa_init_sampler_object(struct gl_sampler_object *sampObj, GLuint name)
 {
+   mtx_init(&sampObj->Mutex, mtx_plain);
    sampObj->Name = name;
    sampObj->RefCount = 1;
    sampObj->WrapS = GL_REPEAT;
@@ -234,18 +248,6 @@ _mesa_new_sampler_object(struct gl_context *ctx, GLuint name)
    return sampObj;
 }
 
-
-/**
- * Fallback for ctx->Driver.DeleteSamplerObject();
- */
-static void
-_mesa_delete_sampler_object(struct gl_context *ctx,
-                            struct gl_sampler_object *sampObj)
-{
-   free(sampObj->Label);
-   free(sampObj);
-}
-
 static void
 create_samplers(struct gl_context *ctx, GLsizei count, GLuint *samplers,
                 const char *caller)
@@ -264,15 +266,19 @@ create_samplers(struct gl_context *ctx, GLsizei count, GLuint *samplers,
    if (!samplers)
       return;
 
+   _mesa_HashLockMutex(ctx->Shared->SamplerObjects);
+
    first = _mesa_HashFindFreeKeyBlock(ctx->Shared->SamplerObjects, count);
 
    /* Insert the ID and pointer to new sampler object into hash table */
    for (i = 0; i < count; i++) {
       struct gl_sampler_object *sampObj =
          ctx->Driver.NewSamplerObject(ctx, first + i);
-      _mesa_HashInsert(ctx->Shared->SamplerObjects, first + i, sampObj);
+      _mesa_HashInsertLocked(ctx->Shared->SamplerObjects, first + i, sampObj);
       samplers[i] = first + i;
    }
+
+   _mesa_HashUnlockMutex(ctx->Shared->SamplerObjects);
 }
 
 void GLAPIENTRY
@@ -303,13 +309,13 @@ _mesa_DeleteSamplers(GLsizei count, const GLuint *samplers)
       return;
    }
 
-   mtx_lock(&ctx->Shared->Mutex);
+   _mesa_HashLockMutex(ctx->Shared->SamplerObjects);
 
    for (i = 0; i < count; i++) {
       if (samplers[i]) {
          GLuint j;
          struct gl_sampler_object *sampObj =
-            _mesa_lookup_samplerobj(ctx, samplers[i]);
+            _mesa_lookup_samplerobj_locked(ctx, samplers[i]);
    
          if (sampObj) {
             /* If the sampler is currently bound, unbind it. */
@@ -321,14 +327,14 @@ _mesa_DeleteSamplers(GLsizei count, const GLuint *samplers)
             }
 
             /* The ID is immediately freed for re-use */
-            _mesa_HashRemove(ctx->Shared->SamplerObjects, samplers[i]);
+            _mesa_HashRemoveLocked(ctx->Shared->SamplerObjects, samplers[i]);
             /* But the object exists until its reference count goes to zero */
             _mesa_reference_sampler_object(ctx, &sampObj, NULL);
          }
       }
    }
 
-   mtx_unlock(&ctx->Shared->Mutex);
+   _mesa_HashUnlockMutex(ctx->Shared->SamplerObjects);
 }
 
 
@@ -348,6 +354,17 @@ _mesa_IsSampler(GLuint sampler)
    return sampObj != NULL;
 }
 
+void
+_mesa_bind_sampler(struct gl_context *ctx, GLuint unit,
+                   struct gl_sampler_object *sampObj)
+{
+   if (ctx->Texture.Unit[unit].Sampler != sampObj) {
+      FLUSH_VERTICES(ctx, _NEW_TEXTURE);
+   }
+
+   _mesa_reference_sampler_object(ctx, &ctx->Texture.Unit[unit].Sampler,
+                                  sampObj);
+}
 
 void GLAPIENTRY
 _mesa_BindSampler(GLuint unit, GLuint sampler)
@@ -375,13 +392,8 @@ _mesa_BindSampler(GLuint unit, GLuint sampler)
       }
    }
    
-   if (ctx->Texture.Unit[unit].Sampler != sampObj) {
-      FLUSH_VERTICES(ctx, _NEW_TEXTURE);
-   }
-
    /* bind new sampler */
-   _mesa_reference_sampler_object(ctx, &ctx->Texture.Unit[unit].Sampler,
-                                  sampObj);
+   _mesa_bind_sampler(ctx, unit, sampObj);
 }
 
 
@@ -522,6 +534,22 @@ flush(struct gl_context *ctx)
    FLUSH_VERTICES(ctx, _NEW_TEXTURE);
 }
 
+void
+_mesa_set_sampler_wrap(struct gl_context *ctx, struct gl_sampler_object *samp,
+                       GLenum s, GLenum t, GLenum r)
+{
+   assert(validate_texture_wrap_mode(ctx, s));
+   assert(validate_texture_wrap_mode(ctx, t));
+   assert(validate_texture_wrap_mode(ctx, r));
+
+   if (samp->WrapS == s && samp->WrapT == t && samp->WrapR == r)
+      return;
+
+   flush(ctx);
+   samp->WrapS = s;
+   samp->WrapT = t;
+   samp->WrapR = r;
+}
 
 #define INVALID_PARAM 0x100
 #define INVALID_PNAME 0x101
@@ -571,6 +599,27 @@ set_sampler_wrap_r(struct gl_context *ctx, struct gl_sampler_object *samp,
    return INVALID_PARAM;
 }
 
+void
+_mesa_set_sampler_filters(struct gl_context *ctx,
+                          struct gl_sampler_object *samp,
+                          GLenum min_filter, GLenum mag_filter)
+{
+   assert(min_filter == GL_NEAREST ||
+          min_filter == GL_LINEAR ||
+          min_filter == GL_NEAREST_MIPMAP_NEAREST ||
+          min_filter == GL_LINEAR_MIPMAP_NEAREST ||
+          min_filter == GL_NEAREST_MIPMAP_LINEAR ||
+          min_filter == GL_LINEAR_MIPMAP_LINEAR);
+   assert(mag_filter == GL_NEAREST ||
+          mag_filter == GL_LINEAR);
+
+   if (samp->MinFilter == min_filter && samp->MagFilter == mag_filter)
+      return;
+
+   flush(ctx);
+   samp->MinFilter = min_filter;
+   samp->MagFilter = mag_filter;
+}
 
 static GLuint
 set_sampler_min_filter(struct gl_context *ctx, struct gl_sampler_object *samp,
@@ -699,8 +748,12 @@ static GLuint
 set_sampler_compare_mode(struct gl_context *ctx,
                          struct gl_sampler_object *samp, GLint param)
 {
+    /* If GL_ARB_shadow is not supported, don't report an error.  The
+     * sampler object extension spec isn't clear on this extension interaction.
+     * Silences errors with Wine on older GPUs such as R200.
+     */
    if (!ctx->Extensions.ARB_shadow)
-      return INVALID_PNAME;
+      return GL_FALSE;
 
    if (samp->CompareMode == param)
       return GL_FALSE;
@@ -720,8 +773,12 @@ static GLuint
 set_sampler_compare_func(struct gl_context *ctx,
                          struct gl_sampler_object *samp, GLint param)
 {
+    /* If GL_ARB_shadow is not supported, don't report an error.  The
+     * sampler object extension spec isn't clear on this extension interaction.
+     * Silences errors with Wine on older GPUs such as R200.
+     */
    if (!ctx->Extensions.ARB_shadow)
-      return INVALID_PNAME;
+      return GL_FALSE;
 
    if (samp->CompareFunc == param)
       return GL_FALSE;
@@ -783,6 +840,16 @@ set_sampler_cube_map_seamless(struct gl_context *ctx,
    return GL_TRUE;
 }
 
+void
+_mesa_set_sampler_srgb_decode(struct gl_context *ctx,
+                              struct gl_sampler_object *samp, GLenum param)
+{
+   assert(param == GL_DECODE_EXT || param == GL_SKIP_DECODE_EXT);
+
+   flush(ctx);
+   samp->sRGBDecode = param;
+}
+
 static GLuint
 set_sampler_srgb_decode(struct gl_context *ctx,
                               struct gl_sampler_object *samp, GLenum param)
@@ -815,10 +882,8 @@ _mesa_SamplerParameteri(GLuint sampler, GLenum pname, GLint param)
        *     "An INVALID_OPERATION error is generated if sampler is not the name
        *     of a sampler object previously returned from a call to GenSamplers."
        *
-       * In desktop GL, an GL_INVALID_VALUE is returned instead.
        */
-      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
-                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glSamplerParameteri(sampler %u)", sampler);
       return;
    }
@@ -908,10 +973,8 @@ _mesa_SamplerParameterf(GLuint sampler, GLenum pname, GLfloat param)
        *     "An INVALID_OPERATION error is generated if sampler is not the name
        *     of a sampler object previously returned from a call to GenSamplers."
        *
-       * In desktop GL, an GL_INVALID_VALUE is returned instead.
        */
-      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
-                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glSamplerParameterf(sampler %u)", sampler);
       return;
    }
@@ -999,11 +1062,8 @@ _mesa_SamplerParameteriv(GLuint sampler, GLenum pname, const GLint *params)
        *
        *     "An INVALID_OPERATION error is generated if sampler is not the name
        *     of a sampler object previously returned from a call to GenSamplers."
-       *
-       * In desktop GL, an GL_INVALID_VALUE is returned instead.
        */
-      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
-                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glSamplerParameteriv(sampler %u)", sampler);
       return;
    }
@@ -1100,10 +1160,8 @@ _mesa_SamplerParameterfv(GLuint sampler, GLenum pname, const GLfloat *params)
        *     "An INVALID_OPERATION error is generated if sampler is not the name
        *     of a sampler object previously returned from a call to GenSamplers."
        *
-       * In desktop GL, an GL_INVALID_VALUE is returned instead.
        */
-      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
-                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glSamplerParameterfv(sampler %u)", sampler);
       return;
    }
@@ -1188,8 +1246,8 @@ _mesa_SamplerParameterIiv(GLuint sampler, GLenum pname, const GLint *params)
 
    sampObj = _mesa_lookup_samplerobj(ctx, sampler);
    if (!sampObj) {
-      _mesa_error(ctx, GL_INVALID_VALUE, "glSamplerParameterIiv(sampler %u)",
-                  sampler);
+      _mesa_error(ctx, GL_INVALID_OPERATION,
+                  "glSamplerParameterIiv(sampler %u)", sampler);
       return;
    }
 
@@ -1274,8 +1332,8 @@ _mesa_SamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint *params)
 
    sampObj = _mesa_lookup_samplerobj(ctx, sampler);
    if (!sampObj) {
-      _mesa_error(ctx, GL_INVALID_VALUE, "glSamplerParameterIuiv(sampler %u)",
-                  sampler);
+      _mesa_error(ctx, GL_INVALID_OPERATION,
+                  "glSamplerParameterIuiv(sampler %u)", sampler);
       return;
    }
 
@@ -1364,10 +1422,8 @@ _mesa_GetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params)
        *     "An INVALID_OPERATION error is generated if sampler is not the name
        *     of a sampler object previously returned from a call to GenSamplers."
        *
-       * In desktop GL, an GL_INVALID_VALUE is returned instead.
        */
-      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
-                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glGetSamplerParameteriv(sampler %u)", sampler);
       return;
    }
@@ -1407,13 +1463,9 @@ _mesa_GetSamplerParameteriv(GLuint sampler, GLenum pname, GLint *params)
       *params = IROUND(sampObj->LodBias);
       break;
    case GL_TEXTURE_COMPARE_MODE:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = sampObj->CompareMode;
       break;
    case GL_TEXTURE_COMPARE_FUNC:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = sampObj->CompareFunc;
       break;
    case GL_TEXTURE_MAX_ANISOTROPY_EXT:
@@ -1462,10 +1514,8 @@ _mesa_GetSamplerParameterfv(GLuint sampler, GLenum pname, GLfloat *params)
        *     "An INVALID_OPERATION error is generated if sampler is not the name
        *     of a sampler object previously returned from a call to GenSamplers."
        *
-       * In desktop GL, an GL_INVALID_VALUE is returned instead.
        */
-      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
-                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glGetSamplerParameterfv(sampler %u)", sampler);
       return;
    }
@@ -1496,13 +1546,9 @@ _mesa_GetSamplerParameterfv(GLuint sampler, GLenum pname, GLfloat *params)
       *params = sampObj->LodBias;
       break;
    case GL_TEXTURE_COMPARE_MODE:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = (GLfloat) sampObj->CompareMode;
       break;
    case GL_TEXTURE_COMPARE_FUNC:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = (GLfloat) sampObj->CompareFunc;
       break;
    case GL_TEXTURE_MAX_ANISOTROPY_EXT:
@@ -1543,7 +1589,7 @@ _mesa_GetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params)
 
    sampObj = _mesa_lookup_samplerobj(ctx, sampler);
    if (!sampObj) {
-      _mesa_error(ctx, GL_INVALID_VALUE,
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glGetSamplerParameterIiv(sampler %u)",
                   sampler);
       return;
@@ -1575,13 +1621,9 @@ _mesa_GetSamplerParameterIiv(GLuint sampler, GLenum pname, GLint *params)
       *params = (GLint) sampObj->LodBias;
       break;
    case GL_TEXTURE_COMPARE_MODE:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = sampObj->CompareMode;
       break;
    case GL_TEXTURE_COMPARE_FUNC:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = sampObj->CompareFunc;
       break;
    case GL_TEXTURE_MAX_ANISOTROPY_EXT:
@@ -1622,7 +1664,7 @@ _mesa_GetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params)
 
    sampObj = _mesa_lookup_samplerobj(ctx, sampler);
    if (!sampObj) {
-      _mesa_error(ctx, GL_INVALID_VALUE,
+      _mesa_error(ctx, GL_INVALID_OPERATION,
                   "glGetSamplerParameterIuiv(sampler %u)",
                   sampler);
       return;
@@ -1654,13 +1696,9 @@ _mesa_GetSamplerParameterIuiv(GLuint sampler, GLenum pname, GLuint *params)
       *params = (GLuint) sampObj->LodBias;
       break;
    case GL_TEXTURE_COMPARE_MODE:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = sampObj->CompareMode;
       break;
    case GL_TEXTURE_COMPARE_FUNC:
-      if (!ctx->Extensions.ARB_shadow)
-         goto invalid_pname;
       *params = sampObj->CompareFunc;
       break;
    case GL_TEXTURE_MAX_ANISOTROPY_EXT:
@@ -1697,8 +1735,174 @@ void
 _mesa_init_sampler_object_functions(struct dd_function_table *driver)
 {
    driver->NewSamplerObject = _mesa_new_sampler_object;
-   driver->DeleteSamplerObject = _mesa_delete_sampler_object;
 }
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d53 9
+d84 8
+d108 1
+a108 1
+      /*mtx_lock(&oldSamp->Mutex);*/
+a110 4
+#if 0
+      printf("SamplerObj %p %d DECR to %d\n",
+             (void *) oldSamp, oldSamp->Name, oldSamp->RefCount);
+#endif
+d112 1
+a112 1
+      /*mtx_unlock(&oldSamp->Mutex);*/
+d114 2
+a115 4
+      if (deleteFlag) {
+	 assert(ctx->Driver.DeleteSamplerObject);
+         ctx->Driver.DeleteSamplerObject(ctx, oldSamp);
+      }
+d123 1
+a123 1
+      /*mtx_lock(&samp->Mutex);*/
+a131 4
+#if 0
+         printf("SamplerObj %p %d INCR to %d\n",
+                (void *) samp, samp->Name, samp->RefCount);
+#endif
+d134 1
+a134 1
+      /*mtx_unlock(&samp->Mutex);*/
+d145 1
+a179 12
+
+/**
+ * Fallback for ctx->Driver.DeleteSamplerObject();
+ */
+static void
+_mesa_delete_sampler_object(struct gl_context *ctx,
+                            struct gl_sampler_object *sampObj)
+{
+   free(sampObj->Label);
+   free(sampObj);
+}
+
+d198 2
+d206 1
+a206 1
+      _mesa_HashInsert(ctx->Shared->SamplerObjects, first + i, sampObj);
+d209 2
+d241 1
+a241 1
+   mtx_lock(&ctx->Shared->Mutex);
+d247 1
+a247 1
+            _mesa_lookup_samplerobj(ctx, samplers[i]);
+d259 1
+a259 1
+            _mesa_HashRemove(ctx->Shared->SamplerObjects, samplers[i]);
+d266 1
+a266 1
+   mtx_unlock(&ctx->Shared->Mutex);
+d286 11
+a323 4
+   if (ctx->Texture.Unit[unit].Sampler != sampObj) {
+      FLUSH_VERTICES(ctx, _NEW_TEXTURE);
+   }
+
+d325 1
+a325 2
+   _mesa_reference_sampler_object(ctx, &ctx->Texture.Unit[unit].Sampler,
+                                  sampObj);
+d466 16
+d531 21
+d680 4
+d685 1
+a685 1
+      return INVALID_PNAME;
+d705 4
+d710 1
+a710 1
+      return INVALID_PNAME;
+d772 10
+a813 1
+       * In desktop GL, an GL_INVALID_VALUE is returned instead.
+d815 1
+a815 2
+      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
+                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+a904 1
+       * In desktop GL, an GL_INVALID_VALUE is returned instead.
+d906 1
+a906 2
+      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
+                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+a993 2
+       *
+       * In desktop GL, an GL_INVALID_VALUE is returned instead.
+d995 1
+a995 2
+      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
+                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+a1091 1
+       * In desktop GL, an GL_INVALID_VALUE is returned instead.
+d1093 1
+a1093 2
+      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
+                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+d1178 2
+a1179 2
+      _mesa_error(ctx, GL_INVALID_VALUE, "glSamplerParameterIiv(sampler %u)",
+                  sampler);
+d1264 2
+a1265 2
+      _mesa_error(ctx, GL_INVALID_VALUE, "glSamplerParameterIuiv(sampler %u)",
+                  sampler);
+a1353 1
+       * In desktop GL, an GL_INVALID_VALUE is returned instead.
+d1355 1
+a1355 2
+      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
+                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+a1394 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+a1397 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+a1445 1
+       * In desktop GL, an GL_INVALID_VALUE is returned instead.
+d1447 1
+a1447 2
+      _mesa_error(ctx, (_mesa_is_gles(ctx) ?
+                        GL_INVALID_OPERATION : GL_INVALID_VALUE),
+a1477 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+a1480 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+d1521 1
+a1521 1
+      _mesa_error(ctx, GL_INVALID_VALUE,
+a1552 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+a1555 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+d1596 1
+a1596 1
+      _mesa_error(ctx, GL_INVALID_VALUE,
+a1627 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+a1630 2
+      if (!ctx->Extensions.ARB_shadow)
+         goto invalid_pname;
+a1666 1
+   driver->DeleteSamplerObject = _mesa_delete_sampler_object;
 @
 
 

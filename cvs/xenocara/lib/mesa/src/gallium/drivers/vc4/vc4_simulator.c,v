@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.29;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.44.23;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -97,6 +103,13 @@ text
 #include "vc4_simulator_validate.h"
 #include "simpenrose/simpenrose.h"
 
+static mtx_t exec_mutex = _MTX_INITIALIZER_NP;
+
+/* A marker placed just after each BO, then checked after rendering to make
+ * sure it's still there.
+ */
+#define BO_SENTINEL		0xfedcba98
+
 #define OVERFLOW_SIZE (32 * 1024 * 1024)
 
 static struct drm_gem_cma_object *
@@ -114,9 +127,11 @@ vc4_wrap_bo_with_cma(struct drm_device *dev, struct vc4_bo *bo)
         obj->vaddr = screen->simulator_mem_base + dev->simulator_mem_next;
         obj->paddr = simpenrose_hw_addr(obj->vaddr);
 
-        dev->simulator_mem_next += size;
+        dev->simulator_mem_next += size + sizeof(uint32_t);
         dev->simulator_mem_next = align(dev->simulator_mem_next, 4096);
         assert(dev->simulator_mem_next <= screen->simulator_mem_size);
+
+        *(uint32_t *)(obj->vaddr + bo->size) = BO_SENTINEL;
 
         return obj;
 }
@@ -132,11 +147,11 @@ drm_gem_cma_create(struct drm_device *dev, size_t size)
 }
 
 static int
-vc4_simulator_pin_bos(struct drm_device *dev, struct vc4_exec_info *exec)
+vc4_simulator_pin_bos(struct drm_device *dev, struct vc4_job *job,
+                      struct vc4_exec_info *exec)
 {
         struct drm_vc4_submit_cl *args = exec->args;
-        struct vc4_context *vc4 = dev->vc4;
-        struct vc4_bo **bos = vc4->bo_pointers.base;
+        struct vc4_bo **bos = job->bo_pointers.base;
 
         exec->bo_count = args->bo_handle_count;
         exec->bo = calloc(exec->bo_count, sizeof(void *));
@@ -171,10 +186,16 @@ vc4_simulator_unpin_bos(struct vc4_exec_info *exec)
 {
         for (int i = 0; i < exec->bo_count; i++) {
                 struct drm_gem_cma_object *obj = exec->bo[i];
-                struct vc4_bo *bo = to_vc4_bo(&obj->base)->bo;
+                struct drm_vc4_bo *drm_bo = to_vc4_bo(&obj->base);
+                struct vc4_bo *bo = drm_bo->bo;
 
+                assert(*(uint32_t *)(obj->vaddr + bo->size) == BO_SENTINEL);
                 memcpy(bo->map, obj->vaddr, bo->size);
 
+                if (drm_bo->validated_shader) {
+                        free(drm_bo->validated_shader->texture_samples);
+                        free(drm_bo->validated_shader);
+                }
                 free(obj);
         }
 
@@ -183,8 +204,96 @@ vc4_simulator_unpin_bos(struct vc4_exec_info *exec)
         return 0;
 }
 
+static void
+vc4_dump_to_file(struct vc4_exec_info *exec)
+{
+        static int dumpno = 0;
+        struct drm_vc4_get_hang_state *state;
+        struct drm_vc4_get_hang_state_bo *bo_state;
+        unsigned int dump_version = 0;
+
+        if (!(vc4_debug & VC4_DEBUG_DUMP))
+                return;
+
+        state = calloc(1, sizeof(*state));
+
+        int unref_count = 0;
+        list_for_each_entry_safe(struct drm_vc4_bo, bo, &exec->unref_list,
+                                 unref_head) {
+                unref_count++;
+        }
+
+        /* Add one more for the overflow area that isn't wrapped in a BO. */
+        state->bo_count = exec->bo_count + unref_count + 1;
+        bo_state = calloc(state->bo_count, sizeof(*bo_state));
+
+        char *filename = NULL;
+        asprintf(&filename, "vc4-dri-%d.dump", dumpno++);
+        FILE *f = fopen(filename, "w+");
+        if (!f) {
+                fprintf(stderr, "Couldn't open %s: %s", filename,
+                        strerror(errno));
+                return;
+        }
+
+        fwrite(&dump_version, sizeof(dump_version), 1, f);
+
+        state->ct0ca = exec->ct0ca;
+        state->ct0ea = exec->ct0ea;
+        state->ct1ca = exec->ct1ca;
+        state->ct1ea = exec->ct1ea;
+        state->start_bin = exec->ct0ca;
+        state->start_render = exec->ct1ca;
+        fwrite(state, sizeof(*state), 1, f);
+
+        int i;
+        for (i = 0; i < exec->bo_count; i++) {
+                struct drm_gem_cma_object *cma_bo = exec->bo[i];
+                bo_state[i].handle = i; /* Not used by the parser. */
+                bo_state[i].paddr = cma_bo->paddr;
+                bo_state[i].size = cma_bo->base.size;
+        }
+
+        list_for_each_entry_safe(struct drm_vc4_bo, bo, &exec->unref_list,
+                                 unref_head) {
+                struct drm_gem_cma_object *cma_bo = &bo->base;
+                bo_state[i].handle = 0;
+                bo_state[i].paddr = cma_bo->paddr;
+                bo_state[i].size = cma_bo->base.size;
+                i++;
+        }
+
+        /* Add the static overflow memory area. */
+        bo_state[i].handle = exec->bo_count;
+        bo_state[i].paddr = 0;
+        bo_state[i].size = OVERFLOW_SIZE;
+        i++;
+
+        fwrite(bo_state, sizeof(*bo_state), state->bo_count, f);
+
+        for (int i = 0; i < exec->bo_count; i++) {
+                struct drm_gem_cma_object *cma_bo = exec->bo[i];
+                fwrite(cma_bo->vaddr, cma_bo->base.size, 1, f);
+        }
+
+        list_for_each_entry_safe(struct drm_vc4_bo, bo, &exec->unref_list,
+                                 unref_head) {
+                struct drm_gem_cma_object *cma_bo = &bo->base;
+                fwrite(cma_bo->vaddr, cma_bo->base.size, 1, f);
+        }
+
+        void *overflow = calloc(1, OVERFLOW_SIZE);
+        fwrite(overflow, 1, OVERFLOW_SIZE, f);
+        free(overflow);
+
+        free(state);
+        free(bo_state);
+        fclose(f);
+}
+
 int
-vc4_simulator_flush(struct vc4_context *vc4, struct drm_vc4_submit_cl *args)
+vc4_simulator_flush(struct vc4_context *vc4,
+                    struct drm_vc4_submit_cl *args, struct vc4_job *job)
 {
         struct vc4_screen *screen = vc4->screen;
         struct vc4_surface *csurf = vc4_surface(vc4->framebuffer.cbufs[0]);
@@ -221,13 +330,21 @@ vc4_simulator_flush(struct vc4_context *vc4, struct drm_vc4_submit_cl *args)
 
         exec.args = args;
 
-        ret = vc4_simulator_pin_bos(dev, &exec);
+        ret = vc4_simulator_pin_bos(dev, job, &exec);
         if (ret)
                 return ret;
 
         ret = vc4_cl_validate(dev, &exec);
         if (ret)
                 return ret;
+
+        if (vc4_debug & VC4_DEBUG_CL) {
+                fprintf(stderr, "RCL:\n");
+                vc4_dump_cl(screen->simulator_mem_base + exec.ct1ca,
+                            exec.ct1ea - exec.ct1ca, true);
+        }
+
+        vc4_dump_to_file(&exec);
 
         if (exec.ct0ca != exec.ct0ea) {
                 int bfc = simpenrose_do_binning(exec.ct0ca, exec.ct0ea);
@@ -257,6 +374,8 @@ vc4_simulator_flush(struct vc4_context *vc4, struct drm_vc4_submit_cl *args)
         list_for_each_entry_safe(struct drm_vc4_bo, bo, &exec.unref_list,
                                  unref_head) {
 		list_del(&bo->unref_head);
+                assert(*(uint32_t *)(bo->base.vaddr + bo->bo->size) ==
+                       BO_SENTINEL);
                 vc4_bo_unreference(&bo->bo);
                 free(bo);
         }
@@ -272,12 +391,27 @@ vc4_simulator_flush(struct vc4_context *vc4, struct drm_vc4_submit_cl *args)
         return 0;
 }
 
+static void *sim_mem_base = NULL;
+static int sim_mem_refcount = 0;
+static ssize_t sim_mem_size = 256 * 1024 * 1024;
+
 void
 vc4_simulator_init(struct vc4_screen *screen)
 {
-        screen->simulator_mem_size = 256 * 1024 * 1024;
-        screen->simulator_mem_base = ralloc_size(screen,
-                                                 screen->simulator_mem_size);
+        mtx_lock(&exec_mutex);
+        if (sim_mem_refcount++) {
+                screen->simulator_mem_size = sim_mem_size;
+                screen->simulator_mem_base = sim_mem_base;
+                mtx_unlock(&exec_mutex);
+                return;
+        }
+
+        sim_mem_base = calloc(sim_mem_size, 1);
+        if (!sim_mem_base)
+                abort();
+
+        screen->simulator_mem_size = sim_mem_size;
+        screen->simulator_mem_base = sim_mem_base;
 
         /* We supply our own memory so that we can have more aperture
          * available (256MB instead of simpenrose's default 64MB).
@@ -293,9 +427,63 @@ vc4_simulator_init(struct vc4_screen *screen)
          * flush), so it had better be big.
          */
         simpenrose_supply_overflow_mem(0, OVERFLOW_SIZE);
+
+        mtx_unlock(&exec_mutex);
+}
+
+void
+vc4_simulator_destroy(struct vc4_screen *screen)
+{
+        mtx_lock(&exec_mutex);
+        if (!--sim_mem_refcount) {
+                free(sim_mem_base);
+                sim_mem_base = NULL;
+        }
+        mtx_unlock(&exec_mutex);
 }
 
 #endif /* USE_VC4_SIMULATOR */
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d35 7
+d59 1
+a59 1
+        dev->simulator_mem_next += size;
+d63 2
+d79 2
+a80 1
+vc4_simulator_pin_bos(struct drm_device *dev, struct vc4_exec_info *exec)
+d83 1
+a83 2
+        struct vc4_context *vc4 = dev->vc4;
+        struct vc4_bo **bos = vc4->bo_pointers.base;
+d118 2
+a119 1
+                struct vc4_bo *bo = to_vc4_bo(&obj->base)->bo;
+d121 1
+d124 4
+d136 87
+d224 2
+a225 1
+vc4_simulator_flush(struct vc4_context *vc4, struct drm_vc4_submit_cl *args)
+d262 1
+a262 1
+        ret = vc4_simulator_pin_bos(dev, &exec);
+d270 8
+d306 2
+d323 4
+d330 14
+a343 3
+        screen->simulator_mem_size = 256 * 1024 * 1024;
+        screen->simulator_mem_base = ralloc_size(screen,
+                                                 screen->simulator_mem_size);
+d359 13
 @
 
 

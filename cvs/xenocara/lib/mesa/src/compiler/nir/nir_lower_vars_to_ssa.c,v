@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.3
@@ -17,6 +16,12 @@ locks; strict;
 comment	@ * @;
 expand	@o@;
 
+
+1.2
+date	2017.08.26.16.59.21;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2016.05.29.10.16.29;	author jsg;	state Exp;
@@ -48,9 +53,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -82,6 +88,7 @@ text
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_phi_builder.h"
 #include "nir_vla.h"
 
 
@@ -102,8 +109,7 @@ struct deref_node {
    struct set *stores;
    struct set *copies;
 
-   nir_ssa_def **def_stack;
-   nir_ssa_def **def_stack_tail;
+   struct nir_phi_builder_value *pb_value;
 
    struct deref_node *wildcard;
    struct deref_node *indirect;
@@ -142,8 +148,7 @@ struct lower_variables_state {
     */
    bool add_to_direct_deref_nodes;
 
-   /* A hash table mapping phi nodes to deref_state data */
-   struct hash_table *phi_table;
+   struct nir_phi_builder *phi_builder;
 };
 
 static struct deref_node *
@@ -460,11 +465,10 @@ register_copy_instr(nir_intrinsic_instr *copy_instr,
 
 /* Registers all variable uses in the given block. */
 static bool
-register_variable_uses_block(nir_block *block, void *void_state)
+register_variable_uses_block(nir_block *block,
+                             struct lower_variables_state *state)
 {
-   struct lower_variables_state *state = void_state;
-
-   nir_foreach_instr_safe(block, instr) {
+   nir_foreach_instr_safe(instr, block) {
       if (instr->type != nir_instr_type_intrinsic)
          continue;
 
@@ -528,6 +532,318 @@ lower_copies_to_load_store(struct deref_node *node,
    return true;
 }
 
+/* Performs variable renaming
+ *
+ * This algorithm is very similar to the one outlined in "Efficiently
+ * Computing Static Single Assignment Form and the Control Dependence
+ * Graph" by Cytron et. al.  The primary difference is that we only put one
+ * SSA def on the stack per block.
+ */
+static bool
+rename_variables(struct lower_variables_state *state)
+{
+   nir_builder b;
+   nir_builder_init(&b, state->impl);
+
+   nir_foreach_block(block, state->impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+         switch (intrin->intrinsic) {
+         case nir_intrinsic_load_var: {
+            struct deref_node *node =
+               get_deref_node(intrin->variables[0], state);
+
+            if (node == NULL) {
+               /* If we hit this path then we are referencing an invalid
+                * value.  Most likely, we unrolled something and are
+                * reading past the end of some array.  In any case, this
+                * should result in an undefined value.
+                */
+               nir_ssa_undef_instr *undef =
+                  nir_ssa_undef_instr_create(state->shader,
+                                             intrin->num_components,
+                                             intrin->dest.ssa.bit_size);
+
+               nir_instr_insert_before(&intrin->instr, &undef->instr);
+               nir_instr_remove(&intrin->instr);
+
+               nir_ssa_def_rewrite_uses(&intrin->dest.ssa,
+                                        nir_src_for_ssa(&undef->def));
+               continue;
+            }
+
+            if (!node->lower_to_ssa)
+               continue;
+
+            nir_alu_instr *mov = nir_alu_instr_create(state->shader,
+                                                      nir_op_imov);
+            mov->src[0].src = nir_src_for_ssa(
+               nir_phi_builder_value_get_block_def(node->pb_value, block));
+            for (unsigned i = intrin->num_components; i < 4; i++)
+               mov->src[0].swizzle[i] = 0;
+
+            assert(intrin->dest.is_ssa);
+
+            mov->dest.write_mask = (1 << intrin->num_components) - 1;
+            nir_ssa_dest_init(&mov->instr, &mov->dest.dest,
+                              intrin->num_components,
+                              intrin->dest.ssa.bit_size, NULL);
+
+            nir_instr_insert_before(&intrin->instr, &mov->instr);
+            nir_instr_remove(&intrin->instr);
+
+            nir_ssa_def_rewrite_uses(&intrin->dest.ssa,
+                                     nir_src_for_ssa(&mov->dest.dest.ssa));
+            break;
+         }
+
+         case nir_intrinsic_store_var: {
+            struct deref_node *node =
+               get_deref_node(intrin->variables[0], state);
+
+            if (node == NULL) {
+               /* Probably an out-of-bounds array store.  That should be a
+                * no-op. */
+               nir_instr_remove(&intrin->instr);
+               continue;
+            }
+
+            if (!node->lower_to_ssa)
+               continue;
+
+            assert(intrin->num_components ==
+                   glsl_get_vector_elements(node->type));
+
+            assert(intrin->src[0].is_ssa);
+
+            nir_ssa_def *new_def;
+            b.cursor = nir_before_instr(&intrin->instr);
+
+            unsigned wrmask = nir_intrinsic_write_mask(intrin);
+            if (wrmask == (1 << intrin->num_components) - 1) {
+               /* Whole variable store - just copy the source.  Note that
+                * intrin->num_components and intrin->src[0].ssa->num_components
+                * may differ.
+                */
+               unsigned swiz[4];
+               for (unsigned i = 0; i < 4; i++)
+                  swiz[i] = i < intrin->num_components ? i : 0;
+
+               new_def = nir_swizzle(&b, intrin->src[0].ssa, swiz,
+                                     intrin->num_components, false);
+            } else {
+               nir_ssa_def *old_def =
+                  nir_phi_builder_value_get_block_def(node->pb_value, block);
+               /* For writemasked store_var intrinsics, we combine the newly
+                * written values with the existing contents of unwritten
+                * channels, creating a new SSA value for the whole vector.
+                */
+               nir_ssa_def *srcs[4];
+               for (unsigned i = 0; i < intrin->num_components; i++) {
+                  if (wrmask & (1 << i)) {
+                     srcs[i] = nir_channel(&b, intrin->src[0].ssa, i);
+                  } else {
+                     srcs[i] = nir_channel(&b, old_def, i);
+                  }
+               }
+               new_def = nir_vec(&b, srcs, intrin->num_components);
+            }
+
+            assert(new_def->num_components == intrin->num_components);
+
+            nir_phi_builder_value_set_block_def(node->pb_value, block, new_def);
+            nir_instr_remove(&intrin->instr);
+            break;
+         }
+
+         default:
+            break;
+         }
+      }
+   }
+
+   return true;
+}
+
+/** Implements a pass to lower variable uses to SSA values
+ *
+ * This path walks the list of instructions and tries to lower as many
+ * local variable load/store operations to SSA defs and uses as it can.
+ * The process involves four passes:
+ *
+ *  1) Iterate over all of the instructions and mark where each local
+ *     variable deref is used in a load, store, or copy.  While we're at
+ *     it, we keep track of all of the fully-qualified (no wildcards) and
+ *     fully-direct references we see and store them in the
+ *     direct_deref_nodes hash table.
+ *
+ *  2) Walk over the list of fully-qualified direct derefs generated in
+ *     the previous pass.  For each deref, we determine if it can ever be
+ *     aliased, i.e. if there is an indirect reference anywhere that may
+ *     refer to it.  If it cannot be aliased, we mark it for lowering to an
+ *     SSA value.  At this point, we lower any var_copy instructions that
+ *     use the given deref to load/store operations and, if the deref has a
+ *     constant initializer, we go ahead and add a load_const value at the
+ *     beginning of the function with the initialized value.
+ *
+ *  3) Walk over the list of derefs we plan to lower to SSA values and
+ *     insert phi nodes as needed.
+ *
+ *  4) Perform "variable renaming" by replacing the load/store instructions
+ *     with SSA definitions and SSA uses.
+ */
+static bool
+nir_lower_vars_to_ssa_impl(nir_function_impl *impl)
+{
+   struct lower_variables_state state;
+
+   state.shader = impl->function->shader;
+   state.dead_ctx = ralloc_context(state.shader);
+   state.impl = impl;
+
+   state.deref_var_nodes = _mesa_hash_table_create(state.dead_ctx,
+                                                   _mesa_hash_pointer,
+                                                   _mesa_key_pointer_equal);
+   exec_list_make_empty(&state.direct_deref_nodes);
+
+   /* Build the initial deref structures and direct_deref_nodes table */
+   state.add_to_direct_deref_nodes = true;
+
+   nir_foreach_block(block, impl) {
+      register_variable_uses_block(block, &state);
+   }
+
+   bool progress = false;
+
+   nir_metadata_require(impl, nir_metadata_block_index);
+
+   /* We're about to iterate through direct_deref_nodes.  Don't modify it. */
+   state.add_to_direct_deref_nodes = false;
+
+   foreach_list_typed_safe(struct deref_node, node, direct_derefs_link,
+                           &state.direct_deref_nodes) {
+      nir_deref_var *deref = node->deref;
+
+      if (deref->var->data.mode != nir_var_local) {
+         exec_node_remove(&node->direct_derefs_link);
+         continue;
+      }
+
+      if (deref_may_be_aliased(deref, &state)) {
+         exec_node_remove(&node->direct_derefs_link);
+         continue;
+      }
+
+      node->lower_to_ssa = true;
+      progress = true;
+
+      foreach_deref_node_match(deref, lower_copies_to_load_store, &state);
+   }
+
+   if (!progress)
+      return false;
+
+   nir_metadata_require(impl, nir_metadata_dominance);
+
+   /* We may have lowered some copy instructions to load/store
+    * instructions.  The uses from the copy instructions hav already been
+    * removed but we need to rescan to ensure that the uses from the newly
+    * added load/store instructions are registered.  We need this
+    * information for phi node insertion below.
+    */
+   nir_foreach_block(block, impl) {
+      register_variable_uses_block(block, &state);
+   }
+
+   state.phi_builder = nir_phi_builder_create(state.impl);
+
+   NIR_VLA(BITSET_WORD, store_blocks, BITSET_WORDS(state.impl->num_blocks));
+   foreach_list_typed(struct deref_node, node, direct_derefs_link,
+                      &state.direct_deref_nodes) {
+      if (!node->lower_to_ssa)
+         continue;
+
+      memset(store_blocks, 0,
+             BITSET_WORDS(state.impl->num_blocks) * sizeof(*store_blocks));
+
+      if (node->stores) {
+         struct set_entry *store_entry;
+         set_foreach(node->stores, store_entry) {
+            nir_intrinsic_instr *store =
+               (nir_intrinsic_instr *)store_entry->key;
+            BITSET_SET(store_blocks, store->instr.block->index);
+         }
+      }
+
+      if (node->deref->var->constant_initializer)
+         BITSET_SET(store_blocks, 0);
+
+      node->pb_value =
+         nir_phi_builder_add_value(state.phi_builder,
+                                   glsl_get_vector_elements(node->type),
+                                   glsl_get_bit_size(node->type),
+                                   store_blocks);
+
+      if (node->deref->var->constant_initializer) {
+         nir_load_const_instr *load =
+            nir_deref_get_const_initializer_load(state.shader, node->deref);
+         nir_instr_insert_before_cf_list(&impl->body, &load->instr);
+         nir_phi_builder_value_set_block_def(node->pb_value,
+                                             nir_start_block(impl), &load->def);
+      }
+   }
+
+   rename_variables(&state);
+
+   nir_phi_builder_finish(state.phi_builder);
+
+   nir_metadata_preserve(impl, nir_metadata_block_index |
+                               nir_metadata_dominance);
+
+   ralloc_free(state.dead_ctx);
+
+   return progress;
+}
+
+void
+nir_lower_vars_to_ssa(nir_shader *shader)
+{
+   nir_foreach_function(function, shader) {
+      if (function->impl)
+         nir_lower_vars_to_ssa_impl(function->impl);
+   }
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d30 1
+d51 1
+a51 2
+   nir_ssa_def **def_stack;
+   nir_ssa_def **def_stack_tail;
+d90 1
+a90 2
+   /* A hash table mapping phi nodes to deref_state data */
+   struct hash_table *phi_table;
+d407 2
+a408 1
+register_variable_uses_block(nir_block *block, void *void_state)
+d410 1
+a410 3
+   struct lower_variables_state *state = void_state;
+
+   nir_foreach_instr_safe(block, instr) {
+d474 1
+a474 109
 /** Pushes an SSA def onto the def stack for the given node
  *
  * Each node is potentially associated with a stack of SSA definitions.
@@ -637,18 +953,11 @@ add_phi_sources(nir_block *block, nir_block *pred,
 }
 
 /* Performs variable renaming by doing a DFS of the dominance tree
- *
- * This algorithm is very similar to the one outlined in "Efficiently
- * Computing Static Single Assignment Form and the Control Dependence
- * Graph" by Cytron et. al.  The primary difference is that we only put one
- * SSA def on the stack per block.
- */
-static bool
+d482 1
+a482 1
 rename_variables_block(nir_block *block, struct lower_variables_state *state)
-{
-   nir_builder b;
-   nir_builder_init(&b, state->impl);
-
+d487 3
+a489 11
    nir_foreach_instr_safe(block, instr) {
       if (instr->type == nir_instr_type_phi) {
          nir_phi_instr *phi = nir_instr_as_phi(instr);
@@ -660,128 +969,32 @@ rename_variables_block(nir_block *block, struct lower_variables_state *state)
           * that were not created in this pass.
           */
          if (!entry)
-            continue;
-
+a491 4
          struct deref_node *node = entry->data;
 
          def_stack_push(node, &phi->dest.ssa, state);
       } else if (instr->type == nir_instr_type_intrinsic) {
-         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
-
-         switch (intrin->intrinsic) {
-         case nir_intrinsic_load_var: {
-            struct deref_node *node =
-               get_deref_node(intrin->variables[0], state);
-
-            if (node == NULL) {
-               /* If we hit this path then we are referencing an invalid
-                * value.  Most likely, we unrolled something and are
-                * reading past the end of some array.  In any case, this
-                * should result in an undefined value.
-                */
-               nir_ssa_undef_instr *undef =
-                  nir_ssa_undef_instr_create(state->shader,
+d507 2
+a508 1
                                              intrin->num_components);
-
-               nir_instr_insert_before(&intrin->instr, &undef->instr);
-               nir_instr_remove(&intrin->instr);
-
-               nir_ssa_def_rewrite_uses(&intrin->dest.ssa,
-                                        nir_src_for_ssa(&undef->def));
-               continue;
-            }
-
-            if (!node->lower_to_ssa)
-               continue;
-
-            nir_alu_instr *mov = nir_alu_instr_create(state->shader,
-                                                      nir_op_imov);
+d523 2
+a524 2
             mov->src[0].src.is_ssa = true;
             mov->src[0].src.ssa = get_ssa_def_for_block(node, block, state);
-            for (unsigned i = intrin->num_components; i < 4; i++)
-               mov->src[0].swizzle[i] = 0;
-
-            assert(intrin->dest.is_ssa);
-
-            mov->dest.write_mask = (1 << intrin->num_components) - 1;
-            nir_ssa_dest_init(&mov->instr, &mov->dest.dest,
+d532 2
+a533 1
                               intrin->num_components, NULL);
-
-            nir_instr_insert_before(&intrin->instr, &mov->instr);
-            nir_instr_remove(&intrin->instr);
-
-            nir_ssa_def_rewrite_uses(&intrin->dest.ssa,
-                                     nir_src_for_ssa(&mov->dest.dest.ssa));
-            break;
-         }
-
-         case nir_intrinsic_store_var: {
-            struct deref_node *node =
-               get_deref_node(intrin->variables[0], state);
-
-            if (node == NULL) {
-               /* Probably an out-of-bounds array store.  That should be a
-                * no-op. */
-               nir_instr_remove(&intrin->instr);
-               continue;
-            }
-
-            if (!node->lower_to_ssa)
-               continue;
-
-            assert(intrin->num_components ==
-                   glsl_get_vector_elements(node->type));
-
-            assert(intrin->src[0].is_ssa);
-
-            nir_ssa_def *new_def;
-            b.cursor = nir_before_instr(&intrin->instr);
-
-            unsigned wrmask = nir_intrinsic_write_mask(intrin);
-            if (wrmask == (1 << intrin->num_components) - 1) {
-               /* Whole variable store - just copy the source.  Note that
-                * intrin->num_components and intrin->src[0].ssa->num_components
-                * may differ.
-                */
-               unsigned swiz[4];
-               for (unsigned i = 0; i < 4; i++)
-                  swiz[i] = i < intrin->num_components ? i : 0;
-
-               new_def = nir_swizzle(&b, intrin->src[0].ssa, swiz,
-                                     intrin->num_components, false);
-            } else {
+d578 2
+a579 1
                nir_ssa_def *old_def = get_ssa_def_for_block(node, block, state);
-               /* For writemasked store_var intrinsics, we combine the newly
-                * written values with the existing contents of unwritten
-                * channels, creating a new SSA value for the whole vector.
-                */
-               nir_ssa_def *srcs[4];
-               for (unsigned i = 0; i < intrin->num_components; i++) {
-                  if (wrmask & (1 << i)) {
-                     srcs[i] = nir_channel(&b, intrin->src[0].ssa, i);
-                  } else {
-                     srcs[i] = nir_channel(&b, old_def, i);
-                  }
-               }
-               new_def = nir_vec(&b, srcs, intrin->num_components);
-            }
-
-            assert(new_def->num_components == intrin->num_components);
-
+d597 2
+a598 5
             def_stack_push(node, new_def, state);
 
             /* We'll wait to remove the instruction until the next pass
              * where we pop the node we just pushed back off the stack.
              */
-            break;
-         }
-
-         default:
-            break;
-         }
-      }
-   }
-
+a607 45
    if (block->successors[0])
       add_phi_sources(block->successors[0], block, state);
    if (block->successors[1])
@@ -827,9 +1040,7 @@ rename_variables_block(nir_block *block, struct lower_variables_state *state)
       }
    }
 
-   return true;
-}
-
+a610 81
 /* Inserts phi nodes for all variables marked lower_to_ssa
  *
  * This is the same algorithm as presented in "Efficiently Computing Static
@@ -911,78 +1122,17 @@ insert_phi_nodes(struct lower_variables_state *state)
 }
 
 
-/** Implements a pass to lower variable uses to SSA values
- *
- * This path walks the list of instructions and tries to lower as many
- * local variable load/store operations to SSA defs and uses as it can.
- * The process involves four passes:
- *
- *  1) Iterate over all of the instructions and mark where each local
- *     variable deref is used in a load, store, or copy.  While we're at
- *     it, we keep track of all of the fully-qualified (no wildcards) and
- *     fully-direct references we see and store them in the
- *     direct_deref_nodes hash table.
- *
+d623 1
+a623 1
  *  2) Walk over the the list of fully-qualified direct derefs generated in
- *     the previous pass.  For each deref, we determine if it can ever be
- *     aliased, i.e. if there is an indirect reference anywhere that may
- *     refer to it.  If it cannot be aliased, we mark it for lowering to an
- *     SSA value.  At this point, we lower any var_copy instructions that
- *     use the given deref to load/store operations and, if the deref has a
- *     constant initializer, we go ahead and add a load_const value at the
- *     beginning of the function with the initialized value.
- *
- *  3) Walk over the list of derefs we plan to lower to SSA values and
- *     insert phi nodes as needed.
- *
- *  4) Perform "variable renaming" by replacing the load/store instructions
- *     with SSA definitions and SSA uses.
- */
-static bool
-nir_lower_vars_to_ssa_impl(nir_function_impl *impl)
-{
-   struct lower_variables_state state;
-
-   state.shader = impl->function->shader;
-   state.dead_ctx = ralloc_context(state.shader);
-   state.impl = impl;
-
-   state.deref_var_nodes = _mesa_hash_table_create(state.dead_ctx,
-                                                   _mesa_hash_pointer,
-                                                   _mesa_key_pointer_equal);
-   exec_list_make_empty(&state.direct_deref_nodes);
+a650 3
    state.phi_table = _mesa_hash_table_create(state.dead_ctx,
                                              _mesa_hash_pointer,
                                              _mesa_key_pointer_equal);
-
-   /* Build the initial deref structures and direct_deref_nodes table */
-   state.add_to_direct_deref_nodes = true;
+d654 4
+a657 1
    nir_foreach_block(impl, register_variable_uses_block, &state);
-
-   bool progress = false;
-
-   nir_metadata_require(impl, nir_metadata_block_index);
-
-   /* We're about to iterate through direct_deref_nodes.  Don't modify it. */
-   state.add_to_direct_deref_nodes = false;
-
-   foreach_list_typed_safe(struct deref_node, node, direct_derefs_link,
-                           &state.direct_deref_nodes) {
-      nir_deref_var *deref = node->deref;
-
-      if (deref->var->data.mode != nir_var_local) {
-         exec_node_remove(&node->direct_derefs_link);
-         continue;
-      }
-
-      if (deref_may_be_aliased(deref, &state)) {
-         exec_node_remove(&node->direct_derefs_link);
-         continue;
-      }
-
-      node->lower_to_ssa = true;
-      progress = true;
-
+a682 9
       if (deref->var->constant_initializer) {
          nir_load_const_instr *load =
             nir_deref_get_const_initializer_load(state.shader, deref);
@@ -992,41 +1142,16 @@ nir_lower_vars_to_ssa_impl(nir_function_impl *impl)
          def_stack_push(node, &load->def, &state);
       }
 
-      foreach_deref_node_match(deref, lower_copies_to_load_store, &state);
-   }
-
-   if (!progress)
-      return false;
-
-   nir_metadata_require(impl, nir_metadata_dominance);
-
-   /* We may have lowered some copy instructions to load/store
-    * instructions.  The uses from the copy instructions hav already been
-    * removed but we need to rescan to ensure that the uses from the newly
-    * added load/store instructions are registered.  We need this
-    * information for phi node insertion below.
-    */
+d697 43
+a739 1
    nir_foreach_block(impl, register_variable_uses_block, &state);
-
+d741 1
+a741 2
    insert_phi_nodes(&state);
    rename_variables_block(nir_start_block(impl), &state);
-
-   nir_metadata_preserve(impl, nir_metadata_block_index |
-                               nir_metadata_dominance);
-
-   ralloc_free(state.dead_ctx);
-
-   return progress;
-}
-
-void
-nir_lower_vars_to_ssa(nir_shader *shader)
-{
+d754 1
+a754 1
    nir_foreach_function(shader, function) {
-      if (function->impl)
-         nir_lower_vars_to_ssa_impl(function->impl);
-   }
-}
 @
 
 

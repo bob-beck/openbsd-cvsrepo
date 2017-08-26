@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.37;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.40.11;	author jsg;	state Exp;
@@ -58,13 +63,13 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
-@/**************************************************************************
- *
+@/*
  * Copyright 2006 VMware, Inc.
  * All Rights Reserved.
  *
@@ -72,7 +77,7 @@ text
  * copy of this software and associated documentation files (the
  * "Software"), to deal in the Software without restriction, including
  * without limitation the rights to use, copy, modify, merge, publish,
- * distribute, sub license, and/or sell copies of the Software, and to
+ * distribute, sublicense, and/or sell copies of the Software, and to
  * permit persons to whom the Software is furnished to do so, subject to
  * the following conditions:
  *
@@ -82,17 +87,15 @@ text
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
  * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
  * IN NO EVENT SHALL VMWARE AND/OR ITS SUPPLIERS BE LIABLE FOR
  * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
  * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- **************************************************************************/
+ */
 
 #include "intel_batchbuffer.h"
 #include "intel_buffer_objects.h"
-#include "intel_reg.h"
 #include "intel_bufmgr.h"
 #include "intel_buffers.h"
 #include "intel_fbo.h"
@@ -140,6 +143,7 @@ intel_batchbuffer_reset(struct brw_context *brw)
    brw->batch.reserved_space = BATCH_RESERVED;
    brw->batch.state_batch_offset = brw->batch.bo->size;
    brw->batch.needs_sol_reset = false;
+   brw->batch.state_base_address_emitted = false;
 
    /* We don't know what ring the new batch will be sent to until we see the
     * first BEGIN_BATCH or BEGIN_BATCH_BLT.  Mark it as unknown.
@@ -173,6 +177,32 @@ intel_batchbuffer_free(struct brw_context *brw)
    drm_intel_bo_unreference(brw->batch.bo);
 }
 
+void
+intel_batchbuffer_require_space(struct brw_context *brw, GLuint sz,
+                                enum brw_gpu_ring ring)
+{
+   /* If we're switching rings, implicitly flush the batch. */
+   if (unlikely(ring != brw->batch.ring) && brw->batch.ring != UNKNOWN_RING &&
+       brw->gen >= 6) {
+      intel_batchbuffer_flush(brw);
+   }
+
+#ifdef DEBUG
+   assert(sz < BATCH_SZ - BATCH_RESERVED);
+#endif
+   if (intel_batchbuffer_space(brw) < sz)
+      intel_batchbuffer_flush(brw);
+
+   enum brw_gpu_ring prev_ring = brw->batch.ring;
+   /* The intel_batchbuffer_flush() calls above might have changed
+    * brw->batch.ring to UNKNOWN_RING, so we need to set it here at the end.
+    */
+   brw->batch.ring = ring;
+
+   if (unlikely(prev_ring == UNKNOWN_RING && ring == RENDER_RING))
+      intel_batchbuffer_emit_render_ring_prelude(brw);
+}
+
 static void
 do_batch_dump(struct brw_context *brw)
 {
@@ -180,7 +210,7 @@ do_batch_dump(struct brw_context *brw)
    struct intel_batchbuffer *batch = &brw->batch;
    int ret;
 
-   decode = drm_intel_decode_context_alloc(brw->intelScreen->deviceID);
+   decode = drm_intel_decode_context_alloc(brw->screen->deviceID);
    if (!decode)
       return;
 
@@ -275,6 +305,13 @@ brw_finish_batch(struct brw_context *brw)
    brw_emit_query_end(brw);
 
    if (brw->batch.ring == RENDER_RING) {
+      /* Work around L3 state leaks into contexts set MI_RESTORE_INHIBIT which
+       * assume that the L3 cache is configured according to the hardware
+       * defaults.
+       */
+      if (brw->gen >= 7)
+         gen7_restore_default_l3_config(brw);
+
       /* We may also need to snapshot and disable OA counters. */
       brw_perf_monitor_finish_batch(brw);
 
@@ -339,8 +376,8 @@ throttle(struct brw_context *brw)
    }
 
    if (brw->need_flush_throttle) {
-      __DRIscreen *psp = brw->intelScreen->driScrnPriv;
-      drmCommandNone(psp->fd, DRM_I915_GEM_THROTTLE);
+      __DRIscreen *dri_screen = brw->screen->driScrnPriv;
+      drmCommandNone(dri_screen->fd, DRM_I915_GEM_THROTTLE);
       brw->need_flush_throttle = false;
    }
 }
@@ -370,7 +407,7 @@ do_flush_locked(struct brw_context *brw)
       }
    }
 
-   if (!brw->intelScreen->no_hw) {
+   if (!brw->screen->no_hw) {
       int flags;
 
       if (brw->gen >= 6 && batch->ring == BLT_RING) {
@@ -400,6 +437,9 @@ do_flush_locked(struct brw_context *brw)
 
    if (unlikely(INTEL_DEBUG & DEBUG_BATCH))
       do_batch_dump(brw);
+
+   if (brw->ctx.Const.ResetStrategy == GL_LOSE_CONTEXT_ON_RESET_ARB)
+      brw_check_for_reset(brw);
 
    if (ret != 0) {
       fprintf(stderr, "intel_do_flush_locked failed: %s\n", strerror(-ret));
@@ -571,6 +611,220 @@ brw_load_register_mem64(struct brw_context *brw,
 {
    load_sized_register_mem(brw, reg, bo, read_domains, write_domain, offset, 2);
 }
+
+/*
+ * Write an arbitrary 32-bit register to a buffer via MI_STORE_REGISTER_MEM.
+ */
+void
+brw_store_register_mem32(struct brw_context *brw,
+                         drm_intel_bo *bo, uint32_t reg, uint32_t offset)
+{
+   assert(brw->gen >= 6);
+
+   if (brw->gen >= 8) {
+      BEGIN_BATCH(4);
+      OUT_BATCH(MI_STORE_REGISTER_MEM | (4 - 2));
+      OUT_BATCH(reg);
+      OUT_RELOC64(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                  offset);
+      ADVANCE_BATCH();
+   } else {
+      BEGIN_BATCH(3);
+      OUT_BATCH(MI_STORE_REGISTER_MEM | (3 - 2));
+      OUT_BATCH(reg);
+      OUT_RELOC(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                offset);
+      ADVANCE_BATCH();
+   }
+}
+
+/*
+ * Write an arbitrary 64-bit register to a buffer via MI_STORE_REGISTER_MEM.
+ */
+void
+brw_store_register_mem64(struct brw_context *brw,
+                         drm_intel_bo *bo, uint32_t reg, uint32_t offset)
+{
+   assert(brw->gen >= 6);
+
+   /* MI_STORE_REGISTER_MEM only stores a single 32-bit value, so to
+    * read a full 64-bit register, we need to do two of them.
+    */
+   if (brw->gen >= 8) {
+      BEGIN_BATCH(8);
+      OUT_BATCH(MI_STORE_REGISTER_MEM | (4 - 2));
+      OUT_BATCH(reg);
+      OUT_RELOC64(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                  offset);
+      OUT_BATCH(MI_STORE_REGISTER_MEM | (4 - 2));
+      OUT_BATCH(reg + sizeof(uint32_t));
+      OUT_RELOC64(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                  offset + sizeof(uint32_t));
+      ADVANCE_BATCH();
+   } else {
+      BEGIN_BATCH(6);
+      OUT_BATCH(MI_STORE_REGISTER_MEM | (3 - 2));
+      OUT_BATCH(reg);
+      OUT_RELOC(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                offset);
+      OUT_BATCH(MI_STORE_REGISTER_MEM | (3 - 2));
+      OUT_BATCH(reg + sizeof(uint32_t));
+      OUT_RELOC(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                offset + sizeof(uint32_t));
+      ADVANCE_BATCH();
+   }
+}
+
+/*
+ * Write a 32-bit register using immediate data.
+ */
+void
+brw_load_register_imm32(struct brw_context *brw, uint32_t reg, uint32_t imm)
+{
+   assert(brw->gen >= 6);
+
+   BEGIN_BATCH(3);
+   OUT_BATCH(MI_LOAD_REGISTER_IMM | (3 - 2));
+   OUT_BATCH(reg);
+   OUT_BATCH(imm);
+   ADVANCE_BATCH();
+}
+
+/*
+ * Write a 64-bit register using immediate data.
+ */
+void
+brw_load_register_imm64(struct brw_context *brw, uint32_t reg, uint64_t imm)
+{
+   assert(brw->gen >= 6);
+
+   BEGIN_BATCH(5);
+   OUT_BATCH(MI_LOAD_REGISTER_IMM | (5 - 2));
+   OUT_BATCH(reg);
+   OUT_BATCH(imm & 0xffffffff);
+   OUT_BATCH(reg + 4);
+   OUT_BATCH(imm >> 32);
+   ADVANCE_BATCH();
+}
+
+/*
+ * Copies a 32-bit register.
+ */
+void
+brw_load_register_reg(struct brw_context *brw, uint32_t src, uint32_t dest)
+{
+   assert(brw->gen >= 8 || brw->is_haswell);
+
+   BEGIN_BATCH(3);
+   OUT_BATCH(MI_LOAD_REGISTER_REG | (3 - 2));
+   OUT_BATCH(src);
+   OUT_BATCH(dest);
+   ADVANCE_BATCH();
+}
+
+/*
+ * Copies a 64-bit register.
+ */
+void
+brw_load_register_reg64(struct brw_context *brw, uint32_t src, uint32_t dest)
+{
+   assert(brw->gen >= 8 || brw->is_haswell);
+
+   BEGIN_BATCH(6);
+   OUT_BATCH(MI_LOAD_REGISTER_REG | (3 - 2));
+   OUT_BATCH(src);
+   OUT_BATCH(dest);
+   OUT_BATCH(MI_LOAD_REGISTER_REG | (3 - 2));
+   OUT_BATCH(src + sizeof(uint32_t));
+   OUT_BATCH(dest + sizeof(uint32_t));
+   ADVANCE_BATCH();
+}
+
+/*
+ * Write 32-bits of immediate data to a GPU memory buffer.
+ */
+void
+brw_store_data_imm32(struct brw_context *brw, drm_intel_bo *bo,
+                     uint32_t offset, uint32_t imm)
+{
+   assert(brw->gen >= 6);
+
+   BEGIN_BATCH(4);
+   OUT_BATCH(MI_STORE_DATA_IMM | (4 - 2));
+   if (brw->gen >= 8)
+      OUT_RELOC64(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                  offset);
+   else {
+      OUT_BATCH(0); /* MBZ */
+      OUT_RELOC(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                offset);
+   }
+   OUT_BATCH(imm);
+   ADVANCE_BATCH();
+}
+
+/*
+ * Write 64-bits of immediate data to a GPU memory buffer.
+ */
+void
+brw_store_data_imm64(struct brw_context *brw, drm_intel_bo *bo,
+                     uint32_t offset, uint64_t imm)
+{
+   assert(brw->gen >= 6);
+
+   BEGIN_BATCH(5);
+   OUT_BATCH(MI_STORE_DATA_IMM | (5 - 2));
+   if (brw->gen >= 8)
+      OUT_RELOC64(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                  offset);
+   else {
+      OUT_BATCH(0); /* MBZ */
+      OUT_RELOC(bo, I915_GEM_DOMAIN_INSTRUCTION, I915_GEM_DOMAIN_INSTRUCTION,
+                offset);
+   }
+   OUT_BATCH(imm & 0xffffffffu);
+   OUT_BATCH(imm >> 32);
+   ADVANCE_BATCH();
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d1 1
+a1 2
+/**************************************************************************
+ *
+d9 1
+a9 1
+ * distribute, sub license, and/or sell copies of the Software, and to
+d19 1
+a19 1
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+d24 1
+a24 2
+ *
+ **************************************************************************/
+a27 1
+#include "intel_reg.h"
+d75 1
+d109 26
+d142 1
+a142 1
+   decode = drm_intel_decode_context_alloc(brw->intelScreen->deviceID);
+d237 7
+d308 2
+a309 2
+      __DRIscreen *psp = brw->intelScreen->driScrnPriv;
+      drmCommandNone(psp->fd, DRM_I915_GEM_THROTTLE);
+d339 1
+a339 1
+   if (!brw->intelScreen->no_hw) {
+d370 3
+d542 175
 @
 
 

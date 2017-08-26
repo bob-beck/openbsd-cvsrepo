@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.25;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.45.00;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -90,6 +96,228 @@ text
 #define NV50_PUSH_EXPLICIT_SPACE_CHECKING
 
 #include "nv50/nv50_context.h"
+#include "nv50/nv50_query.h"
+#include "nv50/nv50_query_hw.h"
+#include "nv50/nv50_query_hw_metric.h"
+#include "nv50/nv50_query_hw_sm.h"
+
+static struct pipe_query *
+nv50_create_query(struct pipe_context *pipe, unsigned type, unsigned index)
+{
+   struct nv50_context *nv50 = nv50_context(pipe);
+   struct nv50_query *q;
+
+   q = nv50_hw_create_query(nv50, type, index);
+   return (struct pipe_query *)q;
+}
+
+static void
+nv50_destroy_query(struct pipe_context *pipe, struct pipe_query *pq)
+{
+   struct nv50_query *q = nv50_query(pq);
+   q->funcs->destroy_query(nv50_context(pipe), q);
+}
+
+static boolean
+nv50_begin_query(struct pipe_context *pipe, struct pipe_query *pq)
+{
+   struct nv50_query *q = nv50_query(pq);
+   return q->funcs->begin_query(nv50_context(pipe), q);
+}
+
+static bool
+nv50_end_query(struct pipe_context *pipe, struct pipe_query *pq)
+{
+   struct nv50_query *q = nv50_query(pq);
+   q->funcs->end_query(nv50_context(pipe), q);
+   return true;
+}
+
+static boolean
+nv50_get_query_result(struct pipe_context *pipe, struct pipe_query *pq,
+                      boolean wait, union pipe_query_result *result)
+{
+   struct nv50_query *q = nv50_query(pq);
+   return q->funcs->get_query_result(nv50_context(pipe), q, wait, result);
+}
+
+static void
+nv50_render_condition(struct pipe_context *pipe,
+                      struct pipe_query *pq,
+                      boolean condition, uint mode)
+{
+   struct nv50_context *nv50 = nv50_context(pipe);
+   struct nouveau_pushbuf *push = nv50->base.pushbuf;
+   struct nv50_query *q = nv50_query(pq);
+   struct nv50_hw_query *hq = nv50_hw_query(q);
+   uint32_t cond;
+   bool wait =
+      mode != PIPE_RENDER_COND_NO_WAIT &&
+      mode != PIPE_RENDER_COND_BY_REGION_NO_WAIT;
+
+   if (!pq) {
+      cond = NV50_3D_COND_MODE_ALWAYS;
+   }
+   else {
+      /* NOTE: comparison of 2 queries only works if both have completed */
+      switch (q->type) {
+      case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+         cond = condition ? NV50_3D_COND_MODE_EQUAL :
+                            NV50_3D_COND_MODE_NOT_EQUAL;
+         wait = true;
+         break;
+      case PIPE_QUERY_OCCLUSION_COUNTER:
+      case PIPE_QUERY_OCCLUSION_PREDICATE:
+         if (likely(!condition)) {
+            if (unlikely(hq->nesting))
+               cond = wait ? NV50_3D_COND_MODE_NOT_EQUAL :
+                             NV50_3D_COND_MODE_ALWAYS;
+            else
+               cond = NV50_3D_COND_MODE_RES_NON_ZERO;
+         } else {
+            cond = wait ? NV50_3D_COND_MODE_EQUAL : NV50_3D_COND_MODE_ALWAYS;
+         }
+         break;
+      default:
+         assert(!"render condition query not a predicate");
+         cond = NV50_3D_COND_MODE_ALWAYS;
+         break;
+      }
+   }
+
+   nv50->cond_query = pq;
+   nv50->cond_cond = condition;
+   nv50->cond_condmode = cond;
+   nv50->cond_mode = mode;
+
+   if (!pq) {
+      PUSH_SPACE(push, 2);
+      BEGIN_NV04(push, NV50_3D(COND_MODE), 1);
+      PUSH_DATA (push, cond);
+      return;
+   }
+
+   PUSH_SPACE(push, 9);
+
+   if (wait) {
+      BEGIN_NV04(push, SUBC_3D(NV50_GRAPH_SERIALIZE), 1);
+      PUSH_DATA (push, 0);
+   }
+
+   PUSH_REFN (push, hq->bo, NOUVEAU_BO_GART | NOUVEAU_BO_RD);
+   BEGIN_NV04(push, NV50_3D(COND_ADDRESS_HIGH), 3);
+   PUSH_DATAh(push, hq->bo->offset + hq->offset);
+   PUSH_DATA (push, hq->bo->offset + hq->offset);
+   PUSH_DATA (push, cond);
+
+   BEGIN_NV04(push, NV50_2D(COND_ADDRESS_HIGH), 2);
+   PUSH_DATAh(push, hq->bo->offset + hq->offset);
+   PUSH_DATA (push, hq->bo->offset + hq->offset);
+}
+
+static void
+nv50_set_active_query_state(struct pipe_context *pipe, boolean enable)
+{
+}
+
+void
+nv50_init_query_functions(struct nv50_context *nv50)
+{
+   struct pipe_context *pipe = &nv50->base.pipe;
+
+   pipe->create_query = nv50_create_query;
+   pipe->destroy_query = nv50_destroy_query;
+   pipe->begin_query = nv50_begin_query;
+   pipe->end_query = nv50_end_query;
+   pipe->get_query_result = nv50_get_query_result;
+   pipe->set_active_query_state = nv50_set_active_query_state;
+   pipe->render_condition = nv50_render_condition;
+   nv50->cond_condmode = NV50_3D_COND_MODE_ALWAYS;
+}
+
+int
+nv50_screen_get_driver_query_info(struct pipe_screen *pscreen,
+                                  unsigned id,
+                                  struct pipe_driver_query_info *info)
+{
+   struct nv50_screen *screen = nv50_screen(pscreen);
+   int num_hw_queries = 0;
+
+   num_hw_queries = nv50_hw_get_driver_query_info(screen, 0, NULL);
+
+   if (!info)
+      return num_hw_queries;
+
+   /* Init default values. */
+   info->name = "this_is_not_the_query_you_are_looking_for";
+   info->query_type = 0xdeadd01d;
+   info->max_value.u64 = 0;
+   info->type = PIPE_DRIVER_QUERY_TYPE_UINT64;
+   info->group_id = -1;
+   info->flags = 0;
+
+   return nv50_hw_get_driver_query_info(screen, id, info);
+}
+
+int
+nv50_screen_get_driver_query_group_info(struct pipe_screen *pscreen,
+                                        unsigned id,
+                                        struct pipe_driver_query_group_info *info)
+{
+   struct nv50_screen *screen = nv50_screen(pscreen);
+   int count = 0;
+
+   if (screen->compute)
+      if (screen->base.class_3d >= NV84_3D_CLASS)
+         count += 2;
+
+   if (!info)
+      return count;
+
+   if (id == NV50_HW_SM_QUERY_GROUP) {
+      if (screen->compute) {
+         if (screen->base.class_3d >= NV84_3D_CLASS) {
+            info->name = "MP counters";
+
+            /* Because we can't expose the number of hardware counters needed
+             * for each different query, we don't want to allow more than one
+             * active query simultaneously to avoid failure when the maximum
+             * number of counters is reached. Note that these groups of GPU
+             * counters are currently only used by AMD_performance_monitor.
+             */
+            info->max_active_queries = 1;
+            info->num_queries = NV50_HW_SM_QUERY_COUNT;
+            return 1;
+         }
+      }
+   } else
+   if (id == NV50_HW_METRIC_QUERY_GROUP) {
+      if (screen->compute) {
+         if (screen->base.class_3d >= NV84_3D_CLASS) {
+            info->name = "Performance metrics";
+            info->max_active_queries = 1;
+            info->num_queries = NV50_HW_METRIC_QUERY_COUNT;
+            return 1;
+         }
+      }
+   }
+
+   /* user asked for info about non-existing query group */
+   info->name = "this_is_not_the_query_group_you_are_looking_for";
+   info->max_active_queries = 0;
+   info->num_queries = 0;
+   return 0;
+}
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d28 4
+a31 76
 #include "nv_object.xml.h"
 
 #define NV50_QUERY_STATE_READY   0
@@ -166,13 +394,11 @@ nv50_query_destroy(struct pipe_context *pipe, struct pipe_query *pq)
    nouveau_fence_ref(NULL, &nv50_query(pq)->fence);
    FREE(nv50_query(pq));
 }
-
-static struct pipe_query *
+d34 1
+a34 1
 nv50_query_create(struct pipe_context *pipe, unsigned type, unsigned index)
-{
-   struct nv50_context *nv50 = nv50_context(pipe);
-   struct nv50_query *q;
-
+d39 1
+a39 20
    q = CALLOC_STRUCT(nv50_query);
    if (!q)
       return NULL;
@@ -193,13 +419,12 @@ nv50_query_create(struct pipe_context *pipe, unsigned type, unsigned index)
       q->data -= 32 / sizeof(*q->data); /* we advance before query_begin ! */
    }
 
-   return (struct pipe_query *)q;
-}
-
-static void
+d44 1
+a44 2
 nv50_query_get(struct nouveau_pushbuf *push, struct nv50_query *q,
                unsigned offset, uint32_t get)
-{
+d46 2
+a47 9
    offset += q->offset;
 
    PUSH_SPACE(push, 5);
@@ -209,14 +434,14 @@ nv50_query_get(struct nouveau_pushbuf *push, struct nv50_query *q,
    PUSH_DATA (push, q->bo->offset + offset);
    PUSH_DATA (push, q->sequence);
    PUSH_DATA (push, get);
-}
-
-static boolean
+d51 1
+a51 1
 nv50_query_begin(struct pipe_context *pipe, struct pipe_query *pq)
-{
+a52 2
    struct nv50_context *nv50 = nv50_context(pipe);
    struct nouveau_pushbuf *push = nv50->base.pushbuf;
-   struct nv50_query *q = nv50_query(pq);
+d54 1
+a54 63
 
    /* For occlusion queries we have to change the storage, because a previous
     * query might set the initial render conition to false even *after* we re-
@@ -280,14 +505,15 @@ nv50_query_begin(struct pipe_context *pipe, struct pipe_query *pq)
    }
    q->state = NV50_QUERY_STATE_ACTIVE;
    return true;
-}
-
+d57 2
+a58 2
 static void
 nv50_query_end(struct pipe_context *pipe, struct pipe_query *pq)
-{
+a59 2
    struct nv50_context *nv50 = nv50_context(pipe);
    struct nouveau_pushbuf *push = nv50->base.pushbuf;
-   struct nv50_query *q = nv50_query(pq);
+d61 2
+a62 69
 
    q->state = NV50_QUERY_STATE_ENDED;
 
@@ -357,9 +583,8 @@ nv50_query_update(struct nv50_query *q)
       if (q->data[0] == q->sequence)
          q->state = NV50_QUERY_STATE_READY;
    }
-}
-
-static boolean
+d66 2
+a67 69
 nv50_query_result(struct pipe_context *pipe, struct pipe_query *pq,
                   boolean wait, union pipe_query_result *result)
 {
@@ -429,8 +654,8 @@ nv50_query_result(struct pipe_context *pipe, struct pipe_query *pq,
 
 void
 nv84_query_fifo_wait(struct nouveau_pushbuf *push, struct pipe_query *pq)
-{
-   struct nv50_query *q = nv50_query(pq);
+d70 1
+a70 9
    unsigned offset = q->offset;
 
    PUSH_SPACE(push, 5);
@@ -440,86 +665,31 @@ nv84_query_fifo_wait(struct nouveau_pushbuf *push, struct pipe_query *pq)
    PUSH_DATA (push, q->bo->offset + offset);
    PUSH_DATA (push, q->sequence);
    PUSH_DATA (push, NV84_SUBCHAN_SEMAPHORE_TRIGGER_ACQUIRE_EQUAL);
-}
-
-static void
-nv50_render_condition(struct pipe_context *pipe,
-                      struct pipe_query *pq,
-                      boolean condition, uint mode)
-{
-   struct nv50_context *nv50 = nv50_context(pipe);
-   struct nouveau_pushbuf *push = nv50->base.pushbuf;
+d80 2
+a81 1
    struct nv50_query *q;
-   uint32_t cond;
-   bool wait =
-      mode != PIPE_RENDER_COND_NO_WAIT &&
-      mode != PIPE_RENDER_COND_BY_REGION_NO_WAIT;
-
-   if (!pq) {
-      cond = NV50_3D_COND_MODE_ALWAYS;
-   }
-   else {
+a90 1
       q = nv50_query(pq);
-      /* NOTE: comparison of 2 queries only works if both have completed */
-      switch (q->type) {
-      case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
-         cond = condition ? NV50_3D_COND_MODE_EQUAL :
-                            NV50_3D_COND_MODE_NOT_EQUAL;
-         wait = true;
-         break;
-      case PIPE_QUERY_OCCLUSION_COUNTER:
-      case PIPE_QUERY_OCCLUSION_PREDICATE:
-         if (likely(!condition)) {
+d101 1
+a101 1
             if (unlikely(q->nesting))
-               cond = wait ? NV50_3D_COND_MODE_NOT_EQUAL :
-                             NV50_3D_COND_MODE_ALWAYS;
-            else
-               cond = NV50_3D_COND_MODE_RES_NON_ZERO;
-         } else {
-            cond = wait ? NV50_3D_COND_MODE_EQUAL : NV50_3D_COND_MODE_ALWAYS;
-         }
-         break;
-      default:
-         assert(!"render condition query not a predicate");
-         cond = NV50_3D_COND_MODE_ALWAYS;
-         break;
-      }
-   }
-
-   nv50->cond_query = pq;
-   nv50->cond_cond = condition;
-   nv50->cond_condmode = cond;
-   nv50->cond_mode = mode;
-
-   if (!pq) {
-      PUSH_SPACE(push, 2);
-      BEGIN_NV04(push, NV50_3D(COND_MODE), 1);
-      PUSH_DATA (push, cond);
-      return;
-   }
-
-   PUSH_SPACE(push, 9);
-
-   if (wait) {
-      BEGIN_NV04(push, SUBC_3D(NV50_GRAPH_SERIALIZE), 1);
-      PUSH_DATA (push, 0);
-   }
-
+d136 1
+a136 1
    PUSH_REFN (push, q->bo, NOUVEAU_BO_GART | NOUVEAU_BO_RD);
-   BEGIN_NV04(push, NV50_3D(COND_ADDRESS_HIGH), 3);
+d138 2
+a139 2
    PUSH_DATAh(push, q->bo->offset + q->offset);
    PUSH_DATA (push, q->bo->offset + q->offset);
-   PUSH_DATA (push, cond);
-
-   BEGIN_NV04(push, NV50_2D(COND_ADDRESS_HIGH), 2);
+d143 2
+a144 2
    PUSH_DATAh(push, q->bo->offset + q->offset);
    PUSH_DATA (push, q->bo->offset + q->offset);
-}
-
+d147 2
+a148 3
 void
 nv50_query_pushbuf_submit(struct nouveau_pushbuf *push, uint16_t method,
                           struct pipe_query *pq, unsigned result_offset)
-{
+a149 9
    struct nv50_query *q = nv50_query(pq);
 
    nv50_query_update(q);
@@ -529,15 +699,16 @@ nv50_query_pushbuf_submit(struct nouveau_pushbuf *push, uint16_t method,
 
    BEGIN_NV04(push, SUBC_3D(method), 1);
    PUSH_DATA (push, q->data[result_offset / 4]);
-}
-
-void
+d153 1
+a153 3
 nva0_so_target_save_offset(struct pipe_context *pipe,
                            struct pipe_stream_output_target *ptarg,
                            unsigned index, bool serialize)
-{
+d155 1
+a155 1
    struct nv50_so_target *targ = nv50_so_target(ptarg);
-
+d157 8
+a164 9
    if (serialize) {
       struct nouveau_pushbuf *push = nv50_context(pipe)->base.pushbuf;
       PUSH_SPACE(push, 2);
@@ -547,20 +718,20 @@ nva0_so_target_save_offset(struct pipe_context *pipe,
 
    nv50_query(targ->pq)->index = index;
    nv50_query_end(pipe, targ->pq);
-}
-
+d167 66
+a232 4
 void
 nv50_init_query_functions(struct nv50_context *nv50)
 {
    struct pipe_context *pipe = &nv50->base.pipe;
-
+d234 5
+a238 6
    pipe->create_query = nv50_query_create;
    pipe->destroy_query = nv50_query_destroy;
    pipe->begin_query = nv50_query_begin;
    pipe->end_query = nv50_query_end;
    pipe->get_query_result = nv50_query_result;
    pipe->render_condition = nv50_render_condition;
-}
 @
 
 

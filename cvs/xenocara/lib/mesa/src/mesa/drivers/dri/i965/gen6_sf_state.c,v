@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.4
@@ -21,6 +20,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.2
+date	2017.08.26.16.59.37;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2015.11.22.02.40.23;	author jsg;	state Exp;
@@ -58,9 +63,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -94,6 +100,7 @@ text
 #include "brw_state.h"
 #include "brw_defines.h"
 #include "brw_util.h"
+#include "compiler/nir/nir.h"
 #include "main/macros.h"
 #include "main/fbobject.h"
 #include "main/framebuffer.h"
@@ -124,6 +131,23 @@ get_attr_override(const struct brw_vue_map *vue_map, int urb_entry_read_offset,
 {
    /* Find the VUE slot for this attribute. */
    int slot = vue_map->varying_to_slot[fs_attr];
+
+   /* Viewport and Layer are stored in the VUE header.  We need to override
+    * them to zero if earlier stages didn't write them, as GL requires that
+    * they read back as zero when not explicitly set.
+    */
+   if (fs_attr == VARYING_SLOT_VIEWPORT || fs_attr == VARYING_SLOT_LAYER) {
+      unsigned override =
+         ATTRIBUTE_0_OVERRIDE_X | ATTRIBUTE_0_OVERRIDE_W |
+         ATTRIBUTE_CONST_0000 << ATTRIBUTE_0_CONST_SOURCE_SHIFT;
+
+      if (!(vue_map->slots_valid & VARYING_BIT_LAYER))
+         override |= ATTRIBUTE_0_OVERRIDE_Y;
+      if (!(vue_map->slots_valid & VARYING_BIT_VIEWPORT))
+         override |= ATTRIBUTE_0_OVERRIDE_Z;
+
+      return override;
+   }
 
    /* If there was only a back color written but not front, use back
     * as the color instead of undefined
@@ -195,26 +219,6 @@ get_attr_override(const struct brw_vue_map *vue_map, int urb_entry_read_offset,
 }
 
 
-static bool
-is_drawing_points(const struct brw_context *brw)
-{
-   /* Determine if the primitives *reaching the SF* are points */
-   /* _NEW_POLYGON */
-   if (brw->ctx.Polygon.FrontMode == GL_POINT ||
-       brw->ctx.Polygon.BackMode == GL_POINT) {
-      return true;
-   }
-
-   if (brw->geometry_program) {
-      /* BRW_NEW_GEOMETRY_PROGRAM */
-      return brw->geometry_program->OutputType == GL_POINTS;
-   } else {
-      /* BRW_NEW_PRIMITIVE */
-      return brw->primitive == _3DPRIM_POINTLIST;
-   }
-}
-
-
 /**
  * Create the mapping from the FS inputs we produce to the previous pipeline
  * stage (GS or VS) outputs they source from.
@@ -223,17 +227,32 @@ void
 calculate_attr_overrides(const struct brw_context *brw,
                          uint16_t *attr_overrides,
                          uint32_t *point_sprite_enables,
-                         uint32_t *flat_enables,
-                         uint32_t *urb_entry_read_length)
+                         uint32_t *urb_entry_read_length,
+                         uint32_t *urb_entry_read_offset)
 {
-   const int urb_entry_read_offset = BRW_SF_URB_ENTRY_READ_OFFSET;
+   /* BRW_NEW_FS_PROG_DATA */
+   const struct brw_wm_prog_data *wm_prog_data =
+      brw_wm_prog_data(brw->wm.base.prog_data);
    uint32_t max_source_attr = 0;
 
    *point_sprite_enables = 0;
-   *flat_enables = 0;
 
-   /* _NEW_LIGHT */
-   bool shade_model_flat = brw->ctx.Light.ShadeModel == GL_FLAT;
+   *urb_entry_read_offset = BRW_SF_URB_ENTRY_READ_OFFSET;
+
+   /* BRW_NEW_FRAGMENT_PROGRAM
+    *
+    * If the fragment shader reads VARYING_SLOT_LAYER, then we need to pass in
+    * the full vertex header.  Otherwise, we can program the SF to start
+    * reading at an offset of 1 (2 varying slots) to skip unnecessary data:
+    * - VARYING_SLOT_PSIZ and BRW_VARYING_SLOT_NDC on gen4-5
+    * - VARYING_SLOT_{PSIZ,LAYER} and VARYING_SLOT_POS on gen6+
+    */
+
+   bool fs_needs_vue_header =
+      brw->fragment_program->Base.nir->info.inputs_read &
+      (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
+
+   *urb_entry_read_offset = fs_needs_vue_header ? 0 : 1;
 
    /* From the Ivybridge PRM, Vol 2 Part 1, 3DSTATE_SBE,
     * description of dw10 Point Sprite Texture Coordinate Enable:
@@ -248,9 +267,11 @@ calculate_attr_overrides(const struct brw_context *brw,
     * This is not required on Haswell, as the hardware ignores this state
     * when drawing non-points -- although we do still need to be careful to
     * correctly set the attr overrides.
+    *
+    * _NEW_POLYGON
+    * BRW_NEW_PRIMITIVE | BRW_NEW_GS_PROG_DATA | BRW_NEW_TES_PROG_DATA
     */
-   /* BRW_NEW_PRIMITIVE | BRW_NEW_GEOMETRY_PROGRAM */
-   bool drawing_points = is_drawing_points(brw);
+   bool drawing_points = brw_is_drawing_points(brw);
 
    /* Initialize all the attr_overrides to 0.  In the loop below we'll modify
     * just the ones that correspond to inputs used by the fs.
@@ -258,12 +279,7 @@ calculate_attr_overrides(const struct brw_context *brw,
    memset(attr_overrides, 0, 16*sizeof(*attr_overrides));
 
    for (int attr = 0; attr < VARYING_SLOT_MAX; attr++) {
-      /* BRW_NEW_FRAGMENT_PROGRAM */
-      enum glsl_interp_qualifier interp_qualifier =
-         brw->fragment_program->InterpQualifier[attr];
-      bool is_gl_Color = attr == VARYING_SLOT_COL0 || attr == VARYING_SLOT_COL1;
-      /* BRW_NEW_FS_PROG_DATA */
-      int input_index = brw->wm.prog_data->urb_setup[attr];
+      int input_index = wm_prog_data->urb_setup[attr];
 
       if (input_index < 0)
 	 continue;
@@ -273,7 +289,7 @@ calculate_attr_overrides(const struct brw_context *brw,
       if (drawing_points) {
          if (brw->ctx.Point.PointSprite &&
              (attr >= VARYING_SLOT_TEX0 && attr <= VARYING_SLOT_TEX7) &&
-             brw->ctx.Point.CoordReplace[attr - VARYING_SLOT_TEX0]) {
+             (brw->ctx.Point.CoordReplace & (1u << (attr - VARYING_SLOT_TEX0)))) {
             point_sprite = true;
          }
 
@@ -284,16 +300,10 @@ calculate_attr_overrides(const struct brw_context *brw,
             *point_sprite_enables |= (1 << input_index);
       }
 
-      /* flat shading */
-      if (interp_qualifier == INTERP_QUALIFIER_FLAT ||
-          (shade_model_flat && is_gl_Color &&
-           interp_qualifier == INTERP_QUALIFIER_NONE))
-         *flat_enables |= (1 << input_index);
-
       /* BRW_NEW_VUE_MAP_GEOM_OUT | _NEW_LIGHT | _NEW_PROGRAM */
       uint16_t attr_override = point_sprite ? 0 :
          get_attr_override(&brw->vue_map_geom_out,
-			   urb_entry_read_offset, attr,
+			   *urb_entry_read_offset, attr,
                            brw->ctx.VertexProgram._TwoSideEnabled,
                            &max_source_attr);
 
@@ -332,16 +342,16 @@ upload_sf_state(struct brw_context *brw)
 {
    struct gl_context *ctx = &brw->ctx;
    /* BRW_NEW_FS_PROG_DATA */
-   uint32_t num_outputs = brw->wm.prog_data->num_varying_inputs;
+   const struct brw_wm_prog_data *wm_prog_data =
+      brw_wm_prog_data(brw->wm.base.prog_data);
+   uint32_t num_outputs = wm_prog_data->num_varying_inputs;
    uint32_t dw1, dw2, dw3, dw4;
    uint32_t point_sprite_enables;
-   uint32_t flat_enables;
    int i;
    /* _NEW_BUFFER */
    bool render_to_fbo = _mesa_is_user_fbo(ctx->DrawBuffer);
    const bool multisampled_fbo = _mesa_geometric_samples(ctx->DrawBuffer) > 1;
 
-   const int urb_entry_read_offset = BRW_SF_URB_ENTRY_READ_OFFSET;
    float point_size;
    uint16_t attr_overrides[16];
    uint32_t point_sprite_origin;
@@ -402,8 +412,11 @@ upload_sf_state(struct brw_context *brw)
        unreachable("not reached");
    }
 
-   /* _NEW_SCISSOR */
-   if (ctx->Scissor.EnableFlags)
+   /* _NEW_SCISSOR | _NEW_POLYGON,
+    * BRW_NEW_GS_PROG_DATA | BRW_NEW_TES_PROG_DATA | BRW_NEW_PRIMITIVE
+    */
+   if (ctx->Scissor.EnableFlags ||
+       brw_is_drawing_points(brw) || brw_is_drawing_lines(brw))
       dw3 |= GEN6_SF_SCISSOR_ENABLE;
 
    /* _NEW_POLYGON */
@@ -439,12 +452,11 @@ upload_sf_state(struct brw_context *brw)
    if (multisampled_fbo && ctx->Multisample.Enabled)
       dw3 |= GEN6_SF_MSRAST_ON_PATTERN;
 
-   /* _NEW_PROGRAM | _NEW_POINT */
-   if (!(ctx->VertexProgram.PointSizeEnabled ||
-	 ctx->Point._Attenuated))
+   /* _NEW_PROGRAM | _NEW_POINT, BRW_NEW_VUE_MAP_GEOM_OUT */
+   if (use_state_point_size(brw))
       dw4 |= GEN6_SF_USE_STATE_POINT_WIDTH;
 
-   /* Clamp to ARB_point_parameters user limits */
+   /* _NEW_POINT - Clamp to ARB_point_parameters user limits */
    point_size = CLAMP(ctx->Point.Size, ctx->Point.MinSize, ctx->Point.MaxSize);
 
    /* Clamp to the hardware limits and convert to fixed point */
@@ -476,8 +488,9 @@ upload_sf_state(struct brw_context *brw)
     * _NEW_POINT | _NEW_LIGHT | _NEW_PROGRAM | BRW_NEW_FS_PROG_DATA
     */
    uint32_t urb_entry_read_length;
+   uint32_t urb_entry_read_offset;
    calculate_attr_overrides(brw, attr_overrides, &point_sprite_enables,
-                            &flat_enables, &urb_entry_read_length);
+                            &urb_entry_read_length, &urb_entry_read_offset);
    dw1 |= (urb_entry_read_length << GEN6_SF_URB_ENTRY_READ_LENGTH_SHIFT |
            urb_entry_read_offset << GEN6_SF_URB_ENTRY_READ_OFFSET_SHIFT);
 
@@ -494,7 +507,7 @@ upload_sf_state(struct brw_context *brw)
       OUT_BATCH(attr_overrides[i * 2] | attr_overrides[i * 2 + 1] << 16);
    }
    OUT_BATCH(point_sprite_enables); /* dw16 */
-   OUT_BATCH(flat_enables);
+   OUT_BATCH(wm_prog_data->flat_inputs);
    OUT_BATCH(0); /* wrapshortest enables 0-7 */
    OUT_BATCH(0); /* wrapshortest enables 8-15 */
    ADVANCE_BATCH();
@@ -510,15 +523,120 @@ const struct brw_tracked_state gen6_sf_state = {
                _NEW_POLYGON |
                _NEW_PROGRAM |
                _NEW_SCISSOR,
-      .brw   = BRW_NEW_CONTEXT |
+      .brw   = BRW_NEW_BLORP |
+               BRW_NEW_CONTEXT |
                BRW_NEW_FRAGMENT_PROGRAM |
                BRW_NEW_FS_PROG_DATA |
-               BRW_NEW_GEOMETRY_PROGRAM |
+               BRW_NEW_GS_PROG_DATA |
                BRW_NEW_PRIMITIVE |
+               BRW_NEW_TES_PROG_DATA |
                BRW_NEW_VUE_MAP_GEOM_OUT,
    },
    .emit = upload_sf_state,
 };
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@d32 1
+d64 17
+a150 20
+static bool
+is_drawing_points(const struct brw_context *brw)
+{
+   /* Determine if the primitives *reaching the SF* are points */
+   /* _NEW_POLYGON */
+   if (brw->ctx.Polygon.FrontMode == GL_POINT ||
+       brw->ctx.Polygon.BackMode == GL_POINT) {
+      return true;
+   }
+
+   if (brw->geometry_program) {
+      /* BRW_NEW_GEOMETRY_PROGRAM */
+      return brw->geometry_program->OutputType == GL_POINTS;
+   } else {
+      /* BRW_NEW_PRIMITIVE */
+      return brw->primitive == _3DPRIM_POINTLIST;
+   }
+}
+
+
+d159 2
+a160 2
+                         uint32_t *flat_enables,
+                         uint32_t *urb_entry_read_length)
+d162 3
+a164 1
+   const int urb_entry_read_offset = BRW_SF_URB_ENTRY_READ_OFFSET;
+a167 1
+   *flat_enables = 0;
+d169 16
+a184 2
+   /* _NEW_LIGHT */
+   bool shade_model_flat = brw->ctx.Light.ShadeModel == GL_FLAT;
+d199 3
+d203 1
+a203 2
+   /* BRW_NEW_PRIMITIVE | BRW_NEW_GEOMETRY_PROGRAM */
+   bool drawing_points = is_drawing_points(brw);
+d211 1
+a211 6
+      /* BRW_NEW_FRAGMENT_PROGRAM */
+      enum glsl_interp_qualifier interp_qualifier =
+         brw->fragment_program->InterpQualifier[attr];
+      bool is_gl_Color = attr == VARYING_SLOT_COL0 || attr == VARYING_SLOT_COL1;
+      /* BRW_NEW_FS_PROG_DATA */
+      int input_index = brw->wm.prog_data->urb_setup[attr];
+d221 1
+a221 1
+             brw->ctx.Point.CoordReplace[attr - VARYING_SLOT_TEX0]) {
+a231 6
+      /* flat shading */
+      if (interp_qualifier == INTERP_QUALIFIER_FLAT ||
+          (shade_model_flat && is_gl_Color &&
+           interp_qualifier == INTERP_QUALIFIER_NONE))
+         *flat_enables |= (1 << input_index);
+
+d235 1
+a235 1
+			   urb_entry_read_offset, attr,
+d274 3
+a276 1
+   uint32_t num_outputs = brw->wm.prog_data->num_varying_inputs;
+a278 1
+   uint32_t flat_enables;
+a283 1
+   const int urb_entry_read_offset = BRW_SF_URB_ENTRY_READ_OFFSET;
+d344 5
+a348 2
+   /* _NEW_SCISSOR */
+   if (ctx->Scissor.EnableFlags)
+d384 2
+a385 3
+   /* _NEW_PROGRAM | _NEW_POINT */
+   if (!(ctx->VertexProgram.PointSizeEnabled ||
+	 ctx->Point._Attenuated))
+d388 1
+a388 1
+   /* Clamp to ARB_point_parameters user limits */
+d420 1
+d422 1
+a422 1
+                            &flat_enables, &urb_entry_read_length);
+d439 1
+a439 1
+   OUT_BATCH(flat_enables);
+d455 2
+a456 1
+      .brw   = BRW_NEW_CONTEXT |
+d459 1
+a459 1
+               BRW_NEW_GEOMETRY_PROGRAM |
+d461 1
 @
 
 

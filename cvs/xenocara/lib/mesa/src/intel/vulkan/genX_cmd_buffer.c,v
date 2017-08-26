@@ -1,5 +1,4 @@
-head	1.1;
-branch	1.1.1;
+head	1.2;
 access;
 symbols
 	mesa-17_1_6:1.1.1.5
@@ -14,6 +13,12 @@ locks; strict;
 comment	@ * @;
 expand	@o@;
 
+
+1.2
+date	2017.08.26.16.59.34;	author jsg;	state Exp;
+branches;
+next	1.1;
+commitid	D0k2io1oY8gcsQ2S;
 
 1.1
 date	2016.12.11.08.35.40;	author jsg;	state Exp;
@@ -57,9 +62,10 @@ desc
 @@
 
 
-1.1
+1.2
 log
-@Initial revision
+@Revert to Mesa 13.0.6 to hopefully address rendering issues a handful of
+people have reported with xpdf/fvwm on ivy bridge with modesetting driver.
 @
 text
 @/*
@@ -118,8 +124,6 @@ genX(cmd_buffer_emit_state_base_address)(struct anv_cmd_buffer *cmd_buffer)
 {
    struct anv_device *device = cmd_buffer->device;
 
-/* XXX: Do we need this on more than just BDW? */
-#if (GEN_GEN >= 8)
    /* Emit a render target cache flush.
     *
     * This isn't documented anywhere in the PRM.  However, it seems to be
@@ -128,9 +132,10 @@ genX(cmd_buffer_emit_state_base_address)(struct anv_cmd_buffer *cmd_buffer)
     * clear depth, reset state base address, and then go render stuff.
     */
    anv_batch_emit(&cmd_buffer->batch, GENX(PIPE_CONTROL), pc) {
+      pc.DCFlushEnable = true;
       pc.RenderTargetCacheFlushEnable = true;
+      pc.CommandStreamerStallEnable = true;
    }
-#endif
 
    anv_batch_emit(&cmd_buffer->batch, GENX(STATE_BASE_ADDRESS), sba) {
       sba.GeneralStateBaseAddress = (struct anv_address) { NULL, 0 };
@@ -211,6 +216,8 @@ genX(cmd_buffer_emit_state_base_address)(struct anv_cmd_buffer *cmd_buffer)
     */
    anv_batch_emit(&cmd_buffer->batch, GENX(PIPE_CONTROL), pc) {
       pc.TextureCacheInvalidationEnable = true;
+      pc.ConstantCacheInvalidationEnable = true;
+      pc.StateCacheInvalidationEnable = true;
    }
 }
 
@@ -1420,21 +1427,12 @@ flush_compute_descriptor_set(struct anv_cmd_buffer *cmd_buffer)
       result = emit_binding_table(cmd_buffer, MESA_SHADER_COMPUTE, &surfaces);
       assert(result == VK_SUCCESS);
    }
+
    result = emit_samplers(cmd_buffer, MESA_SHADER_COMPUTE, &samplers);
    assert(result == VK_SUCCESS);
 
-
-   struct anv_state push_state = anv_cmd_buffer_cs_push_constants(cmd_buffer);
-
    const struct brw_cs_prog_data *cs_prog_data = get_cs_prog_data(pipeline);
    const struct brw_stage_prog_data *prog_data = &cs_prog_data->base;
-
-   if (push_state.alloc_size) {
-      anv_batch_emit(&cmd_buffer->batch, GENX(MEDIA_CURBE_LOAD), curbe) {
-         curbe.CURBETotalDataLength    = push_state.alloc_size;
-         curbe.CURBEDataStartAddress   = push_state.offset;
-      }
-   }
 
    const uint32_t slm_size = encode_slm_size(GEN_GEN, prog_data->total_shared);
 
@@ -1503,6 +1501,18 @@ genX(cmd_buffer_flush_compute_state)(struct anv_cmd_buffer *cmd_buffer)
       result = flush_compute_descriptor_set(cmd_buffer);
       assert(result == VK_SUCCESS);
       cmd_buffer->state.descriptors_dirty &= ~VK_SHADER_STAGE_COMPUTE_BIT;
+   }
+
+   if (cmd_buffer->state.push_constants_dirty & VK_SHADER_STAGE_COMPUTE_BIT) {
+      struct anv_state push_state =
+         anv_cmd_buffer_cs_push_constants(cmd_buffer);
+
+      if (push_state.alloc_size) {
+         anv_batch_emit(&cmd_buffer->batch, GENX(MEDIA_CURBE_LOAD), curbe) {
+            curbe.CURBETotalDataLength    = push_state.alloc_size;
+            curbe.CURBEDataStartAddress   = push_state.offset;
+         }
+      }
    }
 
    cmd_buffer->state.compute_dirty = 0;
@@ -1820,14 +1830,17 @@ cmd_buffer_emit_depth_stencil(struct anv_cmd_buffer *cmd_buffer)
          db.Height               = image->extent.height - 1;
          db.Width                = image->extent.width - 1;
          db.LOD                  = iview->isl.base_level;
-         db.Depth                = image->array_size - 1; /* FIXME: 3-D */
          db.MinimumArrayElement  = iview->isl.base_array_layer;
+
+         assert(image->depth_surface.isl.dim != ISL_SURF_DIM_3D);
+         db.Depth =
+         db.RenderTargetViewExtent =
+            iview->isl.array_len - iview->isl.base_array_layer - 1;
 
 #if GEN_GEN >= 8
          db.SurfaceQPitch =
             isl_surf_get_array_pitch_el_rows(&image->depth_surface.isl) >> 2;
 #endif
-         db.RenderTargetViewExtent = 1 - 1;
       }
    } else {
       /* Even when no depth buffer is present, the hardware requires that
@@ -1860,10 +1873,10 @@ cmd_buffer_emit_depth_stencil(struct anv_cmd_buffer *cmd_buffer)
    if (has_hiz) {
       anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_HIER_DEPTH_BUFFER), hdb) {
          hdb.HierarchicalDepthBufferObjectControlState = GENX(MOCS);
-         hdb.SurfacePitch = image->hiz_surface.isl.row_pitch - 1;
+         hdb.SurfacePitch = image->aux_surface.isl.row_pitch - 1;
          hdb.SurfaceBaseAddress = (struct anv_address) {
             .bo = image->bo,
-            .offset = image->offset + image->hiz_surface.offset,
+            .offset = image->offset + image->aux_surface.offset,
          };
 #if GEN_GEN >= 8
          /* From the SKL PRM Vol2a:
@@ -1873,11 +1886,14 @@ cmd_buffer_emit_depth_stencil(struct anv_cmd_buffer *cmd_buffer)
           *    - SURFTYPE_1D: distance in pixels between array slices
           *    - SURFTYPE_2D/CUBE: distance in rows between array slices
           *    - SURFTYPE_3D: distance in rows between R - slices
+          *
+          * Unfortunately, the docs aren't 100% accurate here.  They fail to
+          * mention that the 1-D rule only applies to linear 1-D images.
+          * Since depth and HiZ buffers are always tiled, they are treated as
+          * 2-D images.  Prior to Sky Lake, this field is always in rows.
           */
          hdb.SurfaceQPitch =
-            image->hiz_surface.isl.dim == ISL_SURF_DIM_1D ?
-               isl_surf_get_array_pitch_el(&image->hiz_surface.isl) >> 2 :
-               isl_surf_get_array_pitch_el_rows(&image->hiz_surface.isl) >> 2;
+            isl_surf_get_array_pitch_sa_rows(&image->aux_surface.isl) >> 2;
 #endif
       }
    } else {
@@ -2012,6 +2028,36 @@ emit_query_availability(struct anv_cmd_buffer *cmd_buffer,
       pc.PostSyncOperation       = WriteImmediateData;
       pc.Address                 = (struct anv_address) { bo, offset };
       pc.ImmediateData           = 1;
+   }
+}
+
+void genX(CmdResetQueryPool)(
+    VkCommandBuffer                             commandBuffer,
+    VkQueryPool                                 queryPool,
+    uint32_t                                    firstQuery,
+    uint32_t                                    queryCount)
+{
+   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+   ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
+
+   for (uint32_t i = 0; i < queryCount; i++) {
+      switch (pool->type) {
+      case VK_QUERY_TYPE_OCCLUSION:
+      case VK_QUERY_TYPE_TIMESTAMP: {
+         anv_batch_emit(&cmd_buffer->batch, GENX(MI_STORE_DATA_IMM), sdm) {
+            sdm.Address = (struct anv_address) {
+               .bo = &pool->bo,
+               .offset = (firstQuery + i) * sizeof(struct anv_query_pool_slot) +
+                         offsetof(struct anv_query_pool_slot, available),
+            };
+            sdm.DataDWord0 = 0;
+            sdm.DataDWord1 = 0;
+         }
+         break;
+      }
+      default:
+         assert(!"Invalid query type");
+      }
    }
 }
 
@@ -2263,6 +2309,54 @@ void genX(CmdCopyQueryPoolResults)(
    anv_finishme("Queries not yet supported on Ivy Bridge");
 }
 #endif
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@a56 2
+/* XXX: Do we need this on more than just BDW? */
+#if (GEN_GEN >= 8)
+d65 1
+d67 1
+a68 1
+#endif
+d149 2
+d1360 1
+a1363 3
+
+   struct anv_state push_state = anv_cmd_buffer_cs_push_constants(cmd_buffer);
+
+a1366 7
+   if (push_state.alloc_size) {
+      anv_batch_emit(&cmd_buffer->batch, GENX(MEDIA_CURBE_LOAD), curbe) {
+         curbe.CURBETotalDataLength    = push_state.alloc_size;
+         curbe.CURBEDataStartAddress   = push_state.offset;
+      }
+   }
+
+d1436 12
+a1762 1
+         db.Depth                = image->array_size - 1; /* FIXME: 3-D */
+d1765 5
+a1773 1
+         db.RenderTargetViewExtent = 1 - 1;
+d1806 1
+a1806 1
+         hdb.SurfacePitch = image->hiz_surface.isl.row_pitch - 1;
+d1809 1
+a1809 1
+            .offset = image->offset + image->hiz_surface.offset,
+d1819 5
+d1826 1
+a1826 3
+            image->hiz_surface.isl.dim == ISL_SURF_DIM_1D ?
+               isl_surf_get_array_pitch_el(&image->hiz_surface.isl) >> 2 :
+               isl_surf_get_array_pitch_el_rows(&image->hiz_surface.isl) >> 2;
+d1961 30
 @
 
 

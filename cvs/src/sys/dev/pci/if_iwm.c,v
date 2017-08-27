@@ -1,4 +1,4 @@
-head	1.212;
+head	1.213;
 access;
 symbols
 	OPENBSD_6_1:1.166.0.4
@@ -14,6 +14,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.213
+date	2017.08.27.12.38.23;	author stsp;	state Exp;
+branches;
+next	1.212;
+commitid	xkLS2215n1qD9Q6I;
 
 1.212
 date	2017.08.23.13.05.12;	author stsp;	state Exp;
@@ -1292,12 +1298,15 @@ desc
 @@
 
 
-1.212
+1.213
 log
-@Fix typos in iwm(4) error messages. Patch by Bryan Linton.
+@Make it possible for iwm_stop() to sleep by always running it in
+a process context. In interrupt context, schedule the init task
+instead of calling iwm_stop() directly.
+ok procter@@
 @
 text
-@/*	$OpenBSD: if_iwm.c,v 1.211 2017/08/13 18:08:03 stsp Exp $	*/
+@/*	$OpenBSD: if_iwm.c,v 1.212 2017/08/23 13:05:12 stsp Exp $	*/
 
 /*
  * Copyright (c) 2014, 2016 genua gmbh <info@@genua.de>
@@ -7816,6 +7825,7 @@ iwm_stop(struct ifnet *ifp)
 	sc->sc_flags &= ~IWM_FLAG_BINDING_ACTIVE;
 	sc->sc_flags &= ~IWM_FLAG_STA_ACTIVE;
 	sc->sc_flags &= ~IWM_FLAG_TE_ACTIVE;
+	sc->sc_flags &= ~IWM_FLAG_HW_ERR;
 
 	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
 
@@ -8468,7 +8478,6 @@ int
 iwm_intr(void *arg)
 {
 	struct iwm_softc *sc = arg;
-	struct ifnet *ifp = IC2IFP(&sc->sc_ic);
 	int handled = 0;
 	int r1, r2, rv = 0;
 	int isperiodic = 0;
@@ -8517,6 +8526,15 @@ iwm_intr(void *arg)
 	/* ignored */
 	handled |= (r1 & (IWM_CSR_INT_BIT_ALIVE /*| IWM_CSR_INT_BIT_SCD*/));
 
+	if (r1 & IWM_CSR_INT_BIT_RF_KILL) {
+		handled |= IWM_CSR_INT_BIT_RF_KILL;
+		if (iwm_check_rfkill(sc)) {
+			task_add(systq, &sc->init_task);
+			rv = 1;
+			goto out;
+		}
+	}
+
 	if (r1 & IWM_CSR_INT_BIT_SW_ERR) {
 #ifdef IWM_DEBUG
 		int i;
@@ -8537,7 +8555,6 @@ iwm_intr(void *arg)
 #endif
 
 		printf("%s: fatal firmware error\n", DEVNAME(sc));
-		iwm_stop(ifp);
 		task_add(systq, &sc->init_task);
 		rv = 1;
 		goto out;
@@ -8547,7 +8564,8 @@ iwm_intr(void *arg)
 	if (r1 & IWM_CSR_INT_BIT_HW_ERR) {
 		handled |= IWM_CSR_INT_BIT_HW_ERR;
 		printf("%s: hardware error, stopping device \n", DEVNAME(sc));
-		iwm_stop(ifp);
+		sc->sc_flags |= IWM_FLAG_HW_ERR;
+		task_add(systq, &sc->init_task);
 		rv = 1;
 		goto out;
 	}
@@ -8559,13 +8577,6 @@ iwm_intr(void *arg)
 
 		sc->sc_fw_chunk_done = 1;
 		wakeup(&sc->sc_fw);
-	}
-
-	if (r1 & IWM_CSR_INT_BIT_RF_KILL) {
-		handled |= IWM_CSR_INT_BIT_RF_KILL;
-		if (iwm_check_rfkill(sc) && (ifp->if_flags & IFF_UP)) {
-			iwm_stop(ifp);
-		}
 	}
 
 	if (r1 & IWM_CSR_INT_BIT_RX_PERIODIC) {
@@ -9038,23 +9049,27 @@ iwm_init_task(void *arg1)
 {
 	struct iwm_softc *sc = arg1;
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
-	int s;
+	int s = splnet();
 	int generation = sc->sc_generation;
+	int fatal = (sc->sc_flags & (IWM_FLAG_HW_ERR | IWM_FLAG_RFKILL));
 
 	rw_enter_write(&sc->ioctl_rwl);
 	if (generation != sc->sc_generation) {
 		rw_exit(&sc->ioctl_rwl);
+		splx(s);
 		return;
 	}
-	s = splnet();
 
 	if (ifp->if_flags & IFF_RUNNING)
 		iwm_stop(ifp);
-	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+	else
+		sc->sc_flags &= ~IWM_FLAG_HW_ERR;
+
+	if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
 		iwm_init(ifp);
 
-	splx(s);
 	rw_exit(&sc->ioctl_rwl);
+	splx(s);
 }
 
 int
@@ -9077,9 +9092,12 @@ iwm_activate(struct device *self, int act)
 	int err = 0;
 
 	switch (act) {
-	case DVACT_SUSPEND:
-		if (ifp->if_flags & IFF_RUNNING)
+	case DVACT_QUIESCE:
+		if (ifp->if_flags & IFF_RUNNING) {
+			rw_enter_write(&sc->ioctl_rwl);
 			iwm_stop(ifp);
+			rw_exit(&sc->ioctl_rwl);
+		}
 		break;
 	case DVACT_RESUME:
 		err = iwm_resume(sc);
@@ -9105,6 +9123,52 @@ struct cfattach iwm_ca = {
 	sizeof(struct iwm_softc), iwm_match, iwm_attach,
 	NULL, iwm_activate
 };
+@
+
+
+1.212
+log
+@Fix typos in iwm(4) error messages. Patch by Bryan Linton.
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: if_iwm.c,v 1.211 2017/08/13 18:08:03 stsp Exp $	*/
+d6520 1
+a7172 1
+	struct ifnet *ifp = IC2IFP(&sc->sc_ic);
+d7221 9
+a7249 1
+		iwm_stop(ifp);
+d7259 2
+a7260 1
+		iwm_stop(ifp);
+a7273 7
+	if (r1 & IWM_CSR_INT_BIT_RF_KILL) {
+		handled |= IWM_CSR_INT_BIT_RF_KILL;
+		if (iwm_check_rfkill(sc) && (ifp->if_flags & IFF_UP)) {
+			iwm_stop(ifp);
+		}
+	}
+
+d7744 1
+a7744 1
+	int s;
+d7746 1
+d7751 1
+a7753 1
+	s = splnet();
+d7757 4
+a7760 1
+	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
+d7763 1
+a7764 1
+	rw_exit(&sc->ioctl_rwl);
+d7787 3
+a7789 2
+	case DVACT_SUSPEND:
+		if (ifp->if_flags & IFF_RUNNING)
+d7791 2
 @
 
 

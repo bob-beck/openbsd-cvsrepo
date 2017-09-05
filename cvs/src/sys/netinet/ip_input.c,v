@@ -1,4 +1,4 @@
-head	1.320;
+head	1.321;
 access;
 symbols
 	OPENBSD_6_1:1.295.0.4
@@ -98,6 +98,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.321
+date	2017.09.05.00.58.16;	author visa;	state Exp;
+branches;
+next	1.320;
+commitid	9ozayweluFTr7tYU;
 
 1.320
 date	2017.09.01.15.38.12;	author visa;	state Exp;
@@ -1924,15 +1930,16 @@ desc
 @@
 
 
-1.320
+1.321
 log
-@Simplify list traversal in ip_freef(), and replace a hand-rolled
-list traversal with LIST_FOREACH_SAFE().
+@Serialize access to IP reassembly queue with a mutex. This lets
+ip_local(), ip_slowtimo() and ip_drain() run without KERNEL_LOCK()
+and NET_LOCK().
 
-OK bluhm@@, mpi@@
+Input and OK mpi@@, bluhm@@
 @
 text
-@/*	$OpenBSD: ip_input.c,v 1.319 2017/08/22 15:02:34 mpi Exp $	*/
+@/*	$OpenBSD: ip_input.c,v 1.320 2017/09/01 15:38:12 visa Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -1973,6 +1980,7 @@ text
 #include <sys/systm.h>
 #include <sys/mbuf.h>
 #include <sys/domain.h>
+#include <sys/mutex.h>
 #include <sys/protosw.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
@@ -2017,8 +2025,6 @@ text
 #include <netinet/ip_carp.h>
 #endif
 
-struct ipqhead ipq;
-
 int encdebug = 0;
 int ipsec_keep_invalid = IPSEC_DEFAULT_EMBRYONIC_SA_TIMEOUT;
 int ipsec_require_pfs = IPSEC_DEFAULT_PFS;
@@ -2047,6 +2053,12 @@ u_int	ip_mtudisc_timeout = IPMTUDISCTIMEOUT;
 int	ip_directedbcast = 0;
 
 struct rttimer_queue *ip_mtudisc_timeout_q = NULL;
+
+/* Protects `ipq' and `ip_frags'. */
+struct mutex	ipq_mutex = MUTEX_INITIALIZER(IPL_SOFTNET);
+
+/* IP reassembly queue */
+LIST_HEAD(, ipq) ipq;
 
 /* Keep track of memory used for reassembly */
 int	ip_maxqueue = 300;
@@ -2450,8 +2462,6 @@ ip_local(struct mbuf **mp, int *offp, int nxt, int af)
 	struct ipqent *ipqe;
 	int mff, hlen;
 
-	KERNEL_ASSERT_LOCKED();
-
 	hlen = ip->ip_hl << 2;
 
 	/*
@@ -2465,10 +2475,12 @@ ip_local(struct mbuf **mp, int *offp, int nxt, int af)
 		if (m->m_flags & M_EXT) {		/* XXX */
 			if ((m = *mp = m_pullup(m, hlen)) == NULL) {
 				ipstat_inc(ips_toosmall);
-				goto bad;
+				return IPPROTO_DONE;
 			}
 			ip = mtod(m, struct ip *);
 		}
+
+		mtx_enter(&ipq_mutex);
 
 		/*
 		 * Look for queue of fragments
@@ -2535,6 +2547,8 @@ found:
 		} else
 			if (fp)
 				ip_freef(fp);
+
+		mtx_leave(&ipq_mutex);
 	}
 
 	*offp = hlen;
@@ -2544,6 +2558,7 @@ found:
 		nxt = ip_deliver(mp, offp, nxt, AF_INET);
 	return nxt;
  bad:
+	mtx_leave(&ipq_mutex);
 	m_freemp(mp);
 	return IPPROTO_DONE;
 }
@@ -2756,6 +2771,8 @@ ip_reass(struct ipqent *ipqe, struct ipq *fp)
 	int i, next;
 	u_int8_t ecn, ecn0;
 
+	MUTEX_ASSERT_LOCKED(&ipq_mutex);
+
 	/*
 	 * Presence of header sizes in mbufs
 	 * would confuse code below.
@@ -2934,6 +2951,8 @@ ip_freef(struct ipq *fp)
 {
 	struct ipqent *q;
 
+	MUTEX_ASSERT_LOCKED(&ipq_mutex);
+
 	while ((q = LIST_FIRST(&fp->ipq_fragq)) != NULL) {
 		LIST_REMOVE(q, ipqe_q);
 		m_freem(q->ipqe_m);
@@ -2947,21 +2966,20 @@ ip_freef(struct ipq *fp)
 /*
  * IP timer processing;
  * if a timer expires on a reassembly queue, discard it.
- * clear the forwarding cache, there might be a better route.
  */
 void
 ip_slowtimo(void)
 {
 	struct ipq *fp, *nfp;
 
-	NET_ASSERT_LOCKED();
-
+	mtx_enter(&ipq_mutex);
 	LIST_FOREACH_SAFE(fp, &ipq, ipq_q, nfp) {
 		if (--fp->ipq_ttl == 0) {
 			ipstat_inc(ips_fragtimeout);
 			ip_freef(fp);
 		}
 	}
+	mtx_leave(&ipq_mutex);
 }
 
 /*
@@ -2970,10 +2988,12 @@ ip_slowtimo(void)
 void
 ip_drain(void)
 {
+	mtx_enter(&ipq_mutex);
 	while (!LIST_EMPTY(&ipq)) {
 		ipstat_inc(ips_fragdropped);
 		ip_freef(LIST_FIRST(&ipq));
 	}
+	mtx_leave(&ipq_mutex);
 }
 
 /*
@@ -2984,7 +3004,8 @@ ip_flush(void)
 {
 	int max = 50;
 
-	/* ipq already locked */
+	MUTEX_ASSERT_LOCKED(&ipq_mutex);
+
 	while (!LIST_EMPTY(&ipq) && ip_frags > ip_maxqueue * 3 / 4 && --max) {
 		ipstat_inc(ips_fragdropped);
 		ip_freef(LIST_FIRST(&ipq));
@@ -3768,6 +3789,48 @@ ip_send(struct mbuf *m)
 	mq_enqueue(&ipsend_mq, m);
 	task_add(softnettq, &ipsend_task);
 }
+@
+
+
+1.320
+log
+@Simplify list traversal in ip_freef(), and replace a hand-rolled
+list traversal with LIST_FOREACH_SAFE().
+
+OK bluhm@@, mpi@@
+@
+text
+@d1 1
+a1 1
+/*	$OpenBSD: ip_input.c,v 1.319 2017/08/22 15:02:34 mpi Exp $	*/
+d42 1
+a86 2
+struct ipqhead ipq;
+
+d116 6
+a523 2
+	KERNEL_ASSERT_LOCKED();
+
+d537 1
+a537 1
+				goto bad;
+d542 2
+d609 2
+d620 1
+d833 2
+d1013 2
+a1027 1
+ * clear the forwarding cache, there might be a better route.
+d1034 1
+a1034 2
+	NET_ASSERT_LOCKED();
+
+d1041 1
+d1050 1
+d1055 1
+d1066 2
+a1067 1
+	/* ipq already locked */
 @
 
 

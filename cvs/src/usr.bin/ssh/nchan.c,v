@@ -1,4 +1,4 @@
-head	1.65;
+head	1.67;
 access;
 symbols
 	OPENBSD_6_1:1.63.0.32
@@ -76,6 +76,18 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.67
+date	2017.09.12.06.35.32;	author djm;	state Exp;
+branches;
+next	1.66;
+commitid	dCi8XAU8Wl0yr6jz;
+
+1.66
+date	2017.09.12.06.32.07;	author djm;	state Exp;
+branches;
+next	1.65;
+commitid	Amj5uk8F1JrQpmI5;
 
 1.65
 date	2017.04.30.23.28.42;	author djm;	state Exp;
@@ -550,14 +562,21 @@ desc
 @@
 
 
-1.65
+1.67
 log
-@obliterate ssh1.h and some dead code that used it
+@Make remote channel ID a u_int
+
+Previously we tracked the remote channel IDs in an int, but this is
+strictly incorrect: the wire protocol uses uint32 and there is nothing
+in-principle stopping a SSH implementation from sending, say, 0xffff0000.
+
+In practice everyone numbers their channels sequentially, so this has
+never been a problem.
 
 ok markus@@
 @
 text
-@/* $OpenBSD: nchan.c,v 1.64 2017/04/30 23:13:25 djm Exp $ */
+@/* $OpenBSD: nchan.c,v 1.66 2017/09/12 06:32:07 djm Exp $ */
 /*
  * Copyright (c) 1999, 2000, 2001, 2002 Markus Friedl.  All rights reserved.
  *
@@ -591,7 +610,8 @@ text
 #include <stdarg.h>
 
 #include "ssh2.h"
-#include "buffer.h"
+#include "sshbuf.h"
+#include "ssherr.h"
 #include "packet.h"
 #include "channels.h"
 #include "compat.h"
@@ -630,15 +650,15 @@ text
 /*
  * ACTIONS: should never update the channel states
  */
-static void	chan_send_eof2(Channel *);
-static void	chan_send_eow2(Channel *);
+static void	chan_send_eof2(struct ssh *, Channel *);
+static void	chan_send_eow2(struct ssh *, Channel *);
 
 /* helper */
-static void	chan_shutdown_write(Channel *);
-static void	chan_shutdown_read(Channel *);
+static void	chan_shutdown_write(struct ssh *, Channel *);
+static void	chan_shutdown_read(struct ssh *, Channel *);
 
-static char *ostates[] = { "open", "drain", "wait_ieof", "closed" };
-static char *istates[] = { "open", "drain", "wait_oclose", "closed" };
+static const char *ostates[] = { "open", "drain", "wait_ieof", "closed" };
+static const char *istates[] = { "open", "drain", "wait_oclose", "closed" };
 
 static void
 chan_set_istate(Channel *c, u_int next)
@@ -661,12 +681,12 @@ chan_set_ostate(Channel *c, u_int next)
 }
 
 void
-chan_read_failed(Channel *c)
+chan_read_failed(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: read failed", c->self);
 	switch (c->istate) {
 	case CHAN_INPUT_OPEN:
-		chan_shutdown_read(c);
+		chan_shutdown_read(ssh, c);
 		chan_set_istate(c, CHAN_INPUT_WAIT_DRAIN);
 		break;
 	default:
@@ -677,10 +697,10 @@ chan_read_failed(Channel *c)
 }
 
 void
-chan_ibuf_empty(Channel *c)
+chan_ibuf_empty(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: ibuf empty", c->self);
-	if (buffer_len(&c->input)) {
+	if (sshbuf_len(c->input)) {
 		error("channel %d: chan_ibuf_empty for non empty buffer",
 		    c->self);
 		return;
@@ -688,7 +708,7 @@ chan_ibuf_empty(Channel *c)
 	switch (c->istate) {
 	case CHAN_INPUT_WAIT_DRAIN:
 		if (!(c->flags & (CHAN_CLOSE_SENT|CHAN_LOCAL)))
-			chan_send_eof2(c);
+			chan_send_eof2(ssh, c);
 		chan_set_istate(c, CHAN_INPUT_CLOSED);
 		break;
 	default:
@@ -699,17 +719,17 @@ chan_ibuf_empty(Channel *c)
 }
 
 void
-chan_obuf_empty(Channel *c)
+chan_obuf_empty(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: obuf empty", c->self);
-	if (buffer_len(&c->output)) {
+	if (sshbuf_len(c->output)) {
 		error("channel %d: chan_obuf_empty for non empty buffer",
 		    c->self);
 		return;
 	}
 	switch (c->ostate) {
 	case CHAN_OUTPUT_WAIT_DRAIN:
-		chan_shutdown_write(c);
+		chan_shutdown_write(ssh, c);
 		chan_set_ostate(c, CHAN_OUTPUT_CLOSED);
 		break;
 	default:
@@ -720,26 +740,32 @@ chan_obuf_empty(Channel *c)
 }
 
 void
-chan_rcvd_eow(Channel *c)
+chan_rcvd_eow(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: rcvd eow", c->self);
 	switch (c->istate) {
 	case CHAN_INPUT_OPEN:
-		chan_shutdown_read(c);
+		chan_shutdown_read(ssh, c);
 		chan_set_istate(c, CHAN_INPUT_CLOSED);
 		break;
 	}
 }
 
 static void
-chan_send_eof2(Channel *c)
+chan_send_eof2(struct ssh *ssh, Channel *c)
 {
+	int r;
+
 	debug2("channel %d: send eof", c->self);
 	switch (c->istate) {
 	case CHAN_INPUT_WAIT_DRAIN:
-		packet_start(SSH2_MSG_CHANNEL_EOF);
-		packet_put_int(c->remote_id);
-		packet_send();
+		if (!c->have_remote_id)
+			fatal("%s: channel %d: no remote_id",
+			    __func__, c->self);
+		if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_EOF)) != 0 ||
+		    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+		    (r = sshpkt_send(ssh)) != 0)
+			fatal("%s: send CHANNEL_EOF: %s", __func__, ssh_err(r));
 		c->flags |= CHAN_EOF_SENT;
 		break;
 	default:
@@ -750,8 +776,10 @@ chan_send_eof2(Channel *c)
 }
 
 static void
-chan_send_close2(Channel *c)
+chan_send_close2(struct ssh *ssh, Channel *c)
 {
+	int r;
+
 	debug2("channel %d: send close", c->self);
 	if (c->ostate != CHAN_OUTPUT_CLOSED ||
 	    c->istate != CHAN_INPUT_CLOSED) {
@@ -760,16 +788,22 @@ chan_send_close2(Channel *c)
 	} else if (c->flags & CHAN_CLOSE_SENT) {
 		error("channel %d: already sent close", c->self);
 	} else {
-		packet_start(SSH2_MSG_CHANNEL_CLOSE);
-		packet_put_int(c->remote_id);
-		packet_send();
+		if (!c->have_remote_id)
+			fatal("%s: channel %d: no remote_id",
+			    __func__, c->self);
+		if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_CLOSE)) != 0 ||
+		    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+		    (r = sshpkt_send(ssh)) != 0)
+			fatal("%s: send CHANNEL_EOF: %s", __func__, ssh_err(r));
 		c->flags |= CHAN_CLOSE_SENT;
 	}
 }
 
 static void
-chan_send_eow2(Channel *c)
+chan_send_eow2(struct ssh *ssh, Channel *c)
 {
+	int r;
+
 	debug2("channel %d: send eow", c->self);
 	if (c->ostate == CHAN_OUTPUT_CLOSED) {
 		error("channel %d: must not sent eow on closed output",
@@ -778,30 +812,33 @@ chan_send_eow2(Channel *c)
 	}
 	if (!(datafellows & SSH_NEW_OPENSSH))
 		return;
-	packet_start(SSH2_MSG_CHANNEL_REQUEST);
-	packet_put_int(c->remote_id);
-	packet_put_cstring("eow@@openssh.com");
-	packet_put_char(0);
-	packet_send();
+	if (!c->have_remote_id)
+		fatal("%s: channel %d: no remote_id", __func__, c->self);
+	if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_REQUEST)) != 0 ||
+	    (r = sshpkt_put_u32(ssh, c->remote_id)) != 0 ||
+	    (r = sshpkt_put_cstring(ssh, "eow@@openssh.com")) != 0 ||
+	    (r = sshpkt_put_u8(ssh, 0)) != 0 ||
+	    (r = sshpkt_send(ssh)) != 0)
+		fatal("%s: send CHANNEL_EOF: %s", __func__, ssh_err(r));
 }
 
 /* shared */
 
 void
-chan_rcvd_ieof(Channel *c)
+chan_rcvd_ieof(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: rcvd eof", c->self);
 	c->flags |= CHAN_EOF_RCVD;
 	if (c->ostate == CHAN_OUTPUT_OPEN)
 		chan_set_ostate(c, CHAN_OUTPUT_WAIT_DRAIN);
 	if (c->ostate == CHAN_OUTPUT_WAIT_DRAIN &&
-	    buffer_len(&c->output) == 0 &&
+	    sshbuf_len(c->output) == 0 &&
 	    !CHANNEL_EFD_OUTPUT_ACTIVE(c))
-		chan_obuf_empty(c);
+		chan_obuf_empty(ssh, c);
 }
 
 void
-chan_rcvd_oclose(Channel *c)
+chan_rcvd_oclose(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: rcvd close", c->self);
 	if (!(c->flags & CHAN_LOCAL)) {
@@ -827,27 +864,27 @@ chan_rcvd_oclose(Channel *c)
 	}
 	switch (c->istate) {
 	case CHAN_INPUT_OPEN:
-		chan_shutdown_read(c);
+		chan_shutdown_read(ssh, c);
 		chan_set_istate(c, CHAN_INPUT_CLOSED);
 		break;
 	case CHAN_INPUT_WAIT_DRAIN:
 		if (!(c->flags & CHAN_LOCAL))
-			chan_send_eof2(c);
+			chan_send_eof2(ssh, c);
 		chan_set_istate(c, CHAN_INPUT_CLOSED);
 		break;
 	}
 }
 
 void
-chan_write_failed(Channel *c)
+chan_write_failed(struct ssh *ssh, Channel *c)
 {
 	debug2("channel %d: write failed", c->self);
 	switch (c->ostate) {
 	case CHAN_OUTPUT_OPEN:
 	case CHAN_OUTPUT_WAIT_DRAIN:
-		chan_shutdown_write(c);
+		chan_shutdown_write(ssh, c);
 		if (strcmp(c->ctype, "session") == 0)
-			chan_send_eow2(c);
+			chan_send_eow2(ssh, c);
 		chan_set_ostate(c, CHAN_OUTPUT_CLOSED);
 		break;
 	default:
@@ -858,13 +895,13 @@ chan_write_failed(Channel *c)
 }
 
 void
-chan_mark_dead(Channel *c)
+chan_mark_dead(struct ssh *ssh, Channel *c)
 {
 	c->type = SSH_CHANNEL_ZOMBIE;
 }
 
 int
-chan_is_dead(Channel *c, int do_send)
+chan_is_dead(struct ssh *ssh, Channel *c, int do_send)
 {
 	if (c->type == SSH_CHANNEL_ZOMBIE) {
 		debug2("channel %d: zombie", c->self);
@@ -875,9 +912,9 @@ chan_is_dead(Channel *c, int do_send)
 	if ((datafellows & SSH_BUG_EXTEOF) &&
 	    c->extended_usage == CHAN_EXTENDED_WRITE &&
 	    c->efd != -1 &&
-	    buffer_len(&c->extended) > 0) {
-		debug2("channel %d: active efd: %d len %d",
-		    c->self, c->efd, buffer_len(&c->extended));
+	    sshbuf_len(c->extended) > 0) {
+		debug2("channel %d: active efd: %d len %zu",
+		    c->self, c->efd, sshbuf_len(c->extended));
 		return 0;
 	}
 	if (c->flags & CHAN_LOCAL) {
@@ -886,7 +923,7 @@ chan_is_dead(Channel *c, int do_send)
 	}		
 	if (!(c->flags & CHAN_CLOSE_SENT)) {
 		if (do_send) {
-			chan_send_close2(c);
+			chan_send_close2(ssh, c);
 		} else {
 			/* channel would be dead if we sent a close */
 			if (c->flags & CHAN_CLOSE_RCVD) {
@@ -906,9 +943,9 @@ chan_is_dead(Channel *c, int do_send)
 
 /* helper */
 static void
-chan_shutdown_write(Channel *c)
+chan_shutdown_write(struct ssh *ssh, Channel *c)
 {
-	buffer_clear(&c->output);
+	sshbuf_reset(c->output);
 	if (c->type == SSH_CHANNEL_LARVAL)
 		return;
 	/* shutdown failure is allowed if write failed already */
@@ -919,7 +956,7 @@ chan_shutdown_write(Channel *c)
 			    "shutdown() failed for fd %d: %.100s",
 			    c->self, c->sock, strerror(errno));
 	} else {
-		if (channel_close_fd(&c->wfd) < 0)
+		if (channel_close_fd(ssh, &c->wfd) < 0)
 			logit("channel %d: chan_shutdown_write: "
 			    "close() failed for fd %d: %.100s",
 			    c->self, c->wfd, strerror(errno));
@@ -927,7 +964,7 @@ chan_shutdown_write(Channel *c)
 }
 
 static void
-chan_shutdown_read(Channel *c)
+chan_shutdown_read(struct ssh *ssh, Channel *c)
 {
 	if (c->type == SSH_CHANNEL_LARVAL)
 		return;
@@ -939,12 +976,185 @@ chan_shutdown_read(Channel *c)
 			    c->self, c->sock, c->istate, c->ostate,
 			    strerror(errno));
 	} else {
-		if (channel_close_fd(&c->rfd) < 0)
+		if (channel_close_fd(ssh, &c->rfd) < 0)
 			logit("channel %d: chan_shutdown_read: "
 			    "close() failed for fd %d: %.100s",
 			    c->self, c->rfd, strerror(errno));
 	}
 }
+@
+
+
+1.66
+log
+@refactor channels.c
+
+Move static state to a "struct ssh_channels" that is allocated at
+runtime and tracked as a member of struct ssh.
+
+Explicitly pass "struct ssh" to all channels functions.
+
+Replace use of the legacy packet APIs in channels.c.
+
+Rework sshd_config PermitOpen handling: previously the configuration
+parser would call directly into the channels layer. After the refactor
+this is not possible, as the channels structures are allocated at
+connection time and aren't available when the configuration is parsed.
+The server config parser now tracks PermitOpen itself and explicitly
+configures the channels code later.
+
+ok markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: nchan.c,v 1.65 2017/04/30 23:28:42 djm Exp $ */
+d184 3
+d213 3
+d237 2
+@
+
+
+1.65
+log
+@obliterate ssh1.h and some dead code that used it
+
+ok markus@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: nchan.c,v 1.64 2017/04/30 23:13:25 djm Exp $ */
+d35 2
+a36 1
+#include "buffer.h"
+d75 2
+a76 2
+static void	chan_send_eof2(Channel *);
+static void	chan_send_eow2(Channel *);
+d79 2
+a80 2
+static void	chan_shutdown_write(Channel *);
+static void	chan_shutdown_read(Channel *);
+d82 2
+a83 2
+static char *ostates[] = { "open", "drain", "wait_ieof", "closed" };
+static char *istates[] = { "open", "drain", "wait_oclose", "closed" };
+d106 1
+a106 1
+chan_read_failed(Channel *c)
+d111 1
+a111 1
+		chan_shutdown_read(c);
+d122 1
+a122 1
+chan_ibuf_empty(Channel *c)
+d125 1
+a125 1
+	if (buffer_len(&c->input)) {
+d133 1
+a133 1
+			chan_send_eof2(c);
+d144 1
+a144 1
+chan_obuf_empty(Channel *c)
+d147 1
+a147 1
+	if (buffer_len(&c->output)) {
+d154 1
+a154 1
+		chan_shutdown_write(c);
+d165 1
+a165 1
+chan_rcvd_eow(Channel *c)
+d170 1
+a170 1
+		chan_shutdown_read(c);
+d177 1
+a177 1
+chan_send_eof2(Channel *c)
+d179 2
+d184 4
+a187 3
+		packet_start(SSH2_MSG_CHANNEL_EOF);
+		packet_put_int(c->remote_id);
+		packet_send();
+d198 1
+a198 1
+chan_send_close2(Channel *c)
+d200 2
+d210 4
+a213 3
+		packet_start(SSH2_MSG_CHANNEL_CLOSE);
+		packet_put_int(c->remote_id);
+		packet_send();
+d219 1
+a219 1
+chan_send_eow2(Channel *c)
+d221 2
+d231 6
+a236 5
+	packet_start(SSH2_MSG_CHANNEL_REQUEST);
+	packet_put_int(c->remote_id);
+	packet_put_cstring("eow@@openssh.com");
+	packet_put_char(0);
+	packet_send();
+d242 1
+a242 1
+chan_rcvd_ieof(Channel *c)
+d249 1
+a249 1
+	    buffer_len(&c->output) == 0 &&
+d251 1
+a251 1
+		chan_obuf_empty(c);
+d255 1
+a255 1
+chan_rcvd_oclose(Channel *c)
+d281 1
+a281 1
+		chan_shutdown_read(c);
+d286 1
+a286 1
+			chan_send_eof2(c);
+d293 1
+a293 1
+chan_write_failed(Channel *c)
+d299 1
+a299 1
+		chan_shutdown_write(c);
+d301 1
+a301 1
+			chan_send_eow2(c);
+d312 1
+a312 1
+chan_mark_dead(Channel *c)
+d318 1
+a318 1
+chan_is_dead(Channel *c, int do_send)
+d329 3
+a331 3
+	    buffer_len(&c->extended) > 0) {
+		debug2("channel %d: active efd: %d len %d",
+		    c->self, c->efd, buffer_len(&c->extended));
+d340 1
+a340 1
+			chan_send_close2(c);
+d360 1
+a360 1
+chan_shutdown_write(Channel *c)
+d362 1
+a362 1
+	buffer_clear(&c->output);
+d373 1
+a373 1
+		if (channel_close_fd(&c->wfd) < 0)
+d381 1
+a381 1
+chan_shutdown_read(Channel *c)
+d393 1
+a393 1
+		if (channel_close_fd(&c->rfd) < 0)
 @
 
 

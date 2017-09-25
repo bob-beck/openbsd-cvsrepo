@@ -1,9 +1,21 @@
-head	1.15;
+head	1.17;
 access;
 symbols;
 locks; strict;
 comment	@ * @;
 
+
+1.17
+date	2017.09.25.18.02.27;	author jsing;	state Exp;
+branches;
+next	1.16;
+commitid	L6TRua7Lg6O4Qb9y;
+
+1.16
+date	2017.09.25.17.51.49;	author jsing;	state Exp;
+branches;
+next	1.15;
+commitid	0mRo7kwxTlpVHtqQ;
 
 1.15
 date	2017.08.30.16.44.37;	author jsing;	state Exp;
@@ -100,15 +112,28 @@ desc
 @@
 
 
-1.15
+1.17
 log
-@Move the full extension building into tlsext_{client,server}hello_build(),
-leaving ssl_add_{client,server}hello_tlsext() as pointer to CBB wrappers.
+@Fix various issues in the OCSP extension parsing code:
 
-ok doug@@
+- When parsing the OCSP extension we can have multiple responder IDs - pull
+  these out correctly.
+
+- Stop using CBS_stow() - it's unnecessary since we just need access to the
+  data and length (which we can get via CBS_data() and CBS_len()).
+
+- Use a temporary pointer when calling d2i_*() functions, since it will
+  increment the pointer by the number of bytes it consumed when decoding.
+
+The original code incorrectly passes the pointer allocated via CBS_stow()
+(using malloc()) to a d2i_*() function and then calls free() on the now
+incremented pointer, most likely resulting in a crash. This issue was
+reported by Robert Swiecki who found the issue using honggfuzz.
+
+ok beck@@
 @
 text
-@/* $OpenBSD: ssl_tlsext.c,v 1.14 2017/08/29 19:20:13 doug Exp $ */
+@/* $OpenBSD: ssl_tlsext.c,v 1.16 2017/09/25 17:51:49 jsing Exp $ */
 /*
  * Copyright (c) 2016, 2017 Joel Sing <jsing@@openbsd.org>
  * Copyright (c) 2017 Doug Hogan <doug@@openbsd.org>
@@ -829,16 +854,14 @@ tlsext_ocsp_clienthello_needs(SSL *s)
 int
 tlsext_ocsp_clienthello_build(SSL *s, CBB *cbb)
 {
-	CBB ocsp_respid_list, respid, exts;
+	CBB respid_list, respid, exts;
 	unsigned char *ext_data;
 	size_t ext_len;
 	int i;
 
 	if (!CBB_add_u8(cbb, TLSEXT_STATUSTYPE_ocsp))
 		return 0;
-	if (!CBB_add_u16_length_prefixed(cbb, &ocsp_respid_list))
-		return 0;
-	if (!CBB_add_u16_length_prefixed(cbb, &exts))
+	if (!CBB_add_u16_length_prefixed(cbb, &respid_list))
 		return 0;
 	for (i = 0; i < sk_OCSP_RESPID_num(s->internal->tlsext_ocsp_ids); i++) {
 		unsigned char *respid_data;
@@ -850,13 +873,15 @@ tlsext_ocsp_clienthello_build(SSL *s, CBB *cbb)
 			return 0;
 		if ((id_len = i2d_OCSP_RESPID(id, NULL)) == -1)
 			return 0;
-		if (!CBB_add_u16_length_prefixed(&ocsp_respid_list, &respid))
+		if (!CBB_add_u16_length_prefixed(&respid_list, &respid))
 			return 0;
 		if (!CBB_add_space(&respid, &respid_data, id_len))
 			return 0;
 		if ((i2d_OCSP_RESPID(id, &respid_data)) != id_len)
 			return 0;
 	}
+	if (!CBB_add_u16_length_prefixed(cbb, &exts))
+		return 0;
 	if ((ext_len = i2d_X509_EXTENSIONS(s->internal->tlsext_ocsp_exts,
 	    NULL)) == -1)
 		return 0;
@@ -874,11 +899,9 @@ int
 tlsext_ocsp_clienthello_parse(SSL *s, CBS *cbs, int *alert)
 {
 	int failure = SSL_AD_DECODE_ERROR;
-	unsigned char *respid_data = NULL;
-	unsigned char *ext_data = NULL;
-	size_t ext_len, respid_len;
+	CBS respid_list, respid, exts;
+	const unsigned char *p;
 	uint8_t status_type;
-	CBS respids, exts;
 	int ret = 0;
 
 	if (!CBS_get_u8(cbs, &status_type))
@@ -894,13 +917,13 @@ tlsext_ocsp_clienthello_parse(SSL *s, CBS *cbs, int *alert)
 		return 1;
 	}
 	s->tlsext_status_type = status_type;
-	if (!CBS_get_u16_length_prefixed(cbs, &respids))
+	if (!CBS_get_u16_length_prefixed(cbs, &respid_list))
 		goto err;
 
 	/* XXX */
 	sk_OCSP_RESPID_pop_free(s->internal->tlsext_ocsp_ids, OCSP_RESPID_free);
 	s->internal->tlsext_ocsp_ids = NULL;
-	if (CBS_len(cbs) > 0) {
+	if (CBS_len(&respid_list) > 0) {
 		s->internal->tlsext_ocsp_ids = sk_OCSP_RESPID_new_null();
 		if (s->internal->tlsext_ocsp_ids == NULL) {
 			failure = SSL_AD_INTERNAL_ERROR;
@@ -908,43 +931,39 @@ tlsext_ocsp_clienthello_parse(SSL *s, CBS *cbs, int *alert)
 		}
 	}
 
-	while (CBS_len(&respids) > 0) {
-		OCSP_RESPID *id = NULL;
+	while (CBS_len(&respid_list) > 0) {
+		OCSP_RESPID *id;
 
-		if (!CBS_stow(cbs, &respid_data, &respid_len))
+		if (!CBS_get_u16_length_prefixed(&respid_list, &respid))
 			goto err;
-		if ((id = d2i_OCSP_RESPID(NULL,
-		    (const unsigned char **)&respid_data, respid_len)) == NULL)
+		p = CBS_data(&respid);
+		if ((id = d2i_OCSP_RESPID(NULL, &p, CBS_len(&respid))) == NULL)
 			goto err;
 		if (!sk_OCSP_RESPID_push(s->internal->tlsext_ocsp_ids, id)) {
 			failure = SSL_AD_INTERNAL_ERROR;
 			OCSP_RESPID_free(id);
 			goto err;
 		}
-		free(respid_data);
-		respid_data = NULL;
 	}
 
 	/* Read in request_extensions */
 	if (!CBS_get_u16_length_prefixed(cbs, &exts))
 		goto err;
-	if (!CBS_stow(&exts, &ext_data, &ext_len))
-		goto err;
-	if (ext_len > 0) {
+	if (CBS_len(&exts) > 0) {
 		sk_X509_EXTENSION_pop_free(s->internal->tlsext_ocsp_exts,
 		    X509_EXTENSION_free);
+		p = CBS_data(&exts);
 		if ((s->internal->tlsext_ocsp_exts = d2i_X509_EXTENSIONS(NULL,
-		    (const unsigned char **)&ext_data, ext_len)) == NULL)
+		    &p, CBS_len(&exts))) == NULL)
 			goto err;
 	}
+
 	/* should be nothing left */
 	if (CBS_len(cbs) > 0)
 		goto err;
 
 	ret = 1;
  err:
-	free(respid_data);
-	free(ext_data);
 	if (ret == 0)
 		*alert = failure;
 	return ret;
@@ -1516,6 +1535,87 @@ tlsext_serverhello_parse_one(SSL *s, CBS *cbs, uint16_t type, int *alert)
 	/* Not found. */
 	return 2;
 }
+@
+
+
+1.16
+log
+@When building the OCSP extension, only add the length prefixed extensions
+after we finish building the responder ID list. Otherwise adding to the
+responder ID list fails.
+
+ok beck@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: ssl_tlsext.c,v 1.15 2017/08/30 16:44:37 jsing Exp $ */
+d767 2
+a768 3
+	unsigned char *respid_data = NULL;
+	unsigned char *ext_data = NULL;
+	size_t ext_len, respid_len;
+a769 1
+	CBS respids, exts;
+d785 1
+a785 1
+	if (!CBS_get_u16_length_prefixed(cbs, &respids))
+d791 1
+a791 1
+	if (CBS_len(cbs) > 0) {
+d799 2
+a800 2
+	while (CBS_len(&respids) > 0) {
+		OCSP_RESPID *id = NULL;
+d802 1
+a802 1
+		if (!CBS_stow(cbs, &respid_data, &respid_len))
+d804 2
+a805 2
+		if ((id = d2i_OCSP_RESPID(NULL,
+		    (const unsigned char **)&respid_data, respid_len)) == NULL)
+a811 2
+		free(respid_data);
+		respid_data = NULL;
+d817 1
+a817 3
+	if (!CBS_stow(&exts, &ext_data, &ext_len))
+		goto err;
+	if (ext_len > 0) {
+d820 1
+d822 1
+a822 1
+		    (const unsigned char **)&ext_data, ext_len)) == NULL)
+d825 1
+a831 2
+	free(respid_data);
+	free(ext_data);
+@
+
+
+1.15
+log
+@Move the full extension building into tlsext_{client,server}hello_build(),
+leaving ssl_add_{client,server}hello_tlsext() as pointer to CBB wrappers.
+
+ok doug@@
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: ssl_tlsext.c,v 1.14 2017/08/29 19:20:13 doug Exp $ */
+d722 1
+a722 1
+	CBB ocsp_respid_list, respid, exts;
+d729 1
+a729 3
+	if (!CBB_add_u16_length_prefixed(cbb, &ocsp_respid_list))
+		return 0;
+	if (!CBB_add_u16_length_prefixed(cbb, &exts))
+d741 1
+a741 1
+		if (!CBB_add_u16_length_prefixed(&ocsp_respid_list, &respid))
+d748 2
 @
 
 

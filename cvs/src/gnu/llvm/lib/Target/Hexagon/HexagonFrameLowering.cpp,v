@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.26;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.01;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -3447,6 +3454,304 @@ bool HexagonFrameLowering::mayOverflowFrameOffset(MachineFunction &MF) const {
   if (HST.useHVXOps())
     return StackSize > 256;
   return false;
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d11 3
+a14 1
+#include "HexagonBlockRanges.h"
+a65 2
+#define DEBUG_TYPE "hexagon-pei"
+
+d181 2
+a182 2
+static cl::opt<bool> EliminateFramePointer("hexagon-fp-elim", cl::init(true),
+    cl::Hidden, cl::desc("Refrain from using FP whenever possible"));
+d304 9
+a312 5
+        if (MO.isReg()) {
+          unsigned R = MO.getReg();
+          // Virtual registers will need scavenging, which then may require
+          // a stack slot.
+          if (TargetRegisterInfo::isVirtualRegister(R))
+a313 18
+          for (MCSubRegIterator S(R, &HRI, true); S.isValid(); ++S)
+            if (CSR[*S])
+              return true;
+          continue;
+        }
+        if (MO.isRegMask()) {
+          // A regmask would normally have all callee-saved registers marked
+          // as preserved, so this check would not be needed, but in case of
+          // ever having other regmasks (for other calling conventions),
+          // make sure they would be processed correctly.
+          const uint32_t *BM = MO.getRegMask();
+          for (int x = CSR.find_first(); x >= 0; x = CSR.find_next(x)) {
+            unsigned R = x;
+            // If this regmask does not preserve a CSR, a frame will be needed.
+            if (!(BM[R/32] & (1u << (R%32))))
+              return true;
+          }
+        }
+d539 1
+d573 18
+a590 1
+  DebugLoc dl = MBB.findDebugLoc(InsertPt);
+d592 6
+a597 16
+  if (hasFP(MF)) {
+    insertAllocframe(MBB, InsertPt, NumBytes);
+    if (AlignStack) {
+      BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::A2_andir), SP)
+          .addReg(SP)
+          .addImm(-int64_t(MaxAlign));
+    }
+    // If the stack-checking is enabled, and we spilled the callee-saved
+    // registers inline (i.e. did not use a spill function), then call
+    // the stack checker directly.
+    if (EnableStackOVFSanitizer && !PrologueStubs)
+      BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::PS_call_stk))
+             .addExternalSymbol("__runtime_stack_check");
+  } else if (NumBytes > 0) {
+    assert(alignTo(NumBytes, 8) == NumBytes);
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::A2_addi), SP)
+d599 11
+a609 1
+      .addImm(-int(NumBytes));
+d611 7
+d622 3
+a629 13
+  MachineBasicBlock::iterator InsertPt = MBB.getFirstTerminator();
+  DebugLoc dl = MBB.findDebugLoc(InsertPt);
+
+  if (!hasFP(MF)) {
+    MachineFrameInfo &MFI = MF.getFrameInfo();
+    if (unsigned NumBytes = MFI.getStackSize()) {
+      BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::A2_addi), SP)
+        .addReg(SP)
+        .addImm(NumBytes);
+    }
+    return;
+  }
+
+d633 7
+d642 2
+a643 2
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::L2_deallocframe));
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::A2_add), SP)
+d688 1
+a688 1
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::L2_deallocframe));
+d692 1
+a692 1
+  MachineInstr *NewI = BuildMI(MBB, RetI, dl, HII.get(NewOpc));
+a697 36
+void HexagonFrameLowering::insertAllocframe(MachineBasicBlock &MBB,
+      MachineBasicBlock::iterator InsertPt, unsigned NumBytes) const {
+  MachineFunction &MF = *MBB.getParent();
+  auto &HST = MF.getSubtarget<HexagonSubtarget>();
+  auto &HII = *HST.getInstrInfo();
+  auto &HRI = *HST.getRegisterInfo();
+
+  // Check for overflow.
+  // Hexagon_TODO: Ugh! hardcoding. Is there an API that can be used?
+  const unsigned int ALLOCFRAME_MAX = 16384;
+
+  // Create a dummy memory operand to avoid allocframe from being treated as
+  // a volatile memory reference.
+  auto *MMO = MF.getMachineMemOperand(MachinePointerInfo::getStack(MF, 0),
+                                      MachineMemOperand::MOStore, 4, 4);
+
+  DebugLoc dl = MBB.findDebugLoc(InsertPt);
+
+  if (NumBytes >= ALLOCFRAME_MAX) {
+    // Emit allocframe(#0).
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::S2_allocframe))
+      .addImm(0)
+      .addMemOperand(MMO);
+
+    // Subtract the size from the stack pointer.
+    unsigned SP = HRI.getStackRegister();
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::A2_addi), SP)
+      .addReg(SP)
+      .addImm(-int(NumBytes));
+  } else {
+    BuildMI(MBB, InsertPt, dl, HII.get(Hexagon::S2_allocframe))
+      .addImm(NumBytes)
+      .addMemOperand(MMO);
+  }
+}
+
+a916 3
+  if (MF.getFunction()->hasFnAttribute(Attribute::Naked))
+    return false;
+
+d919 4
+d936 3
+a938 4
+  // Both, alloca and stack alignment modify the stack pointer by an
+  // undetermined value, so we need to save it at the entry to the function
+  // (i.e. use allocframe).
+  if (HasAlloca || HasExtraAlign)
+d942 1
+a942 5
+    // If FP-elimination is disabled, we have to use FP at this point.
+    const TargetMachine &TM = MF.getTarget();
+    if (TM.Options.DisableFramePointerElim(MF) || !EliminateFramePointer)
+      return true;
+    if (EnableStackOVFSanitizer)
+d946 2
+a947 2
+  const auto &HMFI = *MF.getInfo<HexagonMachineFunctionInfo>();
+  if (MFI.hasCalls() || HMFI.hasClobberLR())
+d1040 1
+d1042 1
+a1043 19
+  unsigned SP = HRI.getStackRegister();
+  unsigned FP = HRI.getFrameRegister();
+  unsigned AP = HMFI.getStackAlignBasePhysReg();
+  // It may happen that AP will be absent even HasAlloca && HasExtraAlign
+  // is true. HasExtraAlign may be set because of vector spills, without
+  // aligned locals or aligned outgoing function arguments. Since vector
+  // spills will ultimately be "unaligned", it is safe to use FP as the
+  // base register.
+  // In fact, in such a scenario the stack is actually not required to be
+  // aligned, although it may end up being aligned anyway, since this
+  // particular case is not easily detectable. The alignment will be
+  // unnecessary, but not incorrect.
+  // Unfortunately there is no quick way to verify that the above is
+  // indeed the case (and that it's not a result of an error), so just
+  // assume that missing AP will be replaced by FP.
+  // (A better fix would be to rematerialize AP from FP and always align
+  // vector spills.)
+  if (AP == 0)
+    AP = FP;
+d1108 1
+a1108 1
+  if (!UseFP && !UseAP)
+d1414 1
+a1414 1
+    int FI = MFI.CreateFixedSpillStackObject(TRI->getSpillSize(*RC), S->Offset);
+d1426 2
+a1427 3
+    unsigned Size = TRI->getSpillSize(*RC);
+    int Off = MinOffset - Size;
+    unsigned Align = std::min(TRI->getSpillAlignment(*RC), getStackAlignment());
+d1430 1
+a1430 1
+    int FI = MFI.CreateFixedSpillStackObject(Size, Off);
+d1476 2
+a1477 1
+  BuildMI(B, It, DL, HII.get(TargetOpcode::COPY), TmpR).add(MI->getOperand(1));
+d1646 1
+a1646 1
+  LivePhysRegs LPR(HRI);
+d1649 1
+a1649 2
+  for (auto R = B.begin(); R != It; ++R) {
+    Clobbers.clear();
+a1650 6
+    // Dead defs are recorded in Clobbers, but are not automatically removed
+    // from the live set.
+    for (auto &C : Clobbers)
+      if (C.second->isReg() && C.second->isDead())
+        LPR.removeReg(C.first);
+  }
+d1660 4
+a1663 4
+  const auto &RC = !Is128B ? Hexagon::VectorRegsRegClass
+                           : Hexagon::VectorRegs128BRegClass;
+  unsigned Size = HRI.getSpillSize(RC);
+  unsigned NeedAlign = HRI.getSpillAlignment(RC);
+d1717 4
+a1720 4
+  const auto &RC = !Is128B ? Hexagon::VectorRegsRegClass
+                           : Hexagon::VectorRegs128BRegClass;
+  unsigned Size = HRI.getSpillSize(RC);
+  unsigned NeedAlign = HRI.getSpillAlignment(RC);
+a1759 1
+  auto &HRI = *HST.getRegisterInfo();
+d1766 4
+a1769 3
+  const auto &RC = !Is128B ? Hexagon::VectorRegsRegClass
+                           : Hexagon::VectorRegs128BRegClass;
+  unsigned NeedAlign = HRI.getSpillAlignment(RC);
+a1797 1
+  auto &HRI = *HST.getRegisterInfo();
+d1803 4
+a1806 3
+  const auto &RC = !Is128B ? Hexagon::VectorRegsRegClass
+                           : Hexagon::VectorRegs128BRegClass;
+  unsigned NeedAlign = HRI.getSpillAlignment(RC);
+d1915 1
+a1915 1
+      unsigned S = HRI.getSpillSize(*RC), A = HRI.getSpillAlignment(*RC);
+d1988 3
+a1990 3
+  auto getCommonRC =
+      [](const TargetRegisterClass *HaveRC,
+         const TargetRegisterClass *NewRC) -> const TargetRegisterClass * {
+d2224 1
+a2224 1
+                       .add(SrcOp);
+d2368 1
+a2368 1
+bool HexagonFrameLowering::shouldInlineCSR(const MachineFunction &MF,
+a2371 2
+  if (!hasFP(MF))
+    return true;
+d2398 1
+a2398 1
+bool HexagonFrameLowering::useSpillFunction(const MachineFunction &MF,
+d2411 1
+a2411 1
+bool HexagonFrameLowering::useRestoreFunction(const MachineFunction &MF,
+d2436 4
+a2439 39
+  // stack location could require an extra register.
+  if (HST.useHVXOps() && StackSize > 256)
+    return true;
+
+  // Check if the function has store-immediate instructions that access
+  // the stack. Since the offset field is not extendable, if the stack
+  // size exceeds the offset limit (6 bits, shifted), the stores will
+  // require a new base register.
+  bool HasImmStack = false;
+  unsigned MinLS = ~0u;   // Log_2 of the memory access size.
+
+  for (const MachineBasicBlock &B : MF) {
+    for (const MachineInstr &MI : B) {
+      unsigned LS = 0;
+      switch (MI.getOpcode()) {
+        case Hexagon::S4_storeirit_io:
+        case Hexagon::S4_storeirif_io:
+        case Hexagon::S4_storeiri_io:
+          ++LS;
+          LLVM_FALLTHROUGH;
+        case Hexagon::S4_storeirht_io:
+        case Hexagon::S4_storeirhf_io:
+        case Hexagon::S4_storeirh_io:
+          ++LS;
+          LLVM_FALLTHROUGH;
+        case Hexagon::S4_storeirbt_io:
+        case Hexagon::S4_storeirbf_io:
+        case Hexagon::S4_storeirb_io:
+          if (MI.getOperand(0).isFI())
+            HasImmStack = true;
+          MinLS = std::min(MinLS, LS);
+          break;
+      }
+    }
+  }
+
+  if (HasImmStack)
+    return !isUInt<6>(StackSize >> MinLS);
+
 @
 
 

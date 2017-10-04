@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.33;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.07;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -338,6 +345,251 @@ a191 2
 d203 1
 a203 1
   if (TT.getOS() == Triple::AMDHSA || TT.getOS() == Triple::Mesa3D) {
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a15 1
+#include "AMDGPUSubtarget.h"
+a16 2
+#include "llvm/Analysis/CallGraphSCCPass.h"
+#include "llvm/CodeGen/TargetPassConfig.h"
+a17 1
+#include "llvm/IR/InstIterator.h"
+d27 1
+a27 1
+class AMDGPUAnnotateKernelFeatures : public CallGraphSCCPass {
+d29 1
+a29 2
+  const TargetMachine *TM = nullptr;
+  AMDGPUAS AS;
+d31 2
+a32 1
+  bool addFeatureAttributes(Function &F);
+d37 2
+a38 4
+  AMDGPUAnnotateKernelFeatures() : CallGraphSCCPass(ID) {}
+
+  bool doInitialization(CallGraph &CG) override;
+  bool runOnSCC(CallGraphSCC &SCC) override;
+d45 1
+a45 1
+    CallGraphSCCPass::getAnalysisUsage(AU);
+d48 1
+a48 1
+  static bool visitConstantExpr(const ConstantExpr *CE, AMDGPUAS AS);
+d51 1
+a51 2
+    SmallPtrSet<const Constant *, 8> &ConstantExprVisited,
+    AMDGPUAS AS);
+d65 2
+a66 2
+static bool castRequiresQueuePtr(unsigned SrcAS, const AMDGPUAS &AS) {
+  return SrcAS == AS.LOCAL_ADDRESS || SrcAS == AS.PRIVATE_ADDRESS;
+d69 2
+a70 3
+static bool castRequiresQueuePtr(const AddrSpaceCastInst *ASC,
+    const AMDGPUAS &AS) {
+  return castRequiresQueuePtr(ASC->getSrcAddressSpace(), AS);
+d73 1
+a73 2
+bool AMDGPUAnnotateKernelFeatures::visitConstantExpr(const ConstantExpr *CE,
+    AMDGPUAS AS) {
+d76 1
+a76 1
+    return castRequiresQueuePtr(SrcAS, AS);
+d84 1
+a84 2
+  SmallPtrSet<const Constant *, 8> &ConstantExprVisited,
+  AMDGPUAS AS) {
+d97 1
+a97 1
+      if (visitConstantExpr(CE, AS))
+d117 2
+a118 80
+// We do not need to note the x workitem or workgroup id because they are always
+// initialized.
+//
+// TODO: We should not add the attributes if the known compile time workgroup
+// size is 1 for y/z.
+static StringRef intrinsicToAttrName(Intrinsic::ID ID,
+                                     bool &NonKernelOnly,
+                                     bool &IsQueuePtr) {
+  switch (ID) {
+  case Intrinsic::amdgcn_workitem_id_x:
+    NonKernelOnly = true;
+    return "amdgpu-work-item-id-x";
+  case Intrinsic::amdgcn_workgroup_id_x:
+    NonKernelOnly = true;
+    return "amdgpu-work-group-id-x";
+  case Intrinsic::amdgcn_workitem_id_y:
+  case Intrinsic::r600_read_tidig_y:
+    return "amdgpu-work-item-id-y";
+  case Intrinsic::amdgcn_workitem_id_z:
+  case Intrinsic::r600_read_tidig_z:
+    return "amdgpu-work-item-id-z";
+  case Intrinsic::amdgcn_workgroup_id_y:
+  case Intrinsic::r600_read_tgid_y:
+    return "amdgpu-work-group-id-y";
+  case Intrinsic::amdgcn_workgroup_id_z:
+  case Intrinsic::r600_read_tgid_z:
+    return "amdgpu-work-group-id-z";
+  case Intrinsic::amdgcn_dispatch_ptr:
+    return "amdgpu-dispatch-ptr";
+  case Intrinsic::amdgcn_dispatch_id:
+    return "amdgpu-dispatch-id";
+  case Intrinsic::amdgcn_kernarg_segment_ptr:
+  case Intrinsic::amdgcn_implicitarg_ptr:
+    return "amdgpu-kernarg-segment-ptr";
+  case Intrinsic::amdgcn_queue_ptr:
+  case Intrinsic::trap:
+  case Intrinsic::debugtrap:
+    IsQueuePtr = true;
+    return "amdgpu-queue-ptr";
+  default:
+    return "";
+  }
+}
+
+static bool handleAttr(Function &Parent, const Function &Callee,
+                       StringRef Name) {
+  if (Callee.hasFnAttribute(Name)) {
+    Parent.addFnAttr(Name);
+    return true;
+  }
+
+  return false;
+}
+
+static void copyFeaturesToFunction(Function &Parent, const Function &Callee,
+                                   bool &NeedQueuePtr) {
+  // X ids unnecessarily propagated to kernels.
+  static const StringRef AttrNames[] = {
+    { "amdgpu-work-item-id-x" },
+    { "amdgpu-work-item-id-y" },
+    { "amdgpu-work-item-id-z" },
+    { "amdgpu-work-group-id-x" },
+    { "amdgpu-work-group-id-y" },
+    { "amdgpu-work-group-id-z" },
+    { "amdgpu-dispatch-ptr" },
+    { "amdgpu-dispatch-id" },
+    { "amdgpu-kernarg-segment-ptr" }
+  };
+
+  if (handleAttr(Parent, Callee, "amdgpu-queue-ptr"))
+    NeedQueuePtr = true;
+
+  for (StringRef AttrName : AttrNames)
+    handleAttr(Parent, Callee, AttrName);
+}
+
+bool AMDGPUAnnotateKernelFeatures::addFeatureAttributes(Function &F) {
+  const AMDGPUSubtarget &ST = TM->getSubtarget<AMDGPUSubtarget>(F);
+  bool HasFlat = ST.hasFlatAddressSpace();
+  bool HasApertureRegs = ST.hasApertureRegs();
+d121 2
+a122 37
+  bool Changed = false;
+  bool NeedQueuePtr = false;
+  bool HaveCall = false;
+  bool IsFunc = !AMDGPU::isEntryFunctionCC(F.getCallingConv());
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      CallSite CS(&I);
+      if (CS) {
+        Function *Callee = CS.getCalledFunction();
+
+        // TODO: Do something with indirect calls.
+        if (!Callee) {
+          if (!CS.isInlineAsm())
+            HaveCall = true;
+          continue;
+        }
+
+        Intrinsic::ID IID = Callee->getIntrinsicID();
+        if (IID == Intrinsic::not_intrinsic) {
+          HaveCall = true;
+          copyFeaturesToFunction(F, *Callee, NeedQueuePtr);
+          Changed = true;
+        } else {
+          bool NonKernelOnly = false;
+          StringRef AttrName = intrinsicToAttrName(IID,
+                                                   NonKernelOnly, NeedQueuePtr);
+          if (!AttrName.empty() && (IsFunc || !NonKernelOnly)) {
+            F.addFnAttr(AttrName);
+            Changed = true;
+          }
+        }
+      }
+
+      if (NeedQueuePtr || HasApertureRegs)
+        continue;
+
+d124 2
+a125 4
+        if (castRequiresQueuePtr(ASC, AS)) {
+          NeedQueuePtr = true;
+          continue;
+        }
+d133 2
+a134 4
+        if (visitConstantExprsRecursively(OpC, ConstantExprVisited, AS)) {
+          NeedQueuePtr = true;
+          break;
+        }
+d139 14
+a152 3
+  if (NeedQueuePtr) {
+    F.addFnAttr("amdgpu-queue-ptr");
+    Changed = true;
+d154 1
+d156 10
+a165 6
+  // TODO: We could refine this to captured pointers that could possibly be
+  // accessed by flat instructions. For now this is mostly a poor way of
+  // estimating whether there are calls before argument lowering.
+  if (HasFlat && !IsFunc && HaveCall) {
+    F.addFnAttr("amdgpu-flat-scratch");
+    Changed = true;
+d171 1
+a171 2
+bool AMDGPUAnnotateKernelFeatures::runOnSCC(CallGraphSCC &SCC) {
+  Module &M = SCC.getCallGraph().getModule();
+d174 26
+a199 5
+  bool Changed = false;
+  for (CallGraphNode *I : SCC) {
+    Function *F = I->getFunction();
+    if (!F || F->isDeclaration())
+      continue;
+d201 2
+a202 2
+    Changed |= addFeatureAttributes(*F);
+  }
+d204 3
+d208 3
+a210 2
+  return Changed;
+}
+d212 4
+a215 4
+bool AMDGPUAnnotateKernelFeatures::doInitialization(CallGraph &CG) {
+  auto *TPC = getAnalysisIfAvailable<TargetPassConfig>();
+  if (!TPC)
+    report_fatal_error("TargetMachine is required");
+d217 1
+a217 3
+  AS = AMDGPU::getAMDGPUAS(CG.getModule());
+  TM = &TPC->getTM<TargetMachine>();
+  return false;
+d220 1
+a220 1
+Pass *llvm::createAMDGPUAnnotateKernelFeaturesPass() {
 @
 
 

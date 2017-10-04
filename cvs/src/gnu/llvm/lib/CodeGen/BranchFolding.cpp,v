@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.5
 	OPENBSD_6_2:1.1.1.4.0.2
 	OPENBSD_6_2_BASE:1.1.1.4
 	OPENBSD_6_1:1.1.1.4.0.4
@@ -43,8 +44,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.4
 date	2017.03.14.08.08.13;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.5;
 commitid	aUi5NxOzBSLCN5eN;
+
+1.1.1.5
+date	2017.10.04.20.28.10;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -2485,6 +2492,281 @@ log
 text
 @d52 1
 d1387 36
+@
+
+
+1.1.1.5
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d1 1
+a1 1
+//===- BranchFolding.cpp - Fold machine code branch instructions ----------===//
+d21 1
+a21 2
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+a22 1
+#include "llvm/ADT/SmallVector.h"
+a23 1
+#include "llvm/ADT/STLExtras.h"
+a24 1
+#include "llvm/CodeGen/MachineBasicBlock.h"
+a26 1
+#include "llvm/CodeGen/MachineFunction.h"
+a27 1
+#include "llvm/CodeGen/MachineInstr.h"
+d29 1
+a31 1
+#include "llvm/CodeGen/MachineOperand.h"
+d33 1
+a34 2
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugLoc.h"
+a35 4
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/BlockFrequency.h"
+#include "llvm/Support/BranchProbability.h"
+a40 1
+#include "llvm/Target/TargetMachine.h"
+d43 1
+a43 6
+#include <cassert>
+#include <cstddef>
+#include <iterator>
+#include <numeric>
+#include <vector>
+
+d46 1
+a46 1
+#define DEBUG_TYPE "branch-folder"
+a51 1
+STATISTIC(NumTailCalls,  "Number of tail calls optimized");
+a69 1
+
+a73 1
+
+d85 1
+a85 2
+
+} // end anonymous namespace
+d90 1
+a90 1
+INITIALIZE_PASS(BranchFolderPass, DEBUG_TYPE,
+d126 2
+d147 3
+a158 1
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+a163 1
+  this->MRI = &MRI;
+d165 1
+d351 2
+d359 1
+a359 1
+    computeLiveIns(LiveRegs, *MRI, *NewDest);
+d365 3
+d378 1
+a378 1
+  MachineBasicBlock *NewMBB = MF.CreateMachineBasicBlock(BB);
+d391 1
+a391 1
+  if (MLI)
+d399 1
+a399 1
+    computeLiveIns(LiveRegs, *MRI, *NewMBB);
+d439 1
+a439 1
+  DebugLoc dl = CurMBB->findBranchDebugLoc();
+a499 9
+void BranchFolder::MBFIWrapper::view(const Twine &Name, bool isSimple) {
+  MBFI.view(Name, isSimple);
+}
+
+uint64_t
+BranchFolder::MBFIWrapper::getEntryFreq() const {
+  return MBFI.getEntryFreq();
+}
+
+d507 1
+a507 1
+  while (true) {
+a518 11
+/// A no successor, non-return block probably ends in unreachable and is cold.
+/// Also consider a block that ends in an indirect branch to be a return block,
+/// since many targets use plain indirect branches to return.
+static bool blockEndsInUnreachable(const MachineBasicBlock *MBB) {
+  if (!MBB->succ_empty())
+    return false;
+  if (MBB->empty())
+    return true;
+  return !(MBB->back().isReturn() || MBB->back().isIndirectBranch());
+}
+
+a572 9
+  // If these are identical non-return blocks with no successors, merge them.
+  // Such blocks are typically cold calls to noreturn functions like abort, and
+  // are unlikely to become a fallthrough target after machine block placement.
+  // Tail merging these blocks is unlikely to create additional unconditional
+  // branches, and will reduce the size of this cold code.
+  if (I1 == MBB1->begin() && I2 == MBB2->begin() &&
+      blockEndsInUnreachable(MBB1) && blockEndsInUnreachable(MBB2))
+    return true;
+
+a581 16
+  // If both blocks are identical and end in a branch, merge them unless they
+  // both have a fallthrough predecessor and successor.
+  // We can only do this after block placement because it depends on whether
+  // there are fallthroughs, and we don't know until after layout.
+  if (AfterPlacement && I1 == MBB1->begin() && I2 == MBB2->begin()) {
+    auto BothFallThrough = [](MachineBasicBlock *MBB) {
+      if (MBB->succ_size() != 0 && !MBB->canFallThrough())
+        return false;
+      MachineFunction::iterator I(MBB);
+      MachineFunction *MF = MBB->getParent();
+      return (MBB != &*MF->begin()) && std::prev(I)->canFallThrough();
+    };
+    if (!BothFallThrough(MBB1) || !BothFallThrough(MBB2))
+      return true;
+  }
+
+d607 10
+d653 2
+d674 2
+a725 37
+void BranchFolder::MergeCommonTailDebugLocs(unsigned commonTailIndex) {
+  MachineBasicBlock *MBB = SameTails[commonTailIndex].getBlock();
+
+  std::vector<MachineBasicBlock::iterator> NextCommonInsts(SameTails.size());
+  for (unsigned int i = 0 ; i != SameTails.size() ; ++i) {
+    if (i != commonTailIndex)
+      NextCommonInsts[i] = SameTails[i].getTailStartPos();
+    else {
+      assert(SameTails[i].getTailStartPos() == MBB->begin() &&
+          "MBB is not a common tail only block");
+    }
+  }
+
+  for (auto &MI : *MBB) {
+    if (MI.isDebugValue())
+      continue;
+    DebugLoc DL = MI.getDebugLoc();
+    for (unsigned int i = 0 ; i < NextCommonInsts.size() ; i++) {
+      if (i == commonTailIndex)
+        continue;
+
+      auto &Pos = NextCommonInsts[i];
+      assert(Pos != SameTails[i].getBlock()->end() &&
+          "Reached BB end within common tail");
+      while (Pos->isDebugValue()) {
+        ++Pos;
+        assert(Pos != SameTails[i].getBlock()->end() &&
+            "Reached BB end within common tail");
+      }
+      assert(MI.isIdenticalTo(*Pos) && "Expected matching MIIs!");
+      DL = DILocation::getMergedLocation(DL, Pos->getDebugLoc());
+      NextCommonInsts[i] = ++Pos;
+    }
+    MI.setDebugLoc(DL);
+  }
+}
+
+d878 4
+a881 2
+    // Merge debug locations across identical instructions for common tail.
+    MergeCommonTailDebugLocs(commonTailIndex);
+d1046 1
+a1046 1
+          DebugLoc dl = PBB->findBranchDebugLoc();
+d1196 2
+a1388 37
+  if (!IsEmptyBlock(MBB) && MBB->pred_size() == 1 &&
+      MF.getFunction()->optForSize()) {
+    // Changing "Jcc foo; foo: jmp bar;" into "Jcc bar;" might change the branch
+    // direction, thereby defeating careful block placement and regressing
+    // performance. Therefore, only consider this for optsize functions.
+    MachineInstr &TailCall = *MBB->getFirstNonDebugInstr();
+    if (TII->isUnconditionalTailCall(TailCall)) {
+      MachineBasicBlock *Pred = *MBB->pred_begin();
+      MachineBasicBlock *PredTBB = nullptr, *PredFBB = nullptr;
+      SmallVector<MachineOperand, 4> PredCond;
+      bool PredAnalyzable =
+          !TII->analyzeBranch(*Pred, PredTBB, PredFBB, PredCond, true);
+
+      if (PredAnalyzable && !PredCond.empty() && PredTBB == MBB &&
+          PredTBB != PredFBB) {
+        // The predecessor has a conditional branch to this block which consists
+        // of only a tail call. Try to fold the tail call into the conditional
+        // branch.
+        if (TII->canMakeTailCallConditional(PredCond, TailCall)) {
+          // TODO: It would be nice if analyzeBranch() could provide a pointer
+          // to the branch instruction so replaceBranchWithTailCall() doesn't
+          // have to search for it.
+          TII->replaceBranchWithTailCall(*Pred, PredCond, TailCall);
+          ++NumTailCalls;
+          Pred->removeSuccessor(MBB);
+          MadeChange = true;
+          return MadeChange;
+        }
+      }
+      // If the predecessor is falling through to this block, we could reverse
+      // the branch condition and fold the tail call into that. However, after
+      // that we might have to re-arrange the CFG to fall through to the other
+      // block and there is a high risk of regressing code size rather than
+      // improving it.
+    }
+  }
+
+d1511 1
+d1602 2
+d1737 3
+d1766 2
+a1767 2
+  SmallVector<unsigned, 4> LocalDefs, LocalKills;
+  SmallSet<unsigned, 4> ActiveDefsSet, AllDefsSet;
+d1821 1
+a1821 1
+      } else if (!ActiveDefsSet.count(Reg)) {
+d1841 1
+a1841 1
+    // Remove kills from ActiveDefsSet, these registers had short live ranges.
+d1846 1
+a1846 1
+      if (!Reg)
+a1847 4
+      if (!AllDefsSet.count(Reg)) {
+        LocalKills.push_back(Reg);
+        continue;
+      }
+d1850 1
+a1850 1
+          ActiveDefsSet.erase(*AI);
+d1852 1
+a1852 1
+        ActiveDefsSet.erase(Reg);
+d1864 1
+a1864 2
+      addRegAndItsAliases(Reg, TRI, ActiveDefsSet);
+      addRegAndItsAliases(Reg, TRI, AllDefsSet);
+d1879 1
+a1879 1
+  bool ChangedLiveIns = false;
+d1882 1
+a1882 1
+    if (ActiveDefsSet.count(Def)) {
+d1885 1
+a1885 1
+      ChangedLiveIns = true;
+a1887 5
+  for (unsigned K : LocalKills) {
+    TBB->removeLiveIn(K);
+    FBB->removeLiveIn(K);
+    ChangedLiveIns = true;
+  }
+d1889 1
+a1889 1
+  if (ChangedLiveIns) {
 @
 
 

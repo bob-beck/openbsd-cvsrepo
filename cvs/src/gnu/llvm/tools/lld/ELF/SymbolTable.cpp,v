@@ -1,6 +1,7 @@
-head	1.2;
+head	1.3;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.2.0.2
 	OPENBSD_6_2_BASE:1.2
 	OPENBSD_6_1:1.2.0.4
@@ -13,6 +14,12 @@ locks; strict;
 comment	@// @;
 expand	@o@;
 
+
+1.3
+date	2017.10.04.20.51.29;	author patrick;	state Exp;
+branches;
+next	1.2;
+commitid	s9g4O09EGmKo3yXv;
 
 1.2
 date	2017.03.19.11.13.23;	author kettenis;	state Exp;
@@ -42,24 +49,23 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.3
 date	2017.03.14.08.07.53;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	aUi5NxOzBSLCN5eN;
+
+1.1.1.4
+date	2017.10.04.20.27.35;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
 @@
 
 
-1.2
+1.3
 log
-@Work around a problem where linker-generated symbols are not properly
-versioned and end up as local symbols despite being explicitly listed as
-global in the version script.  This breaks out brk()/sbrk() implementation.
-
-The diff is only a partial solution and unlikely to be accepted as-is
-upstream.  We'll keep it as a local diff until a better solution is found.
-
-ok guenther@@
+@Merge LLVM 5.0.0 release.
 @
 text
 @//===- SymbolTable.cpp ----------------------------------------------------===//
@@ -116,6 +122,9 @@ template <class ELFT> static bool isCompatible(InputFile *F) {
 
 // Add symbols in File to the symbol table.
 template <class ELFT> void SymbolTable<ELFT>::addFile(InputFile *File) {
+  if (!Config->FirstElf && isa<ELFFileBase<ELFT>>(File))
+    Config->FirstElf = File;
+
   if (!isCompatible<ELFT>(File))
     return;
 
@@ -139,13 +148,13 @@ template <class ELFT> void SymbolTable<ELFT>::addFile(InputFile *File) {
   }
 
   if (Config->Trace)
-    outs() << toString(File) << "\n";
+    message(toString(File));
 
   // .so file
   if (auto *F = dyn_cast<SharedFile<ELFT>>(File)) {
     // DSOs are uniquified not by filename but by soname.
     F->parseSoName();
-    if (ErrorCount || !SoNames.insert(F->getSoName()).second)
+    if (ErrorCount || !SoNames.insert(F->SoName).second)
       return;
     SharedFiles.push_back(F);
     F->parseRest();
@@ -179,7 +188,7 @@ template <class ELFT> void SymbolTable<ELFT>::addCombinedLTOObject() {
   // Compile bitcode files and replace bitcode symbols.
   LTO.reset(new BitcodeCompiler);
   for (BitcodeFile *F : BitcodeFiles)
-    LTO->add<ELFT>(*F);
+    LTO->add(*F);
 
   for (InputFile *File : LTO->compile()) {
     ObjectFile<ELFT> *Obj = cast<ObjectFile<ELFT>>(File);
@@ -190,19 +199,19 @@ template <class ELFT> void SymbolTable<ELFT>::addCombinedLTOObject() {
 }
 
 template <class ELFT>
-DefinedRegular<ELFT> *SymbolTable<ELFT>::addAbsolute(StringRef Name,
-                                                     uint8_t Visibility,
-                                                     uint8_t Binding) {
+DefinedRegular *SymbolTable<ELFT>::addAbsolute(StringRef Name,
+                                               uint8_t Visibility,
+                                               uint8_t Binding) {
   Symbol *Sym =
       addRegular(Name, Visibility, STT_NOTYPE, 0, 0, Binding, nullptr, nullptr);
-  return cast<DefinedRegular<ELFT>>(Sym->body());
+  return cast<DefinedRegular>(Sym->body());
 }
 
 // Add Name as an "ignored" symbol. An ignored symbol is a regular
 // linker-synthesized defined symbol, but is only defined if needed.
 template <class ELFT>
-DefinedRegular<ELFT> *SymbolTable<ELFT>::addIgnored(StringRef Name,
-                                                    uint8_t Visibility) {
+DefinedRegular *SymbolTable<ELFT>::addIgnored(StringRef Name,
+                                              uint8_t Visibility) {
   SymbolBody *S = find(Name);
   if (!S || S->isInCurrentDSO())
     return nullptr;
@@ -223,7 +232,7 @@ template <class ELFT> void SymbolTable<ELFT>::trace(StringRef Name) {
 
 // Rename SYM as __wrap_SYM. The original symbol is preserved as __real_SYM.
 // Used to implement --wrap.
-template <class ELFT> void SymbolTable<ELFT>::wrap(StringRef Name) {
+template <class ELFT> void SymbolTable<ELFT>::addSymbolWrap(StringRef Name) {
   SymbolBody *B = find(Name);
   if (!B)
     return;
@@ -231,11 +240,40 @@ template <class ELFT> void SymbolTable<ELFT>::wrap(StringRef Name) {
   Symbol *Real = addUndefined(Saver.save("__real_" + Name));
   Symbol *Wrap = addUndefined(Saver.save("__wrap_" + Name));
 
-  // We rename symbols by replacing the old symbol's SymbolBody with the new
-  // symbol's SymbolBody. This causes all SymbolBody pointers referring to the
-  // old symbol to instead refer to the new symbol.
-  memcpy(Real->Body.buffer, Sym->Body.buffer, sizeof(Sym->Body));
-  memcpy(Sym->Body.buffer, Wrap->Body.buffer, sizeof(Wrap->Body));
+  // Tell LTO not to eliminate this symbol
+  Wrap->IsUsedInRegularObj = true;
+
+  Config->RenamedSymbols[Real] = {Sym, Real->Binding};
+  Config->RenamedSymbols[Sym] = {Wrap, Sym->Binding};
+}
+
+// Creates alias for symbol. Used to implement --defsym=ALIAS=SYM.
+template <class ELFT>
+void SymbolTable<ELFT>::addSymbolAlias(StringRef Alias, StringRef Name) {
+  SymbolBody *B = find(Name);
+  if (!B) {
+    error("-defsym: undefined symbol: " + Name);
+    return;
+  }
+  Symbol *Sym = B->symbol();
+  Symbol *AliasSym = addUndefined(Alias);
+
+  // Tell LTO not to eliminate this symbol
+  Sym->IsUsedInRegularObj = true;
+  Config->RenamedSymbols[AliasSym] = {Sym, AliasSym->Binding};
+}
+
+// Apply symbol renames created by -wrap and -defsym. The renames are created
+// before LTO in addSymbolWrap() and addSymbolAlias() to have a chance to inform
+// LTO (if LTO is running) not to include these symbols in IPO. Now that the
+// symbols are finalized, we can perform the replacement.
+template <class ELFT> void SymbolTable<ELFT>::applySymbolRenames() {
+  for (auto &KV : Config->RenamedSymbols) {
+    Symbol *Dst = KV.first;
+    Symbol *Src = KV.second.Target;
+    Dst->body()->copy(Src->body());
+    Dst->Binding = KV.second.OriginalBinding;
+  }
 }
 
 static uint8_t getMinVisibility(uint8_t VA, uint8_t VB) {
@@ -249,6 +287,12 @@ static uint8_t getMinVisibility(uint8_t VA, uint8_t VB) {
 // Find an existing symbol or create and insert a new one.
 template <class ELFT>
 std::pair<Symbol *, bool> SymbolTable<ELFT>::insert(StringRef Name) {
+  // <name>@@@@<version> means the symbol is the default version. In that
+  // case <name>@@@@<version> will be used to resolve references to <name>.
+  size_t Pos = Name.find("@@@@");
+  if (Pos != StringRef::npos)
+    Name = Name.take_front(Pos);
+
   auto P = Symtab.insert(
       {CachedHashStringRef(Name), SymIndex((int)SymVector.size(), false)});
   SymIndex &V = P.first->second;
@@ -261,7 +305,7 @@ std::pair<Symbol *, bool> SymbolTable<ELFT>::insert(StringRef Name) {
 
   Symbol *Sym;
   if (IsNew) {
-    Sym = new (BAlloc) Symbol;
+    Sym = make<Symbol>();
     Sym->InVersionScript = false;
     Sym->Binding = STB_WEAK;
     Sym->Visibility = STV_DEFAULT;
@@ -274,13 +318,6 @@ std::pair<Symbol *, bool> SymbolTable<ELFT>::insert(StringRef Name) {
     Sym = SymVector[V.Idx];
   }
   return {Sym, IsNew};
-}
-
-// Construct a string in the form of "Sym in File1 and File2".
-// Used to construct an error message.
-static std::string conflictMsg(SymbolBody *Existing, InputFile *NewFile) {
-  return "'" + toString(*Existing) + "' in " + toString(Existing->File) +
-         " and " + toString(NewFile);
 }
 
 // Find an existing symbol or create and insert a new one, then apply the given
@@ -296,13 +333,19 @@ SymbolTable<ELFT>::insert(StringRef Name, uint8_t Type, uint8_t Visibility,
 
   // Merge in the new symbol's visibility.
   S->Visibility = getMinVisibility(S->Visibility, Visibility);
+
   if (!CanOmitFromDynSym && (Config->Shared || Config->ExportDynamic))
     S->ExportDynamic = true;
+
   if (IsUsedInRegularObj)
     S->IsUsedInRegularObj = true;
+
   if (!WasInserted && S->body()->Type != SymbolBody::UnknownType &&
-      ((Type == STT_TLS) != S->body()->isTls()))
-    error("TLS attribute mismatch for symbol " + conflictMsg(S->body(), File));
+      ((Type == STT_TLS) != S->body()->isTls())) {
+    error("TLS attribute mismatch: " + toString(*S->body()) +
+          "\n>>> defined in " + toString(S->body()->File) +
+          "\n>>> defined in " + toString(File));
+  }
 
   return {S, WasInserted};
 }
@@ -322,18 +365,23 @@ Symbol *SymbolTable<ELFT>::addUndefined(StringRef Name, bool IsLocal,
                                         InputFile *File) {
   Symbol *S;
   bool WasInserted;
+  uint8_t Visibility = getVisibility(StOther);
   std::tie(S, WasInserted) =
-      insert(Name, Type, getVisibility(StOther), CanOmitFromDynSym, File);
-  if (WasInserted) {
+      insert(Name, Type, Visibility, CanOmitFromDynSym, File);
+  // An undefined symbol with non default visibility must be satisfied
+  // in the same DSO.
+  if (WasInserted ||
+      (isa<SharedSymbol>(S->body()) && Visibility != STV_DEFAULT)) {
     S->Binding = Binding;
-    replaceBody<Undefined<ELFT>>(S, Name, IsLocal, StOther, Type, File);
+    replaceBody<Undefined>(S, Name, IsLocal, StOther, Type, File);
     return S;
   }
   if (Binding != STB_WEAK) {
-    if (S->body()->isShared() || S->body()->isLazy())
+    SymbolBody *B = S->body();
+    if (B->isShared() || B->isLazy() || B->isUndefined())
       S->Binding = Binding;
-    if (auto *SS = dyn_cast<SharedSymbol<ELFT>>(S->body()))
-      SS->file()->IsUsed = true;
+    if (auto *SS = dyn_cast<SharedSymbol>(B))
+      cast<SharedFile<ELFT>>(SS->File)->IsUsed = true;
   }
   if (auto *L = dyn_cast<Lazy>(S->body())) {
     // An undefined weak will not fetch archive members, but we have to remember
@@ -346,15 +394,36 @@ Symbol *SymbolTable<ELFT>::addUndefined(StringRef Name, bool IsLocal,
   return S;
 }
 
+// Using .symver foo,foo@@@@VER unfortunately creates two symbols: foo and
+// foo@@@@VER. We want to effectively ignore foo, so give precedence to
+// foo@@@@VER.
+// FIXME: If users can transition to using
+// .symver foo,foo@@@@@@VER
+// we can delete this hack.
+static int compareVersion(Symbol *S, StringRef Name) {
+  if (Name.find("@@@@") != StringRef::npos &&
+      S->body()->getName().find("@@@@") == StringRef::npos)
+    return 1;
+  if (Name.find("@@@@") == StringRef::npos &&
+      S->body()->getName().find("@@@@") != StringRef::npos)
+    return -1;
+  return 0;
+}
+
 // We have a new defined symbol with the specified binding. Return 1 if the new
 // symbol should win, -1 if the new symbol should lose, or 0 if both symbols are
 // strong defined symbols.
-static int compareDefined(Symbol *S, bool WasInserted, uint8_t Binding) {
+static int compareDefined(Symbol *S, bool WasInserted, uint8_t Binding,
+                          StringRef Name) {
   if (WasInserted)
     return 1;
   SymbolBody *Body = S->body();
-  if (Body->isLazy() || !Body->isInCurrentDSO())
+  if (!Body->isInCurrentDSO())
     return 1;
+
+  if (int R = compareVersion(S, Name))
+    return R;
+
   if (Binding == STB_WEAK)
     return -1;
   if (S->isWeak())
@@ -367,8 +436,9 @@ static int compareDefined(Symbol *S, bool WasInserted, uint8_t Binding) {
 // is a conflict. If the new symbol wins, also update the binding.
 template <typename ELFT>
 static int compareDefinedNonCommon(Symbol *S, bool WasInserted, uint8_t Binding,
-                                   bool IsAbsolute, typename ELFT::uint Value) {
-  if (int Cmp = compareDefined(S, WasInserted, Binding)) {
+                                   bool IsAbsolute, typename ELFT::uint Value,
+                                   StringRef Name) {
+  if (int Cmp = compareDefined(S, WasInserted, Binding, Name)) {
     if (Cmp > 0)
       S->Binding = Binding;
     return Cmp;
@@ -379,7 +449,7 @@ static int compareDefinedNonCommon(Symbol *S, bool WasInserted, uint8_t Binding,
     if (Config->WarnCommon)
       warn("common " + S->body()->getName() + " is overridden");
     return 1;
-  } else if (auto *R = dyn_cast<DefinedRegular<ELFT>>(B)) {
+  } else if (auto *R = dyn_cast<DefinedRegular>(B)) {
     if (R->Section == nullptr && Binding == STB_GLOBAL && IsAbsolute &&
         R->Value == Value)
       return -1;
@@ -389,14 +459,14 @@ static int compareDefinedNonCommon(Symbol *S, bool WasInserted, uint8_t Binding,
 
 template <class ELFT>
 Symbol *SymbolTable<ELFT>::addCommon(StringRef N, uint64_t Size,
-                                     uint64_t Alignment, uint8_t Binding,
+                                     uint32_t Alignment, uint8_t Binding,
                                      uint8_t StOther, uint8_t Type,
                                      InputFile *File) {
   Symbol *S;
   bool WasInserted;
   std::tie(S, WasInserted) = insert(N, Type, getVisibility(StOther),
                                     /*CanOmitFromDynSym*/ false, File);
-  int Cmp = compareDefined(S, WasInserted, Binding);
+  int Cmp = compareDefined(S, WasInserted, Binding, N);
   if (Cmp > 0) {
     S->Binding = Binding;
     replaceBody<DefinedCommon>(S, N, Size, Alignment, StOther, Type, File);
@@ -419,73 +489,72 @@ Symbol *SymbolTable<ELFT>::addCommon(StringRef N, uint64_t Size,
   return S;
 }
 
-static void print(const Twine &Msg) {
+static void warnOrError(const Twine &Msg) {
   if (Config->AllowMultipleDefinition)
     warn(Msg);
   else
     error(Msg);
 }
 
-static void reportDuplicate(SymbolBody *Existing, InputFile *NewFile) {
-  print("duplicate symbol " + conflictMsg(Existing, NewFile));
+static void reportDuplicate(SymbolBody *Sym, InputFile *NewFile) {
+  warnOrError("duplicate symbol: " + toString(*Sym) + "\n>>> defined in " +
+              toString(Sym->File) + "\n>>> defined in " + toString(NewFile));
 }
 
 template <class ELFT>
-static void reportDuplicate(SymbolBody *Existing,
-                            InputSectionBase<ELFT> *ErrSec,
+static void reportDuplicate(SymbolBody *Sym, InputSectionBase *ErrSec,
                             typename ELFT::uint ErrOffset) {
-  DefinedRegular<ELFT> *D = dyn_cast<DefinedRegular<ELFT>>(Existing);
+  DefinedRegular *D = dyn_cast<DefinedRegular>(Sym);
   if (!D || !D->Section || !ErrSec) {
-    reportDuplicate(Existing, ErrSec ? ErrSec->getFile() : nullptr);
+    reportDuplicate(Sym, ErrSec ? ErrSec->getFile<ELFT>() : nullptr);
     return;
   }
 
-  std::string OldLoc = D->Section->getLocation(D->Value);
-  std::string NewLoc = ErrSec->getLocation(ErrOffset);
+  // Construct and print an error message in the form of:
+  //
+  //   ld.lld: error: duplicate symbol: foo
+  //   >>> defined at bar.c:30
+  //   >>>            bar.o (/home/alice/src/bar.o)
+  //   >>> defined at baz.c:563
+  //   >>>            baz.o in archive libbaz.a
+  auto *Sec1 = cast<InputSectionBase>(D->Section);
+  std::string Src1 = Sec1->getSrcMsg<ELFT>(D->Value);
+  std::string Obj1 = Sec1->getObjMsg<ELFT>(D->Value);
+  std::string Src2 = ErrSec->getSrcMsg<ELFT>(ErrOffset);
+  std::string Obj2 = ErrSec->getObjMsg<ELFT>(ErrOffset);
 
-  print(NewLoc + ": duplicate symbol '" + toString(*Existing) + "'");
-  print(OldLoc + ": previous definition was here");
+  std::string Msg = "duplicate symbol: " + toString(*Sym) + "\n>>> defined at ";
+  if (!Src1.empty())
+    Msg += Src1 + "\n>>>            ";
+  Msg += Obj1 + "\n>>> defined at ";
+  if (!Src2.empty())
+    Msg += Src2 + "\n>>>            ";
+  Msg += Obj2;
+  warnOrError(Msg);
 }
 
 template <typename ELFT>
 Symbol *SymbolTable<ELFT>::addRegular(StringRef Name, uint8_t StOther,
-                                      uint8_t Type, uintX_t Value, uintX_t Size,
-                                      uint8_t Binding,
-                                      InputSectionBase<ELFT> *Section,
-                                      InputFile *File) {
+                                      uint8_t Type, uint64_t Value,
+                                      uint64_t Size, uint8_t Binding,
+                                      SectionBase *Section, InputFile *File) {
   Symbol *S;
   bool WasInserted;
   std::tie(S, WasInserted) = insert(Name, Type, getVisibility(StOther),
                                     /*CanOmitFromDynSym*/ false, File);
   int Cmp = compareDefinedNonCommon<ELFT>(S, WasInserted, Binding,
-                                          Section == nullptr, Value);
+                                          Section == nullptr, Value, Name);
   if (Cmp > 0)
-    replaceBody<DefinedRegular<ELFT>>(S, Name, /*IsLocal=*/false, StOther, Type,
-                                      Value, Size, Section, File);
+    replaceBody<DefinedRegular>(S, Name, /*IsLocal=*/false, StOther, Type,
+                                Value, Size, Section, File);
   else if (Cmp == 0)
-    reportDuplicate(S->body(), Section, Value);
+    reportDuplicate<ELFT>(S->body(),
+                          dyn_cast_or_null<InputSectionBase>(Section), Value);
   return S;
 }
 
 template <typename ELFT>
-Symbol *SymbolTable<ELFT>::addSynthetic(StringRef N,
-                                        const OutputSectionBase *Section,
-                                        uintX_t Value, uint8_t StOther) {
-  Symbol *S;
-  bool WasInserted;
-  std::tie(S, WasInserted) = insert(N, STT_NOTYPE, getVisibility(StOther),
-                                    /*CanOmitFromDynSym*/ false, nullptr);
-  int Cmp = compareDefinedNonCommon<ELFT>(S, WasInserted, STB_GLOBAL,
-                                          /*IsAbsolute*/ false, /*Value*/ 0);
-  if (Cmp > 0)
-    replaceBody<DefinedSynthetic>(S, N, Value, Section);
-  else if (Cmp == 0)
-    reportDuplicate(S->body(), nullptr);
-  return S;
-}
-
-template <typename ELFT>
-void SymbolTable<ELFT>::addShared(SharedFile<ELFT> *F, StringRef Name,
+void SymbolTable<ELFT>::addShared(SharedFile<ELFT> *File, StringRef Name,
                                   const Elf_Sym &Sym,
                                   const typename ELFT::Verdef *Verdef) {
   // DSO symbols do not affect visibility in the output, so we pass STV_DEFAULT
@@ -493,15 +562,21 @@ void SymbolTable<ELFT>::addShared(SharedFile<ELFT> *F, StringRef Name,
   // unchanged.
   Symbol *S;
   bool WasInserted;
-  std::tie(S, WasInserted) =
-      insert(Name, Sym.getType(), STV_DEFAULT, /*CanOmitFromDynSym*/ true, F);
+  std::tie(S, WasInserted) = insert(Name, Sym.getType(), STV_DEFAULT,
+                                    /*CanOmitFromDynSym*/ true, File);
   // Make sure we preempt DSO symbols with default visibility.
   if (Sym.getVisibility() == STV_DEFAULT)
     S->ExportDynamic = true;
-  if (WasInserted || isa<Undefined<ELFT>>(S->body())) {
-    replaceBody<SharedSymbol<ELFT>>(S, F, Name, Sym, Verdef);
+
+  SymbolBody *Body = S->body();
+  // An undefined symbol with non default visibility must be satisfied
+  // in the same DSO.
+  if (WasInserted ||
+      (isa<Undefined>(Body) && Body->getVisibility() == STV_DEFAULT)) {
+    replaceBody<SharedSymbol>(S, File, Name, Sym.st_other, Sym.getType(), &Sym,
+                              Verdef);
     if (!S->isWeak())
-      F->IsUsed = true;
+      File->IsUsed = true;
   }
 }
 
@@ -514,10 +589,10 @@ Symbol *SymbolTable<ELFT>::addBitcode(StringRef Name, uint8_t Binding,
   std::tie(S, WasInserted) =
       insert(Name, Type, getVisibility(StOther), CanOmitFromDynSym, F);
   int Cmp = compareDefinedNonCommon<ELFT>(S, WasInserted, Binding,
-                                          /*IsAbs*/ false, /*Value*/ 0);
+                                          /*IsAbs*/ false, /*Value*/ 0, Name);
   if (Cmp > 0)
-    replaceBody<DefinedRegular<ELFT>>(S, Name, /*IsLocal=*/false, StOther, Type,
-                                      0, 0, nullptr, F);
+    replaceBody<DefinedRegular>(S, Name, /*IsLocal=*/false, StOther, Type, 0, 0,
+                                nullptr, F);
   else if (Cmp == 0)
     reportDuplicate(S->body(), F);
   return S;
@@ -542,18 +617,18 @@ SymbolBody *SymbolTable<ELFT>::findInCurrentDSO(StringRef Name) {
 }
 
 template <class ELFT>
-void SymbolTable<ELFT>::addLazyArchive(ArchiveFile *F,
-                                       const object::Archive::Symbol Sym) {
+Symbol *SymbolTable<ELFT>::addLazyArchive(ArchiveFile *F,
+                                          const object::Archive::Symbol Sym) {
   Symbol *S;
   bool WasInserted;
   StringRef Name = Sym.getName();
   std::tie(S, WasInserted) = insert(Name);
   if (WasInserted) {
     replaceBody<LazyArchive>(S, *F, Sym, SymbolBody::UnknownType);
-    return;
+    return S;
   }
   if (!S->body()->isUndefined())
-    return;
+    return S;
 
   // Weak undefined symbols should not fetch members from archives. If we were
   // to keep old symbol we would not know that an archive member was available
@@ -564,11 +639,12 @@ void SymbolTable<ELFT>::addLazyArchive(ArchiveFile *F,
   // to preserve its type. FIXME: Move the Type field to Symbol.
   if (S->isWeak()) {
     replaceBody<LazyArchive>(S, *F, Sym, S->body()->Type);
-    return;
+    return S;
   }
   std::pair<MemoryBufferRef, uint64_t> MBInfo = F->getMember(&Sym);
   if (!MBInfo.first.getBuffer().empty())
     addFile(createObjectFile(MBInfo.first, F->getName(), MBInfo.second));
+  return S;
 }
 
 template <class ELFT>
@@ -584,13 +660,10 @@ void SymbolTable<ELFT>::addLazyObject(StringRef Name, LazyObjectFile &Obj) {
     return;
 
   // See comment for addLazyArchive above.
-  if (S->isWeak()) {
+  if (S->isWeak())
     replaceBody<LazyObject>(S, Name, Obj, S->body()->Type);
-  } else {
-    MemoryBufferRef MBRef = Obj.getBuffer();
-    if (!MBRef.getBuffer().empty())
-      addFile(createObjectFile(MBRef));
-  }
+  else if (InputFile *F = Obj.fetch())
+    addFile(F);
 }
 
 // Process undefined (-u) flags by loading lazy symbols named by those flags.
@@ -609,11 +682,20 @@ template <class ELFT> void SymbolTable<ELFT>::scanUndefinedFlags() {
 // shared libraries can find them.
 // Except this, we ignore undefined symbols in DSOs.
 template <class ELFT> void SymbolTable<ELFT>::scanShlibUndefined() {
-  for (SharedFile<ELFT> *File : SharedFiles)
-    for (StringRef U : File->getUndefinedSymbols())
-      if (SymbolBody *Sym = find(U))
-        if (Sym->isDefined())
-          Sym->symbol()->ExportDynamic = true;
+  for (SharedFile<ELFT> *File : SharedFiles) {
+    for (StringRef U : File->getUndefinedSymbols()) {
+      SymbolBody *Sym = find(U);
+      if (!Sym || !Sym->isDefined())
+        continue;
+      Sym->symbol()->ExportDynamic = true;
+
+      // If -dynamic-list is given, the default version is set to
+      // VER_NDX_LOCAL, which prevents a symbol to be exported via .dynsym.
+      // Set to VER_NDX_GLOBAL so the symbol will be handled as if it were
+      // specified by -dynamic-list.
+      Sym->symbol()->VersionId = VER_NDX_GLOBAL;
+    }
+  }
 }
 
 // Initialize DemangledSyms with a map from demangled symbols to symbol
@@ -694,7 +776,8 @@ template <class ELFT> void SymbolTable<ELFT>::handleAnonymousVersion() {
 // Set symbol versions to symbols. This function handles patterns
 // containing no wildcard characters.
 template <class ELFT>
-void SymbolTable<ELFT>::assignExactVersion(SymbolVersion Ver, uint16_t VersionId,
+void SymbolTable<ELFT>::assignExactVersion(SymbolVersion Ver,
+                                           uint16_t VersionId,
                                            StringRef VersionName) {
   if (Ver.HasWildcard)
     return;
@@ -710,6 +793,12 @@ void SymbolTable<ELFT>::assignExactVersion(SymbolVersion Ver, uint16_t VersionId
 
   // Assign the version.
   for (SymbolBody *B : Syms) {
+    // Skip symbols containing version info because symbol versions
+    // specified by symbol names take precedence over version scripts.
+    // See parseSymbolVersion().
+    if (B->getName().find('@@') != StringRef::npos)
+      continue;
+
     Symbol *Sym = B->symbol();
     if (Sym->InVersionScript)
       warn("duplicate symbol '" + Ver.Name + "' in version script");
@@ -723,12 +812,11 @@ void SymbolTable<ELFT>::assignWildcardVersion(SymbolVersion Ver,
                                               uint16_t VersionId) {
   if (!Ver.HasWildcard)
     return;
-  std::vector<SymbolBody *> Syms = findAllByVersion(Ver);
 
   // Exact matching takes precendence over fuzzy matching,
   // so we set a version to a symbol only if no version has been assigned
   // to the symbol. This behavior is compatible with GNU.
-  for (SymbolBody *B : Syms)
+  for (SymbolBody *B : findAllByVersion(Ver))
     if (B->symbol()->VersionId == Config->DefaultSymbolVersion)
       B->symbol()->VersionId = VersionId;
 }
@@ -736,18 +824,8 @@ void SymbolTable<ELFT>::assignWildcardVersion(SymbolVersion Ver,
 // This function processes version scripts by updating VersionId
 // member of symbols.
 template <class ELFT> void SymbolTable<ELFT>::scanVersionScript() {
-  // Symbol themselves might know their versions because symbols
-  // can contain versions in the form of <name>@@<version>.
-  // Let them parse their names.
-  if (!Config->VersionDefinitions.empty())
-    for (Symbol *Sym : SymVector)
-      Sym->body()->parseSymbolVersion();
-
   // Handle edge cases first.
   handleAnonymousVersion();
-
-  if (Config->VersionDefinitions.empty())
-    return;
 
   // Now we have version definitions, so we need to set version ids to symbols.
   // Each version definition has a glob pattern, and all symbols that match
@@ -766,12 +844,251 @@ template <class ELFT> void SymbolTable<ELFT>::scanVersionScript() {
   for (VersionDefinition &V : llvm::reverse(Config->VersionDefinitions))
     for (SymbolVersion &Ver : V.Globals)
       assignWildcardVersion(Ver, V.Id);
+
+  // Symbol themselves might know their versions because symbols
+  // can contain versions in the form of <name>@@<version>.
+  // Let them parse and update their names to exclude version suffix.
+  for (Symbol *Sym : SymVector)
+    Sym->body()->parseSymbolVersion();
 }
 
 template class elf::SymbolTable<ELF32LE>;
 template class elf::SymbolTable<ELF32BE>;
 template class elf::SymbolTable<ELF64LE>;
 template class elf::SymbolTable<ELF64BE>;
+@
+
+
+1.2
+log
+@Work around a problem where linker-generated symbols are not properly
+versioned and end up as local symbols despite being explicitly listed as
+global in the version script.  This breaks out brk()/sbrk() implementation.
+
+The diff is only a partial solution and unlikely to be accepted as-is
+upstream.  We'll keep it as a local diff until a better solution is found.
+
+ok guenther@@
+@
+text
+@d55 3
+d81 1
+a81 1
+    outs() << toString(File) << "\n";
+d87 1
+a87 1
+    if (ErrorCount || !SoNames.insert(F->getSoName()).second)
+d121 1
+a121 1
+    LTO->add<ELFT>(*F);
+d132 3
+a134 3
+DefinedRegular<ELFT> *SymbolTable<ELFT>::addAbsolute(StringRef Name,
+                                                     uint8_t Visibility,
+                                                     uint8_t Binding) {
+d137 1
+a137 1
+  return cast<DefinedRegular<ELFT>>(Sym->body());
+d143 2
+a144 2
+DefinedRegular<ELFT> *SymbolTable<ELFT>::addIgnored(StringRef Name,
+                                                    uint8_t Visibility) {
+d165 1
+a165 1
+template <class ELFT> void SymbolTable<ELFT>::wrap(StringRef Name) {
+d173 34
+a206 5
+  // We rename symbols by replacing the old symbol's SymbolBody with the new
+  // symbol's SymbolBody. This causes all SymbolBody pointers referring to the
+  // old symbol to instead refer to the new symbol.
+  memcpy(Real->Body.buffer, Sym->Body.buffer, sizeof(Sym->Body));
+  memcpy(Sym->Body.buffer, Wrap->Body.buffer, sizeof(Wrap->Body));
+d220 6
+d238 1
+a238 1
+    Sym = new (BAlloc) Symbol;
+a252 7
+// Construct a string in the form of "Sym in File1 and File2".
+// Used to construct an error message.
+static std::string conflictMsg(SymbolBody *Existing, InputFile *NewFile) {
+  return "'" + toString(*Existing) + "' in " + toString(Existing->File) +
+         " and " + toString(NewFile);
+}
+
+d266 1
+d269 1
+d272 1
+d274 5
+a278 2
+      ((Type == STT_TLS) != S->body()->isTls()))
+    error("TLS attribute mismatch for symbol " + conflictMsg(S->body(), File));
+d298 1
+d300 5
+a304 2
+      insert(Name, Type, getVisibility(StOther), CanOmitFromDynSym, File);
+  if (WasInserted) {
+d306 1
+a306 1
+    replaceBody<Undefined<ELFT>>(S, Name, IsLocal, StOther, Type, File);
+d310 2
+a311 1
+    if (S->body()->isShared() || S->body()->isLazy())
+d313 2
+a314 2
+    if (auto *SS = dyn_cast<SharedSymbol<ELFT>>(S->body()))
+      SS->file()->IsUsed = true;
+d327 16
+d346 2
+a347 1
+static int compareDefined(Symbol *S, bool WasInserted, uint8_t Binding) {
+d351 1
+a351 1
+  if (Body->isLazy() || !Body->isInCurrentDSO())
+d353 4
+d369 3
+a371 2
+                                   bool IsAbsolute, typename ELFT::uint Value) {
+  if (int Cmp = compareDefined(S, WasInserted, Binding)) {
+d382 1
+a382 1
+  } else if (auto *R = dyn_cast<DefinedRegular<ELFT>>(B)) {
+d392 1
+a392 1
+                                     uint64_t Alignment, uint8_t Binding,
+d399 1
+a399 1
+  int Cmp = compareDefined(S, WasInserted, Binding);
+d422 1
+a422 1
+static void print(const Twine &Msg) {
+d429 3
+a431 2
+static void reportDuplicate(SymbolBody *Existing, InputFile *NewFile) {
+  print("duplicate symbol " + conflictMsg(Existing, NewFile));
+d435 1
+a435 2
+static void reportDuplicate(SymbolBody *Existing,
+                            InputSectionBase<ELFT> *ErrSec,
+d437 1
+a437 1
+  DefinedRegular<ELFT> *D = dyn_cast<DefinedRegular<ELFT>>(Existing);
+d439 1
+a439 1
+    reportDuplicate(Existing, ErrSec ? ErrSec->getFile() : nullptr);
+d443 21
+a463 5
+  std::string OldLoc = D->Section->getLocation(D->Value);
+  std::string NewLoc = ErrSec->getLocation(ErrOffset);
+
+  print(NewLoc + ": duplicate symbol '" + toString(*Existing) + "'");
+  print(OldLoc + ": previous definition was here");
+d468 3
+a470 4
+                                      uint8_t Type, uintX_t Value, uintX_t Size,
+                                      uint8_t Binding,
+                                      InputSectionBase<ELFT> *Section,
+                                      InputFile *File) {
+d476 1
+a476 19
+                                          Section == nullptr, Value);
+  if (Cmp > 0)
+    replaceBody<DefinedRegular<ELFT>>(S, Name, /*IsLocal=*/false, StOther, Type,
+                                      Value, Size, Section, File);
+  else if (Cmp == 0)
+    reportDuplicate(S->body(), Section, Value);
+  return S;
+}
+
+template <typename ELFT>
+Symbol *SymbolTable<ELFT>::addSynthetic(StringRef N,
+                                        const OutputSectionBase *Section,
+                                        uintX_t Value, uint8_t StOther) {
+  Symbol *S;
+  bool WasInserted;
+  std::tie(S, WasInserted) = insert(N, STT_NOTYPE, getVisibility(StOther),
+                                    /*CanOmitFromDynSym*/ false, nullptr);
+  int Cmp = compareDefinedNonCommon<ELFT>(S, WasInserted, STB_GLOBAL,
+                                          /*IsAbsolute*/ false, /*Value*/ 0);
+d478 2
+a479 1
+    replaceBody<DefinedSynthetic>(S, N, Value, Section);
+d481 2
+a482 1
+    reportDuplicate(S->body(), nullptr);
+d487 1
+a487 1
+void SymbolTable<ELFT>::addShared(SharedFile<ELFT> *F, StringRef Name,
+d495 2
+a496 2
+  std::tie(S, WasInserted) =
+      insert(Name, Sym.getType(), STV_DEFAULT, /*CanOmitFromDynSym*/ true, F);
+d500 8
+a507 2
+  if (WasInserted || isa<Undefined<ELFT>>(S->body())) {
+    replaceBody<SharedSymbol<ELFT>>(S, F, Name, Sym, Verdef);
+d509 1
+a509 1
+      F->IsUsed = true;
+d522 1
+a522 1
+                                          /*IsAbs*/ false, /*Value*/ 0);
+d524 2
+a525 2
+    replaceBody<DefinedRegular<ELFT>>(S, Name, /*IsLocal=*/false, StOther, Type,
+                                      0, 0, nullptr, F);
+d550 2
+a551 2
+void SymbolTable<ELFT>::addLazyArchive(ArchiveFile *F,
+                                       const object::Archive::Symbol Sym) {
+d558 1
+a558 1
+    return;
+d561 1
+a561 1
+    return;
+d572 1
+a572 1
+    return;
+d577 1
+d593 1
+a593 1
+  if (S->isWeak()) {
+d595 2
+a596 5
+  } else {
+    MemoryBufferRef MBRef = Obj.getBuffer();
+    if (!MBRef.getBuffer().empty())
+      addFile(createObjectFile(MBRef));
+  }
+d615 14
+a628 5
+  for (SharedFile<ELFT> *File : SharedFiles)
+    for (StringRef U : File->getUndefinedSymbols())
+      if (SymbolBody *Sym = find(U))
+        if (Sym->isDefined())
+          Sym->symbol()->ExportDynamic = true;
+d709 2
+a710 1
+void SymbolTable<ELFT>::assignExactVersion(SymbolVersion Ver, uint16_t VersionId,
+d726 6
+a744 1
+  std::vector<SymbolBody *> Syms = findAllByVersion(Ver);
+d749 1
+a749 1
+  for (SymbolBody *B : Syms)
+a756 7
+  // Symbol themselves might know their versions because symbols
+  // can contain versions in the form of <name>@@<version>.
+  // Let them parse their names.
+  if (!Config->VersionDefinitions.empty())
+    for (Symbol *Sym : SymVector)
+      Sym->body()->parseSymbolVersion();
+
+a759 3
+  if (Config->VersionDefinitions.empty())
+    return;
+
+d777 6
 @
 
 
@@ -1700,6 +2017,310 @@ SymbolBody *SymbolTable<ELFT>::findInCurrentDSO(StringRef Name) {
     if (S->isInCurrentDSO())
       return S;
   return nullptr;
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a54 3
+  if (!Config->FirstElf && isa<ELFFileBase<ELFT>>(File))
+    Config->FirstElf = File;
+
+d78 1
+a78 1
+    message(toString(File));
+d84 1
+a84 1
+    if (ErrorCount || !SoNames.insert(F->SoName).second)
+d118 1
+a118 1
+    LTO->add(*F);
+d129 3
+a131 3
+DefinedRegular *SymbolTable<ELFT>::addAbsolute(StringRef Name,
+                                               uint8_t Visibility,
+                                               uint8_t Binding) {
+d134 1
+a134 1
+  return cast<DefinedRegular>(Sym->body());
+d140 2
+a141 2
+DefinedRegular *SymbolTable<ELFT>::addIgnored(StringRef Name,
+                                              uint8_t Visibility) {
+d156 1
+a156 1
+template <class ELFT> void SymbolTable<ELFT>::addSymbolWrap(StringRef Name) {
+d164 5
+a168 34
+  // Tell LTO not to eliminate this symbol
+  Wrap->IsUsedInRegularObj = true;
+
+  Config->RenamedSymbols[Real] = {Sym, Real->Binding};
+  Config->RenamedSymbols[Sym] = {Wrap, Sym->Binding};
+}
+
+// Creates alias for symbol. Used to implement --defsym=ALIAS=SYM.
+template <class ELFT>
+void SymbolTable<ELFT>::addSymbolAlias(StringRef Alias, StringRef Name) {
+  SymbolBody *B = find(Name);
+  if (!B) {
+    error("-defsym: undefined symbol: " + Name);
+    return;
+  }
+  Symbol *Sym = B->symbol();
+  Symbol *AliasSym = addUndefined(Alias);
+
+  // Tell LTO not to eliminate this symbol
+  Sym->IsUsedInRegularObj = true;
+  Config->RenamedSymbols[AliasSym] = {Sym, AliasSym->Binding};
+}
+
+// Apply symbol renames created by -wrap and -defsym. The renames are created
+// before LTO in addSymbolWrap() and addSymbolAlias() to have a chance to inform
+// LTO (if LTO is running) not to include these symbols in IPO. Now that the
+// symbols are finalized, we can perform the replacement.
+template <class ELFT> void SymbolTable<ELFT>::applySymbolRenames() {
+  for (auto &KV : Config->RenamedSymbols) {
+    Symbol *Dst = KV.first;
+    Symbol *Src = KV.second.Target;
+    Dst->body()->copy(Src->body());
+    Dst->Binding = KV.second.OriginalBinding;
+  }
+a181 6
+  // <name>@@@@<version> means the symbol is the default version. In that
+  // case <name>@@@@<version> will be used to resolve references to <name>.
+  size_t Pos = Name.find("@@@@");
+  if (Pos != StringRef::npos)
+    Name = Name.take_front(Pos);
+
+d194 1
+a194 1
+    Sym = make<Symbol>();
+d209 7
+a228 1
+
+a230 1
+
+a232 1
+
+d234 2
+a235 5
+      ((Type == STT_TLS) != S->body()->isTls())) {
+    error("TLS attribute mismatch: " + toString(*S->body()) +
+          "\n>>> defined in " + toString(S->body()->File) +
+          "\n>>> defined in " + toString(File));
+  }
+a254 1
+  uint8_t Visibility = getVisibility(StOther);
+d256 2
+a257 5
+      insert(Name, Type, Visibility, CanOmitFromDynSym, File);
+  // An undefined symbol with non default visibility must be satisfied
+  // in the same DSO.
+  if (WasInserted ||
+      (isa<SharedSymbol>(S->body()) && Visibility != STV_DEFAULT)) {
+d259 1
+a259 1
+    replaceBody<Undefined>(S, Name, IsLocal, StOther, Type, File);
+d263 1
+a263 2
+    SymbolBody *B = S->body();
+    if (B->isShared() || B->isLazy() || B->isUndefined())
+d265 2
+a266 2
+    if (auto *SS = dyn_cast<SharedSymbol>(B))
+      cast<SharedFile<ELFT>>(SS->File)->IsUsed = true;
+a278 16
+// Using .symver foo,foo@@@@VER unfortunately creates two symbols: foo and
+// foo@@@@VER. We want to effectively ignore foo, so give precedence to
+// foo@@@@VER.
+// FIXME: If users can transition to using
+// .symver foo,foo@@@@@@VER
+// we can delete this hack.
+static int compareVersion(Symbol *S, StringRef Name) {
+  if (Name.find("@@@@") != StringRef::npos &&
+      S->body()->getName().find("@@@@") == StringRef::npos)
+    return 1;
+  if (Name.find("@@@@") == StringRef::npos &&
+      S->body()->getName().find("@@@@") != StringRef::npos)
+    return -1;
+  return 0;
+}
+
+d282 1
+a282 2
+static int compareDefined(Symbol *S, bool WasInserted, uint8_t Binding,
+                          StringRef Name) {
+d286 1
+a286 1
+  if (!Body->isInCurrentDSO())
+a287 4
+
+  if (int R = compareVersion(S, Name))
+    return R;
+
+d300 2
+a301 3
+                                   bool IsAbsolute, typename ELFT::uint Value,
+                                   StringRef Name) {
+  if (int Cmp = compareDefined(S, WasInserted, Binding, Name)) {
+d312 1
+a312 1
+  } else if (auto *R = dyn_cast<DefinedRegular>(B)) {
+d322 1
+a322 1
+                                     uint32_t Alignment, uint8_t Binding,
+d329 1
+a329 1
+  int Cmp = compareDefined(S, WasInserted, Binding, N);
+d352 1
+a352 1
+static void warnOrError(const Twine &Msg) {
+d359 2
+a360 3
+static void reportDuplicate(SymbolBody *Sym, InputFile *NewFile) {
+  warnOrError("duplicate symbol: " + toString(*Sym) + "\n>>> defined in " +
+              toString(Sym->File) + "\n>>> defined in " + toString(NewFile));
+d364 2
+a365 1
+static void reportDuplicate(SymbolBody *Sym, InputSectionBase *ErrSec,
+d367 1
+a367 1
+  DefinedRegular *D = dyn_cast<DefinedRegular>(Sym);
+d369 1
+a369 1
+    reportDuplicate(Sym, ErrSec ? ErrSec->getFile<ELFT>() : nullptr);
+d373 5
+a377 21
+  // Construct and print an error message in the form of:
+  //
+  //   ld.lld: error: duplicate symbol: foo
+  //   >>> defined at bar.c:30
+  //   >>>            bar.o (/home/alice/src/bar.o)
+  //   >>> defined at baz.c:563
+  //   >>>            baz.o in archive libbaz.a
+  auto *Sec1 = cast<InputSectionBase>(D->Section);
+  std::string Src1 = Sec1->getSrcMsg<ELFT>(D->Value);
+  std::string Obj1 = Sec1->getObjMsg<ELFT>(D->Value);
+  std::string Src2 = ErrSec->getSrcMsg<ELFT>(ErrOffset);
+  std::string Obj2 = ErrSec->getObjMsg<ELFT>(ErrOffset);
+
+  std::string Msg = "duplicate symbol: " + toString(*Sym) + "\n>>> defined at ";
+  if (!Src1.empty())
+    Msg += Src1 + "\n>>>            ";
+  Msg += Obj1 + "\n>>> defined at ";
+  if (!Src2.empty())
+    Msg += Src2 + "\n>>>            ";
+  Msg += Obj2;
+  warnOrError(Msg);
+d382 4
+a385 3
+                                      uint8_t Type, uint64_t Value,
+                                      uint64_t Size, uint8_t Binding,
+                                      SectionBase *Section, InputFile *File) {
+d391 19
+a409 1
+                                          Section == nullptr, Value, Name);
+d411 1
+a411 2
+    replaceBody<DefinedRegular>(S, Name, /*IsLocal=*/false, StOther, Type,
+                                Value, Size, Section, File);
+d413 1
+a413 2
+    reportDuplicate<ELFT>(S->body(),
+                          dyn_cast_or_null<InputSectionBase>(Section), Value);
+d418 1
+a418 1
+void SymbolTable<ELFT>::addShared(SharedFile<ELFT> *File, StringRef Name,
+d426 2
+a427 2
+  std::tie(S, WasInserted) = insert(Name, Sym.getType(), STV_DEFAULT,
+                                    /*CanOmitFromDynSym*/ true, File);
+d431 2
+a432 8
+
+  SymbolBody *Body = S->body();
+  // An undefined symbol with non default visibility must be satisfied
+  // in the same DSO.
+  if (WasInserted ||
+      (isa<Undefined>(Body) && Body->getVisibility() == STV_DEFAULT)) {
+    replaceBody<SharedSymbol>(S, File, Name, Sym.st_other, Sym.getType(), &Sym,
+                              Verdef);
+d434 1
+a434 1
+      File->IsUsed = true;
+d447 1
+a447 1
+                                          /*IsAbs*/ false, /*Value*/ 0, Name);
+d449 2
+a450 2
+    replaceBody<DefinedRegular>(S, Name, /*IsLocal=*/false, StOther, Type, 0, 0,
+                                nullptr, F);
+d475 2
+a476 2
+Symbol *SymbolTable<ELFT>::addLazyArchive(ArchiveFile *F,
+                                          const object::Archive::Symbol Sym) {
+d483 1
+a483 1
+    return S;
+d486 1
+a486 1
+    return S;
+d497 1
+a497 1
+    return S;
+a501 1
+  return S;
+d517 1
+a517 1
+  if (S->isWeak())
+d519 5
+a523 2
+  else if (InputFile *F = Obj.fetch())
+    addFile(F);
+d542 5
+a546 14
+  for (SharedFile<ELFT> *File : SharedFiles) {
+    for (StringRef U : File->getUndefinedSymbols()) {
+      SymbolBody *Sym = find(U);
+      if (!Sym || !Sym->isDefined())
+        continue;
+      Sym->symbol()->ExportDynamic = true;
+
+      // If -dynamic-list is given, the default version is set to
+      // VER_NDX_LOCAL, which prevents a symbol to be exported via .dynsym.
+      // Set to VER_NDX_GLOBAL so the symbol will be handled as if it were
+      // specified by -dynamic-list.
+      Sym->symbol()->VersionId = VER_NDX_GLOBAL;
+    }
+  }
+d627 1
+a627 2
+void SymbolTable<ELFT>::assignExactVersion(SymbolVersion Ver,
+                                           uint16_t VersionId,
+a642 6
+    // Skip symbols containing version info because symbol versions
+    // specified by symbol names take precedence over version scripts.
+    // See parseSymbolVersion().
+    if (B->getName().find('@@') != StringRef::npos)
+      continue;
+
+d656 1
+d661 1
+a661 1
+  for (SymbolBody *B : findAllByVersion(Ver))
+d669 7
+d679 3
+a698 6
+
+  // Symbol themselves might know their versions because symbols
+  // can contain versions in the form of <name>@@<version>.
+  // Let them parse and update their names to exclude version suffix.
+  for (Symbol *Sym : SymVector)
+    Sym->body()->parseSymbolVersion();
 @
 
 

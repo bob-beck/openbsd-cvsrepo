@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.32;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.06;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -5950,6 +5957,1038 @@ a5083 6
         CastN->getDestAddressSpace() == ADDRESS_SPACE_PARAM &&
         CastN->getOperand(0).getOpcode() == NVPTXISD::MoveParam)
       return SelectDirectAddr(CastN->getOperand(0).getOperand(0), Address);
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d29 17
+d60 2
+a61 2
+  Subtarget = &static_cast<const NVPTXSubtarget &>(MF.getSubtarget());
+  return SelectionDAGISel::runOnMachineFunction(MF);
+d65 10
+a74 1
+  return Subtarget->getTargetLowering()->getDivF32Level();
+d78 7
+a84 1
+  return Subtarget->getTargetLowering()->usePrecSqrtF32();
+d88 11
+a98 1
+  return Subtarget->getTargetLowering()->useF32FTZ(*MF);
+a105 5
+bool NVPTXDAGToDAGISel::allowUnsafeFPMath() const {
+  const NVPTXTargetLowering *TL = Subtarget->getTargetLowering();
+  return TL->allowUnsafeFPMath(*MF);
+}
+
+a123 8
+  case ISD::EXTRACT_VECTOR_ELT:
+    if (tryEXTRACT_VECTOR_ELEMENT(N))
+      return;
+    break;
+  case NVPTXISD::SETP_F16X2:
+    SelectSETP_F16X2(N);
+    return;
+
+a517 4
+  case ISD::ConstantFP:
+    if (tryConstantFP16(N))
+      return;
+    break;
+a538 134
+// There's no way to specify FP16 immediates in .f16 ops, so we have to
+// load them into an .f16 register first.
+bool NVPTXDAGToDAGISel::tryConstantFP16(SDNode *N) {
+  if (N->getValueType(0) != MVT::f16)
+    return false;
+  SDValue Val = CurDAG->getTargetConstantFP(
+      cast<ConstantFPSDNode>(N)->getValueAPF(), SDLoc(N), MVT::f16);
+  SDNode *LoadConstF16 =
+      CurDAG->getMachineNode(NVPTX::LOAD_CONST_F16, SDLoc(N), MVT::f16, Val);
+  ReplaceNode(N, LoadConstF16);
+  return true;
+}
+
+// Map ISD:CONDCODE value to appropriate CmpMode expected by
+// NVPTXInstPrinter::printCmpMode()
+static unsigned getPTXCmpMode(const CondCodeSDNode &CondCode, bool FTZ) {
+  using NVPTX::PTXCmpMode::CmpMode;
+  unsigned PTXCmpMode = [](ISD::CondCode CC) {
+    switch (CC) {
+    default:
+      llvm_unreachable("Unexpected condition code.");
+    case ISD::SETOEQ:
+      return CmpMode::EQ;
+    case ISD::SETOGT:
+      return CmpMode::GT;
+    case ISD::SETOGE:
+      return CmpMode::GE;
+    case ISD::SETOLT:
+      return CmpMode::LT;
+    case ISD::SETOLE:
+      return CmpMode::LE;
+    case ISD::SETONE:
+      return CmpMode::NE;
+    case ISD::SETO:
+      return CmpMode::NUM;
+    case ISD::SETUO:
+      return CmpMode::NotANumber;
+    case ISD::SETUEQ:
+      return CmpMode::EQU;
+    case ISD::SETUGT:
+      return CmpMode::GTU;
+    case ISD::SETUGE:
+      return CmpMode::GEU;
+    case ISD::SETULT:
+      return CmpMode::LTU;
+    case ISD::SETULE:
+      return CmpMode::LEU;
+    case ISD::SETUNE:
+      return CmpMode::NEU;
+    case ISD::SETEQ:
+      return CmpMode::EQ;
+    case ISD::SETGT:
+      return CmpMode::GT;
+    case ISD::SETGE:
+      return CmpMode::GE;
+    case ISD::SETLT:
+      return CmpMode::LT;
+    case ISD::SETLE:
+      return CmpMode::LE;
+    case ISD::SETNE:
+      return CmpMode::NE;
+    }
+  }(CondCode.get());
+
+  if (FTZ)
+    PTXCmpMode |= NVPTX::PTXCmpMode::FTZ_FLAG;
+
+  return PTXCmpMode;
+}
+
+bool NVPTXDAGToDAGISel::SelectSETP_F16X2(SDNode *N) {
+  unsigned PTXCmpMode =
+      getPTXCmpMode(*cast<CondCodeSDNode>(N->getOperand(2)), useF32FTZ());
+  SDLoc DL(N);
+  SDNode *SetP = CurDAG->getMachineNode(
+      NVPTX::SETP_f16x2rr, DL, MVT::i1, MVT::i1, N->getOperand(0),
+      N->getOperand(1), CurDAG->getTargetConstant(PTXCmpMode, DL, MVT::i32));
+  ReplaceNode(N, SetP);
+  return true;
+}
+
+// Find all instances of extract_vector_elt that use this v2f16 vector
+// and coalesce them into a scattering move instruction.
+bool NVPTXDAGToDAGISel::tryEXTRACT_VECTOR_ELEMENT(SDNode *N) {
+  SDValue Vector = N->getOperand(0);
+
+  // We only care about f16x2 as it's the only real vector type we
+  // need to deal with.
+  if (Vector.getSimpleValueType() != MVT::v2f16)
+    return false;
+
+  // Find and record all uses of this vector that extract element 0 or 1.
+  SmallVector<SDNode *, 4> E0, E1;
+  for (const auto &U : Vector.getNode()->uses()) {
+    if (U->getOpcode() != ISD::EXTRACT_VECTOR_ELT)
+      continue;
+    if (U->getOperand(0) != Vector)
+      continue;
+    if (const ConstantSDNode *IdxConst =
+            dyn_cast<ConstantSDNode>(U->getOperand(1))) {
+      if (IdxConst->getZExtValue() == 0)
+        E0.push_back(U);
+      else if (IdxConst->getZExtValue() == 1)
+        E1.push_back(U);
+      else
+        llvm_unreachable("Invalid vector index.");
+    }
+  }
+
+  // There's no point scattering f16x2 if we only ever access one
+  // element of it.
+  if (E0.empty() || E1.empty())
+    return false;
+
+  unsigned Op = NVPTX::SplitF16x2;
+  // If the vector has been BITCAST'ed from i32, we can use original
+  // value directly and avoid register-to-register move.
+  SDValue Source = Vector;
+  if (Vector->getOpcode() == ISD::BITCAST) {
+    Op = NVPTX::SplitI32toF16x2;
+    Source = Vector->getOperand(0);
+  }
+  // Merge (f16 extractelt(V, 0), f16 extractelt(V,1))
+  // into f16,f16 SplitF16x2(V)
+  SDNode *ScatterOp =
+      CurDAG->getMachineNode(Op, SDLoc(N), MVT::f16, MVT::f16, Source);
+  for (auto *Node : E0)
+    ReplaceUses(SDValue(Node, 0), SDValue(ScatterOp, 0));
+  for (auto *Node : E1)
+    ReplaceUses(SDValue(Node, 0), SDValue(ScatterOp, 1));
+
+  return true;
+}
+
+a683 29
+// Helper function template to reduce amount of boilerplate code for
+// opcode selection.
+static Optional<unsigned> pickOpcodeForVT(
+    MVT::SimpleValueType VT, unsigned Opcode_i8, unsigned Opcode_i16,
+    unsigned Opcode_i32, Optional<unsigned> Opcode_i64, unsigned Opcode_f16,
+    unsigned Opcode_f16x2, unsigned Opcode_f32, Optional<unsigned> Opcode_f64) {
+  switch (VT) {
+  case MVT::i1:
+  case MVT::i8:
+    return Opcode_i8;
+  case MVT::i16:
+    return Opcode_i16;
+  case MVT::i32:
+    return Opcode_i32;
+  case MVT::i64:
+    return Opcode_i64;
+  case MVT::f16:
+    return Opcode_f16;
+  case MVT::v2f16:
+    return Opcode_f16x2;
+  case MVT::f32:
+    return Opcode_f32;
+  case MVT::f64:
+    return Opcode_f64;
+  default:
+    return None;
+  }
+}
+
+d712 13
+a730 1
+  MVT SimpleVT = LoadedVT.getSimpleVT();
+a734 9
+
+  // Vector Setting
+  unsigned vecType = NVPTX::PTXLdStInstCode::Scalar;
+  if (SimpleVT.isVector()) {
+    assert(LoadedVT == MVT::v2f16 && "Unexpected vector type");
+    // v2f16 is loaded using ld.b32
+    fromTypeWidth = 32;
+  }
+
+d738 1
+a738 3
+    // f16 uses .b16 as its storage type.
+    fromType = ScalarVT.SimpleTy == MVT::f16 ? NVPTX::PTXLdStInstCode::Untyped
+                                             : NVPTX::PTXLdStInstCode::Float;
+d747 1
+a747 1
+  Optional<unsigned> Opcode;
+d751 20
+a770 5
+    Opcode = pickOpcodeForVT(
+        TargetVT, NVPTX::LD_i8_avar, NVPTX::LD_i16_avar, NVPTX::LD_i32_avar,
+        NVPTX::LD_i64_avar, NVPTX::LD_f16_avar, NVPTX::LD_f16x2_avar,
+        NVPTX::LD_f32_avar, NVPTX::LD_f64_avar);
+    if (!Opcode)
+d772 1
+d776 1
+a776 2
+    NVPTXLD = CurDAG->getMachineNode(Opcode.getValue(), dl, TargetVT,
+                                     MVT::Other, Ops);
+d779 20
+a798 5
+    Opcode = pickOpcodeForVT(TargetVT, NVPTX::LD_i8_asi, NVPTX::LD_i16_asi,
+                                 NVPTX::LD_i32_asi, NVPTX::LD_i64_asi,
+                                 NVPTX::LD_f16_asi, NVPTX::LD_f16x2_asi,
+                                 NVPTX::LD_f32_asi, NVPTX::LD_f64_asi);
+    if (!Opcode)
+d800 1
+d804 1
+a804 2
+    NVPTXLD = CurDAG->getMachineNode(Opcode.getValue(), dl, TargetVT,
+                                     MVT::Other, Ops);
+d807 47
+a853 12
+    if (TM.is64Bit())
+      Opcode = pickOpcodeForVT(
+          TargetVT, NVPTX::LD_i8_ari_64, NVPTX::LD_i16_ari_64,
+          NVPTX::LD_i32_ari_64, NVPTX::LD_i64_ari_64, NVPTX::LD_f16_ari_64,
+          NVPTX::LD_f16x2_ari_64, NVPTX::LD_f32_ari_64, NVPTX::LD_f64_ari_64);
+    else
+      Opcode = pickOpcodeForVT(
+          TargetVT, NVPTX::LD_i8_ari, NVPTX::LD_i16_ari, NVPTX::LD_i32_ari,
+          NVPTX::LD_i64_ari, NVPTX::LD_f16_ari, NVPTX::LD_f16x2_ari,
+          NVPTX::LD_f32_ari, NVPTX::LD_f64_ari);
+    if (!Opcode)
+      return false;
+d857 1
+a857 2
+    NVPTXLD = CurDAG->getMachineNode(Opcode.getValue(), dl, TargetVT,
+                                     MVT::Other, Ops);
+d859 47
+a905 13
+    if (TM.is64Bit())
+      Opcode = pickOpcodeForVT(
+          TargetVT, NVPTX::LD_i8_areg_64, NVPTX::LD_i16_areg_64,
+          NVPTX::LD_i32_areg_64, NVPTX::LD_i64_areg_64, NVPTX::LD_f16_areg_64,
+          NVPTX::LD_f16x2_areg_64, NVPTX::LD_f32_areg_64,
+          NVPTX::LD_f64_areg_64);
+    else
+      Opcode = pickOpcodeForVT(
+          TargetVT, NVPTX::LD_i8_areg, NVPTX::LD_i16_areg, NVPTX::LD_i32_areg,
+          NVPTX::LD_i64_areg, NVPTX::LD_f16_areg, NVPTX::LD_f16x2_areg,
+          NVPTX::LD_f32_areg, NVPTX::LD_f64_areg);
+    if (!Opcode)
+      return false;
+d909 1
+a909 2
+    NVPTXLD = CurDAG->getMachineNode(Opcode.getValue(), dl, TargetVT,
+                                     MVT::Other, Ops);
+d928 1
+a928 1
+  Optional<unsigned> Opcode;
+d971 1
+a971 2
+    FromType = ScalarVT.SimpleTy == MVT::f16 ? NVPTX::PTXLdStInstCode::Untyped
+                                             : NVPTX::PTXLdStInstCode::Float;
+a989 10
+  // v8f16 is a special case. PTX doesn't have ld.v8.f16
+  // instruction. Instead, we split the vector into v2f16 chunks and
+  // load them with ld.v4.b32.
+  if (EltVT == MVT::v2f16) {
+    assert(N->getOpcode() == NVPTXISD::LoadV4 && "Unexpected load opcode.");
+    EltVT = MVT::i32;
+    FromType = NVPTX::PTXLdStInstCode::Untyped;
+    FromTypeWidth = 32;
+  }
+
+d995 22
+a1016 5
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                               NVPTX::LDV_i8_v2_avar, NVPTX::LDV_i16_v2_avar,
+                               NVPTX::LDV_i32_v2_avar, NVPTX::LDV_i64_v2_avar,
+                               NVPTX::LDV_f16_v2_avar, NVPTX::LDV_f16x2_v2_avar,
+                               NVPTX::LDV_f32_v2_avar, NVPTX::LDV_f64_v2_avar);
+d1019 16
+a1034 5
+      Opcode =
+          pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v4_avar,
+                          NVPTX::LDV_i16_v4_avar, NVPTX::LDV_i32_v4_avar, None,
+                          NVPTX::LDV_f16_v4_avar, NVPTX::LDV_f16x2_v4_avar,
+                          NVPTX::LDV_f32_v4_avar, None);
+d1037 1
+a1037 2
+    if (!Opcode)
+      return false;
+d1041 1
+a1041 1
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, N->getVTList(), Ops);
+d1048 22
+a1069 5
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                               NVPTX::LDV_i8_v2_asi, NVPTX::LDV_i16_v2_asi,
+                               NVPTX::LDV_i32_v2_asi, NVPTX::LDV_i64_v2_asi,
+                               NVPTX::LDV_f16_v2_asi, NVPTX::LDV_f16x2_v2_asi,
+                               NVPTX::LDV_f32_v2_asi, NVPTX::LDV_f64_v2_asi);
+d1072 16
+a1087 5
+      Opcode =
+          pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v4_asi,
+                          NVPTX::LDV_i16_v4_asi, NVPTX::LDV_i32_v4_asi, None,
+                          NVPTX::LDV_f16_v4_asi, NVPTX::LDV_f16x2_v4_asi,
+                          NVPTX::LDV_f32_v4_asi, None);
+d1090 1
+a1090 2
+    if (!Opcode)
+      return false;
+d1094 1
+a1094 1
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, N->getVTList(), Ops);
+d1102 22
+a1123 6
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v2_ari_64,
+            NVPTX::LDV_i16_v2_ari_64, NVPTX::LDV_i32_v2_ari_64,
+            NVPTX::LDV_i64_v2_ari_64, NVPTX::LDV_f16_v2_ari_64,
+            NVPTX::LDV_f16x2_v2_ari_64, NVPTX::LDV_f32_v2_ari_64,
+            NVPTX::LDV_f64_v2_ari_64);
+d1126 16
+a1141 5
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v4_ari_64,
+            NVPTX::LDV_i16_v4_ari_64, NVPTX::LDV_i32_v4_ari_64, None,
+            NVPTX::LDV_f16_v4_ari_64, NVPTX::LDV_f16x2_v4_ari_64,
+            NVPTX::LDV_f32_v4_ari_64, None);
+d1149 22
+a1170 5
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::LDV_i8_v2_ari, NVPTX::LDV_i16_v2_ari,
+                                 NVPTX::LDV_i32_v2_ari, NVPTX::LDV_i64_v2_ari,
+                                 NVPTX::LDV_f16_v2_ari, NVPTX::LDV_f16x2_v2_ari,
+                                 NVPTX::LDV_f32_v2_ari, NVPTX::LDV_f64_v2_ari);
+d1173 16
+a1188 5
+        Opcode =
+            pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v4_ari,
+                            NVPTX::LDV_i16_v4_ari, NVPTX::LDV_i32_v4_ari, None,
+                            NVPTX::LDV_f16_v4_ari, NVPTX::LDV_f16x2_v4_ari,
+                            NVPTX::LDV_f32_v4_ari, None);
+d1192 1
+a1192 2
+    if (!Opcode)
+      return false;
+d1197 1
+a1197 1
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, N->getVTList(), Ops);
+d1204 22
+a1225 6
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v2_areg_64,
+            NVPTX::LDV_i16_v2_areg_64, NVPTX::LDV_i32_v2_areg_64,
+            NVPTX::LDV_i64_v2_areg_64, NVPTX::LDV_f16_v2_areg_64,
+            NVPTX::LDV_f16x2_v2_areg_64, NVPTX::LDV_f32_v2_areg_64,
+            NVPTX::LDV_f64_v2_areg_64);
+d1228 16
+a1243 5
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v4_areg_64,
+            NVPTX::LDV_i16_v4_areg_64, NVPTX::LDV_i32_v4_areg_64, None,
+            NVPTX::LDV_f16_v4_areg_64, NVPTX::LDV_f16x2_v4_areg_64,
+            NVPTX::LDV_f32_v4_areg_64, None);
+d1251 22
+a1272 6
+        Opcode =
+            pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v2_areg,
+                            NVPTX::LDV_i16_v2_areg, NVPTX::LDV_i32_v2_areg,
+                            NVPTX::LDV_i64_v2_areg, NVPTX::LDV_f16_v2_areg,
+                            NVPTX::LDV_f16x2_v2_areg, NVPTX::LDV_f32_v2_areg,
+                            NVPTX::LDV_f64_v2_areg);
+d1275 16
+a1290 5
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::LDV_i8_v4_areg,
+            NVPTX::LDV_i16_v4_areg, NVPTX::LDV_i32_v4_areg, None,
+            NVPTX::LDV_f16_v4_areg, NVPTX::LDV_f16x2_v4_areg,
+            NVPTX::LDV_f32_v4_areg, None);
+d1294 1
+a1294 2
+    if (!Opcode)
+      return false;
+d1298 1
+a1298 1
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, N->getVTList(), Ops);
+d1341 1
+a1341 1
+  Optional<unsigned> Opcode;
+d1369 47
+a1415 20
+      if (IsLDG)
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_i8avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_i16avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_i32avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_i64avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_f16avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_f16x2avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_f32avar,
+                                     NVPTX::INT_PTX_LDG_GLOBAL_f64avar);
+      else
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_i8avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_i16avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_i32avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_i64avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_f16avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_f16x2avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_f32avar,
+                                     NVPTX::INT_PTX_LDU_GLOBAL_f64avar);
+d1418 22
+a1439 9
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                   NVPTX::INT_PTX_LDG_G_v2i8_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2i16_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2i32_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2i64_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2f16_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2f16x2_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2f32_ELE_avar,
+                                   NVPTX::INT_PTX_LDG_G_v2f64_ELE_avar);
+d1442 22
+a1463 9
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                   NVPTX::INT_PTX_LDU_G_v2i8_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2i16_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2i32_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2i64_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2f16_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2f16x2_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2f32_ELE_avar,
+                                   NVPTX::INT_PTX_LDU_G_v2f64_ELE_avar);
+d1466 16
+a1481 7
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                               NVPTX::INT_PTX_LDG_G_v4i8_ELE_avar,
+                               NVPTX::INT_PTX_LDG_G_v4i16_ELE_avar,
+                               NVPTX::INT_PTX_LDG_G_v4i32_ELE_avar, None,
+                               NVPTX::INT_PTX_LDG_G_v4f16_ELE_avar,
+                               NVPTX::INT_PTX_LDG_G_v4f16x2_ELE_avar,
+                               NVPTX::INT_PTX_LDG_G_v4f32_ELE_avar, None);
+d1484 16
+a1499 7
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                               NVPTX::INT_PTX_LDU_G_v4i8_ELE_avar,
+                               NVPTX::INT_PTX_LDU_G_v4i16_ELE_avar,
+                               NVPTX::INT_PTX_LDU_G_v4i32_ELE_avar, None,
+                               NVPTX::INT_PTX_LDU_G_v4f16_ELE_avar,
+                               NVPTX::INT_PTX_LDU_G_v4f16x2_ELE_avar,
+                               NVPTX::INT_PTX_LDU_G_v4f32_ELE_avar, None);
+d1502 1
+a1502 2
+    if (!Opcode)
+      return false;
+d1504 1
+a1504 1
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, InstVTList, Ops);
+d1513 47
+a1559 20
+        if (IsLDG)
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i8ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i16ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i32ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i64ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f16ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f16x2ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f32ari64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f64ari64);
+        else
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i8ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i16ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i32ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i64ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f16ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f16x2ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f32ari64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f64ari64);
+d1563 22
+a1584 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDG_G_v2i8_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2i16_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2i32_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2i64_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2f16_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2f16x2_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2f32_ELE_ari64,
+                                     NVPTX::INT_PTX_LDG_G_v2f64_ELE_ari64);
+d1587 22
+a1608 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDU_G_v2i8_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2i16_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2i32_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2i64_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2f16_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2f16x2_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2f32_ELE_ari64,
+                                     NVPTX::INT_PTX_LDU_G_v2f64_ELE_ari64);
+d1612 16
+a1627 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDG_G_v4i8_ELE_ari64,
+                                 NVPTX::INT_PTX_LDG_G_v4i16_ELE_ari64,
+                                 NVPTX::INT_PTX_LDG_G_v4i32_ELE_ari64, None,
+                                 NVPTX::INT_PTX_LDG_G_v4f16_ELE_ari64,
+                                 NVPTX::INT_PTX_LDG_G_v4f16x2_ELE_ari64,
+                                 NVPTX::INT_PTX_LDG_G_v4f32_ELE_ari64, None);
+d1630 16
+a1645 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDU_G_v4i8_ELE_ari64,
+                                 NVPTX::INT_PTX_LDU_G_v4i16_ELE_ari64,
+                                 NVPTX::INT_PTX_LDU_G_v4i32_ELE_ari64, None,
+                                 NVPTX::INT_PTX_LDU_G_v4f16_ELE_ari64,
+                                 NVPTX::INT_PTX_LDU_G_v4f16x2_ELE_ari64,
+                                 NVPTX::INT_PTX_LDU_G_v4f32_ELE_ari64, None);
+d1654 47
+a1700 20
+        if (IsLDG)
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i8ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i16ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i32ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i64ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f16ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f16x2ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f32ari,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f64ari);
+        else
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i8ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i16ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i32ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i64ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f16ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f16x2ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f32ari,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f64ari);
+d1704 22
+a1725 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDG_G_v2i8_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2i16_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2i32_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2i64_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2f16_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2f16x2_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2f32_ELE_ari32,
+                                     NVPTX::INT_PTX_LDG_G_v2f64_ELE_ari32);
+d1728 22
+a1749 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDU_G_v2i8_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2i16_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2i32_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2i64_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2f16_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2f16x2_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2f32_ELE_ari32,
+                                     NVPTX::INT_PTX_LDU_G_v2f64_ELE_ari32);
+d1753 16
+a1768 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDG_G_v4i8_ELE_ari32,
+                                 NVPTX::INT_PTX_LDG_G_v4i16_ELE_ari32,
+                                 NVPTX::INT_PTX_LDG_G_v4i32_ELE_ari32, None,
+                                 NVPTX::INT_PTX_LDG_G_v4f16_ELE_ari32,
+                                 NVPTX::INT_PTX_LDG_G_v4f16x2_ELE_ari32,
+                                 NVPTX::INT_PTX_LDG_G_v4f32_ELE_ari32, None);
+d1771 16
+a1786 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDU_G_v4i8_ELE_ari32,
+                                 NVPTX::INT_PTX_LDU_G_v4i16_ELE_ari32,
+                                 NVPTX::INT_PTX_LDU_G_v4i32_ELE_ari32, None,
+                                 NVPTX::INT_PTX_LDU_G_v4f16_ELE_ari32,
+                                 NVPTX::INT_PTX_LDU_G_v4f16x2_ELE_ari32,
+                                 NVPTX::INT_PTX_LDU_G_v4f32_ELE_ari32, None);
+d1790 4
+a1793 4
+    if (!Opcode)
+      return false;
+    SDValue Ops[] = {Base, Offset, Chain};
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, InstVTList, Ops);
+d1801 47
+a1847 20
+        if (IsLDG)
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i8areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i16areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i32areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_i64areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f16areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f16x2areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f32areg64,
+                                       NVPTX::INT_PTX_LDG_GLOBAL_f64areg64);
+        else
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i8areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i16areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i32areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_i64areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f16areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f16x2areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f32areg64,
+                                       NVPTX::INT_PTX_LDU_GLOBAL_f64areg64);
+d1851 22
+a1872 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDG_G_v2i8_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2i16_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2i32_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2i64_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2f16_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2f16x2_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2f32_ELE_areg64,
+                                     NVPTX::INT_PTX_LDG_G_v2f64_ELE_areg64);
+d1875 22
+a1896 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                     NVPTX::INT_PTX_LDU_G_v2i8_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2i16_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2i32_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2i64_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2f16_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2f16x2_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2f32_ELE_areg64,
+                                     NVPTX::INT_PTX_LDU_G_v2f64_ELE_areg64);
+d1900 16
+a1915 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDG_G_v4i8_ELE_areg64,
+                                 NVPTX::INT_PTX_LDG_G_v4i16_ELE_areg64,
+                                 NVPTX::INT_PTX_LDG_G_v4i32_ELE_areg64, None,
+                                 NVPTX::INT_PTX_LDG_G_v4f16_ELE_areg64,
+                                 NVPTX::INT_PTX_LDG_G_v4f16x2_ELE_areg64,
+                                 NVPTX::INT_PTX_LDG_G_v4f32_ELE_areg64, None);
+d1918 16
+a1933 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDU_G_v4i8_ELE_areg64,
+                                 NVPTX::INT_PTX_LDU_G_v4i16_ELE_areg64,
+                                 NVPTX::INT_PTX_LDU_G_v4i32_ELE_areg64, None,
+                                 NVPTX::INT_PTX_LDU_G_v4f16_ELE_areg64,
+                                 NVPTX::INT_PTX_LDU_G_v4f16x2_ELE_areg64,
+                                 NVPTX::INT_PTX_LDU_G_v4f32_ELE_areg64, None);
+d1942 47
+a1988 20
+        if (IsLDG)
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_i8areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_i16areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_i32areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_i64areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_f16areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_f16x2areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_f32areg,
+                                   NVPTX::INT_PTX_LDG_GLOBAL_f64areg);
+        else
+          Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_i8areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_i16areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_i32areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_i64areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_f16areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_f16x2areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_f32areg,
+                                   NVPTX::INT_PTX_LDU_GLOBAL_f64areg);
+d1992 22
+a2013 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDG_G_v2i8_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2i16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2i32_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2i64_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2f16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2f16x2_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2f32_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v2f64_ELE_areg32);
+d2016 22
+a2037 9
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDU_G_v2i8_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2i16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2i32_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2i64_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2f16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2f16x2_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2f32_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v2f64_ELE_areg32);
+d2041 16
+a2056 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDG_G_v4i8_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v4i16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v4i32_ELE_areg32, None,
+                                 NVPTX::INT_PTX_LDG_G_v4f16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v4f16x2_ELE_areg32,
+                                 NVPTX::INT_PTX_LDG_G_v4f32_ELE_areg32, None);
+d2059 16
+a2074 7
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::INT_PTX_LDU_G_v4i8_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v4i16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v4i32_ELE_areg32, None,
+                                 NVPTX::INT_PTX_LDU_G_v4f16_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v4f16x2_ELE_areg32,
+                                 NVPTX::INT_PTX_LDU_G_v4f32_ELE_areg32, None);
+d2078 1
+a2078 2
+    if (!Opcode)
+      return false;
+d2080 1
+a2080 1
+    LD = CurDAG->getMachineNode(Opcode.getValue(), DL, InstVTList, Ops);
+d2154 9
+a2168 6
+  if (SimpleVT.isVector()) {
+    assert(StoreVT == MVT::v2f16 && "Unexpected vector type");
+    // v2f16 is stored using st.b32
+    toTypeWidth = 32;
+  }
+
+d2171 1
+a2171 3
+    // f16 uses .b16 as its storage type.
+    toType = ScalarVT.SimpleTy == MVT::f16 ? NVPTX::PTXLdStInstCode::Untyped
+                                           : NVPTX::PTXLdStInstCode::Float;
+d2181 1
+a2181 1
+  Optional<unsigned> Opcode;
+d2185 20
+a2204 5
+    Opcode = pickOpcodeForVT(SourceVT, NVPTX::ST_i8_avar, NVPTX::ST_i16_avar,
+                             NVPTX::ST_i32_avar, NVPTX::ST_i64_avar,
+                             NVPTX::ST_f16_avar, NVPTX::ST_f16x2_avar,
+                             NVPTX::ST_f32_avar, NVPTX::ST_f64_avar);
+    if (!Opcode)
+d2206 1
+d2211 1
+a2211 1
+    NVPTXST = CurDAG->getMachineNode(Opcode.getValue(), dl, MVT::Other, Ops);
+d2214 20
+a2233 5
+    Opcode = pickOpcodeForVT(SourceVT, NVPTX::ST_i8_asi, NVPTX::ST_i16_asi,
+                             NVPTX::ST_i32_asi, NVPTX::ST_i64_asi,
+                             NVPTX::ST_f16_asi, NVPTX::ST_f16x2_asi,
+                             NVPTX::ST_f32_asi, NVPTX::ST_f64_asi);
+    if (!Opcode)
+d2235 1
+d2240 1
+a2240 1
+    NVPTXST = CurDAG->getMachineNode(Opcode.getValue(), dl, MVT::Other, Ops);
+d2243 47
+a2289 13
+    if (TM.is64Bit())
+      Opcode = pickOpcodeForVT(
+          SourceVT, NVPTX::ST_i8_ari_64, NVPTX::ST_i16_ari_64,
+          NVPTX::ST_i32_ari_64, NVPTX::ST_i64_ari_64, NVPTX::ST_f16_ari_64,
+          NVPTX::ST_f16x2_ari_64, NVPTX::ST_f32_ari_64, NVPTX::ST_f64_ari_64);
+    else
+      Opcode = pickOpcodeForVT(SourceVT, NVPTX::ST_i8_ari, NVPTX::ST_i16_ari,
+                               NVPTX::ST_i32_ari, NVPTX::ST_i64_ari,
+                               NVPTX::ST_f16_ari, NVPTX::ST_f16x2_ari,
+                               NVPTX::ST_f32_ari, NVPTX::ST_f64_ari);
+    if (!Opcode)
+      return false;
+
+d2294 1
+a2294 1
+    NVPTXST = CurDAG->getMachineNode(Opcode.getValue(), dl, MVT::Other, Ops);
+d2296 47
+a2342 13
+    if (TM.is64Bit())
+      Opcode =
+          pickOpcodeForVT(SourceVT, NVPTX::ST_i8_areg_64, NVPTX::ST_i16_areg_64,
+                          NVPTX::ST_i32_areg_64, NVPTX::ST_i64_areg_64,
+                          NVPTX::ST_f16_areg_64, NVPTX::ST_f16x2_areg_64,
+                          NVPTX::ST_f32_areg_64, NVPTX::ST_f64_areg_64);
+    else
+      Opcode = pickOpcodeForVT(SourceVT, NVPTX::ST_i8_areg, NVPTX::ST_i16_areg,
+                               NVPTX::ST_i32_areg, NVPTX::ST_i64_areg,
+                               NVPTX::ST_f16_areg, NVPTX::ST_f16x2_areg,
+                               NVPTX::ST_f32_areg, NVPTX::ST_f64_areg);
+    if (!Opcode)
+      return false;
+d2347 1
+a2347 1
+    NVPTXST = CurDAG->getMachineNode(Opcode.getValue(), dl, MVT::Other, Ops);
+d2364 1
+a2364 1
+  Optional<unsigned> Opcode;
+d2394 1
+a2394 2
+    ToType = ScalarVT.SimpleTy == MVT::f16 ? NVPTX::PTXLdStInstCode::Untyped
+                                           : NVPTX::PTXLdStInstCode::Float;
+a2420 10
+  // v8f16 is a special case. PTX doesn't have st.v8.f16
+  // instruction. Instead, we split the vector into v2f16 chunks and
+  // store them with st.v4.b32.
+  if (EltVT == MVT::v2f16) {
+    assert(N->getOpcode() == NVPTXISD::StoreV4 && "Unexpected load opcode.");
+    EltVT = MVT::i32;
+    ToType = NVPTX::PTXLdStInstCode::Untyped;
+    ToTypeWidth = 32;
+  }
+
+d2432 22
+a2453 5
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                               NVPTX::STV_i8_v2_avar, NVPTX::STV_i16_v2_avar,
+                               NVPTX::STV_i32_v2_avar, NVPTX::STV_i64_v2_avar,
+                               NVPTX::STV_f16_v2_avar, NVPTX::STV_f16x2_v2_avar,
+                               NVPTX::STV_f32_v2_avar, NVPTX::STV_f64_v2_avar);
+d2456 16
+a2471 5
+      Opcode =
+          pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v4_avar,
+                          NVPTX::STV_i16_v4_avar, NVPTX::STV_i32_v4_avar, None,
+                          NVPTX::STV_f16_v4_avar, NVPTX::STV_f16x2_v4_avar,
+                          NVPTX::STV_f32_v4_avar, None);
+d2481 22
+a2502 5
+      Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                               NVPTX::STV_i8_v2_asi, NVPTX::STV_i16_v2_asi,
+                               NVPTX::STV_i32_v2_asi, NVPTX::STV_i64_v2_asi,
+                               NVPTX::STV_f16_v2_asi, NVPTX::STV_f16x2_v2_asi,
+                               NVPTX::STV_f32_v2_asi, NVPTX::STV_f64_v2_asi);
+d2505 16
+a2520 5
+      Opcode =
+          pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v4_asi,
+                          NVPTX::STV_i16_v4_asi, NVPTX::STV_i32_v4_asi, None,
+                          NVPTX::STV_f16_v4_asi, NVPTX::STV_f16x2_v4_asi,
+                          NVPTX::STV_f32_v4_asi, None);
+d2532 22
+a2553 6
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v2_ari_64,
+            NVPTX::STV_i16_v2_ari_64, NVPTX::STV_i32_v2_ari_64,
+            NVPTX::STV_i64_v2_ari_64, NVPTX::STV_f16_v2_ari_64,
+            NVPTX::STV_f16x2_v2_ari_64, NVPTX::STV_f32_v2_ari_64,
+            NVPTX::STV_f64_v2_ari_64);
+d2556 16
+a2571 5
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v4_ari_64,
+            NVPTX::STV_i16_v4_ari_64, NVPTX::STV_i32_v4_ari_64, None,
+            NVPTX::STV_f16_v4_ari_64, NVPTX::STV_f16x2_v4_ari_64,
+            NVPTX::STV_f32_v4_ari_64, None);
+d2579 22
+a2600 5
+        Opcode = pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy,
+                                 NVPTX::STV_i8_v2_ari, NVPTX::STV_i16_v2_ari,
+                                 NVPTX::STV_i32_v2_ari, NVPTX::STV_i64_v2_ari,
+                                 NVPTX::STV_f16_v2_ari, NVPTX::STV_f16x2_v2_ari,
+                                 NVPTX::STV_f32_v2_ari, NVPTX::STV_f64_v2_ari);
+d2603 16
+a2618 5
+        Opcode =
+            pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v4_ari,
+                            NVPTX::STV_i16_v4_ari, NVPTX::STV_i32_v4_ari, None,
+                            NVPTX::STV_f16_v4_ari, NVPTX::STV_f16x2_v4_ari,
+                            NVPTX::STV_f32_v4_ari, None);
+d2630 22
+a2651 6
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v2_areg_64,
+            NVPTX::STV_i16_v2_areg_64, NVPTX::STV_i32_v2_areg_64,
+            NVPTX::STV_i64_v2_areg_64, NVPTX::STV_f16_v2_areg_64,
+            NVPTX::STV_f16x2_v2_areg_64, NVPTX::STV_f32_v2_areg_64,
+            NVPTX::STV_f64_v2_areg_64);
+d2654 16
+a2669 5
+        Opcode = pickOpcodeForVT(
+            EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v4_areg_64,
+            NVPTX::STV_i16_v4_areg_64, NVPTX::STV_i32_v4_areg_64, None,
+            NVPTX::STV_f16_v4_areg_64, NVPTX::STV_f16x2_v4_areg_64,
+            NVPTX::STV_f32_v4_areg_64, None);
+d2677 22
+a2698 6
+        Opcode =
+            pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v2_areg,
+                            NVPTX::STV_i16_v2_areg, NVPTX::STV_i32_v2_areg,
+                            NVPTX::STV_i64_v2_areg, NVPTX::STV_f16_v2_areg,
+                            NVPTX::STV_f16x2_v2_areg, NVPTX::STV_f32_v2_areg,
+                            NVPTX::STV_f64_v2_areg);
+d2701 16
+a2716 5
+        Opcode =
+            pickOpcodeForVT(EltVT.getSimpleVT().SimpleTy, NVPTX::STV_i8_v4_areg,
+                            NVPTX::STV_i16_v4_areg, NVPTX::STV_i32_v4_areg, None,
+                            NVPTX::STV_f16_v4_areg, NVPTX::STV_f16x2_v4_areg,
+                            NVPTX::STV_f32_v4_areg, None);
+a2722 3
+  if (!Opcode)
+    return false;
+
+d2725 1
+a2725 1
+  ST = CurDAG->getMachineNode(Opcode.getValue(), DL, MVT::Other, StOps);
+d2760 1
+a2760 1
+  Optional<unsigned> Opcode;
+d2766 25
+a2790 5
+    Opcode = pickOpcodeForVT(MemVT.getSimpleVT().SimpleTy,
+                             NVPTX::LoadParamMemI8, NVPTX::LoadParamMemI16,
+                             NVPTX::LoadParamMemI32, NVPTX::LoadParamMemI64,
+                             NVPTX::LoadParamMemF16, NVPTX::LoadParamMemF16x2,
+                             NVPTX::LoadParamMemF32, NVPTX::LoadParamMemF64);
+d2793 25
+a2817 6
+    Opcode =
+        pickOpcodeForVT(MemVT.getSimpleVT().SimpleTy, NVPTX::LoadParamMemV2I8,
+                        NVPTX::LoadParamMemV2I16, NVPTX::LoadParamMemV2I32,
+                        NVPTX::LoadParamMemV2I64, NVPTX::LoadParamMemV2F16,
+                        NVPTX::LoadParamMemV2F16x2, NVPTX::LoadParamMemV2F32,
+                        NVPTX::LoadParamMemV2F64);
+d2820 19
+a2838 5
+    Opcode = pickOpcodeForVT(
+        MemVT.getSimpleVT().SimpleTy, NVPTX::LoadParamMemV4I8,
+        NVPTX::LoadParamMemV4I16, NVPTX::LoadParamMemV4I32, None,
+        NVPTX::LoadParamMemV4F16, NVPTX::LoadParamMemV4F16x2,
+        NVPTX::LoadParamMemV4F32, None);
+a2840 2
+  if (!Opcode)
+    return false;
+d2859 1
+a2859 1
+  ReplaceNode(Node, CurDAG->getMachineNode(Opcode.getValue(), DL, VTs, Ops));
+d2896 1
+a2896 1
+  Optional<unsigned> Opcode = 0;
+d2901 25
+a2925 5
+    Opcode = pickOpcodeForVT(Mem->getMemoryVT().getSimpleVT().SimpleTy,
+                             NVPTX::StoreRetvalI8, NVPTX::StoreRetvalI16,
+                             NVPTX::StoreRetvalI32, NVPTX::StoreRetvalI64,
+                             NVPTX::StoreRetvalF16, NVPTX::StoreRetvalF16x2,
+                             NVPTX::StoreRetvalF32, NVPTX::StoreRetvalF64);
+d2928 25
+a2952 5
+    Opcode = pickOpcodeForVT(Mem->getMemoryVT().getSimpleVT().SimpleTy,
+                             NVPTX::StoreRetvalV2I8, NVPTX::StoreRetvalV2I16,
+                             NVPTX::StoreRetvalV2I32, NVPTX::StoreRetvalV2I64,
+                             NVPTX::StoreRetvalV2F16, NVPTX::StoreRetvalV2F16x2,
+                             NVPTX::StoreRetvalV2F32, NVPTX::StoreRetvalV2F64);
+d2955 19
+a2973 5
+    Opcode = pickOpcodeForVT(Mem->getMemoryVT().getSimpleVT().SimpleTy,
+                             NVPTX::StoreRetvalV4I8, NVPTX::StoreRetvalV4I16,
+                             NVPTX::StoreRetvalV4I32, None,
+                             NVPTX::StoreRetvalV4F16, NVPTX::StoreRetvalV4F16x2,
+                             NVPTX::StoreRetvalV4F32, None);
+a2975 2
+  if (!Opcode)
+    return false;
+d2977 2
+a2978 1
+  SDNode *Ret = CurDAG->getMachineNode(Opcode.getValue(), DL, MVT::Other, Ops);
+d3027 1
+a3027 1
+  Optional<unsigned> Opcode = 0;
+d3034 25
+a3058 5
+      Opcode = pickOpcodeForVT(Mem->getMemoryVT().getSimpleVT().SimpleTy,
+                               NVPTX::StoreParamI8, NVPTX::StoreParamI16,
+                               NVPTX::StoreParamI32, NVPTX::StoreParamI64,
+                               NVPTX::StoreParamF16, NVPTX::StoreParamF16x2,
+                               NVPTX::StoreParamF32, NVPTX::StoreParamF64);
+d3061 25
+a3085 5
+      Opcode = pickOpcodeForVT(Mem->getMemoryVT().getSimpleVT().SimpleTy,
+                               NVPTX::StoreParamV2I8, NVPTX::StoreParamV2I16,
+                               NVPTX::StoreParamV2I32, NVPTX::StoreParamV2I64,
+                               NVPTX::StoreParamV2F16, NVPTX::StoreParamV2F16x2,
+                               NVPTX::StoreParamV2F32, NVPTX::StoreParamV2F64);
+d3088 19
+a3106 5
+      Opcode = pickOpcodeForVT(Mem->getMemoryVT().getSimpleVT().SimpleTy,
+                               NVPTX::StoreParamV4I8, NVPTX::StoreParamV4I16,
+                               NVPTX::StoreParamV4I32, None,
+                               NVPTX::StoreParamV4F16, NVPTX::StoreParamV4F16x2,
+                               NVPTX::StoreParamV4F32, None);
+a3108 2
+    if (!Opcode)
+      return false;
+d3135 1
+a3135 1
+      CurDAG->getMachineNode(Opcode.getValue(), DL, RetVTs, Ops);
 @
 
 

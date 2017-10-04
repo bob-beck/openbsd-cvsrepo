@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.36;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.10;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1431,6 +1438,312 @@ a784 1
 d983 1
 a983 1
   MFI = &MF->getFrameInfo();
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d26 1
+a40 1
+#include "llvm/CodeGen/SelectionDAGNodes.h"
+d57 1
+a57 1
+#define DEBUG_TYPE "stack-coloring"
+a89 50
+//===----------------------------------------------------------------------===//
+//                           StackColoring Pass
+//===----------------------------------------------------------------------===//
+//
+// Stack Coloring reduces stack usage by merging stack slots when they
+// can't be used together. For example, consider the following C program:
+//
+//     void bar(char *, int);
+//     void foo(bool var) {
+//         A: {
+//             char z[4096];
+//             bar(z, 0);
+//         }
+//
+//         char *p;
+//         char x[4096];
+//         char y[4096];
+//         if (var) {
+//             p = x;
+//         } else {
+//             bar(y, 1);
+//             p = y + 1024;
+//         }
+//     B:
+//         bar(p, 2);
+//     }
+//
+// Naively-compiled, this program would use 12k of stack space. However, the
+// stack slot corresponding to `z` is always destroyed before either of the
+// stack slots for `x` or `y` are used, and then `x` is only used if `var`
+// is true, while `y` is only used if `var` is false. So in no time are 2
+// of the stack slots used together, and therefore we can merge them,
+// compiling the function using only a single 4k alloca:
+//
+//     void foo(bool var) { // equivalent
+//         char x[4096];
+//         char *p;
+//         bar(x, 0);
+//         if (var) {
+//             p = x;
+//         } else {
+//             bar(x, 1);
+//             p = x + 1024;
+//         }
+//         bar(p, 2);
+//     }
+//
+// This is an important optimization if we want stack space to be under
+// control in large functions, both open-coded ones and ones created by
+// inlining.
+a93 74
+// An important part of the above reasoning is that `z` can't be accessed
+// while the latter 2 calls to `bar` are running. This is justified because
+// `z`'s lifetime is over after we exit from block `A:`, so any further
+// accesses to it would be UB. The way we represent this information
+// in LLVM is by having frontends delimit blocks with `lifetime.start`
+// and `lifetime.end` intrinsics.
+//
+// The effect of these intrinsics seems to be as follows (maybe I should
+// specify this in the reference?):
+//
+//   L1) at start, each stack-slot is marked as *out-of-scope*, unless no
+//   lifetime intrinsic refers to that stack slot, in which case
+//   it is marked as *in-scope*.
+//   L2) on a `lifetime.start`, a stack slot is marked as *in-scope* and
+//   the stack slot is overwritten with `undef`.
+//   L3) on a `lifetime.end`, a stack slot is marked as *out-of-scope*.
+//   L4) on function exit, all stack slots are marked as *out-of-scope*.
+//   L5) `lifetime.end` is a no-op when called on a slot that is already
+//   *out-of-scope*.
+//   L6) memory accesses to *out-of-scope* stack slots are UB.
+//   L7) when a stack-slot is marked as *out-of-scope*, all pointers to it
+//   are invalidated, unless the slot is "degenerate". This is used to
+//   justify not marking slots as in-use until the pointer to them is
+//   used, but feels a bit hacky in the presence of things like LICM. See
+//   the "Degenerate Slots" section for more details.
+//
+// Now, let's ground stack coloring on these rules. We'll define a slot
+// as *in-use* at a (dynamic) point in execution if it either can be
+// written to at that point, or if it has a live and non-undef content
+// at that point.
+//
+// Obviously, slots that are never *in-use* together can be merged, and
+// in our example `foo`, the slots for `x`, `y` and `z` are never
+// in-use together (of course, sometimes slots that *are* in-use together
+// might still be mergable, but we don't care about that here).
+//
+// In this implementation, we successively merge pairs of slots that are
+// not *in-use* together. We could be smarter - for example, we could merge
+// a single large slot with 2 small slots, or we could construct the
+// interference graph and run a "smart" graph coloring algorithm, but with
+// that aside, how do we find out whether a pair of slots might be *in-use*
+// together?
+//
+// From our rules, we see that *out-of-scope* slots are never *in-use*,
+// and from (L7) we see that "non-degenerate" slots remain non-*in-use*
+// until their address is taken. Therefore, we can approximate slot activity
+// using dataflow.
+//
+// A subtle point: naively, we might try to figure out which pairs of
+// stack-slots interfere by propagating `S in-use` through the CFG for every
+// stack-slot `S`, and having `S` and `T` interfere if there is a CFG point in
+// which they are both *in-use*.
+//
+// That is sound, but overly conservative in some cases: in our (artificial)
+// example `foo`, either `x` or `y` might be in use at the label `B:`, but
+// as `x` is only in use if we came in from the `var` edge and `y` only
+// if we came from the `!var` edge, they still can't be in use together.
+// See PR32488 for an important real-life case.
+//
+// If we wanted to find all points of interference precisely, we could
+// propagate `S in-use` and `S&T in-use` predicates through the CFG. That
+// would be precise, but requires propagating `O(n^2)` dataflow facts.
+//
+// However, we aren't interested in the *set* of points of interference
+// between 2 stack slots, only *whether* there *is* such a point. So we
+// can rely on a little trick: for `S` and `T` to be in-use together,
+// one of them needs to become in-use while the other is in-use (or
+// they might both become in use simultaneously). We can check this
+// by also keeping track of the points at which a stack slot might *start*
+// being in-use.
+//
+// Exact first use:
+// ----------------
+//
+a161 3
+// Degenerate Slots:
+// -----------------
+//
+d241 4
+d275 1
+a275 2
+  /// Maps slots to their use interval. Outside of this interval, slots
+  /// values are either dead or `undef` and they will not be written to.
+a276 2
+  /// Maps slots to the points where they can become in-use.
+  SmallVector<SmallVector<SlotIndex, 4>, 16> LiveStarts;
+d375 2
+a376 2
+INITIALIZE_PASS_BEGIN(StackColoring, DEBUG_TYPE,
+                      "Merge disjoint stack slots", false, false)
+d379 2
+a380 2
+INITIALIZE_PASS_END(StackColoring, DEBUG_TYPE,
+                    "Merge disjoint stack slots", false, false)
+d388 2
+a389 1
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+d392 1
+a392 1
+  dbgs() << tag << " : { ";
+d394 2
+a395 2
+    dbgs() << BV.test(I) << " ";
+  dbgs() << "}\n";
+d411 3
+a413 3
+    dbgs() << "Inspecting block #" << MBB->getNumber() << " ["
+           << MBB->getName() << "]\n";
+    dumpBB(MBB);
+d419 2
+a420 2
+    dbgs() << "Interval[" << I << "]:\n";
+    Intervals[I]->dump();
+d423 2
+a424 1
+#endif
+d573 3
+a575 2
+  // NOTE: We use a depth-first iteration to ensure that we obtain a
+  // deterministic numbering.
+d679 1
+a679 1
+  SmallVector<bool, 16> DefinitelyInUse;
+d686 2
+a687 9
+    DefinitelyInUse.clear();
+    DefinitelyInUse.resize(NumSlots);
+
+    // Start the interval of the slots that we previously found to be 'in-use'.
+    BlockLifetimeInfo &MBBLiveness = BlockLiveness[&MBB];
+    for (int pos = MBBLiveness.LiveIn.find_first(); pos != -1;
+         pos = MBBLiveness.LiveIn.find_next(pos)) {
+      Starts[pos] = Indexes->getMBBStartIdx(&MBB);
+    }
+d699 1
+a699 8
+          // If a slot is already definitely in use, we don't have to emit
+          // a new start marker because there is already a pre-existing
+          // one.
+          if (!DefinitelyInUse[Slot]) {
+            LiveStarts[Slot].push_back(ThisIndex);
+            DefinitelyInUse[Slot] = true;
+          }
+          if (!Starts[Slot].isValid())
+d702 2
+a703 7
+          if (Starts[Slot].isValid()) {
+            VNInfo *VNI = Intervals[Slot]->getValNumInfo(0);
+            Intervals[Slot]->addSegment(
+                LiveInterval::Segment(Starts[Slot], ThisIndex, VNI));
+            Starts[Slot] = SlotIndex(); // Invalidate the start index
+            DefinitelyInUse[Slot] = false;
+          }
+d708 11
+a718 1
+    // Finish up started segments
+d720 23
+d746 15
+a760 3
+      SlotIndex EndIdx = Indexes->getMBBEndIdx(&MBB);
+      VNInfo *VNI = Intervals[i]->getValNumInfo(0);
+      Intervals[i]->addSegment(LiveInterval::Segment(Starts[i], EndIdx, VNI));
+a795 4
+
+  // Keep a list of allocas which has been affected by the remap.
+  SmallPtrSet<const AllocaInst*, 32> MergedAllocas;
+
+a814 4
+    // We keep both slots to maintain AliasAnalysis metadata later.
+    MergedAllocas.insert(From);
+    MergedAllocas.insert(To);
+
+d846 7
+a903 42
+
+      // We adjust AliasAnalysis information for merged stack slots.
+      MachineSDNode::mmo_iterator NewMemOps =
+          MF->allocateMemRefsArray(I.getNumMemOperands());
+      unsigned MemOpIdx = 0;
+      bool ReplaceMemOps = false;
+      for (MachineMemOperand *MMO : I.memoperands()) {
+        // If this memory location can be a slot remapped here,
+        // we remove AA information.
+        bool MayHaveConflictingAAMD = false;
+        if (MMO->getAAInfo()) {
+          if (const Value *MMOV = MMO->getValue()) {
+            SmallVector<Value *, 4> Objs;
+            getUnderlyingObjectsForCodeGen(MMOV, Objs, MF->getDataLayout());
+
+            if (Objs.empty())
+              MayHaveConflictingAAMD = true;
+            else
+              for (Value *V : Objs) {
+                // If this memory location comes from a known stack slot
+                // that is not remapped, we continue checking.
+                // Otherwise, we need to invalidate AA infomation.
+                const AllocaInst *AI = dyn_cast_or_null<AllocaInst>(V);
+                if (AI && MergedAllocas.count(AI)) {
+                  MayHaveConflictingAAMD = true;
+                  break;
+                }
+              }
+          }
+        }
+        if (MayHaveConflictingAAMD) {
+          NewMemOps[MemOpIdx++] = MF->getMachineMemOperand(MMO, AAMDNodes());
+          ReplaceMemOps = true;
+        }
+        else
+          NewMemOps[MemOpIdx++] = MMO;
+      }
+
+      // If any memory operand is updated, set memory references of
+      // this instruction.
+      if (ReplaceMemOps)
+        I.setMemRefs(std::make_pair(NewMemOps, I.getNumMemOperands()));
+a989 1
+  LiveStarts.clear();
+a1000 1
+  LiveStarts.resize(NumSlots);
+a1071 3
+  for (auto &s : LiveStarts)
+    std::sort(s.begin(), s.end());
+
+a1086 2
+        auto &FirstS = LiveStarts[FirstSlot];
+        auto &SecondS = LiveStarts[SecondSlot];
+d1089 2
+a1090 4
+        // Merge disjoint slots. This is a little bit tricky - see the
+        // Implementation Notes section for an explanation.
+        if (!First->isLiveAtIndexes(SecondS) &&
+            !Second->isLiveAtIndexes(FirstS)) {
+a1092 6
+
+          int OldSize = FirstS.size();
+          FirstS.append(SecondS.begin(), SecondS.end());
+          auto Mid = FirstS.begin() + OldSize;
+          std::inplace_merge(FirstS.begin(), Mid, FirstS.end());
+
 @
 
 

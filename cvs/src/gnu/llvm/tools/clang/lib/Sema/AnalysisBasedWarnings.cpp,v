@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.08;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.48;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -2328,6 +2335,220 @@ a2000 9
                    : (IsCoro()
                           ? CheckFallThroughDiagnostics::MakeForCoroutine(D)
                           : CheckFallThroughDiagnostics::MakeForFunction(D)));
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a281 153
+// Check for throw in a non-throwing function.
+//===----------------------------------------------------------------------===//
+enum ThrowState {
+  FoundNoPathForThrow,
+  FoundPathForThrow,
+  FoundPathWithNoThrowOutFunction,
+};
+
+static bool isThrowCaught(const CXXThrowExpr *Throw,
+                          const CXXCatchStmt *Catch) {
+  const Type *ThrowType = nullptr;
+  if (Throw->getSubExpr())
+    ThrowType = Throw->getSubExpr()->getType().getTypePtrOrNull();
+  if (!ThrowType)
+    return false;
+  const Type *CaughtType = Catch->getCaughtType().getTypePtrOrNull();
+  if (!CaughtType)
+    return true;
+  if (ThrowType->isReferenceType())
+    ThrowType = ThrowType->castAs<ReferenceType>()
+                    ->getPointeeType()
+                    ->getUnqualifiedDesugaredType();
+  if (CaughtType->isReferenceType())
+    CaughtType = CaughtType->castAs<ReferenceType>()
+                     ->getPointeeType()
+                     ->getUnqualifiedDesugaredType();
+  if (ThrowType->isPointerType() && CaughtType->isPointerType()) {
+    ThrowType = ThrowType->getPointeeType()->getUnqualifiedDesugaredType();
+    CaughtType = CaughtType->getPointeeType()->getUnqualifiedDesugaredType();
+  }
+  if (CaughtType == ThrowType)
+    return true;
+  const CXXRecordDecl *CaughtAsRecordType =
+      CaughtType->getAsCXXRecordDecl();
+  const CXXRecordDecl *ThrowTypeAsRecordType = ThrowType->getAsCXXRecordDecl();
+  if (CaughtAsRecordType && ThrowTypeAsRecordType)
+    return ThrowTypeAsRecordType->isDerivedFrom(CaughtAsRecordType);
+  return false;
+}
+
+static bool isThrowCaughtByHandlers(const CXXThrowExpr *CE,
+                                    const CXXTryStmt *TryStmt) {
+  for (unsigned H = 0, E = TryStmt->getNumHandlers(); H < E; ++H) {
+    if (isThrowCaught(CE, TryStmt->getHandler(H)))
+      return true;
+  }
+  return false;
+}
+
+static bool doesThrowEscapePath(CFGBlock Block, SourceLocation &OpLoc) {
+  for (const auto &B : Block) {
+    if (B.getKind() != CFGElement::Statement)
+      continue;
+    const auto *CE = dyn_cast<CXXThrowExpr>(B.getAs<CFGStmt>()->getStmt());
+    if (!CE)
+      continue;
+
+    OpLoc = CE->getThrowLoc();
+    for (const auto &I : Block.succs()) {
+      if (!I.isReachable())
+        continue;
+      if (const auto *Terminator =
+              dyn_cast_or_null<CXXTryStmt>(I->getTerminator()))
+        if (isThrowCaughtByHandlers(CE, Terminator))
+          return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+static bool hasThrowOutNonThrowingFunc(SourceLocation &OpLoc, CFG *BodyCFG) {
+
+  unsigned ExitID = BodyCFG->getExit().getBlockID();
+
+  SmallVector<ThrowState, 16> States(BodyCFG->getNumBlockIDs(),
+                                     FoundNoPathForThrow);
+  States[BodyCFG->getEntry().getBlockID()] = FoundPathWithNoThrowOutFunction;
+
+  SmallVector<CFGBlock *, 16> Stack;
+  Stack.push_back(&BodyCFG->getEntry());
+  while (!Stack.empty()) {
+    CFGBlock *CurBlock = Stack.back();
+    Stack.pop_back();
+
+    unsigned ID = CurBlock->getBlockID();
+    ThrowState CurState = States[ID];
+    if (CurState == FoundPathWithNoThrowOutFunction) {
+      if (ExitID == ID)
+        continue;
+
+      if (doesThrowEscapePath(*CurBlock, OpLoc))
+        CurState = FoundPathForThrow;
+    }
+
+    // Loop over successor blocks and add them to the Stack if their state
+    // changes.
+    for (const auto &I : CurBlock->succs())
+      if (I.isReachable()) {
+        unsigned NextID = I->getBlockID();
+        if (NextID == ExitID && CurState == FoundPathForThrow) {
+          States[NextID] = CurState;
+        } else if (States[NextID] < CurState) {
+          States[NextID] = CurState;
+          Stack.push_back(I);
+        }
+      }
+  }
+  // Return true if the exit node is reachable, and only reachable through
+  // a throw expression.
+  return States[ExitID] == FoundPathForThrow;
+}
+
+static void EmitDiagForCXXThrowInNonThrowingFunc(Sema &S, SourceLocation OpLoc,
+                                                 const FunctionDecl *FD) {
+  if (!S.getSourceManager().isInSystemHeader(OpLoc) &&
+      FD->getTypeSourceInfo()) {
+    S.Diag(OpLoc, diag::warn_throw_in_noexcept_func) << FD;
+    if (S.getLangOpts().CPlusPlus11 &&
+        (isa<CXXDestructorDecl>(FD) ||
+         FD->getDeclName().getCXXOverloadedOperator() == OO_Delete ||
+         FD->getDeclName().getCXXOverloadedOperator() == OO_Array_Delete)) {
+      if (const auto *Ty = FD->getTypeSourceInfo()->getType()->
+                                         getAs<FunctionProtoType>())
+        S.Diag(FD->getLocation(), diag::note_throw_in_dtor)
+            << !isa<CXXDestructorDecl>(FD) << !Ty->hasExceptionSpec()
+            << FD->getExceptionSpecSourceRange();
+    } else 
+      S.Diag(FD->getLocation(), diag::note_throw_in_function)
+          << FD->getExceptionSpecSourceRange();
+  }
+}
+
+static void checkThrowInNonThrowingFunc(Sema &S, const FunctionDecl *FD,
+                                        AnalysisDeclContext &AC) {
+  CFG *BodyCFG = AC.getCFG();
+  if (!BodyCFG)
+    return;
+  if (BodyCFG->getExit().pred_empty())
+    return;
+  SourceLocation OpLoc;
+  if (hasThrowOutNonThrowingFunc(OpLoc, BodyCFG))
+    EmitDiagForCXXThrowInNonThrowingFunc(S, OpLoc, FD);
+}
+
+static bool isNoexcept(const FunctionDecl *FD) {
+  const auto *FPT = FD->getType()->castAs<FunctionProtoType>();
+  if (FPT->isNothrow(FD->getASTContext()))
+    return true;
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
+a544 1
+  bool IsCoroutine = S.getCurFunction() && S.getCurFunction()->isCoroutine();
+d573 1
+a574 6
+  auto EmitDiag = [&](SourceLocation Loc, unsigned DiagID) {
+    if (IsCoroutine)
+      S.Diag(Loc, DiagID) << S.getCurFunction()->CoroutinePromise->getType();
+    else
+      S.Diag(Loc, DiagID);
+  };
+d582 1
+a582 1
+        EmitDiag(RBrace, CD.diag_MaybeFallThrough_HasNoReturn);
+d584 1
+a584 1
+        EmitDiag(RBrace, CD.diag_MaybeFallThrough_ReturnsNonVoid);
+d588 1
+a588 1
+        EmitDiag(RBrace, CD.diag_AlwaysFallThrough_HasNoReturn);
+d590 1
+a590 1
+        EmitDiag(RBrace, CD.diag_AlwaysFallThrough_ReturnsNonVoid);
+d975 1
+a975 2
+    bool checkFallThroughIntoBlock(const CFGBlock &B, int &AnnotatedCnt,
+                                   bool IsTemplateInstantiation) {
+d1005 2
+a1006 6
+                // Don't issue a warning for an unreachable fallthrough
+                // attribute in template instantiations as it may not be
+                // unreachable in all instantiations of the template.
+                if (!IsTemplateInstantiation)
+                  S.Diag(AS->getLocStart(),
+                         diag::warn_fallthrough_attr_unreachable);
+d1167 1
+a1167 5
+    bool IsTemplateInstantiation = false;
+    if (const FunctionDecl *Function = dyn_cast<FunctionDecl>(AC.getDecl()))
+      IsTemplateInstantiation = Function->isTemplateInstantiation();
+    if (!FM.checkFallThroughIntoBlock(*B, AnnotatedCnt,
+                                      IsTemplateInstantiation))
+d2021 6
+d2034 1
+a2034 1
+                   : (fscope->isCoroutine()
+a2119 6
+
+  // Check for throw out of non-throwing function.
+  if (!Diags.isIgnored(diag::warn_throw_in_noexcept_func, D->getLocStart()))
+    if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(D))
+      if (S.getLangOpts().CPlusPlus && isNoexcept(FD))
+        checkThrowInNonThrowingFunc(S, FD, AC);
 @
 
 

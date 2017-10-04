@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.24;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.59;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -469,6 +476,256 @@ PreservedAnalyses LoopDeletionPass::run(Loop &L, LoopAnalysisManager &AM,
                                         LoopStandardAnalysisResults &AR,
                                         LPMUpdater &) {
   bool Changed = runImpl(&L, AR.DT, AR.SE, AR.LI);
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a22 1
+#include "llvm/IR/PatternMatch.h"
+d32 9
+a40 22
+/// This function deletes dead loops. The caller of this function needs to
+/// guarantee that the loop is infact dead. Here we handle two kinds of dead
+/// loop. The first kind (\p isLoopDead) is where only invariant values from
+/// within the loop are used outside of it. The second kind (\p
+/// isLoopNeverExecuted) is where the loop is provably never executed. We can
+/// always remove never executed loops since they will not cause any difference
+/// to program behaviour.
+/// 
+/// This also updates the relevant analysis information in \p DT, \p SE, and \p
+/// LI. It also updates the loop PM if an updater struct is provided.
+// TODO: This function will be used by loop-simplifyCFG as well. So, move this
+// to LoopUtils.cpp
+static void deleteDeadLoop(Loop *L, DominatorTree &DT, ScalarEvolution &SE,
+                           LoopInfo &LI, LPMUpdater *Updater = nullptr);
+/// Determines if a loop is dead.
+///
+/// This assumes that we've already checked for unique exit and exiting blocks,
+/// and that the code is in LCSSA form.
+static bool isLoopDead(Loop *L, ScalarEvolution &SE,
+                       SmallVectorImpl<BasicBlock *> &ExitingBlocks,
+                       BasicBlock *ExitBlock, bool &Changed,
+                       BasicBlock *Preheader) {
+d46 1
+a46 1
+  BasicBlock::iterator BI = ExitBlock->begin();
+d50 1
+a50 1
+    Value *incoming = P->getIncomingValueForBlock(ExitingBlocks[0]);
+d57 1
+a57 1
+        all_of(makeArrayRef(ExitingBlocks).slice(1), [&](BasicBlock *BB) {
+d81 10
+a90 4
+  // marked volatile.
+  for (auto &I : L->blocks())
+    if (any_of(*I, [](Instruction &I) { return I.mayHaveSideEffects(); }))
+      return false;
+d94 9
+a102 10
+/// This function returns true if there is no viable path from the
+/// entry block to the header of \p L. Right now, it only does
+/// a local search to save compile time.
+static bool isLoopNeverExecuted(Loop *L) {
+  using namespace PatternMatch;
+
+  auto *Preheader = L->getLoopPreheader();
+  // TODO: We can relax this constraint, since we just need a loop
+  // predecessor.
+  assert(Preheader && "Needs preheader!");
+d104 4
+a107 1
+  if (Preheader == &Preheader->getParent()->getEntryBlock())
+a108 18
+  // All predecessors of the preheader should have a constant conditional
+  // branch, with the loop's preheader as not-taken.
+  for (auto *Pred: predecessors(Preheader)) {
+    BasicBlock *Taken, *NotTaken;
+    ConstantInt *Cond;
+    if (!match(Pred->getTerminator(),
+               m_Br(m_ConstantInt(Cond), Taken, NotTaken)))
+      return false;
+    if (!Cond->getZExtValue())
+      std::swap(Taken, NotTaken);
+    if (Taken == Preheader)
+      return false;
+  }
+  assert(!pred_empty(Preheader) &&
+         "Preheader should have predecessors at this point!");
+  // All the predecessors have the loop preheader as not-taken target.
+  return true;
+}
+d110 3
+a112 16
+/// Remove a loop if it is dead.
+///
+/// A loop is considered dead if it does not impact the observable behavior of
+/// the program other than finite running time. This never removes a loop that
+/// might be infinite (unless it is never executed), as doing so could change
+/// the halting/non-halting nature of a program.
+///
+/// This entire process relies pretty heavily on LoopSimplify form and LCSSA in
+/// order to make various safety checks work.
+///
+/// \returns true if any changes were made. This may mutate the loop even if it
+/// is unable to delete it due to hoisting trivially loop invariant
+/// instructions out of the loop.
+static bool deleteLoopIfDead(Loop *L, DominatorTree &DT, ScalarEvolution &SE,
+                             LoopInfo &LI, LPMUpdater *Updater = nullptr) {
+  assert(L->isLCSSAForm(DT) && "Expected LCSSA!");
+a113 9
+  // We can only remove the loop if there is a preheader that we can branch from
+  // after removing it. Also, if LoopSimplify form is not available, stay out
+  // of trouble.
+  BasicBlock *Preheader = L->getLoopPreheader();
+  if (!Preheader || !L->hasDedicatedExits()) {
+    DEBUG(dbgs()
+          << "Deletion requires Loop with preheader and dedicated exits.\n");
+    return false;
+  }
+d116 1
+a116 2
+  if (L->begin() != L->end()) {
+    DEBUG(dbgs() << "Loop contains subloops.\n");
+a117 1
+  }
+d119 2
+d122 2
+a123 20
+  BasicBlock *ExitBlock = L->getUniqueExitBlock();
+
+  if (ExitBlock && isLoopNeverExecuted(L)) {
+    DEBUG(dbgs() << "Loop is proven to never execute, delete it!");
+    // Set incoming value to undef for phi nodes in the exit block.
+    BasicBlock::iterator BI = ExitBlock->begin();
+    while (PHINode *P = dyn_cast<PHINode>(BI)) {
+      for (unsigned i = 0; i < P->getNumIncomingValues(); i++)
+        P->setIncomingValue(i, UndefValue::get(P->getType()));
+      BI++;
+    }
+    deleteDeadLoop(L, DT, SE, LI, Updater);
+    ++NumDeleted;
+    return true;
+  }
+
+  // The remaining checks below are for a loop being dead because all statements
+  // in the loop are invariant.
+  SmallVector<BasicBlock *, 4> ExitingBlocks;
+  L->getExitingBlocks(ExitingBlocks);
+d129 1
+a129 2
+  if (!ExitBlock) {
+    DEBUG(dbgs() << "Deletion requires single exit block\n");
+d131 1
+a131 1
+  }
+d134 1
+a134 2
+  if (!isLoopDead(L, SE, ExitingBlocks, ExitBlock, Changed, Preheader)) {
+    DEBUG(dbgs() << "Loop is not invariant, cannot delete.\n");
+a135 1
+  }
+d140 1
+a140 2
+  if (isa<SCEVCouldNotCompute>(S)) {
+    DEBUG(dbgs() << "Could not compute SCEV MaxBackedgeTakenCount.\n");
+a141 14
+  }
+
+  DEBUG(dbgs() << "Loop is invariant, delete it!");
+  deleteDeadLoop(L, DT, SE, LI, Updater);
+  ++NumDeleted;
+
+  return true;
+}
+
+static void deleteDeadLoop(Loop *L, DominatorTree &DT, ScalarEvolution &SE,
+                           LoopInfo &LI, LPMUpdater *Updater) {
+  assert(L->isLCSSAForm(DT) && "Expected LCSSA!");
+  auto *Preheader = L->getLoopPreheader();
+  assert(Preheader && "Preheader should exist!");
+d145 2
+a146 1
+  //
+d148 2
+a149 5
+  // we remove things is very important to avoid invalidation issues.
+
+  // If we have an LPM updater, tell it about the loop being removed.
+  if (Updater)
+    Updater->markLoopAsDeleted(*L);
+d156 3
+a158 2
+  auto *ExitBlock = L->getUniqueExitBlock();
+  assert(ExitBlock && "Should have a unique exit block!");
+d160 4
+a163 14
+  assert(L->hasDedicatedExits() && "Loop should have dedicated exits!");
+
+  // Connect the preheader directly to the exit block.
+  // Even when the loop is never executed, we cannot remove the edge from the
+  // source block to the exit block. Consider the case where the unexecuted loop
+  // branches back to an outer loop. If we deleted the loop and removed the edge
+  // coming to this inner loop, this will break the outer loop structure (by
+  // deleting the backedge of the outer loop). If the outer loop is indeed a
+  // non-loop, it will be deleted in a future iteration of loop deletion pass.
+  Preheader->getTerminator()->replaceUsesOfWith(L->getHeader(), ExitBlock);
+
+  // Rewrite phis in the exit block to get their inputs from the Preheader
+  // instead of the exiting block.
+  BasicBlock::iterator BI = ExitBlock->begin();
+d165 5
+a169 18
+    // Set the zero'th element of Phi to be from the preheader and remove all
+    // other incoming values. Given the loop has dedicated exits, all other
+    // incoming values must be from the exiting blocks.
+    int PredIndex = 0;
+    P->setIncomingBlock(PredIndex, Preheader);
+    // Removes all incoming values from all other exiting blocks (including
+    // duplicate values from an exiting block).
+    // Nuke all entries except the zero'th entry which is the preheader entry.
+    // NOTE! We need to remove Incoming Values in the reverse order as done
+    // below, to keep the indices valid for deletion (removeIncomingValues
+    // updates getNumIncomingValues and shifts all values down into the operand
+    // being deleted).
+    for (unsigned i = 0, e = P->getNumIncomingValues() - 1; i != e; ++i)
+      P->removeIncomingValue(e-i, false);
+
+    assert((P->getNumIncomingValues() == 1 &&
+            P->getIncomingBlock(PredIndex) == Preheader) &&
+           "Should have exactly one value and that's from the preheader!");
+d178 1
+a178 1
+    // Move all of the block's children to be children of the Preheader, which
+d182 1
+a182 1
+      DT.changeImmediateDominator(ChildNode, DT[Preheader]);
+d207 1
+a207 1
+    LI.removeBlock(BB);
+d210 6
+a215 1
+  LI.markAsRemoved(L);
+d220 3
+a222 5
+                                        LPMUpdater &Updater) {
+
+  DEBUG(dbgs() << "Analyzing Loop for deletion: ");
+  DEBUG(L.dump());
+  if (!deleteLoopIfDead(&L, AR.DT, AR.SE, AR.LI, &Updater))
+d257 1
+d260 1
+a260 1
+  LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+d262 2
+a263 3
+  DEBUG(dbgs() << "Analyzing Loop for deletion: ");
+  DEBUG(L->dump());
+  return deleteLoopIfDead(L, DT, SE, LI);
 @
 
 

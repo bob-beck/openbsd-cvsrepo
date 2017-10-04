@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.6
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.14;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.51;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1223,6 +1230,394 @@ a789 1
 d798 1
 a798 1
     if timeoutInfo is not None:
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a7 6
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+
+from lit.ShCommands import GlobItem
+a11 1
+from lit.BooleanExpression import BooleanExpression
+a142 11
+def expand_glob(arg, cwd):
+    if isinstance(arg, GlobItem):
+        return arg.resolve(cwd)
+    return [arg]
+
+def expand_glob_expressions(args, cwd):
+    result = [args[0]]
+    for arg in args[1:]:
+        result.extend(expand_glob(arg, cwd))
+    return result
+
+a198 161
+# cmd is export or env
+def updateEnv(env, cmd):
+    arg_idx = 1
+    for arg_idx, arg in enumerate(cmd.args[1:]):
+        # Partition the string into KEY=VALUE.
+        key, eq, val = arg.partition('=')
+        # Stop if there was no equals.
+        if eq == '':
+            break
+        env.env[key] = val
+    cmd.args = cmd.args[arg_idx+1:]
+
+def executeBuiltinEcho(cmd, shenv):
+    """Interpret a redirected echo command"""
+    opened_files = []
+    stdin, stdout, stderr = processRedirects(cmd, subprocess.PIPE, shenv,
+                                             opened_files)
+    if stdin != subprocess.PIPE or stderr != subprocess.PIPE:
+        raise InternalShellError(
+                cmd, "stdin and stderr redirects not supported for echo")
+
+    # Some tests have un-redirected echo commands to help debug test failures.
+    # Buffer our output and return it to the caller.
+    is_redirected = True
+    if stdout == subprocess.PIPE:
+        is_redirected = False
+        stdout = StringIO()
+    elif kIsWindows:
+        # Reopen stdout in binary mode to avoid CRLF translation. The versions
+        # of echo we are replacing on Windows all emit plain LF, and the LLVM
+        # tests now depend on this.
+        stdout = open(stdout.name, stdout.mode + 'b')
+        opened_files.append((None, None, stdout, None))
+
+    # Implement echo flags. We only support -e and -n, and not yet in
+    # combination. We have to ignore unknown flags, because `echo "-D FOO"`
+    # prints the dash.
+    args = cmd.args[1:]
+    interpret_escapes = False
+    write_newline = True
+    while len(args) >= 1 and args[0] in ('-e', '-n'):
+        flag = args[0]
+        args = args[1:]
+        if flag == '-e':
+            interpret_escapes = True
+        elif flag == '-n':
+            write_newline = False
+
+    def maybeUnescape(arg):
+        if not interpret_escapes:
+            return arg
+        # Python string escapes and "echo" escapes are obviously different, but
+        # this should be enough for the LLVM test suite.
+        return arg.decode('string_escape')
+
+    if args:
+        for arg in args[:-1]:
+            stdout.write(maybeUnescape(arg))
+            stdout.write(' ')
+        stdout.write(maybeUnescape(args[-1]))
+    if write_newline:
+        stdout.write('\n')
+
+    for (name, mode, f, path) in opened_files:
+        f.close()
+
+    if not is_redirected:
+        return stdout.getvalue()
+    return ""
+
+def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
+    """Return the standard fds for cmd after applying redirects
+
+    Returns the three standard file descriptors for the new child process.  Each
+    fd may be an open, writable file object or a sentinel value from the
+    subprocess module.
+    """
+
+    # Apply the redirections, we use (N,) as a sentinel to indicate stdin,
+    # stdout, stderr for N equal to 0, 1, or 2 respectively. Redirects to or
+    # from a file are represented with a list [file, mode, file-object]
+    # where file-object is initially None.
+    redirects = [(0,), (1,), (2,)]
+    for (op, filename) in cmd.redirects:
+        if op == ('>',2):
+            redirects[2] = [filename, 'w', None]
+        elif op == ('>>',2):
+            redirects[2] = [filename, 'a', None]
+        elif op == ('>&',2) and filename in '012':
+            redirects[2] = redirects[int(filename)]
+        elif op == ('>&',) or op == ('&>',):
+            redirects[1] = redirects[2] = [filename, 'w', None]
+        elif op == ('>',):
+            redirects[1] = [filename, 'w', None]
+        elif op == ('>>',):
+            redirects[1] = [filename, 'a', None]
+        elif op == ('<',):
+            redirects[0] = [filename, 'r', None]
+        else:
+            raise InternalShellError(cmd, "Unsupported redirect: %r" % ((op, filename),))
+
+    # Open file descriptors in a second pass.
+    std_fds = [None, None, None]
+    for (index, r) in enumerate(redirects):
+        # Handle the sentinel values for defaults up front.
+        if isinstance(r, tuple):
+            if r == (0,):
+                fd = stdin_source
+            elif r == (1,):
+                if index == 0:
+                    raise InternalShellError(cmd, "Unsupported redirect for stdin")
+                elif index == 1:
+                    fd = subprocess.PIPE
+                else:
+                    fd = subprocess.STDOUT
+            elif r == (2,):
+                if index != 2:
+                    raise InternalShellError(cmd, "Unsupported redirect on stdout")
+                fd = subprocess.PIPE
+            else:
+                raise InternalShellError(cmd, "Bad redirect")
+            std_fds[index] = fd
+            continue
+
+        (filename, mode, fd) = r
+
+        # Check if we already have an open fd. This can happen if stdout and
+        # stderr go to the same place.
+        if fd is not None:
+            std_fds[index] = fd
+            continue
+
+        redir_filename = None
+        name = expand_glob(filename, cmd_shenv.cwd)
+        if len(name) != 1:
+           raise InternalShellError(cmd, "Unsupported: glob in "
+                                    "redirect expanded to multiple files")
+        name = name[0]
+        if kAvoidDevNull and name == '/dev/null':
+            fd = tempfile.TemporaryFile(mode=mode)
+        elif kIsWindows and name == '/dev/tty':
+            # Simulate /dev/tty on Windows.
+            # "CON" is a special filename for the console.
+            fd = open("CON", mode)
+        else:
+            # Make sure relative paths are relative to the cwd.
+            redir_filename = os.path.join(cmd_shenv.cwd, name)
+            fd = open(redir_filename, mode)
+        # Workaround a Win32 and/or subprocess bug when appending.
+        #
+        # FIXME: Actually, this is probably an instance of PR6753.
+        if mode == 'a':
+            fd.seek(0, 2)
+        # Mutate the underlying redirect list so that we can redirect stdout
+        # and stderr to the same place without opening the file twice.
+        r[2] = fd
+        opened_files.append((filename, mode, fd) + (redir_filename,))
+        std_fds[index] = fd
+
+    return std_fds
+
+d242 1
+a242 1
+            shenv.cwd = os.path.realpath(os.path.join(shenv.cwd, newdir))
+a246 19
+    # Handle "echo" as a builtin if it is not part of a pipeline. This greatly
+    # speeds up tests that construct input files by repeatedly echo-appending to
+    # a file.
+    # FIXME: Standardize on the builtin echo implementation. We can use a
+    # temporary file to sidestep blocking pipe write issues.
+    if cmd.commands[0].args[0] == 'echo' and len(cmd.commands) == 1:
+        output = executeBuiltinEcho(cmd.commands[0], shenv)
+        results.append(ShellCommandResult(cmd.commands[0], output, "", 0,
+                                          False))
+        return 0
+
+    if cmd.commands[0].args[0] == 'export':
+        if len(cmd.commands) != 1:
+            raise ValueError("'export' cannot be part of a pipeline")
+        if len(cmd.commands[0].args) != 2:
+            raise ValueError("'export' supports only one argument")
+        updateEnv(shenv, cmd.commands[0])
+        return 0
+
+d248 1
+a248 1
+    default_stdin = subprocess.PIPE
+d263 32
+a294 1
+            updateEnv(cmd_shenv, j)
+d296 39
+a334 2
+        stdin, stdout, stderr = processRedirects(j, default_stdin, cmd_shenv,
+                                                 opened_files)
+a373 3
+        # Expand all glob expressions
+        args = expand_glob_expressions(args, cmd_shenv.cwd)
+
+d399 1
+a399 1
+            default_stdin = procs[-1].stdout
+d401 1
+a401 1
+            default_stdin = procs[-1].stderr
+d403 1
+a403 1
+            default_stdin = subprocess.PIPE
+d477 2
+a478 2
+            # Take the last failing exit code from the pipeline.
+            if not exitCode or res != 0:
+d480 4
+a588 2
+        if litConfig.echo_all_commands:
+            f.write('set -x;')
+a688 2
+    tmpName = tmpBase + '.tmp'
+    baseName = os.path.basename(tmpBase)
+d693 1
+a693 2
+                          ('%t', tmpName),
+                          ('%basename_t', baseName),
+d749 2
+a750 4
+    COMMAND: A keyword taking a list of shell commands. Ex 'RUN:'
+    LIST: A keyword taking a comma-separated list of values.
+    BOOLEAN_EXPR: A keyword taking a comma-separated list of 
+        boolean expressions. Ex 'XFAIL:'
+d756 1
+a756 20
+    BOOLEAN_EXPR = 3
+    CUSTOM = 4
+
+    @@staticmethod
+    def allowedKeywordSuffixes(value):
+        return { ParserKind.TAG:          ['.'],
+                 ParserKind.COMMAND:      [':'],
+                 ParserKind.LIST:         [':'],
+                 ParserKind.BOOLEAN_EXPR: [':'],
+                 ParserKind.CUSTOM:       [':', '.']
+               } [value]
+
+    @@staticmethod
+    def str(value):
+        return { ParserKind.TAG:          'TAG',
+                 ParserKind.COMMAND:      'COMMAND',
+                 ParserKind.LIST:         'LIST',
+                 ParserKind.BOOLEAN_EXPR: 'BOOLEAN_EXPR',
+                 ParserKind.CUSTOM:       'CUSTOM'
+               } [value]
+d768 6
+a773 11
+        allowedSuffixes = ParserKind.allowedKeywordSuffixes(kind)
+        if len(keyword) == 0 or keyword[-1] not in allowedSuffixes:
+            if len(allowedSuffixes) == 1:
+                raise ValueError("Keyword '%s' of kind '%s' must end in '%s'"
+                                 % (keyword, ParserKind.str(kind),
+                                    allowedSuffixes[0]))
+            else:
+                raise ValueError("Keyword '%s' of kind '%s' must end in "
+                                 " one of '%s'"
+                                 % (keyword, ParserKind.str(kind),
+                                    ' '.join(allowedSuffixes)))
+d775 2
+a789 2
+        elif kind == ParserKind.BOOLEAN_EXPR:
+            self.parser = self._handleBooleanExpr
+d791 2
+d802 2
+a803 6
+        try:
+            self.parsed_lines += [(line_number, line)]
+            self.value = self.parser(line_number, line, self.value)
+        except ValueError as e:
+            raise ValueError(str(e) + ("\nin %s directive on test line %d" %
+                                       (self.keyword, line_number)))
+a843 26
+    @@staticmethod
+    def _handleBooleanExpr(line_number, line, output):
+        """A parser for BOOLEAN_EXPR type keywords"""
+        if output is None:
+            output = []
+        output.extend([s.strip() for s in line.split(',')])
+        # Evaluate each expression to verify syntax.
+        # We don't want any results, just the raised ValueError.
+        for s in output:
+            if s != '*':
+                BooleanExpression.evaluate(s, [])
+        return output
+
+    @@staticmethod
+    def _handleRequiresAny(line_number, line, output):
+        """A custom parser to transform REQUIRES-ANY: into REQUIRES:"""
+
+        # Extract the conditions specified in REQUIRES-ANY: as written.
+        conditions = []
+        IntegratedTestKeywordParser._handleList(line_number, line, conditions)
+
+        # Output a `REQUIRES: a || b || c` expression in its place.
+        expression = ' || '.join(conditions)
+        IntegratedTestKeywordParser._handleBooleanExpr(line_number,
+                                                       expression, output)
+        return output
+d849 1
+a849 1
+    and 'UNSUPPORTED' information.
+d858 2
+a859 2
+
+    # Install the built-in keyword parsers.
+d861 3
+d867 1
+a867 1
+        IntegratedTestKeywordParser('XFAIL:', ParserKind.BOOLEAN_EXPR,
+d869 6
+a874 7
+        IntegratedTestKeywordParser('REQUIRES:', ParserKind.BOOLEAN_EXPR,
+                                    initial_value=test.requires),
+        IntegratedTestKeywordParser('REQUIRES-ANY:', ParserKind.CUSTOM,
+                                    IntegratedTestKeywordParser._handleRequiresAny, 
+                                    initial_value=test.requires), 
+        IntegratedTestKeywordParser('UNSUPPORTED:', ParserKind.BOOLEAN_EXPR,
+                                    initial_value=test.unsupported),
+a877 2
+    
+    # Install user-defined additional parsers.
+d886 1
+a886 3
+        
+    # Collect the test lines from the script.
+    sourcepath = test.getSourcePath()
+d904 3
+a906 2
+    # Enforce REQUIRES:
+    missing_required_features = test.getMissingRequiredFeatures()
+d910 11
+a920 5
+                               "Test requires the following unavailable "
+                               "features: %s" % msg)
+
+    # Enforce UNSUPPORTED:
+    unsupported_features = test.getUnsupportedFeatures()
+d925 1
+a925 2
+            "Test does not support the following features "
+            "and/or targets: %s" % msg)
+d927 7
+a933 6
+    # Enforce limit_to_features.
+    if not test.isWithinFeatureLimits():
+        msg = ', '.join(test.config.limit_to_features)
+        return lit.Test.Result(Test.UNSUPPORTED,
+                               "Test does not require any of the features "
+                               "specified in limit_to_features: %s" % msg)
+d935 9
+d988 1
+a988 1
+        return lit.Test.Result(Test.UNSUPPORTED, 'Test is unsupported')
 @
 
 

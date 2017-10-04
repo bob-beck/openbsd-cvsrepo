@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.3
 	OPENBSD_6_2:1.1.1.2.0.2
 	OPENBSD_6_2_BASE:1.1.1.2
 	OPENBSD_6_1:1.1.1.2.0.4
@@ -31,8 +32,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.2
 date	2017.01.24.08.33.37;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.3;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.3
+date	2017.10.04.20.28.10;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1004,4 +1011,225 @@ bool TargetPassConfig::isGlobalISelAbortEnabled() const {
 bool TargetPassConfig::reportDiagnosticWhenGlobalISelFallback() const {
   return EnableGlobalISelAbort == 2;
 @
+
+
+1.1.1.3
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d1 1
+a1 1
+//===- TargetPassConfig.cpp - Target independent code generation passes ---===//
+d16 1
+a16 3
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+d21 1
+a22 1
+#include "llvm/Analysis/TargetTransformInfo.h"
+a24 2
+#include "llvm/CodeGen/MachinePassRegistry.h"
+#include "llvm/CodeGen/Passes.h"
+d26 1
+a30 5
+#include "llvm/MC/MCTargetOptions.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/CodeGen.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compiler.h"
+d33 1
+a33 1
+#include "llvm/Support/Threading.h"
+d35 1
+a37 2
+#include <cassert>
+#include <string>
+a94 13
+static cl::opt<bool> EnableMachineOutliner("enable-machine-outliner",
+    cl::Hidden,
+    cl::desc("Enable machine outliner"));
+// Enable or disable FastISel. Both options are needed, because
+// FastISel is enabled by default with -fast, and we wish to be
+// able to enable or disable fast-isel independently from -O0.
+static cl::opt<cl::boolOrDefault>
+EnableFastISelOption("fast-isel", cl::Hidden,
+  cl::desc("Enable the \"fast\" instruction selector"));
+
+static cl::opt<cl::boolOrDefault>
+    EnableGlobalISel("global-isel", cl::Hidden,
+                     cl::desc("Enable the \"global\" instruction selector"));
+a213 1
+
+d234 1
+a234 2
+
+} // end anonymous namespace
+a236 1
+
+d252 1
+a252 2
+
+} // end namespace llvm
+d261 5
+a265 2
+TargetPassConfig::TargetPassConfig(LLVMTargetMachine &TM, PassManagerBase &pm)
+    : ImmutablePass(ID), PM(&pm), TM(&TM) {
+d281 1
+a281 4
+    TM.Options.PrintMachineCode = true;
+
+  if (TM.Options.EnableIPRA)
+    setRequiresCodeGenSCCOrder();
+d306 1
+a306 1
+  return new TargetPassConfig(*this, PM);
+d310 2
+a311 4
+  : ImmutablePass(ID) {
+  report_fatal_error("Trying to construct TargetPassConfig without a target "
+                     "machine. Scheduling a CodeGen pass without a target "
+                     "triple set?");
+d424 1
+a424 6
+  bool Verify = VerifyMachineCode;
+#ifdef EXPENSIVE_CHECKS
+  if (VerifyMachineCode == cl::BOU_UNSET)
+    Verify = TM->isMachineVerifierClean();
+#endif
+  if (Verify)
+a482 8
+
+  // Add scalarization of target's unsupported masked memory intrinsics pass.
+  // the unsupported intrinsic will be replaced with a chain of basic blocks,
+  // that stores/loads element one-by-one if the appropriate mask bit is set.
+  addPass(createScalarizeMaskedMemIntrinPass());
+
+  // Expand reduction intrinsics into shuffle sequences if the target wants to.
+  addPass(createExpandReductionsPass());
+d502 1
+a502 1
+    addPass(createDwarfEHPass());
+d508 2
+a509 2
+    addPass(createWinEHPass());
+    addPass(createDwarfEHPass());
+d524 1
+a524 1
+    addPass(createCodeGenPreparePass());
+d534 1
+a534 1
+  if (requiresCodeGenSCCOrder())
+d539 2
+a540 2
+  addPass(createSafeStackPass());
+  addPass(createStackProtectorPass());
+a551 68
+bool TargetPassConfig::addCoreISelPasses() {
+  // Enable FastISel with -fast, but allow that to be overridden.
+  TM->setO0WantsFastISel(EnableFastISelOption != cl::BOU_FALSE);
+  if (EnableFastISelOption == cl::BOU_TRUE ||
+      (TM->getOptLevel() == CodeGenOpt::None && TM->getO0WantsFastISel()))
+    TM->setFastISel(true);
+
+  // Ask the target for an isel.
+  // Enable GlobalISel if the target wants to, but allow that to be overriden.
+  if (EnableGlobalISel == cl::BOU_TRUE ||
+      (EnableGlobalISel == cl::BOU_UNSET && isGlobalISelEnabled())) {
+    if (addIRTranslator())
+      return true;
+
+    addPreLegalizeMachineIR();
+
+    if (addLegalizeMachineIR())
+      return true;
+
+    // Before running the register bank selector, ask the target if it
+    // wants to run some passes.
+    addPreRegBankSelect();
+
+    if (addRegBankSelect())
+      return true;
+
+    addPreGlobalInstructionSelect();
+
+    if (addGlobalInstructionSelect())
+      return true;
+
+    // Pass to reset the MachineFunction if the ISel failed.
+    addPass(createResetMachineFunctionPass(
+        reportDiagnosticWhenGlobalISelFallback(), isGlobalISelAbortEnabled()));
+
+    // Provide a fallback path when we do not want to abort on
+    // not-yet-supported input.
+    if (!isGlobalISelAbortEnabled() && addInstSelector())
+      return true;
+
+  } else if (addInstSelector())
+    return true;
+
+  return false;
+}
+
+bool TargetPassConfig::addISelPasses() {
+  if (TM->Options.EmulatedTLS)
+    addPass(createLowerEmuTLSPass());
+
+  addPass(createPreISelIntrinsicLoweringPass());
+  addPass(createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
+  addIRPasses();
+  addCodeGenPrepare();
+  addPassesToHandleExceptions();
+  addISelPrepare();
+
+  return addCoreISelPasses();
+}
+
+/// -regalloc=... command line option.
+static FunctionPass *useDefaultRegisterAllocator() { return nullptr; }
+static cl::opt<RegisterRegAlloc::FunctionPassCtor, false,
+               RegisterPassParser<RegisterRegAlloc> >
+RegAlloc("regalloc",
+         cl::init(&useDefaultRegisterAllocator),
+         cl::desc("Register allocator to use"));
+
+d610 1
+a610 4
+  else {
+    if (RegAlloc != &useDefaultRegisterAllocator &&
+        RegAlloc != &createFastRegisterAllocator)
+      report_fatal_error("Must use fast (default) register allocator for unoptimized regalloc.");
+a611 1
+  }
+d623 1
+a623 1
+      addPass(createPrologEpilogInserterPass());
+a670 3
+  // Insert before XRay Instrumentation.
+  addPass(&FEntryInserterID, false);
+
+a673 3
+  if (EnableMachineOutliner)
+    PM->add(createMachineOutlinerPass());
+
+a706 4
+
+  // Coalesce basic blocks with the same branch condition
+  addPass(&BranchCoalescingID);
+
+d733 2
+a734 2
+static llvm::once_flag InitializeDefaultRegisterAllocatorFlag;
+
+d740 7
+d756 1
+a905 5
+
+bool TargetPassConfig::isGlobalISelEnabled() const {
+  return false;
+}
+
+@
+
 

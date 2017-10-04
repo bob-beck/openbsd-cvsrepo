@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.3
 	OPENBSD_6_2:1.1.1.2.0.2
 	OPENBSD_6_2_BASE:1.1.1.2
 	OPENBSD_6_1:1.1.1.2.0.4
@@ -31,8 +32,14 @@ commitid	piLU3CHugy63NlaI;
 1.1.1.2
 date	2017.01.24.08.33.35;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.3;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.3
+date	2017.10.04.20.28.09;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -259,4 +266,214 @@ d122 1
 a122 1
 #if defined(HAVE_DLFCN_H) && defined(HAVE_DLOPEN)
 @
+
+
+1.1.1.3
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d12 2
+a18 1
+#include "llvm/ADT/STLExtras.h"
+a24 1
+#include <vector>
+d26 13
+a38 2
+using namespace llvm;
+using namespace llvm::sys;
+d40 1
+a40 10
+// All methods for HandleSet should be used holding SymbolsMutex.
+class DynamicLibrary::HandleSet {
+  typedef std::vector<void *> HandleList;
+  HandleList Handles;
+  void *Process;
+
+public:
+  static void *DLOpen(const char *Filename, std::string *Err);
+  static void DLClose(void *Handle);
+  static void *DLSym(void *Handle, const char *Symbol);
+d42 1
+a42 2
+  HandleSet() : Process(nullptr) {}
+  ~HandleSet();
+d44 4
+a47 3
+  HandleList::iterator Find(void *Handle) {
+    return std::find(Handles.begin(), Handles.end(), Handle);
+  }
+d49 4
+a52 3
+  bool Contains(void *Handle) {
+    return Handle == Process || Find(Handle) != Handles.end();
+  }
+d54 1
+a54 4
+  bool AddLibrary(void *Handle, bool IsProcess = false, bool CanClose = true) {
+#ifdef LLVM_ON_WIN32
+    assert((Handle == this ? IsProcess : !IsProcess) && "Bad Handle.");
+#endif
+d56 15
+a70 15
+    if (LLVM_LIKELY(!IsProcess)) {
+      if (Find(Handle) != Handles.end()) {
+        if (CanClose)
+          DLClose(Handle);
+        return false;
+      }
+      Handles.push_back(Handle);
+    } else {
+#ifndef LLVM_ON_WIN32
+      if (Process) {
+        if (CanClose)
+          DLClose(Process);
+        if (Process == Handle)
+          return false;
+      }
+a71 4
+      Process = Handle;
+    }
+    return true;
+  }
+d73 2
+a74 14
+  void *LibLookup(const char *Symbol, DynamicLibrary::SearchOrdering Order) {
+    if (Order & SO_LoadOrder) {
+      for (void *Handle : Handles) {
+        if (void *Ptr = DLSym(Handle, Symbol))
+          return Ptr;
+      }
+    } else {
+      for (void *Handle : llvm::reverse(Handles)) {
+        if (void *Ptr = DLSym(Handle, Symbol))
+          return Ptr;
+      }
+    }
+    return nullptr;
+  }
+d76 4
+a79 22
+  void *Lookup(const char *Symbol, DynamicLibrary::SearchOrdering Order) {
+    assert(!((Order & SO_LoadedFirst) && (Order & SO_LoadedLast)) &&
+           "Invalid Ordering");
+
+    if (!Process || (Order & SO_LoadedFirst)) {
+      if (void *Ptr = LibLookup(Symbol, Order))
+        return Ptr;
+    }
+    if (Process) {
+      // Use OS facilities to search the current binary and all loaded libs.
+      if (void *Ptr = DLSym(Process, Symbol))
+        return Ptr;
+
+      // Search any libs that might have been skipped because of RTLD_LOCAL.
+      if (Order & SO_LoadedLast) {
+        if (void *Ptr = LibLookup(Symbol, Order))
+          return Ptr;
+      }
+    }
+    return nullptr;
+  }
+};
+d81 1
+a81 7
+namespace {
+// Collection of symbol name/value pairs to be searched prior to any libraries.
+static llvm::ManagedStatic<llvm::StringMap<void *>> ExplicitSymbols;
+// Collection of known library handles.
+static llvm::ManagedStatic<DynamicLibrary::HandleSet> OpenedHandles;
+// Lock for ExplicitSymbols and OpenedHandles.
+static llvm::ManagedStatic<llvm::sys::SmartMutex<true>> SymbolsMutex;
+d84 5
+a88 3
+#ifdef LLVM_ON_WIN32
+
+#include "Windows/DynamicLibrary.inc"
+d92 2
+a93 1
+#include "Unix/DynamicLibrary.inc"
+d95 4
+a98 10
+#endif
+
+char DynamicLibrary::Invalid;
+DynamicLibrary::SearchOrdering DynamicLibrary::SearchOrder =
+    DynamicLibrary::SO_Linker;
+
+namespace llvm {
+void *SearchForAddressOfSpecialSymbol(const char *SymbolName) {
+  return DoSearch(SymbolName); // DynamicLibrary.inc
+}
+d101 2
+a102 3
+void DynamicLibrary::AddSymbol(StringRef SymbolName, void *SymbolValue) {
+  SmartScopedLock<true> Lock(*SymbolsMutex);
+  (*ExplicitSymbols)[SymbolName] = SymbolValue;
+d105 1
+a105 11
+DynamicLibrary DynamicLibrary::getPermanentLibrary(const char *FileName,
+                                                   std::string *Err) {
+  // Force OpenedHandles to be added into the ManagedStatic list before any
+  // ManagedStatic can be added from static constructors in HandleSet::DLOpen.
+  HandleSet& HS = *OpenedHandles;
+
+  void *Handle = HandleSet::DLOpen(FileName, Err);
+  if (Handle != &Invalid) {
+    SmartScopedLock<true> Lock(*SymbolsMutex);
+    HS.AddLibrary(Handle, /*IsProcess*/ FileName == nullptr);
+  }
+d107 2
+a108 1
+  return DynamicLibrary(Handle);
+d111 1
+a111 2
+DynamicLibrary DynamicLibrary::addPermanentLibrary(void *Handle,
+                                                   std::string *Err) {
+a112 3
+  // If we've already loaded this library, tell the caller.
+  if (!OpenedHandles->AddLibrary(Handle, /*IsProcess*/false, /*CanClose*/false))
+    *Err = "Library already loaded";
+d114 21
+a134 2
+  return DynamicLibrary(Handle);
+}
+d136 2
+a137 5
+void *DynamicLibrary::getAddressOfSymbol(const char *SymbolName) {
+  if (!isValid())
+    return nullptr;
+  return HandleSet::DLSym(Data, SymbolName);
+}
+d139 8
+a146 1
+void *DynamicLibrary::SearchForAddressOfSymbol(const char *SymbolName) {
+d148 17
+a164 15
+    SmartScopedLock<true> Lock(*SymbolsMutex);
+
+    // First check symbols added via AddSymbol().
+    if (ExplicitSymbols.isConstructed()) {
+      StringMap<void *>::iterator i = ExplicitSymbols->find(SymbolName);
+
+      if (i != ExplicitSymbols->end())
+        return i->second;
+    }
+
+    // Now search the libraries.
+    if (OpenedHandles.isConstructed()) {
+      if (void *Ptr = OpenedHandles->Lookup(SymbolName, SearchOrder))
+        return Ptr;
+    }
+d166 2
+d169 1
+a169 1
+  return llvm::SearchForAddressOfSpecialSymbol(SymbolName);
+d172 2
+d178 1
+a178 1
+LLVMBool LLVMLoadLibraryPermanently(const char *Filename) {
+d189 1
+@
+
 

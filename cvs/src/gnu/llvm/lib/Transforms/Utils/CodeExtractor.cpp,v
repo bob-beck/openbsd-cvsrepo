@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.24;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.59;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1118,6 +1125,372 @@ a724 4
   // Update the branch weights for the exit block.
   if (BFI && NumExitBlocks > 1)
     calculateNewCallTerminatorWeights(codeReplacer, ExitWeights, BPI);
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a29 1
+#include "llvm/IR/IntrinsicInst.h"
+a60 27
+  // taking the address of a basic block moved to another function is illegal
+  if (BB.hasAddressTaken())
+    return false;
+
+  // don't hoist code that uses another basicblock address, as it's likely to
+  // lead to unexpected behavior, like cross-function jumps
+  SmallPtrSet<User const *, 16> Visited;
+  SmallVector<User const *, 16> ToVisit;
+
+  for (Instruction const &Inst : BB)
+    ToVisit.push_back(&Inst);
+
+  while (!ToVisit.empty()) {
+    User const *Curr = ToVisit.pop_back_val();
+    if (!Visited.insert(Curr).second)
+      continue;
+    if (isa<BlockAddress const>(Curr))
+      return false; // even a reference to self is likely to be not compatible
+
+    if (isa<Instruction>(Curr) && cast<Instruction>(Curr)->getParent() != &BB)
+      continue;
+
+    for (auto const &U : Curr->operands()) {
+      if (auto *UU = dyn_cast<User>(U))
+        ToVisit.push_back(UU);
+    }
+  }
+d76 3
+a78 3
+static SetVector<BasicBlock *>
+buildExtractionBlockSet(ArrayRef<BasicBlock *> BBs, DominatorTree *DT) {
+  assert(!BBs.empty() && "The set of blocks to extract must be non-empty");
+d81 2
+d85 3
+a87 1
+  for (BasicBlock *BB : BBs) {
+d89 1
+a89 7
+    // If this block is dead, don't process it.
+    if (DT && !DT->isReachableFromEntry(BB))
+      continue;
+
+    if (!Result.insert(BB))
+      llvm_unreachable("Repeated basic blocks in extraction input");
+    if (!CodeExtractor::isBlockValidForExtraction(*BB)) {
+d93 1
+a93 1
+  }
+d109 24
+d137 1
+a137 1
+      BPI(BPI), Blocks(buildExtractionBlockSet(BBs, DT)), NumExitBlocks(~0U) {}
+d143 1
+a143 1
+      BPI(BPI), Blocks(buildExtractionBlockSet(L.getBlocks(), &DT)),
+d146 6
+d172 2
+a173 239
+static BasicBlock *getCommonExitBlock(const SetVector<BasicBlock *> &Blocks) {
+  BasicBlock *CommonExitBlock = nullptr;
+  auto hasNonCommonExitSucc = [&](BasicBlock *Block) {
+    for (auto *Succ : successors(Block)) {
+      // Internal edges, ok.
+      if (Blocks.count(Succ))
+        continue;
+      if (!CommonExitBlock) {
+        CommonExitBlock = Succ;
+        continue;
+      }
+      if (CommonExitBlock == Succ)
+        continue;
+
+      return true;
+    }
+    return false;
+  };
+
+  if (any_of(Blocks, hasNonCommonExitSucc))
+    return nullptr;
+
+  return CommonExitBlock;
+}
+
+bool CodeExtractor::isLegalToShrinkwrapLifetimeMarkers(
+    Instruction *Addr) const {
+  AllocaInst *AI = cast<AllocaInst>(Addr->stripInBoundsConstantOffsets());
+  Function *Func = (*Blocks.begin())->getParent();
+  for (BasicBlock &BB : *Func) {
+    if (Blocks.count(&BB))
+      continue;
+    for (Instruction &II : BB) {
+
+      if (isa<DbgInfoIntrinsic>(II))
+        continue;
+
+      unsigned Opcode = II.getOpcode();
+      Value *MemAddr = nullptr;
+      switch (Opcode) {
+      case Instruction::Store:
+      case Instruction::Load: {
+        if (Opcode == Instruction::Store) {
+          StoreInst *SI = cast<StoreInst>(&II);
+          MemAddr = SI->getPointerOperand();
+        } else {
+          LoadInst *LI = cast<LoadInst>(&II);
+          MemAddr = LI->getPointerOperand();
+        }
+        // Global variable can not be aliased with locals.
+        if (dyn_cast<Constant>(MemAddr))
+          break;
+        Value *Base = MemAddr->stripInBoundsConstantOffsets();
+        if (!dyn_cast<AllocaInst>(Base) || Base == AI)
+          return false;
+        break;
+      }
+      default: {
+        IntrinsicInst *IntrInst = dyn_cast<IntrinsicInst>(&II);
+        if (IntrInst) {
+          if (IntrInst->getIntrinsicID() == Intrinsic::lifetime_start ||
+              IntrInst->getIntrinsicID() == Intrinsic::lifetime_end)
+            break;
+          return false;
+        }
+        // Treat all the other cases conservatively if it has side effects.
+        if (II.mayHaveSideEffects())
+          return false;
+      }
+      }
+    }
+  }
+
+  return true;
+}
+
+BasicBlock *
+CodeExtractor::findOrCreateBlockForHoisting(BasicBlock *CommonExitBlock) {
+  BasicBlock *SinglePredFromOutlineRegion = nullptr;
+  assert(!Blocks.count(CommonExitBlock) &&
+         "Expect a block outside the region!");
+  for (auto *Pred : predecessors(CommonExitBlock)) {
+    if (!Blocks.count(Pred))
+      continue;
+    if (!SinglePredFromOutlineRegion) {
+      SinglePredFromOutlineRegion = Pred;
+    } else if (SinglePredFromOutlineRegion != Pred) {
+      SinglePredFromOutlineRegion = nullptr;
+      break;
+    }
+  }
+
+  if (SinglePredFromOutlineRegion)
+    return SinglePredFromOutlineRegion;
+
+#ifndef NDEBUG
+  auto getFirstPHI = [](BasicBlock *BB) {
+    BasicBlock::iterator I = BB->begin();
+    PHINode *FirstPhi = nullptr;
+    while (I != BB->end()) {
+      PHINode *Phi = dyn_cast<PHINode>(I);
+      if (!Phi)
+        break;
+      if (!FirstPhi) {
+        FirstPhi = Phi;
+        break;
+      }
+    }
+    return FirstPhi;
+  };
+  // If there are any phi nodes, the single pred either exists or has already
+  // be created before code extraction.
+  assert(!getFirstPHI(CommonExitBlock) && "Phi not expected");
+#endif
+
+  BasicBlock *NewExitBlock = CommonExitBlock->splitBasicBlock(
+      CommonExitBlock->getFirstNonPHI()->getIterator());
+
+  for (auto *Pred : predecessors(CommonExitBlock)) {
+    if (Blocks.count(Pred))
+      continue;
+    Pred->getTerminator()->replaceUsesOfWith(CommonExitBlock, NewExitBlock);
+  }
+  // Now add the old exit block to the outline region.
+  Blocks.insert(CommonExitBlock);
+  return CommonExitBlock;
+}
+
+void CodeExtractor::findAllocas(ValueSet &SinkCands, ValueSet &HoistCands,
+                                BasicBlock *&ExitBlock) const {
+  Function *Func = (*Blocks.begin())->getParent();
+  ExitBlock = getCommonExitBlock(Blocks);
+
+  for (BasicBlock &BB : *Func) {
+    if (Blocks.count(&BB))
+      continue;
+    for (Instruction &II : BB) {
+      auto *AI = dyn_cast<AllocaInst>(&II);
+      if (!AI)
+        continue;
+
+      // Find the pair of life time markers for address 'Addr' that are either
+      // defined inside the outline region or can legally be shrinkwrapped into
+      // the outline region. If there are not other untracked uses of the
+      // address, return the pair of markers if found; otherwise return a pair
+      // of nullptr.
+      auto GetLifeTimeMarkers =
+          [&](Instruction *Addr, bool &SinkLifeStart,
+              bool &HoistLifeEnd) -> std::pair<Instruction *, Instruction *> {
+        Instruction *LifeStart = nullptr, *LifeEnd = nullptr;
+
+        for (User *U : Addr->users()) {
+          IntrinsicInst *IntrInst = dyn_cast<IntrinsicInst>(U);
+          if (IntrInst) {
+            if (IntrInst->getIntrinsicID() == Intrinsic::lifetime_start) {
+              // Do not handle the case where AI has multiple start markers.
+              if (LifeStart)
+                return std::make_pair<Instruction *>(nullptr, nullptr);
+              LifeStart = IntrInst;
+            }
+            if (IntrInst->getIntrinsicID() == Intrinsic::lifetime_end) {
+              if (LifeEnd)
+                return std::make_pair<Instruction *>(nullptr, nullptr);
+              LifeEnd = IntrInst;
+            }
+            continue;
+          }
+          // Find untracked uses of the address, bail.
+          if (!definedInRegion(Blocks, U))
+            return std::make_pair<Instruction *>(nullptr, nullptr);
+        }
+
+        if (!LifeStart || !LifeEnd)
+          return std::make_pair<Instruction *>(nullptr, nullptr);
+
+        SinkLifeStart = !definedInRegion(Blocks, LifeStart);
+        HoistLifeEnd = !definedInRegion(Blocks, LifeEnd);
+        // Do legality Check.
+        if ((SinkLifeStart || HoistLifeEnd) &&
+            !isLegalToShrinkwrapLifetimeMarkers(Addr))
+          return std::make_pair<Instruction *>(nullptr, nullptr);
+
+        // Check to see if we have a place to do hoisting, if not, bail.
+        if (HoistLifeEnd && !ExitBlock)
+          return std::make_pair<Instruction *>(nullptr, nullptr);
+
+        return std::make_pair(LifeStart, LifeEnd);
+      };
+
+      bool SinkLifeStart = false, HoistLifeEnd = false;
+      auto Markers = GetLifeTimeMarkers(AI, SinkLifeStart, HoistLifeEnd);
+
+      if (Markers.first) {
+        if (SinkLifeStart)
+          SinkCands.insert(Markers.first);
+        SinkCands.insert(AI);
+        if (HoistLifeEnd)
+          HoistCands.insert(Markers.second);
+        continue;
+      }
+
+      // Follow the bitcast.
+      Instruction *MarkerAddr = nullptr;
+      for (User *U : AI->users()) {
+
+        if (U->stripInBoundsConstantOffsets() == AI) {
+          SinkLifeStart = false;
+          HoistLifeEnd = false;
+          Instruction *Bitcast = cast<Instruction>(U);
+          Markers = GetLifeTimeMarkers(Bitcast, SinkLifeStart, HoistLifeEnd);
+          if (Markers.first) {
+            MarkerAddr = Bitcast;
+            continue;
+          }
+        }
+
+        // Found unknown use of AI.
+        if (!definedInRegion(Blocks, U)) {
+          MarkerAddr = nullptr;
+          break;
+        }
+      }
+
+      if (MarkerAddr) {
+        if (SinkLifeStart)
+          SinkCands.insert(Markers.first);
+        if (!definedInRegion(Blocks, MarkerAddr))
+          SinkCands.insert(MarkerAddr);
+        SinkCands.insert(AI);
+        if (HoistLifeEnd)
+          HoistCands.insert(Markers.second);
+      }
+    }
+  }
+}
+
+void CodeExtractor::findInputsOutputs(ValueSet &Inputs, ValueSet &Outputs,
+                                      const ValueSet &SinkCands) const {
+
+d179 3
+a181 5
+           ++OI) {
+        Value *V = *OI;
+        if (!SinkCands.count(V) && definedInCaller(Blocks, V))
+          Inputs.insert(V);
+      }
+d221 3
+a223 1
+  BasicBlock *NewBB = llvm::SplitBlock(Header, Header->getFirstNonPHI(), DT);
+d232 5
+a250 1
+    BasicBlock::iterator AfterPHIs;
+a256 1
+      PN->replaceAllUsesWith(NewPN);
+d365 3
+a367 2
+  AttrBuilder AB(oldFunction->getAttributes().getFnAttributes());
+  for (const auto &Attr : AB.td_attrs())
+d443 2
+a444 4
+
+  Module *M = newFunction->getParent();
+  LLVMContext &Context = M->getContext();
+  const DataLayout &DL = M->getDataLayout();
+d459 2
+a460 3
+        new AllocaInst(output->getType(), DL.getAllocaAddrSpace(),
+                       nullptr, output->getName() + ".loc",
+                       &codeReplacer->getParent()->front().front());
+d476 1
+a476 2
+    Struct = new AllocaInst(StructArgTy, DL.getAllocaAddrSpace(), nullptr,
+                            "structArg",
+d751 1
+a751 2
+  ValueSet inputs, outputs, SinkingCands, HoistingCands;
+  BasicBlock *CommonExit = nullptr;
+a789 3
+  findAllocas(SinkingCands, HoistingCands, CommonExit);
+  assert(HoistingCands.empty() || CommonExit);
+
+d791 1
+a791 13
+  findInputsOutputs(inputs, outputs, SinkingCands);
+
+  // Now sink all instructions which only have non-phi uses inside the region
+  for (auto *II : SinkingCands)
+    cast<Instruction>(II)->moveBefore(*newFuncRoot,
+                                      newFuncRoot->getFirstInsertionPt());
+
+  if (!HoistingCands.empty()) {
+    auto *HoistToBlock = findOrCreateBlockForHoisting(CommonExit);
+    Instruction *TI = HoistToBlock->getTerminator();
+    for (auto *II : HoistingCands)
+      cast<Instruction>(II)->moveBefore(TI);
+  }
+d865 6
 @
 
 

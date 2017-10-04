@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.25;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.00;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1923,6 +1930,127 @@ a1427 6
                                      createPPCAsmPrinterPass);
   TargetRegistry::RegisterAsmPrinter(getThePPC64LETarget(),
                                      createPPCAsmPrinterPass);
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d19 2
+a23 2
+#include "PPC.h"
+#include "PPCInstrInfo.h"
+a31 2
+#include "llvm/BinaryFormat/ELF.h"
+#include "llvm/BinaryFormat/MachO.h"
+d58 1
+d60 2
+a62 1
+#include "llvm/Support/raw_ostream.h"
+d115 1
+a115 3
+      bool Changed = AsmPrinter::runOnMachineFunction(MF);
+      emitXRayTable();
+      return Changed;
+a136 1
+    void EmitInstruction(const MachineInstr *MI) override;
+d405 1
+a405 1
+      int TOCSaveOffset = Subtarget->getFrameLowering()->getTOCSaveOffset();
+a1046 91
+}
+
+void PPCLinuxAsmPrinter::EmitInstruction(const MachineInstr *MI) {
+  if (!Subtarget->isPPC64())
+    return PPCAsmPrinter::EmitInstruction(MI);
+
+  switch (MI->getOpcode()) {
+  default:
+    return PPCAsmPrinter::EmitInstruction(MI);
+  case TargetOpcode::PATCHABLE_FUNCTION_ENTER: {
+    // .begin:
+    //   b .end # lis 0, FuncId[16..32]
+    //   nop    # li  0, FuncId[0..15]
+    //   std 0, -8(1)
+    //   mflr 0
+    //   bl __xray_FunctionEntry
+    //   mtlr 0
+    // .end:
+    //
+    // Update compiler-rt/lib/xray/xray_powerpc64.cc accordingly when number
+    // of instructions change.
+    MCSymbol *BeginOfSled = OutContext.createTempSymbol();
+    MCSymbol *EndOfSled = OutContext.createTempSymbol();
+    OutStreamer->EmitLabel(BeginOfSled);
+    EmitToStreamer(*OutStreamer,
+                   MCInstBuilder(PPC::B).addExpr(
+                       MCSymbolRefExpr::create(EndOfSled, OutContext)));
+    EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::NOP));
+    EmitToStreamer(
+        *OutStreamer,
+        MCInstBuilder(PPC::STD).addReg(PPC::X0).addImm(-8).addReg(PPC::X1));
+    EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::MFLR8).addReg(PPC::X0));
+    EmitToStreamer(*OutStreamer,
+                   MCInstBuilder(PPC::BL8_NOP)
+                       .addExpr(MCSymbolRefExpr::create(
+                           OutContext.getOrCreateSymbol("__xray_FunctionEntry"),
+                           OutContext)));
+    EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::MTLR8).addReg(PPC::X0));
+    OutStreamer->EmitLabel(EndOfSled);
+    recordSled(BeginOfSled, *MI, SledKind::FUNCTION_ENTER);
+    break;
+  }
+  case TargetOpcode::PATCHABLE_FUNCTION_EXIT: {
+    // .p2align 3
+    // .begin:
+    //   b(lr)? # lis 0, FuncId[16..32]
+    //   nop    # li  0, FuncId[0..15]
+    //   std 0, -8(1)
+    //   mflr 0
+    //   bl __xray_FunctionExit
+    //   mtlr 0
+    // .end:
+    //   b(lr)?
+    //
+    // Update compiler-rt/lib/xray/xray_powerpc64.cc accordingly when number
+    // of instructions change.
+    const MachineInstr *Next = [&] {
+      MachineBasicBlock::const_iterator It(MI);
+      assert(It != MI->getParent()->end());
+      ++It;
+      assert(It->isReturn());
+      return &*It;
+    }();
+    OutStreamer->EmitCodeAlignment(8);
+    MCSymbol *BeginOfSled = OutContext.createTempSymbol();
+    OutStreamer->EmitLabel(BeginOfSled);
+    MCInst TmpInst;
+    LowerPPCMachineInstrToMCInst(Next, TmpInst, *this, false);
+    EmitToStreamer(*OutStreamer, TmpInst);
+    EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::NOP));
+    EmitToStreamer(
+        *OutStreamer,
+        MCInstBuilder(PPC::STD).addReg(PPC::X0).addImm(-8).addReg(PPC::X1));
+    EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::MFLR8).addReg(PPC::X0));
+    EmitToStreamer(*OutStreamer,
+                   MCInstBuilder(PPC::BL8_NOP)
+                       .addExpr(MCSymbolRefExpr::create(
+                           OutContext.getOrCreateSymbol("__xray_FunctionExit"),
+                           OutContext)));
+    EmitToStreamer(*OutStreamer, MCInstBuilder(PPC::MTLR8).addReg(PPC::X0));
+    recordSled(BeginOfSled, *MI, SledKind::FUNCTION_EXIT);
+    break;
+  }
+  case TargetOpcode::PATCHABLE_TAIL_CALL:
+  case TargetOpcode::PATCHABLE_RET:
+    // PPC's tail call instruction, e.g. PPC::TCRETURNdi8, doesn't really
+    // lower to a PPC::B instruction. The PPC::B instruction is generated
+    // before it, and handled by the normal case.
+    llvm_unreachable("Tail call is handled in the normal case. See comments"
+                     "around this assert.");
+  }
 @
 
 

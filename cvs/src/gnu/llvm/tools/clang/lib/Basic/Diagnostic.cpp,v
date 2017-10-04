@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.06;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.46;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1111,6 +1118,159 @@ a1013 3
   assert((NumFreeListEntries == NumCached ||
           llvm::CrashRecoveryContext::isRecoveringFromCrash()) &&
          "A partial is on the lam");
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a18 1
+#include "clang/Basic/SourceManager.h"
+d69 6
+a74 1
+  SuppressAfterFatalError = true;
+d80 1
+d134 1
+a134 1
+  DiagStatesByLoc.clear();
+d140 1
+a140 1
+  DiagStatesByLoc.appendFirst(&DiagStates.back());
+d154 1
+a154 1
+  unsigned ID = DelayedDiagID;
+d156 2
+a157 1
+  Report(ID) << DelayedDiagArg1 << DelayedDiagArg2;
+d160 21
+a180 88
+void DiagnosticsEngine::DiagStateMap::appendFirst(
+                                             DiagState *State) {
+  assert(Files.empty() && "not first");
+  FirstDiagState = CurDiagState = State;
+  CurDiagStateLoc = SourceLocation();
+}
+
+void DiagnosticsEngine::DiagStateMap::append(SourceManager &SrcMgr,
+                                             SourceLocation Loc,
+                                             DiagState *State) {
+  CurDiagState = State;
+  CurDiagStateLoc = Loc;
+
+  std::pair<FileID, unsigned> Decomp = SrcMgr.getDecomposedLoc(Loc);
+  unsigned Offset = Decomp.second;
+  for (File *F = getFile(SrcMgr, Decomp.first); F;
+       Offset = F->ParentOffset, F = F->Parent) {
+    F->HasLocalTransitions = true;
+    auto &Last = F->StateTransitions.back();
+    assert(Last.Offset <= Offset && "state transitions added out of order");
+
+    if (Last.Offset == Offset) {
+      if (Last.State == State)
+        break;
+      Last.State = State;
+      continue;
+    }
+
+    F->StateTransitions.push_back({State, Offset});
+  }
+}
+
+DiagnosticsEngine::DiagState *
+DiagnosticsEngine::DiagStateMap::lookup(SourceManager &SrcMgr,
+                                        SourceLocation Loc) const {
+  // Common case: we have not seen any diagnostic pragmas.
+  if (Files.empty())
+    return FirstDiagState;
+
+  std::pair<FileID, unsigned> Decomp = SrcMgr.getDecomposedLoc(Loc);
+  const File *F = getFile(SrcMgr, Decomp.first);
+  return F->lookup(Decomp.second);
+}
+
+DiagnosticsEngine::DiagState *
+DiagnosticsEngine::DiagStateMap::File::lookup(unsigned Offset) const {
+  auto OnePastIt = std::upper_bound(
+      StateTransitions.begin(), StateTransitions.end(), Offset,
+      [](unsigned Offset, const DiagStatePoint &P) {
+        return Offset < P.Offset;
+      });
+  assert(OnePastIt != StateTransitions.begin() && "missing initial state");
+  return OnePastIt[-1].State;
+}
+
+DiagnosticsEngine::DiagStateMap::File *
+DiagnosticsEngine::DiagStateMap::getFile(SourceManager &SrcMgr,
+                                         FileID ID) const {
+  // Get or insert the File for this ID.
+  auto Range = Files.equal_range(ID);
+  if (Range.first != Range.second)
+    return &Range.first->second;
+  auto &F = Files.insert(Range.first, std::make_pair(ID, File()))->second;
+
+  // We created a new File; look up the diagnostic state at the start of it and
+  // initialize it.
+  if (ID.isValid()) {
+    std::pair<FileID, unsigned> Decomp = SrcMgr.getDecomposedIncludedLoc(ID);
+    F.Parent = getFile(SrcMgr, Decomp.first);
+    F.ParentOffset = Decomp.second;
+    F.StateTransitions.push_back({F.Parent->lookup(Decomp.second), 0});
+  } else {
+    // This is the (imaginary) root file into which we pretend all top-level
+    // files are included; it descends from the initial state.
+    //
+    // FIXME: This doesn't guarantee that we use the same ordering as
+    // isBeforeInTranslationUnit in the cases where someone invented another
+    // top-level file and added diagnostic pragmas to it. See the code at the
+    // end of isBeforeInTranslationUnit for the quirks it deals with.
+    F.StateTransitions.push_back({FirstDiagState, 0});
+  }
+  return &F;
+}
+
+void DiagnosticsEngine::PushDiagStatePoint(DiagState *State,
+                                           SourceLocation Loc) {
+  assert(Loc.isValid() && "Adding invalid loc point");
+  DiagStatesByLoc.append(*SourceMgr, Loc, State);
+d190 1
+d193 2
+a195 1
+  bool WasUpgradedFromWarning = false;
+d199 1
+a199 1
+        Info.getSeverity() == diag::Severity::Fatal) {
+a200 2
+      WasUpgradedFromWarning = true;
+    }
+a202 1
+  Mapping.setUpgradedFromWarning(WasUpgradedFromWarning);
+d205 2
+a206 7
+  if ((L.isInvalid() || L == DiagStatesByLoc.getCurDiagStateLoc()) &&
+      DiagStatesByLoc.getCurDiagState()) {
+    // FIXME: This is theoretically wrong: if the current state is shared with
+    // some other location (via push/pop) we will change the state for that
+    // other location as well. This cannot currently happen, as we can't update
+    // the diagnostic state at the same location at which we pop.
+    DiagStatesByLoc.getCurDiagState()->setMapping(Diag, Mapping);
+d210 39
+a248 6
+  // A diagnostic pragma occurred, create a new DiagState initialized with
+  // the current one and a new DiagStatePoint to record at which location
+  // the new state became active.
+  DiagStates.push_back(*GetCurDiagState());
+  DiagStates.back().setMapping(Diag, Mapping);
+  PushDiagStatePoint(&DiagStates.back(), L);
+d305 2
+a306 2
+  // Otherwise, we want to set the diagnostic mapping's "no Wfatal-errors" bit,
+  // and potentially downgrade anything already mapped to be a fatal error.
+d388 1
+d392 1
+a392 1
+  if (!Force && DelayedDiagID)
 @
 
 

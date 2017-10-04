@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.5
 	OPENBSD_6_2:1.1.1.4.0.2
 	OPENBSD_6_2_BASE:1.1.1.4
 	OPENBSD_6_1:1.1.1.4.0.4
@@ -43,8 +44,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.4
 date	2017.03.14.08.08.05;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.5;
 commitid	aUi5NxOzBSLCN5eN;
+
+1.1.1.5
+date	2017.10.04.20.27.59;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -2167,6 +2174,203 @@ log
 text
 @d1199 2
 d1202 1
+@
+
+
+1.1.1.5
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a79 1
+/// Memory promotion is enabled by default.
+d81 1
+a81 1
+    DisablePromotion("disable-licm-promotion", cl::Hidden, cl::init(false),
+a83 5
+static cl::opt<uint32_t> MaxNumUsesTraversed(
+    "licm-max-num-uses-traversed", cl::Hidden, cl::init(8),
+    cl::desc("Max num uses visited for identifying load "
+             "invariance in loop using invariant start (default = 8)"));
+
+d204 3
+a206 3
+  auto PA = getLoopPassPreservedAnalyses();
+  PA.preserveSet<CFGAnalyses>();
+  return PA;
+a427 23
+      // Attempt to remove floating point division out of the loop by converting
+      // it to a reciprocal multiplication.
+      if (I.getOpcode() == Instruction::FDiv &&
+          CurLoop->isLoopInvariant(I.getOperand(1)) &&
+          I.hasAllowReciprocal()) {
+        auto Divisor = I.getOperand(1);
+        auto One = llvm::ConstantFP::get(Divisor->getType(), 1.0);
+        auto ReciprocalDivisor = BinaryOperator::CreateFDiv(One, Divisor);
+        ReciprocalDivisor->setFastMathFlags(I.getFastMathFlags());
+        ReciprocalDivisor->insertBefore(&I);
+
+        auto Product = BinaryOperator::CreateFMul(I.getOperand(0),
+                                                  ReciprocalDivisor);
+        Product->setFastMathFlags(I.getFastMathFlags());
+        Product->insertAfter(&I);
+        I.replaceAllUsesWith(Product);
+        I.eraseFromParent();
+
+        hoist(*ReciprocalDivisor, DT, CurLoop, SafetyInfo, ORE);
+        Changed = true;
+        continue;
+      }
+
+d464 1
+a464 4
+  // Skip header as it has been computed and stored in HeaderMayThrow.
+  // The first block in loopinfo.Blocks is guaranteed to be the header.
+  assert(Header == *CurLoop->getBlocks().begin() && "First block must be header");
+  for (Loop::block_iterator BB = std::next(CurLoop->block_begin()),
+a479 53
+// Return true if LI is invariant within scope of the loop. LI is invariant if
+// CurLoop is dominated by an invariant.start representing the same memory location
+// and size as the memory location LI loads from, and also the invariant.start
+// has no uses.
+static bool isLoadInvariantInLoop(LoadInst *LI, DominatorTree *DT,
+                                  Loop *CurLoop) {
+  Value *Addr = LI->getOperand(0);
+  const DataLayout &DL = LI->getModule()->getDataLayout();
+  const uint32_t LocSizeInBits = DL.getTypeSizeInBits(
+      cast<PointerType>(Addr->getType())->getElementType());
+
+  // if the type is i8 addrspace(x)*, we know this is the type of
+  // llvm.invariant.start operand
+  auto *PtrInt8Ty = PointerType::get(Type::getInt8Ty(LI->getContext()),
+                                     LI->getPointerAddressSpace());
+  unsigned BitcastsVisited = 0;
+  // Look through bitcasts until we reach the i8* type (this is invariant.start
+  // operand type).
+  while (Addr->getType() != PtrInt8Ty) {
+    auto *BC = dyn_cast<BitCastInst>(Addr);
+    // Avoid traversing high number of bitcast uses.
+    if (++BitcastsVisited > MaxNumUsesTraversed || !BC)
+      return false;
+    Addr = BC->getOperand(0);
+  }
+
+  unsigned UsesVisited = 0;
+  // Traverse all uses of the load operand value, to see if invariant.start is
+  // one of the uses, and whether it dominates the load instruction.
+  for (auto *U : Addr->users()) {
+    // Avoid traversing for Load operand with high number of users.
+    if (++UsesVisited > MaxNumUsesTraversed)
+      return false;
+    IntrinsicInst *II = dyn_cast<IntrinsicInst>(U);
+    // If there are escaping uses of invariant.start instruction, the load maybe
+    // non-invariant.
+    if (!II || II->getIntrinsicID() != Intrinsic::invariant_start ||
+        !II->use_empty())
+      continue;
+    unsigned InvariantSizeInBits =
+        cast<ConstantInt>(II->getArgOperand(0))->getSExtValue() * 8;
+    // Confirm the invariant.start location size contains the load operand size
+    // in bits. Also, the invariant.start should dominate the load, and we
+    // should not hoist the load out of a loop that contains this dominating
+    // invariant.start.
+    if (LocSizeInBits <= InvariantSizeInBits &&
+        DT->properlyDominates(II->getParent(), CurLoop->getHeader()))
+      return true;
+  }
+
+  return false;
+}
+
+a495 4
+    // This checks for an invariant.start dominating the load.
+    if (isLoadInvariantInLoop(LI, DT, CurLoop))
+      return true;
+
+d785 1
+a785 1
+            << "hoisting " << ore::NV("Inst", &I));
+a854 1
+  bool UnorderedAtomic;
+d878 1
+a878 1
+               bool UnorderedAtomic, const AAMDNodes &AATags)
+d881 1
+a881 2
+        LI(li), DL(std::move(dl)), Alignment(alignment),
+        UnorderedAtomic(UnorderedAtomic),AATags(AATags) {}
+a904 2
+      if (UnorderedAtomic)
+        NewSI->setOrdering(AtomicOrdering::Unordered);
+a994 3
+  // Keep track of which types of access we see
+  bool SawUnorderedAtomic = false; 
+  bool SawNotAtomic = false;
+a998 2
+  // Do we know this object does not escape ?
+  bool IsKnownNonEscapingObject = false;
+d1004 3
+a1006 21
+    // If the underlying object is not an alloca, nor a pointer that does not
+    // escape, then we can not effectively prove that the store is dead along
+    // the unwind edge. i.e. the caller of this function could have ways to
+    // access the pointed object.
+    Value *Object = GetUnderlyingObject(SomePtr, MDL);
+    // If this is a base pointer we do not understand, simply bail.
+    // We only handle alloca and return value from alloc-like fn right now.
+    if (!isa<AllocaInst>(Object)) {
+        if (!isAllocLikeFn(Object, TLI))
+          return false;
+      // If this is an alloc like fn. There are more constraints we need to verify.
+      // More specifically, we must make sure that the pointer can not escape.
+      //
+      // NOTE: PointerMayBeCaptured is not enough as the pointer may have escaped
+      // even though its not captured by the enclosing function. Standard allocation
+      // functions like malloc, calloc, and operator new return values which can
+      // be assumed not to have previously escaped.
+      if (PointerMayBeCaptured(Object, true, true))
+        return false;
+      IsKnownNonEscapingObject = true;
+    }
+d1032 1
+a1032 1
+        if (!Load->isUnordered())
+a1033 3
+        
+        SawUnorderedAtomic |= Load->isAtomic();
+        SawNotAtomic |= !Load->isAtomic();
+d1044 1
+a1044 1
+        if (!Store->isUnordered())
+a1046 3
+        SawUnorderedAtomic |= Store->isAtomic();
+        SawNotAtomic |= !Store->isAtomic();
+
+a1098 6
+  // If we found both an unordered atomic instruction and a non-atomic memory
+  // access, bail.  We can't blindly promote non-atomic to atomic since we
+  // might not be able to lower the result.  We can't downgrade since that
+  // would violate memory model.  Also, align 0 is an error for atomics.
+  if (SawUnorderedAtomic && SawNotAtomic)
+    return false;
+d1109 3
+a1111 7
+    // If this is a known non-escaping object, it is safe to insert the stores.
+    if (IsKnownNonEscapingObject)
+      SafeToInsertStore = true;
+    else {
+      Value *Object = GetUnderlyingObject(SomePtr, MDL);
+      SafeToInsertStore =
+        (isAllocLikeFn(Object, TLI) || isa<AllocaInst>(Object)) && 
+a1112 1
+    }
+d1137 1
+a1137 2
+                        InsertPts, PIC, *CurAST, *LI, DL, Alignment,
+                        SawUnorderedAtomic, AATags);
+a1142 2
+  if (SawUnorderedAtomic)
+    PreheaderLoad->setOrdering(AtomicOrdering::Unordered);
 @
 
 

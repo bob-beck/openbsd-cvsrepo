@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.30;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.05;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -766,6 +773,291 @@ a483 2
 d486 1
 a486 1
     unsigned NumVecElts = Ty->getVectorNumElements();
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d12 1
+a13 1
+#include "llvm/Analysis/TargetTransformInfo.h"
+a22 17
+static cl::opt<bool> EnableFalkorHWPFUnrollFix("enable-falkor-hwpf-unroll-fix",
+                                               cl::init(true), cl::Hidden);
+
+bool AArch64TTIImpl::areInlineCompatible(const Function *Caller,
+                                         const Function *Callee) const {
+  const TargetMachine &TM = getTLI()->getTargetMachine();
+
+  const FeatureBitset &CallerBits =
+      TM.getSubtargetImpl(*Caller)->getFeatureBits();
+  const FeatureBitset &CalleeBits =
+      TM.getSubtargetImpl(*Callee)->getFeatureBits();
+
+  // Inline a callee if its target-features are a subset of the callers
+  // target-features.
+  return (CallerBits & CalleeBits) == CalleeBits;
+}
+
+d179 1
+a179 66
+bool AArch64TTIImpl::isWideningInstruction(Type *DstTy, unsigned Opcode,
+                                           ArrayRef<const Value *> Args) {
+
+  // A helper that returns a vector type from the given type. The number of
+  // elements in type Ty determine the vector width.
+  auto toVectorTy = [&](Type *ArgTy) {
+    return VectorType::get(ArgTy->getScalarType(),
+                           DstTy->getVectorNumElements());
+  };
+
+  // Exit early if DstTy is not a vector type whose elements are at least
+  // 16-bits wide.
+  if (!DstTy->isVectorTy() || DstTy->getScalarSizeInBits() < 16)
+    return false;
+
+  // Determine if the operation has a widening variant. We consider both the
+  // "long" (e.g., usubl) and "wide" (e.g., usubw) versions of the
+  // instructions.
+  //
+  // TODO: Add additional widening operations (e.g., mul, shl, etc.) once we
+  //       verify that their extending operands are eliminated during code
+  //       generation.
+  switch (Opcode) {
+  case Instruction::Add: // UADDL(2), SADDL(2), UADDW(2), SADDW(2).
+  case Instruction::Sub: // USUBL(2), SSUBL(2), USUBW(2), SSUBW(2).
+    break;
+  default:
+    return false;
+  }
+
+  // To be a widening instruction (either the "wide" or "long" versions), the
+  // second operand must be a sign- or zero extend having a single user. We
+  // only consider extends having a single user because they may otherwise not
+  // be eliminated.
+  if (Args.size() != 2 ||
+      (!isa<SExtInst>(Args[1]) && !isa<ZExtInst>(Args[1])) ||
+      !Args[1]->hasOneUse())
+    return false;
+  auto *Extend = cast<CastInst>(Args[1]);
+
+  // Legalize the destination type and ensure it can be used in a widening
+  // operation.
+  auto DstTyL = TLI->getTypeLegalizationCost(DL, DstTy);
+  unsigned DstElTySize = DstTyL.second.getScalarSizeInBits();
+  if (!DstTyL.second.isVector() || DstElTySize != DstTy->getScalarSizeInBits())
+    return false;
+
+  // Legalize the source type and ensure it can be used in a widening
+  // operation.
+  Type *SrcTy = toVectorTy(Extend->getSrcTy());
+  auto SrcTyL = TLI->getTypeLegalizationCost(DL, SrcTy);
+  unsigned SrcElTySize = SrcTyL.second.getScalarSizeInBits();
+  if (!SrcTyL.second.isVector() || SrcElTySize != SrcTy->getScalarSizeInBits())
+    return false;
+
+  // Get the total number of vector elements in the legalized types.
+  unsigned NumDstEls = DstTyL.first * DstTyL.second.getVectorNumElements();
+  unsigned NumSrcEls = SrcTyL.first * SrcTyL.second.getVectorNumElements();
+
+  // Return true if the legalized types have the same number of vector elements
+  // and the destination element type size is twice that of the source type.
+  return NumDstEls == NumSrcEls && 2 * SrcElTySize == DstElTySize;
+}
+
+int AArch64TTIImpl::getCastInstrCost(unsigned Opcode, Type *Dst, Type *Src,
+                                     const Instruction *I) {
+a182 20
+  // If the cast is observable, and it is used by a widening instruction (e.g.,
+  // uaddl, saddw, etc.), it may be free.
+  if (I && I->hasOneUse()) {
+    auto *SingleUser = cast<Instruction>(*I->user_begin());
+    SmallVector<const Value *, 4> Operands(SingleUser->operand_values());
+    if (isWideningInstruction(Dst, SingleUser->getOpcode(), Operands)) {
+      // If the cast is the second operand, it is free. We will generate either
+      // a "wide" or "long" version of the widening instruction.
+      if (I == SingleUser->getOperand(1))
+        return 0;
+      // If the cast is not the second operand, it will be free if it looks the
+      // same as the second operand. In this case, we will generate a "long"
+      // version of the widening instruction.
+      if (auto *Cast = dyn_cast<CastInst>(SingleUser->getOperand(1)))
+        if (I->getOpcode() == Cast->getOpcode() &&
+            cast<CastInst>(I)->getSrcTy() == Cast->getSrcTy())
+          return 0;
+    }
+  }
+
+a380 10
+  // If the instruction is a widening instruction (e.g., uaddl, saddw, etc.),
+  // add in the widening overhead specified by the sub-target. Since the
+  // extends feeding widening instructions are performed automatically, they
+  // aren't present in the generated code and have a zero cost. By adding a
+  // widening overhead here, we attach the total cost of the combined operation
+  // to the widening instruction.
+  int Cost = 0;
+  if (isWideningInstruction(Ty, Opcode, Args))
+    Cost += ST->getWideningBaseCost();
+
+d390 3
+a392 3
+    Cost += getArithmeticInstrCost(Instruction::Add, Ty, Opd1Info, Opd2Info,
+                                   TargetTransformInfo::OP_None,
+                                   TargetTransformInfo::OP_None);
+d407 2
+a408 2
+    return Cost + BaseT::getArithmeticInstrCost(Opcode, Ty, Opd1Info, Opd2Info,
+                                                Opd1PropInfo, Opd2PropInfo);
+d416 1
+a416 1
+    return (Cost + 1) * LT.first;
+d439 1
+a439 1
+                                       Type *CondTy, const Instruction *I) {
+d466 1
+a466 1
+  return BaseT::getCmpSelInstrCost(Opcode, ValTy, CondTy, I);
+d470 1
+a470 2
+                                    unsigned Alignment, unsigned AddressSpace,
+                                    const Instruction *I) {
+d508 2
+a509 1
+    auto *SubVecTy = VectorType::get(VecTy->getScalarType(), NumElts / Factor);
+d512 2
+a513 5
+    // Accesses having vector types that are a multiple of 128 bits can be
+    // matched to more than one ldN/stN instruction.
+    if (NumElts % Factor == 0 &&
+        TLI->isLegalInterleavedAccessType(SubVecTy, DL))
+      return Factor * TLI->getNumInterleavedAccesses(SubVecTy, DL);
+d536 1
+a536 53
+// For Falkor, we want to avoid having too many strided loads in a loop since
+// that can exhaust the HW prefetcher resources.  We adjust the unroller
+// MaxCount preference below to attempt to ensure unrolling doesn't create too
+// many strided loads.
+static void
+getFalkorUnrollingPreferences(Loop *L, ScalarEvolution &SE,
+                              TargetTransformInfo::UnrollingPreferences &UP) {
+  enum { MaxStridedLoads = 7 };
+  auto countStridedLoads = [](Loop *L, ScalarEvolution &SE) {
+    int StridedLoads = 0;
+    // FIXME? We could make this more precise by looking at the CFG and
+    // e.g. not counting loads in each side of an if-then-else diamond.
+    for (const auto BB : L->blocks()) {
+      for (auto &I : *BB) {
+        LoadInst *LMemI = dyn_cast<LoadInst>(&I);
+        if (!LMemI)
+          continue;
+
+        Value *PtrValue = LMemI->getPointerOperand();
+        if (L->isLoopInvariant(PtrValue))
+          continue;
+
+        const SCEV *LSCEV = SE.getSCEV(PtrValue);
+        const SCEVAddRecExpr *LSCEVAddRec = dyn_cast<SCEVAddRecExpr>(LSCEV);
+        if (!LSCEVAddRec || !LSCEVAddRec->isAffine())
+          continue;
+
+        // FIXME? We could take pairing of unrolled load copies into account
+        // by looking at the AddRec, but we would probably have to limit this
+        // to loops with no stores or other memory optimization barriers.
+        ++StridedLoads;
+        // We've seen enough strided loads that seeing more won't make a
+        // difference.
+        if (StridedLoads > MaxStridedLoads / 2)
+          return StridedLoads;
+      }
+    }
+    return StridedLoads;
+  };
+
+  int StridedLoads = countStridedLoads(L, SE);
+  DEBUG(dbgs() << "falkor-hwpf: detected " << StridedLoads
+               << " strided loads\n");
+  // Pick the largest power of 2 unroll count that won't result in too many
+  // strided loads.
+  if (StridedLoads) {
+    UP.MaxCount = 1 << Log2_32(MaxStridedLoads / StridedLoads);
+    DEBUG(dbgs() << "falkor-hwpf: setting unroll MaxCount to " << UP.MaxCount
+                 << '\n');
+  }
+}
+
+void AArch64TTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
+d539 1
+a539 1
+  BaseT::getUnrollingPreferences(L, SE, UP);
+a548 4
+
+  if (ST->getProcFamily() == AArch64Subtarget::Falkor &&
+      EnableFalkorHWPFUnrollFix)
+    getFalkorUnrollingPreferences(L, SE, UP);
+d597 2
+d606 2
+a630 32
+/// See if \p I should be considered for address type promotion. We check if \p
+/// I is a sext with right type and used in memory accesses. If it used in a
+/// "complex" getelementptr, we allow it to be promoted without finding other
+/// sext instructions that sign extended the same initial value. A getelementptr
+/// is considered as "complex" if it has more than 2 operands.
+bool AArch64TTIImpl::shouldConsiderAddressTypePromotion(
+    const Instruction &I, bool &AllowPromotionWithoutCommonHeader) {
+  bool Considerable = false;
+  AllowPromotionWithoutCommonHeader = false;
+  if (!isa<SExtInst>(&I))
+    return false;
+  Type *ConsideredSExtType =
+      Type::getInt64Ty(I.getParent()->getParent()->getContext());
+  if (I.getType() != ConsideredSExtType)
+    return false;
+  // See if the sext is the one with the right type and used in at least one
+  // GetElementPtrInst.
+  for (const User *U : I.users()) {
+    if (const GetElementPtrInst *GEPInst = dyn_cast<GetElementPtrInst>(U)) {
+      Considerable = true;
+      // A getelementptr is considered as "complex" if it has more than 2
+      // operands. We will promote a SExt used in such complex GEP as we
+      // expect some computation to be merged if they are done on 64 bits.
+      if (GEPInst->getNumOperands() > 2) {
+        AllowPromotionWithoutCommonHeader = true;
+        break;
+      }
+    }
+  }
+  return Considerable;
+}
+
+a644 25
+}
+
+bool AArch64TTIImpl::useReductionIntrinsic(unsigned Opcode, Type *Ty,
+                                           TTI::ReductionFlags Flags) const {
+  assert(isa<VectorType>(Ty) && "Expected Ty to be a vector type");
+  unsigned ScalarBits = Ty->getScalarSizeInBits();
+  switch (Opcode) {
+  case Instruction::FAdd:
+  case Instruction::FMul:
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor:
+  case Instruction::Mul:
+    return false;
+  case Instruction::Add:
+    return ScalarBits * Ty->getVectorNumElements() >= 128;
+  case Instruction::ICmp:
+    return (ScalarBits < 64) &&
+           (ScalarBits * Ty->getVectorNumElements() >= 128);
+  case Instruction::FCmp:
+    return Flags.NoNaN;
+  default:
+    llvm_unreachable("Unhandled reduction opcode");
+  }
+  return false;
 @
 
 

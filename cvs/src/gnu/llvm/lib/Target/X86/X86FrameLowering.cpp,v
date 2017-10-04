@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.28;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.02;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -3639,6 +3646,191 @@ a2964 2
 d2973 1
 a2973 1
       MFI.CreateFixedObject(SlotSize, UnwindHelpOffset, /*Immutable=*/false);
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d32 1
+a33 1
+#include "llvm/Target/TargetOptions.h"
+a254 2
+  MachineInstr::MIFlag Flag =
+      isSub ? MachineInstr::FrameSetup : MachineInstr::FrameDestroy;
+d259 5
+a263 5
+  if (Offset > Chunk) {
+    // Rather than emit a long series of instructions for large offsets,
+    // load the offset into a register and do one sub/add
+    unsigned Reg = 0;
+    unsigned Rax = (unsigned)(Is64Bit ? X86::RAX : X86::EAX);
+d265 4
+a268 4
+    if (isSub && !isEAXLiveIn(MBB))
+      Reg = Rax;
+    else
+      Reg = findDeadCallerSavedReg(MBB, MBBI, TRI, Is64Bit);
+d270 14
+a283 45
+    unsigned MovRIOpc = Is64Bit ? X86::MOV64ri : X86::MOV32ri;
+    unsigned AddSubRROpc =
+        isSub ? getSUBrrOpcode(Is64Bit) : getADDrrOpcode(Is64Bit);
+    if (Reg) {
+      BuildMI(MBB, MBBI, DL, TII.get(MovRIOpc), Reg)
+          .addImm(Offset)
+          .setMIFlag(Flag);
+      MachineInstr *MI = BuildMI(MBB, MBBI, DL, TII.get(AddSubRROpc), StackPtr)
+                             .addReg(StackPtr)
+                             .addReg(Reg);
+      MI->getOperand(3).setIsDead(); // The EFLAGS implicit def is dead.
+      return;
+    } else if (Offset > 8 * Chunk) {
+      // If we would need more than 8 add or sub instructions (a >16GB stack
+      // frame), it's worth spilling RAX to materialize this immediate.
+      //   pushq %rax
+      //   movabsq +-$Offset+-SlotSize, %rax
+      //   addq %rsp, %rax
+      //   xchg %rax, (%rsp)
+      //   movq (%rsp), %rsp
+      assert(Is64Bit && "can't have 32-bit 16GB stack frame");
+      BuildMI(MBB, MBBI, DL, TII.get(X86::PUSH64r))
+          .addReg(Rax, RegState::Kill)
+          .setMIFlag(Flag);
+      // Subtract is not commutative, so negate the offset and always use add.
+      // Subtract 8 less and add 8 more to account for the PUSH we just did.
+      if (isSub)
+        Offset = -(Offset - SlotSize);
+      else
+        Offset = Offset + SlotSize;
+      BuildMI(MBB, MBBI, DL, TII.get(MovRIOpc), Rax)
+          .addImm(Offset)
+          .setMIFlag(Flag);
+      MachineInstr *MI = BuildMI(MBB, MBBI, DL, TII.get(X86::ADD64rr), Rax)
+                             .addReg(Rax)
+                             .addReg(StackPtr);
+      MI->getOperand(3).setIsDead(); // The EFLAGS implicit def is dead.
+      // Exchange the new SP in RAX with the top of the stack.
+      addRegOffset(
+          BuildMI(MBB, MBBI, DL, TII.get(X86::XCHG64rm), Rax).addReg(Rax),
+          StackPtr, false, 0);
+      // Load new SP from the top of the stack into RSP.
+      addRegOffset(BuildMI(MBB, MBBI, DL, TII.get(X86::MOV64rm), StackPtr),
+                   StackPtr, false, 0);
+      return;
+a284 1
+  }
+a285 1
+  while (Offset) {
+d287 2
+a288 3
+    if (ThisVal == SlotSize) {
+      // Use push / pop for slot sized adjustments as a size optimization. We
+      // need to find a dead register when using pop.
+d296 6
+a301 3
+        BuildMI(MBB, MBBI, DL, TII.get(Opc))
+            .addReg(Reg, getDefRegState(!isSub) | getUndefRegState(isSub))
+            .setMIFlag(Flag);
+d307 6
+a312 2
+    BuildStackAdjustment(MBB, MBBI, DL, isSub ? -ThisVal : ThisVal, InEpilogue)
+        .setMIFlag(Flag);
+d722 11
+a732 1
+  StringRef Symbol = STI.getTargetLowering()->getStackProbeSymbolName(MF);
+d743 1
+a743 1
+        .addExternalSymbol(MF.createExternalSymbolName(Symbol));
+d746 1
+a746 2
+    CI = BuildMI(MBB, MBBI, DL, TII.get(CallOp))
+        .addExternalSymbol(MF.createExternalSymbolName(Symbol));
+d757 1
+a757 2
+  if (STI.isTargetWin64() || !STI.isOSWindows()) {
+    // MSVC x32's _chkstk and cygwin/mingw's _alloca adjust %esp themselves.
+d759 1
+a759 1
+    // themselves. They also does not clobber %rax so we can reuse it when
+d761 3
+a763 5
+    // All other platforms do not specify a particular ABI for the stack probe
+    // function, so we arbitrarily define it to not adjust %esp/%rsp itself.
+    BuildMI(MBB, MBBI, DL, TII.get(getSUBrrOpcode(Is64Bit)), SP)
+        .addReg(SP)
+        .addReg(AX);
+d952 1
+a952 1
+  bool UseStackProbe = !STI.getTargetLowering()->getStackProbeSymbolName(MF).empty();
+a961 10
+  // Re-align the stack on 64-bit if the x86-interrupt calling convention is
+  // used and an error code was pushed, since the x86-64 ABI requires a 16-byte
+  // stack alignment.
+  if (Fn->getCallingConv() == CallingConv::X86_INTR && Is64Bit &&
+      Fn->arg_size() == 2) {
+    StackSize += 8;
+    MFI.setStackSize(StackSize);
+    emitSPUpdate(MBB, MBBI, -8, /*InEpilogue=*/false);
+  }
+
+a970 1
+      !UseStackProbe &&                        // No stack probes.
+a1025 2
+    assert(MF.getRegInfo().isReserved(MachineFramePtr) && "FP reserved");
+
+d1088 7
+a1160 3
+    assert(!X86FI->getUsesRedZone() &&
+           "The Red Zone is not accounted for in stack probes");
+
+d1662 4
+a1669 1
+  bool IsFixed = MFI.isFixedObjectIndex(FI);
+d1674 1
+a1674 1
+    FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getBaseRegister();
+d1676 1
+a1676 1
+    FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getStackRegister();
+a1749 8
+int X86FrameLowering::getFrameIndexReferenceSP(const MachineFunction &MF,
+                                               int FI, unsigned &FrameReg,
+                                               int Adjustment) const {
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  FrameReg = TRI->getStackRegister();
+  return MFI.getObjectOffset(FI) - getOffsetOfLocalArea() + Adjustment;
+}
+
+d1806 3
+d1833 4
+d1838 1
+a1838 1
+  return getFrameIndexReferenceSP(MF, FI, FrameReg, StackSize);
+a1889 2
+    unsigned Size = TRI->getSpillSize(*RC);
+    unsigned Align = TRI->getSpillAlignment(*RC);
+d1891 1
+a1891 1
+    SpillSlotOffset -= std::abs(SpillSlotOffset) % Align;
+d1893 3
+a1895 2
+    SpillSlotOffset -= Size;
+    int SlotIndex = MFI.CreateFixedSpillStackObject(Size, SpillSlotOffset);
+d1897 1
+a1897 1
+    MFI.ensureMaxAlignment(Align);
+d2590 2
+a2591 2
+  uint64_t Amount = !reserveCallFrame ? TII.getFrameSize(*I) : 0;
+  uint64_t InternalAmt = (isDestroy || Amount) ? TII.getFrameAdjustment(*I) : 0;
+a2954 4
+  // Mark the function as not having WinCFI. We will set it back to true in
+  // emitPrologue if it gets called and emits CFI.
+  MF.setHasWinCFI(false);
+
 @
 
 

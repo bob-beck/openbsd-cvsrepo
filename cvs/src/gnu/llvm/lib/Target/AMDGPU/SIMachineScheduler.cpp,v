@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.33;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.07;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -2234,6 +2241,248 @@ a1665 2
 d1668 3
 a1670 1
 SIScheduleDAGMI::~SIScheduleDAGMI() = default;
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a14 1
+#include "SIMachineScheduler.h"
+d17 1
+d41 1
+a41 1
+#define DEBUG_TYPE "machine-scheduler"
+d542 1
+a542 4
+                 [=](std::pair<SIScheduleBlock*,
+                     SIScheduleBlockLinkKind> S) {
+                   return PredID == S.first->getID();
+                    }) &&
+d546 1
+a546 2
+void SIScheduleBlock::addSucc(SIScheduleBlock *Succ,
+                              SIScheduleBlockLinkKind Kind) {
+d550 2
+a551 5
+  for (std::pair<SIScheduleBlock*, SIScheduleBlockLinkKind> &S : Succs) {
+    if (SuccID == S.first->getID()) {
+      if (S.second == SIScheduleBlockLinkKind::NoData &&
+          Kind == SIScheduleBlockLinkKind::Data)
+        S.second = Kind;
+a552 1
+    }
+d556 1
+a556 2
+  Succs.push_back(std::make_pair(Succ, Kind));
+
+d576 2
+a577 4
+  for (std::pair<SIScheduleBlock*, SIScheduleBlockLinkKind> S : Succs) {
+    if (S.second == SIScheduleBlockLinkKind::Data)
+      dbgs() << "(Data Dep) ";
+    S.first->printDebug(false);
+a653 10
+static bool
+hasDataDependencyPred(const SUnit &SU, const SUnit &FromSU) {
+  for (const auto &PredDep : SU.Preds) {
+    if (PredDep.getSUnit() == &FromSU &&
+        PredDep.getKind() == llvm::SDep::Data)
+      return true;
+  }
+  return false;
+}
+
+d658 1
+a658 1
+  int Color = NextReservedID;
+d678 3
+a680 3
+  for (unsigned SUNum : DAG->TopDownIndex2SU) {
+    const SUnit &SU = DAG->SUnits[SUNum];
+    if (DAG->IsHighLatencySU[SU.NodeNum]) {
+d682 1
+a682 13
+      int ProposedColor = Color;
+      std::vector<int> AdditionalElements;
+
+      // We don't want to put in the same block
+      // two high latency instructions that depend
+      // on each other.
+      // One way would be to check canAddEdge
+      // in both directions, but that currently is not
+      // enough because there the high latency order is
+      // enforced (via links).
+      // Instead, look at the dependencies between the
+      // high latency instructions and deduce if it is
+      // a data dependency or not.
+d684 9
+a692 16
+        bool HasSubGraph;
+        std::vector<int> SubGraph;
+        // By construction (topological order), if SU and
+        // DAG->SUnits[j] are linked, DAG->SUnits[j] is neccessary
+        // in the parent graph of SU.
+#ifndef NDEBUG
+        SubGraph = DAG->GetTopo()->GetSubGraph(SU, DAG->SUnits[j],
+                                               HasSubGraph);
+        assert(!HasSubGraph);
+#endif
+        SubGraph = DAG->GetTopo()->GetSubGraph(DAG->SUnits[j], SU,
+                                               HasSubGraph);
+        if (!HasSubGraph)
+          continue; // No dependencies between each other
+        else if (SubGraph.size() > 5) {
+          // Too many elements would be required to be added to the block.
+a693 37
+          break;
+        }
+        else {
+          // Check the type of dependency
+          for (unsigned k : SubGraph) {
+            // If in the path to join the two instructions,
+            // there is another high latency instruction,
+            // or instructions colored for another block
+            // abort the merge.
+            if (DAG->IsHighLatencySU[k] ||
+                (CurrentColoring[k] != ProposedColor &&
+                 CurrentColoring[k] != 0)) {
+              CompatibleGroup = false;
+              break;
+            }
+            // If one of the SU in the subgraph depends on the result of SU j,
+            // there'll be a data dependency.
+            if (hasDataDependencyPred(DAG->SUnits[k], DAG->SUnits[j])) {
+              CompatibleGroup = false;
+              break;
+            }
+          }
+          if (!CompatibleGroup)
+            break;
+          // Same check for the SU
+          if (hasDataDependencyPred(SU, DAG->SUnits[j])) {
+            CompatibleGroup = false;
+            break;
+          }
+          // Add all the required instructions to the block
+          // These cannot live in another block (because they
+          // depend (order dependency) on one of the
+          // instruction in the block, and are required for the
+          // high latency instruction we add.
+          AdditionalElements.insert(AdditionalElements.end(),
+                                    SubGraph.begin(), SubGraph.end());
+        }
+d695 1
+a695 11
+      if (CompatibleGroup) {
+        FormingGroup.insert(SU.NodeNum);
+        for (unsigned j : AdditionalElements)
+          CurrentColoring[j] = ProposedColor;
+        CurrentColoring[SU.NodeNum] = ProposedColor;
+        ++Count;
+      }
+      // Found one incompatible instruction,
+      // or has filled a big enough group.
+      // -> start a new one.
+      if (!CompatibleGroup) {
+d698 4
+a701 8
+        ProposedColor = Color;
+        FormingGroup.insert(SU.NodeNum);
+        CurrentColoring[SU.NodeNum] = ProposedColor;
+        Count = 0;
+      } else if (Count == GroupSize) {
+        FormingGroup.clear();
+        Color = ++NextReservedID;
+        ProposedColor = Color;
+d703 2
+d706 1
+a837 11
+  assert(DAGSize >= 1 &&
+         CurrentBottomUpReservedDependencyColoring.size() == DAGSize &&
+         CurrentTopDownReservedDependencyColoring.size() == DAGSize);
+  // If there is no reserved block at all, do nothing. We don't want
+  // everything in one block.
+  if (*std::max_element(CurrentBottomUpReservedDependencyColoring.begin(),
+                        CurrentBottomUpReservedDependencyColoring.end()) == 0 &&
+      *std::max_element(CurrentTopDownReservedDependencyColoring.begin(),
+                        CurrentTopDownReservedDependencyColoring.end()) == 0)
+    return;
+
+a858 3
+    // If there is only one child/parent block, and that block
+    // is not among the ones we are removing in this path, then
+    // merge the instruction to that block
+d977 6
+a982 1
+     ++ColorCount[color];
+d1090 1
+a1090 2
+        CurrentBlocks[SUID]->addSucc(CurrentBlocks[Node2CurrentBlock[Succ->NodeNum]],
+                                     SuccDep.isCtrl() ? NoData : Data);
+d1284 4
+a1287 2
+      for (const auto &Succ : Block->getSuccs())
+        Height = std::min(Height, Succ.first->Height + 1);
+d1334 7
+a1340 1
+      ++LiveOutRegsNumUsages[PredID][Reg];
+a1363 18
+  // Increase LiveOutRegsNumUsages for blocks
+  // producing registers consumed in another
+  // scheduling region.
+  for (unsigned Reg : DAG->getOutRegs()) {
+    for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+      // Do reverse traversal
+      int ID = BlocksStruct.TopDownIndex2Block[Blocks.size()-1-i];
+      SIScheduleBlock *Block = Blocks[ID];
+      const std::set<unsigned> &OutRegs = Block->getOutRegs();
+
+      if (OutRegs.find(Reg) == OutRegs.end())
+        continue;
+
+      ++LiveOutRegsNumUsages[ID][Reg];
+      break;
+    }
+  }
+
+d1380 6
+a1385 2
+      if (!Found)
+        ++LiveRegsConsumers[Reg];
+a1405 1
+    dbgs() << '\n';
+d1467 2
+a1468 2
+  if (SregCurrentUsage > maxSregUsage)
+    maxSregUsage = SregCurrentUsage;
+d1559 11
+a1569 7
+  for (const auto &Block : Parent->getSuccs()) {
+    if (--BlockNumPredsLeft[Block.first->getID()] == 0)
+      ReadyBlocks.push_back(Block.first);
+
+    if (Parent->isHighLatencyBlock() &&
+        Block.second == SIScheduleBlockLinkKind::Data)
+      LastPosHighLatencyParentScheduled[Block.first->getID()] = NumBlockScheduled;
+d1581 6
+a1586 4
+    // We produce this register, thus it must not be previously alive.
+    assert(LiveRegsConsumers.find(RegP.first) == LiveRegsConsumers.end() ||
+           LiveRegsConsumers[RegP.first] == 0);
+    LiveRegsConsumers[RegP.first] += RegP.second;
+d1828 1
+a1828 3
+    static const std::pair<SISchedulerBlockCreatorVariant,
+                           SISchedulerBlockSchedulerVariant>
+        Variants[] = {
+d1847 1
+a1847 3
+    static const std::pair<SISchedulerBlockCreatorVariant,
+                           SISchedulerBlockSchedulerVariant>
+        Variants[] = {
 @
 
 

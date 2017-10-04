@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.2
 	OPENBSD_6_2:1.1.1.1.0.2
 	OPENBSD_6_2_BASE:1.1.1.1
 	OPENBSD_6_1:1.1.1.1.0.4
@@ -24,8 +25,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.1
 date	2017.01.24.08.33.24;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.2;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.2
+date	2017.10.04.20.27.59;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -687,3 +694,161 @@ development effort on OpenBSD/arm64.
 @
 text
 @@
+
+
+1.1.1.2
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a25 1
+#include "llvm/IR/InstIterator.h"
+a146 27
+// In Resumers, we replace unwind coro.end with True to force the immediate
+// unwind to caller.
+static void replaceUnwindCoroEnds(coro::Shape &Shape, ValueToValueMapTy &VMap) {
+  if (Shape.CoroEnds.empty())
+    return;
+
+  LLVMContext &Context = Shape.CoroEnds.front()->getContext();
+  auto *True = ConstantInt::getTrue(Context);
+  for (CoroEndInst *CE : Shape.CoroEnds) {
+    if (!CE->isUnwind())
+      continue;
+
+    auto *NewCE = cast<IntrinsicInst>(VMap[CE]);
+
+    // If coro.end has an associated bundle, add cleanupret instruction.
+    if (auto Bundle = NewCE->getOperandBundle(LLVMContext::OB_funclet)) {
+      Value *FromPad = Bundle->Inputs[0];
+      auto *CleanupRet = CleanupReturnInst::Create(FromPad, nullptr, NewCE);
+      NewCE->getParent()->splitBasicBlock(NewCE);
+      CleanupRet->getParent()->getTerminator()->eraseFromParent();
+    }
+
+    NewCE->replaceAllUsesWith(True);
+    NewCE->eraseFromParent();
+  }
+}
+
+d160 3
+a162 3
+  auto FinalCaseIt = std::prev(Switch->case_end());
+  BasicBlock *ResumeBB = FinalCaseIt->getCaseSuccessor();
+  Switch->removeCase(FinalCaseIt);
+d191 2
+a192 2
+  NewF->addParamAttr(0, Attribute::NonNull);
+  NewF->addParamAttr(0, Attribute::NoAlias);
+d198 1
+a198 1
+  for (Argument &A : F.args())
+d203 8
+d219 4
+a222 2
+      AttributeList::ReturnIndex,
+      AttributeFuncs::typeIncompatible(NewF->getReturnType()));
+d239 1
+a239 1
+  Argument *NewFramePtr = &*NewF->arg_begin();
+d273 3
+a275 1
+  replaceUnwindCoroEnds(Shape, VMap);
+d287 1
+a287 8
+  if (Shape.CoroEnds.empty())
+    return;
+
+  LLVMContext &Context = Shape.CoroEnds.front()->getContext();
+  auto *False = ConstantInt::getFalse(Context);
+
+  for (CoroEndInst *CE : Shape.CoroEnds) {
+    CE->replaceAllUsesWith(False);
+a288 1
+  }
+a479 74
+static SmallPtrSet<BasicBlock *, 4> getCoroBeginPredBlocks(CoroBeginInst *CB) {
+  // Collect all blocks that we need to look for instructions to relocate.
+  SmallPtrSet<BasicBlock *, 4> RelocBlocks;
+  SmallVector<BasicBlock *, 4> Work;
+  Work.push_back(CB->getParent());
+
+  do {
+    BasicBlock *Current = Work.pop_back_val();
+    for (BasicBlock *BB : predecessors(Current))
+      if (RelocBlocks.count(BB) == 0) {
+        RelocBlocks.insert(BB);
+        Work.push_back(BB);
+      }
+  } while (!Work.empty());
+  return RelocBlocks;
+}
+
+static SmallPtrSet<Instruction *, 8>
+getNotRelocatableInstructions(CoroBeginInst *CoroBegin,
+                              SmallPtrSetImpl<BasicBlock *> &RelocBlocks) {
+  SmallPtrSet<Instruction *, 8> DoNotRelocate;
+  // Collect all instructions that we should not relocate
+  SmallVector<Instruction *, 8> Work;
+
+  // Start with CoroBegin and terminators of all preceding blocks.
+  Work.push_back(CoroBegin);
+  BasicBlock *CoroBeginBB = CoroBegin->getParent();
+  for (BasicBlock *BB : RelocBlocks)
+    if (BB != CoroBeginBB)
+      Work.push_back(BB->getTerminator());
+
+  // For every instruction in the Work list, place its operands in DoNotRelocate
+  // set.
+  do {
+    Instruction *Current = Work.pop_back_val();
+    DoNotRelocate.insert(Current);
+    for (Value *U : Current->operands()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I)
+        continue;
+      if (isa<AllocaInst>(U))
+        continue;
+      if (DoNotRelocate.count(I) == 0) {
+        Work.push_back(I);
+        DoNotRelocate.insert(I);
+      }
+    }
+  } while (!Work.empty());
+  return DoNotRelocate;
+}
+
+static void relocateInstructionBefore(CoroBeginInst *CoroBegin, Function &F) {
+  // Analyze which non-alloca instructions are needed for allocation and
+  // relocate the rest to after coro.begin. We need to do it, since some of the
+  // targets of those instructions may be placed into coroutine frame memory
+  // for which becomes available after coro.begin intrinsic.
+
+  auto BlockSet = getCoroBeginPredBlocks(CoroBegin);
+  auto DoNotRelocateSet = getNotRelocatableInstructions(CoroBegin, BlockSet);
+
+  Instruction *InsertPt = CoroBegin->getNextNode();
+  BasicBlock &BB = F.getEntryBlock(); // TODO: Look at other blocks as well.
+  for (auto B = BB.begin(), E = BB.end(); B != E;) {
+    Instruction &I = *B++;
+    if (isa<AllocaInst>(&I))
+      continue;
+    if (&I == CoroBegin)
+      break;
+    if (DoNotRelocateSet.count(&I))
+      continue;
+    I.moveBefore(InsertPt);
+  }
+}
+
+a485 1
+  relocateInstructionBefore(Shape.CoroBegin, F);
+d585 1
+a585 3
+  CoroSplit() : CallGraphSCCPass(ID) {
+    initializeCoroSplitPass(*PassRegistry::getPassRegistry());
+  }
+a630 1
+  StringRef getPassName() const override { return "Coroutine Splitting"; }
+@
+

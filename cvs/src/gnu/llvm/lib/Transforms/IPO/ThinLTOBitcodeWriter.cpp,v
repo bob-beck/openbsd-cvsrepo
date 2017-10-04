@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.2
 	OPENBSD_6_2:1.1.1.1.0.2
 	OPENBSD_6_2_BASE:1.1.1.1
 	OPENBSD_6_1:1.1.1.1.0.4
@@ -24,8 +25,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.1
 date	2017.01.24.08.33.23;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.2;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.2
+date	2017.10.04.20.27.58;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -391,3 +398,347 @@ development effort on OpenBSD/arm64.
 @
 text
 @@
+
+
+1.1.1.2
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d9 7
+d17 1
+a17 2
+#include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
+a18 1
+#include "llvm/Analysis/ProfileSummaryInfo.h"
+a21 1
+#include "llvm/IR/DebugInfo.h"
+a25 1
+#include "llvm/Support/FileSystem.h"
+a26 3
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/FunctionAttrs.h"
+a27 1
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+d32 41
+d75 2
+a76 4
+void promoteInternals(Module &ExportM, Module &ImportM, StringRef ModuleId,
+                      SetVector<GlobalValue *> &PromoteExtra) {
+  DenseMap<const Comdat *, Comdat *> RenamedComdats;
+  for (auto &ExportGV : ExportM.global_values()) {
+d78 1
+a78 1
+      continue;
+d80 3
+a82 6
+    auto Name = ExportGV.getName();
+    GlobalValue *ImportGV = ImportM.getNamedValue(Name);
+    if ((!ImportGV || ImportGV->use_empty()) && !PromoteExtra.count(&ExportGV))
+      continue;
+
+    std::string NewName = (Name + ModuleId).str();
+d84 1
+a84 3
+    if (const auto *C = ExportGV.getComdat())
+      if (C->getName() == Name)
+        RenamedComdats.try_emplace(C, ExportM.getOrInsertComdat(NewName));
+d90 3
+a92 5
+    if (ImportGV) {
+      ImportGV->setName(NewName);
+      ImportGV->setVisibility(GlobalValue::HiddenVisibility);
+    }
+  }
+d94 8
+a101 7
+  if (!RenamedComdats.empty())
+    for (auto &GO : ExportM.global_objects())
+      if (auto *C = GO.getComdat()) {
+        auto Replacement = RenamedComdats.find(C);
+        if (Replacement != RenamedComdats.end())
+          GO.setComdat(Replacement->second);
+      }
+d197 18
+a214 1
+    Module *M, function_ref<bool(const GlobalValue *)> ShouldKeepDefinition) {
+d222 1
+a222 1
+    if (GA->getValueType()->isFunctionTy())
+d228 1
+a228 1
+          nullptr, "", nullptr,
+a233 28
+
+  for (Function &F : *M) {
+    if (ShouldKeepDefinition(&F))
+      continue;
+
+    F.deleteBody();
+    F.setComdat(nullptr);
+    F.clearMetadata();
+  }
+
+  for (GlobalVariable &GV : M->globals()) {
+    if (ShouldKeepDefinition(&GV))
+      continue;
+
+    GV.setInitializer(nullptr);
+    GV.setLinkage(GlobalValue::ExternalLinkage);
+    GV.setComdat(nullptr);
+    GV.clearMetadata();
+  }
+}
+
+void forEachVirtualFunction(Constant *C, function_ref<void(Function *)> Fn) {
+  if (auto *F = dyn_cast<Function>(C))
+    return Fn(F);
+  if (isa<GlobalValue>(C))
+    return;
+  for (Value *Op : C->operands())
+    forEachVirtualFunction(cast<Constant>(Op), Fn);
+d239 2
+a240 4
+void splitAndWriteThinLTOBitcode(
+    raw_ostream &OS, raw_ostream *ThinLinkOS,
+    function_ref<AAResults &(Function &)> AARGetter, Module &M) {
+  std::string ModuleId = getUniqueModuleId(&M);
+a244 4
+    if (ThinLinkOS)
+      // We don't have a ThinLTO part, but still write the module to the
+      // ThinLinkOS if requested so that the expected output file is produced.
+      WriteBitcodeToFile(&M, *ThinLinkOS);
+d250 5
+a254 4
+  // Returns whether a global has attached type metadata. Such globals may
+  // participate in CFI or whole-program devirtualization, so they need to
+  // appear in the merged module instead of the thin LTO module.
+  auto HasTypeMetadata = [&](const GlobalObject *GO) {
+d256 1
+a256 1
+    GO->getMetadata(LLVMContext::MD_type, MDs);
+a259 36
+  // Collect the set of virtual functions that are eligible for virtual constant
+  // propagation. Each eligible function must not access memory, must return
+  // an integer of width <=64 bits, must take at least one argument, must not
+  // use its first argument (assumed to be "this") and all arguments other than
+  // the first one must be of <=64 bit integer type.
+  //
+  // Note that we test whether this copy of the function is readnone, rather
+  // than testing function attributes, which must hold for any copy of the
+  // function, even a less optimized version substituted at link time. This is
+  // sound because the virtual constant propagation optimizations effectively
+  // inline all implementations of the virtual function into each call site,
+  // rather than using function attributes to perform local optimization.
+  std::set<const Function *> EligibleVirtualFns;
+  // If any member of a comdat lives in MergedM, put all members of that
+  // comdat in MergedM to keep the comdat together.
+  DenseSet<const Comdat *> MergedMComdats;
+  for (GlobalVariable &GV : M.globals())
+    if (HasTypeMetadata(&GV)) {
+      if (const auto *C = GV.getComdat())
+        MergedMComdats.insert(C);
+      forEachVirtualFunction(GV.getInitializer(), [&](Function *F) {
+        auto *RT = dyn_cast<IntegerType>(F->getReturnType());
+        if (!RT || RT->getBitWidth() > 64 || F->arg_empty() ||
+            !F->arg_begin()->use_empty())
+          return;
+        for (auto &Arg : make_range(std::next(F->arg_begin()), F->arg_end())) {
+          auto *ArgT = dyn_cast<IntegerType>(Arg.getType());
+          if (!ArgT || ArgT->getBitWidth() > 64)
+            return;
+        }
+        if (!F->isDeclaration() &&
+            computeFunctionBodyMemoryAccess(*F, AARGetter(*F)) == MAK_ReadNone)
+          EligibleVirtualFns.insert(F);
+      });
+    }
+
+d261 1
+a261 38
+  std::unique_ptr<Module> MergedM(
+      CloneModule(&M, VMap, [&](const GlobalValue *GV) -> bool {
+        if (const auto *C = GV->getComdat())
+          if (MergedMComdats.count(C))
+            return true;
+        if (auto *F = dyn_cast<Function>(GV))
+          return EligibleVirtualFns.count(F);
+        if (auto *GVar = dyn_cast_or_null<GlobalVariable>(GV->getBaseObject()))
+          return HasTypeMetadata(GVar);
+        return false;
+      }));
+  StripDebugInfo(*MergedM);
+
+  for (Function &F : *MergedM)
+    if (!F.isDeclaration()) {
+      // Reset the linkage of all functions eligible for virtual constant
+      // propagation. The canonical definitions live in the thin LTO module so
+      // that they can be imported.
+      F.setLinkage(GlobalValue::AvailableExternallyLinkage);
+      F.setComdat(nullptr);
+    }
+
+  SetVector<GlobalValue *> CfiFunctions;
+  for (auto &F : M)
+    if ((!F.hasLocalLinkage() || F.hasAddressTaken()) && HasTypeMetadata(&F))
+      CfiFunctions.insert(&F);
+
+  // Remove all globals with type metadata, globals with comdats that live in
+  // MergedM, and aliases pointing to such globals from the thin LTO module.
+  filterModule(&M, [&](const GlobalValue *GV) {
+    if (auto *GVar = dyn_cast_or_null<GlobalVariable>(GV->getBaseObject()))
+      if (HasTypeMetadata(GVar))
+        return false;
+    if (const auto *C = GV->getComdat())
+      if (MergedMComdats.count(C))
+        return false;
+    return true;
+  });
+d263 1
+a263 2
+  promoteInternals(*MergedM, M, ModuleId, CfiFunctions);
+  promoteInternals(M, *MergedM, ModuleId, CfiFunctions);
+d265 2
+a266 22
+  SmallVector<MDNode *, 8> CfiFunctionMDs;
+  for (auto V : CfiFunctions) {
+    Function &F = *cast<Function>(V);
+    SmallVector<MDNode *, 2> Types;
+    F.getMetadata(LLVMContext::MD_type, Types);
+
+    auto &Ctx = MergedM->getContext();
+    SmallVector<Metadata *, 4> Elts;
+    Elts.push_back(MDString::get(Ctx, F.getName()));
+    CfiFunctionLinkage Linkage;
+    if (!F.isDeclarationForLinker())
+      Linkage = CFL_Definition;
+    else if (F.isWeakForLinker())
+      Linkage = CFL_WeakDeclaration;
+    else
+      Linkage = CFL_Declaration;
+    Elts.push_back(ConstantAsMetadata::get(
+        llvm::ConstantInt::get(Type::getInt8Ty(Ctx), Linkage)));
+    for (auto Type : Types)
+      Elts.push_back(Type);
+    CfiFunctionMDs.push_back(MDTuple::get(Ctx, Elts));
+  }
+d268 1
+a268 5
+  if(!CfiFunctionMDs.empty()) {
+    NamedMDNode *NMD = MergedM->getOrInsertNamedMetadata("cfi.functions");
+    for (auto MD : CfiFunctionMDs)
+      NMD->addOperand(MD);
+  }
+d270 2
+a271 1
+  simplifyExternals(*MergedM);
+d274 3
+a276 2
+  ProfileSummaryInfo PSI(M);
+  ModuleSummaryIndex Index = buildModuleSummaryIndex(M, nullptr, &PSI);
+d278 1
+a278 5
+  // Mark the merged module as requiring full LTO. We still want an index for
+  // it though, so that it can participate in summary-based dead stripping.
+  MergedM->addModuleFlag(Module::Error, "ThinLTO", uint32_t(0));
+  ModuleSummaryIndex MergedMIndex =
+      buildModuleSummaryIndex(*MergedM, nullptr, &PSI);
+a279 13
+  SmallVector<char, 0> Buffer;
+
+  BitcodeWriter W(Buffer);
+  // Save the module hash produced for the full bitcode, which will
+  // be used in the backends, and use that in the minimized bitcode
+  // produced for the full link.
+  ModuleHash ModHash = {{0}};
+  W.writeModule(&M, /*ShouldPreserveUseListOrder=*/false, &Index,
+                /*GenerateHash=*/true, &ModHash);
+  W.writeModule(MergedM.get(), /*ShouldPreserveUseListOrder=*/false,
+                &MergedMIndex);
+  W.writeSymtab();
+  W.writeStrtab();
+a280 16
+
+  // If a minimized bitcode module was requested for the thin link,
+  // strip the debug info (the merged module was already stripped above)
+  // and write it to the given OS.
+  if (ThinLinkOS) {
+    Buffer.clear();
+    BitcodeWriter W2(Buffer);
+    StripDebugInfo(M);
+    W2.writeModule(&M, /*ShouldPreserveUseListOrder=*/false, &Index,
+                   /*GenerateHash=*/false, &ModHash);
+    W2.writeModule(MergedM.get(), /*ShouldPreserveUseListOrder=*/false,
+                   &MergedMIndex);
+    W2.writeSymtab();
+    W2.writeStrtab();
+    *ThinLinkOS << Buffer;
+  }
+d295 2
+a296 3
+void writeThinLTOBitcode(raw_ostream &OS, raw_ostream *ThinLinkOS,
+                         function_ref<AAResults &(Function &)> AARGetter,
+                         Module &M, const ModuleSummaryIndex *Index) {
+d299 1
+a299 1
+    return splitAndWriteThinLTOBitcode(OS, ThinLinkOS, AARGetter, M);
+a301 5
+
+  // Save the module hash produced for the full bitcode, which will
+  // be used in the backends, and use that in the minimized bitcode
+  // produced for the full link.
+  ModuleHash ModHash = {{0}};
+d303 1
+a303 9
+                     /*GenerateHash=*/true, &ModHash);
+  // If a minimized bitcode module was requested for the thin link,
+  // strip the debug info and write it to the given OS.
+  if (ThinLinkOS) {
+    StripDebugInfo(M);
+    WriteBitcodeToFile(&M, *ThinLinkOS, /*ShouldPreserveUseListOrder=*/false,
+                       Index,
+                       /*GenerateHash=*/false, &ModHash);
+  }
+a307 3
+  // The output stream on which to emit a minimized module for use
+  // just in the thin link, if requested.
+  raw_ostream *ThinLinkOS;
+d311 1
+a311 1
+  WriteThinLTOBitcode() : ModulePass(ID), OS(dbgs()), ThinLinkOS(nullptr) {
+d315 2
+a316 2
+  explicit WriteThinLTOBitcode(raw_ostream &o, raw_ostream *ThinLinkOS)
+      : ModulePass(ID), OS(o), ThinLinkOS(ThinLinkOS) {
+d325 1
+a325 1
+    writeThinLTOBitcode(OS, ThinLinkOS, LegacyAARGetter(*this), M, Index);
+a329 1
+    AU.addRequired<AssumptionCacheTracker>();
+a330 1
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
+a337 1
+INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
+a338 1
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
+d342 2
+a343 15
+ModulePass *llvm::createWriteThinLTOBitcodePass(raw_ostream &Str,
+                                                raw_ostream *ThinLinkOS) {
+  return new WriteThinLTOBitcode(Str, ThinLinkOS);
+}
+
+PreservedAnalyses
+llvm::ThinLTOBitcodeWriterPass::run(Module &M, ModuleAnalysisManager &AM) {
+  FunctionAnalysisManager &FAM =
+      AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+  writeThinLTOBitcode(OS, ThinLinkOS,
+                      [&FAM](Function &F) -> AAResults & {
+                        return FAM.getResult<AAManager>(F);
+                      },
+                      M, &AM.getResult<ModuleSummaryIndexAnalysis>(M));
+  return PreservedAnalyses::all();
+@
+

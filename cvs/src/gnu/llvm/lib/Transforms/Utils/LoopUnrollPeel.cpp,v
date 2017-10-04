@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.2
 	OPENBSD_6_2:1.1.1.1.0.2
 	OPENBSD_6_2_BASE:1.1.1.1
 	OPENBSD_6_1:1.1.1.1.0.4
@@ -24,8 +25,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.1
 date	2017.01.24.08.33.24;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.2;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.2
+date	2017.10.04.20.27.59;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -461,3 +468,184 @@ development effort on OpenBSD/arm64.
 @
 text
 @@
+
+
+1.1.1.2
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@a30 1
+#include "llvm/Transforms/Utils/LoopSimplify.h"
+a47 5
+// Designates that a Phi is estimated to become invariant after an "infinite"
+// number of loop iterations (i.e. only may become an invariant if the loop is
+// fully unrolled).
+static const unsigned InfiniteIterationsToInvariance = UINT_MAX;
+
+a57 7
+  // Don't try to peel loops where the latch is not the exiting block.
+  // This can be an indication of two different things:
+  // 1) The loop is not rotated.
+  // 2) The loop contains irreducible control flow that involves the latch.
+  if (L->getLoopLatch() != L->getExitingBlock())
+    return false;
+
+a60 51
+// This function calculates the number of iterations after which the given Phi
+// becomes an invariant. The pre-calculated values are memorized in the map. The
+// function (shortcut is I) is calculated according to the following definition:
+// Given %x = phi <Inputs from above the loop>, ..., [%y, %back.edge].
+//   If %y is a loop invariant, then I(%x) = 1.
+//   If %y is a Phi from the loop header, I(%x) = I(%y) + 1.
+//   Otherwise, I(%x) is infinite.
+// TODO: Actually if %y is an expression that depends only on Phi %z and some
+//       loop invariants, we can estimate I(%x) = I(%z) + 1. The example
+//       looks like:
+//         %x = phi(0, %a),  <-- becomes invariant starting from 3rd iteration.
+//         %y = phi(0, 5),
+//         %a = %y + 1.
+static unsigned calculateIterationsToInvariance(
+    PHINode *Phi, Loop *L, BasicBlock *BackEdge,
+    SmallDenseMap<PHINode *, unsigned> &IterationsToInvariance) {
+  assert(Phi->getParent() == L->getHeader() &&
+         "Non-loop Phi should not be checked for turning into invariant.");
+  assert(BackEdge == L->getLoopLatch() && "Wrong latch?");
+  // If we already know the answer, take it from the map.
+  auto I = IterationsToInvariance.find(Phi);
+  if (I != IterationsToInvariance.end())
+    return I->second;
+
+  // Otherwise we need to analyze the input from the back edge.
+  Value *Input = Phi->getIncomingValueForBlock(BackEdge);
+  // Place infinity to map to avoid infinite recursion for cycled Phis. Such
+  // cycles can never stop on an invariant.
+  IterationsToInvariance[Phi] = InfiniteIterationsToInvariance;
+  unsigned ToInvariance = InfiniteIterationsToInvariance;
+
+  if (L->isLoopInvariant(Input))
+    ToInvariance = 1u;
+  else if (PHINode *IncPhi = dyn_cast<PHINode>(Input)) {
+    // Only consider Phis in header block.
+    if (IncPhi->getParent() != L->getHeader())
+      return InfiniteIterationsToInvariance;
+    // If the input becomes an invariant after X iterations, then our Phi
+    // becomes an invariant after X + 1 iterations.
+    unsigned InputToInvariance = calculateIterationsToInvariance(
+        IncPhi, L, BackEdge, IterationsToInvariance);
+    if (InputToInvariance != InfiniteIterationsToInvariance)
+      ToInvariance = InputToInvariance + 1u;
+  }
+
+  // If we found that this Phi lies in an invariant chain, update the map.
+  if (ToInvariance != InfiniteIterationsToInvariance)
+    IterationsToInvariance[Phi] = ToInvariance;
+  return ToInvariance;
+}
+
+d63 1
+a63 3
+                            TargetTransformInfo::UnrollingPreferences &UP,
+                            unsigned &TripCount) {
+  assert(LoopSize > 0 && "Zero loop size is not allowed!");
+a71 40
+  // Here we try to get rid of Phis which become invariants after 1, 2, ..., N
+  // iterations of the loop. For this we compute the number for iterations after
+  // which every Phi is guaranteed to become an invariant, and try to peel the
+  // maximum number of iterations among these values, thus turning all those
+  // Phis into invariants.
+  // First, check that we can peel at least one iteration.
+  if (2 * LoopSize <= UP.Threshold && UnrollPeelMaxCount > 0) {
+    // Store the pre-calculated values here.
+    SmallDenseMap<PHINode *, unsigned> IterationsToInvariance;
+    // Now go through all Phis to calculate their the number of iterations they
+    // need to become invariants.
+    unsigned DesiredPeelCount = 0;
+    BasicBlock *BackEdge = L->getLoopLatch();
+    assert(BackEdge && "Loop is not in simplified form?");
+    for (auto BI = L->getHeader()->begin(); isa<PHINode>(&*BI); ++BI) {
+      PHINode *Phi = cast<PHINode>(&*BI);
+      unsigned ToInvariance = calculateIterationsToInvariance(
+          Phi, L, BackEdge, IterationsToInvariance);
+      if (ToInvariance != InfiniteIterationsToInvariance)
+        DesiredPeelCount = std::max(DesiredPeelCount, ToInvariance);
+    }
+    if (DesiredPeelCount > 0) {
+      // Pay respect to limitations implied by loop size and the max peel count.
+      unsigned MaxPeelCount = UnrollPeelMaxCount;
+      MaxPeelCount = std::min(MaxPeelCount, UP.Threshold / LoopSize - 1);
+      DesiredPeelCount = std::min(DesiredPeelCount, MaxPeelCount);
+      // Consider max peel count limitation.
+      assert(DesiredPeelCount > 0 && "Wrong loop size estimation?");
+      DEBUG(dbgs() << "Peel " << DesiredPeelCount << " iteration(s) to turn"
+                   << " some Phis into invariants.\n");
+      UP.PeelCount = DesiredPeelCount;
+      return;
+    }
+  }
+
+  // Bail if we know the statically calculated trip count.
+  // In this case we rather prefer partial unrolling.
+  if (TripCount)
+    return;
+
+d167 1
+a167 2
+                            ValueToValueMapTy &LVMap, DominatorTree *DT,
+                            LoopInfo *LI) {
+a187 11
+
+    // If dominator tree is available, insert nodes to represent cloned blocks.
+    if (DT) {
+      if (Header == *BB)
+        DT->addNewBlock(NewBB, InsertTop);
+      else {
+        DomTreeNode *IDom = DT->getNode(*BB)->getIDom();
+        // VMap must contain entry for IDom, as the iteration order is RPO.
+        DT->addNewBlock(NewBB, cast<BasicBlock>(VMap[IDom->getBlock()]));
+      }
+    }
+d201 2
+a202 2
+  BasicBlock *NewLatch = cast<BasicBlock>(VMap[Latch]);
+  BranchInst *LatchBR = cast<BranchInst>(NewLatch->getTerminator());
+a205 2
+  if (DT)
+    DT->changeImmediateDominator(InsertBot, NewLatch);
+d260 1
+a260 1
+                    AssumptionCache *AC, bool PreserveLCSSA) {
+d361 1
+a361 18
+                    NewBlocks, LoopBlocks, VMap, LVMap, DT, LI);
+
+    // Remap to use values from the current iteration instead of the
+    // previous one.
+    remapInstructionsInBlocks(NewBlocks, VMap);
+
+    if (DT) {
+      // Latches of the cloned loops dominate over the loop exit, so idom of the
+      // latter is the first cloned loop body, as original PreHeader dominates
+      // the original loop body.
+      if (Iter == 0)
+        DT->changeImmediateDominator(Exit, cast<BasicBlock>(LVMap[Latch]));
+#ifndef NDEBUG
+      if (VerifyDomInfo)
+        DT->verifyDomTree();
+#endif
+    }
+
+d372 4
+d408 1
+a408 1
+  if (Loop *ParentLoop = L->getParentLoop()) {
+a409 7
+
+    // FIXME: Incrementally update loop-simplify
+    simplifyLoop(ParentLoop, DT, LI, SE, AC, PreserveLCSSA);
+  } else {
+    // FIXME: Incrementally update loop-simplify
+    simplifyLoop(L, DT, LI, SE, AC, PreserveLCSSA);
+  }
+@
+

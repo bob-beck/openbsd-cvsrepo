@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.24;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.59;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -2499,6 +2506,200 @@ a2132 2
 d2134 2
 a2135 1
     if (Value *V = SimplifyInstruction(PHI, DL, nullptr, nullptr, AC)) {
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d15 1
+a22 1
+#include "llvm/Analysis/BlockFrequencyInfo.h"
+a26 1
+#include "llvm/Analysis/ProfileSummaryInfo.h"
+d29 1
+a30 1
+#include "llvm/IR/CallSite.h"
+a31 1
+#include "llvm/IR/DIBuilder.h"
+d35 1
+d43 1
+a44 2
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/Local.h"
+d1110 5
+a1114 3
+  for (Argument &Arg : CalledFunc->args()) {
+    unsigned Align = Arg.getType()->isPointerTy() ? Arg.getParamAlignment() : 0;
+    if (Align && !Arg.hasByValOrInAllocaAttr() && !Arg.hasNUses(0)) {
+d1116 2
+a1117 1
+        DT.recalculate(*CS.getCaller());
+d1123 2
+a1124 2
+      Value *ArgVal = CS.getArgument(Arg.getArgNo());
+      if (getKnownAlignment(ArgVal, DL, CS.getInstruction(), AC, &DT) >= Align)
+d1127 3
+a1129 3
+      CallInst *NewAsmp = IRBuilder<>(CS.getInstruction())
+                              .CreateAlignmentAssumption(DL, ArgVal, Align);
+      AC->registerAssumption(NewAsmp);
+d1143 1
+a1143 1
+  const Function *Caller = CS.getCaller();
+d1228 1
+a1228 2
+  Function *Caller = TheCall->getFunction();
+  const DataLayout &DL = Caller->getParent()->getDataLayout();
+d1242 1
+d1249 1
+a1249 1
+
+d1255 2
+a1256 1
+  unsigned Align = DL.getPrefTypeAlignment(AggTy);
+d1262 2
+a1263 3
+
+  Value *NewAlloca = new AllocaInst(AggTy, DL.getAllocaAddrSpace(),
+                                    nullptr, Align, Arg->getName(),
+d1266 1
+a1266 1
+
+d1306 35
+d1368 1
+a1368 1
+  DenseMap<const MDNode *, MDNode *> IANodes;
+d1374 2
+a1375 4
+        auto IA = DebugLoc::appendInlinedAt(DL, InlinedAtNode, BI->getContext(),
+                                            IANodes);
+        auto IDL = DebugLoc::get(DL.getLine(), DL.getCol(), DL.getScope(), IA);
+        BI->setDebugLoc(IDL);
+a1395 85
+/// Update the block frequencies of the caller after a callee has been inlined.
+///
+/// Each block cloned into the caller has its block frequency scaled by the
+/// ratio of CallSiteFreq/CalleeEntryFreq. This ensures that the cloned copy of
+/// callee's entry block gets the same frequency as the callsite block and the
+/// relative frequencies of all cloned blocks remain the same after cloning.
+static void updateCallerBFI(BasicBlock *CallSiteBlock,
+                            const ValueToValueMapTy &VMap,
+                            BlockFrequencyInfo *CallerBFI,
+                            BlockFrequencyInfo *CalleeBFI,
+                            const BasicBlock &CalleeEntryBlock) {
+  SmallPtrSet<BasicBlock *, 16> ClonedBBs;
+  for (auto const &Entry : VMap) {
+    if (!isa<BasicBlock>(Entry.first) || !Entry.second)
+      continue;
+    auto *OrigBB = cast<BasicBlock>(Entry.first);
+    auto *ClonedBB = cast<BasicBlock>(Entry.second);
+    uint64_t Freq = CalleeBFI->getBlockFreq(OrigBB).getFrequency();
+    if (!ClonedBBs.insert(ClonedBB).second) {
+      // Multiple blocks in the callee might get mapped to one cloned block in
+      // the caller since we prune the callee as we clone it. When that happens,
+      // we want to use the maximum among the original blocks' frequencies.
+      uint64_t NewFreq = CallerBFI->getBlockFreq(ClonedBB).getFrequency();
+      if (NewFreq > Freq)
+        Freq = NewFreq;
+    }
+    CallerBFI->setBlockFreq(ClonedBB, Freq);
+  }
+  BasicBlock *EntryClone = cast<BasicBlock>(VMap.lookup(&CalleeEntryBlock));
+  CallerBFI->setBlockFreqAndScale(
+      EntryClone, CallerBFI->getBlockFreq(CallSiteBlock).getFrequency(),
+      ClonedBBs);
+}
+
+/// Update the branch metadata for cloned call instructions.
+static void updateCallProfile(Function *Callee, const ValueToValueMapTy &VMap,
+                              const Optional<uint64_t> &CalleeEntryCount,
+                              const Instruction *TheCall,
+                              ProfileSummaryInfo *PSI,
+                              BlockFrequencyInfo *CallerBFI) {
+  if (!CalleeEntryCount.hasValue() || CalleeEntryCount.getValue() < 1)
+    return;
+  Optional<uint64_t> CallSiteCount =
+      PSI ? PSI->getProfileCount(TheCall, CallerBFI) : None;
+  uint64_t CallCount =
+      std::min(CallSiteCount.hasValue() ? CallSiteCount.getValue() : 0,
+               CalleeEntryCount.getValue());
+
+  for (auto const &Entry : VMap)
+    if (isa<CallInst>(Entry.first))
+      if (auto *CI = dyn_cast_or_null<CallInst>(Entry.second))
+        CI->updateProfWeight(CallCount, CalleeEntryCount.getValue());
+  for (BasicBlock &BB : *Callee)
+    // No need to update the callsite if it is pruned during inlining.
+    if (VMap.count(&BB))
+      for (Instruction &I : BB)
+        if (CallInst *CI = dyn_cast<CallInst>(&I))
+          CI->updateProfWeight(CalleeEntryCount.getValue() - CallCount,
+                               CalleeEntryCount.getValue());
+}
+
+/// Update the entry count of callee after inlining.
+///
+/// The callsite's block count is subtracted from the callee's function entry
+/// count.
+static void updateCalleeCount(BlockFrequencyInfo *CallerBFI, BasicBlock *CallBB,
+                              Instruction *CallInst, Function *Callee,
+                              ProfileSummaryInfo *PSI) {
+  // If the callee has a original count of N, and the estimated count of
+  // callsite is M, the new callee count is set to N - M. M is estimated from
+  // the caller's entry count, its entry block frequency and the block frequency
+  // of the callsite.
+  Optional<uint64_t> CalleeCount = Callee->getEntryCount();
+  if (!CalleeCount.hasValue() || !PSI)
+    return;
+  Optional<uint64_t> CallCount = PSI->getProfileCount(CallInst, CallerBFI);
+  if (!CallCount.hasValue())
+    return;
+  // Since CallSiteCount is an estimate, it could exceed the original callee
+  // count and has to be set to 0.
+  if (CallCount.getValue() > CalleeCount.getValue())
+    Callee->setEntryCount(0);
+  else
+    Callee->setEntryCount(CalleeCount.getValue() - CallCount.getValue());
+}
+d1408 2
+a1409 2
+  assert(TheCall->getParent() && TheCall->getFunction()
+         && "Instruction not in function!");
+d1413 2
+a1414 2
+
+  Function *CalledFunc = CS.getCalledFunction();
+d1551 1
+a1551 1
+    for (Function::arg_iterator I = CalledFunc->arg_begin(),
+d1561 1
+a1561 1
+                                        CalledFunc->getParamAlignment(ArgNo));
+d1581 1
+a1584 10
+    if (IFI.CallerBFI != nullptr && IFI.CalleeBFI != nullptr)
+      // Update the BFI of blocks cloned into the caller.
+      updateCallerBFI(OrigBB, VMap, IFI.CallerBFI, IFI.CalleeBFI,
+                      CalledFunc->front());
+
+    updateCallProfile(CalledFunc, VMap, CalledFunc->getEntryCount(), TheCall,
+                      IFI.PSI, IFI.CallerBFI);
+    // Update the profile count of callee.
+    updateCalleeCount(IFI.CallerBFI, OrigBB, TheCall, CalledFunc, IFI.PSI);
+
+a2089 6
+  if (IFI.CallerBFI) {
+    // Copy original BB's block frequency to AfterCallBB
+    IFI.CallerBFI->setBlockFreq(
+        AfterCallBB, IFI.CallerBFI->getBlockFreq(OrigBB).getFrequency());
+  }
+
+d2209 1
+a2209 1
+    if (Value *V = SimplifyInstruction(PHI, {DL, nullptr, nullptr, AC})) {
 @
 
 

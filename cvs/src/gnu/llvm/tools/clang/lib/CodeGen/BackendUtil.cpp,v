@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.11;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.27.50;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -1634,6 +1641,445 @@ a751 4
     AsmHelper.EmitAssemblyWithNewPassManager(Action, std::move(OS));
   else
     AsmHelper.EmitAssembly(Action, std::move(OS));
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d38 1
+a52 1
+#include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
+a56 1
+#include "llvm/Transforms/Utils/NameAnonGlobals.h"
+a63 3
+// Default filename used for profile generation.
+static constexpr StringLiteral DefaultProfileGenName = "default_%m.profraw";
+
+d76 1
+d84 3
+d133 1
+a133 2
+  PassManagerBuilderWrapper(const Triple &TargetTriple,
+                            const CodeGenOptions &CGOpts,
+d135 1
+a135 3
+      : PassManagerBuilder(), TargetTriple(TargetTriple), CGOpts(CGOpts),
+        LangOpts(LangOpts) {}
+  const Triple &getTargetTriple() const { return TargetTriple; }
+a137 1
+
+a138 1
+  const Triple &TargetTriple;
+d142 1
+a185 2
+  Opts.NoPrune = CGOpts.SanitizeCoverageNoPrune;
+  Opts.Inline8bitCounters = CGOpts.SanitizeCoverageInline8bitCounters;
+a188 18
+// Check if ASan should use GC-friendly instrumentation for globals.
+// First of all, there is no point if -fdata-sections is off (expect for MachO,
+// where this is not a factor). Also, on ELF this feature requires an assembler
+// extension that only works with -integrated-as at the moment.
+static bool asanUseGlobalsGC(const Triple &T, const CodeGenOptions &CGOpts) {
+  if (!CGOpts.SanitizeAddressGlobalsDeadStripping)
+    return false;
+  switch (T.getObjectFormat()) {
+  case Triple::MachO:
+  case Triple::COFF:
+    return true;
+  case Triple::ELF:
+    return CGOpts.DataSections && !CGOpts.DisableIntegratedAS;
+  default:
+    return false;
+  }
+}
+
+a192 1
+  const Triple &T = BuilderWrapper.getTargetTriple();
+a195 1
+  bool UseGlobalsGC = asanUseGlobalsGC(T, CGOpts);
+d198 1
+a198 2
+  PM.add(createAddressSanitizerModulePass(/*CompileKernel*/ false, Recover,
+                                          UseGlobalsGC));
+d265 1
+a265 1
+    LibFunc F;
+a294 134
+static CodeGenOpt::Level getCGOptLevel(const CodeGenOptions &CodeGenOpts) {
+  switch (CodeGenOpts.OptimizationLevel) {
+  default:
+    llvm_unreachable("Invalid optimization level!");
+  case 0:
+    return CodeGenOpt::None;
+  case 1:
+    return CodeGenOpt::Less;
+  case 2:
+    return CodeGenOpt::Default; // O2/Os/Oz
+  case 3:
+    return CodeGenOpt::Aggressive;
+  }
+}
+
+static llvm::CodeModel::Model getCodeModel(const CodeGenOptions &CodeGenOpts) {
+  unsigned CodeModel =
+      llvm::StringSwitch<unsigned>(CodeGenOpts.CodeModel)
+      .Case("small", llvm::CodeModel::Small)
+      .Case("kernel", llvm::CodeModel::Kernel)
+      .Case("medium", llvm::CodeModel::Medium)
+      .Case("large", llvm::CodeModel::Large)
+      .Case("default", llvm::CodeModel::Default)
+      .Default(~0u);
+  assert(CodeModel != ~0u && "invalid code model!");
+  return static_cast<llvm::CodeModel::Model>(CodeModel);
+}
+
+static llvm::Reloc::Model getRelocModel(const CodeGenOptions &CodeGenOpts) {
+  // Keep this synced with the equivalent code in
+  // lib/Frontend/CompilerInvocation.cpp
+  llvm::Optional<llvm::Reloc::Model> RM;
+  RM = llvm::StringSwitch<llvm::Reloc::Model>(CodeGenOpts.RelocationModel)
+      .Case("static", llvm::Reloc::Static)
+      .Case("pic", llvm::Reloc::PIC_)
+      .Case("ropi", llvm::Reloc::ROPI)
+      .Case("rwpi", llvm::Reloc::RWPI)
+      .Case("ropi-rwpi", llvm::Reloc::ROPI_RWPI)
+      .Case("dynamic-no-pic", llvm::Reloc::DynamicNoPIC);
+  assert(RM.hasValue() && "invalid PIC model!");
+  return *RM;
+}
+
+static TargetMachine::CodeGenFileType getCodeGenFileType(BackendAction Action) {
+  if (Action == Backend_EmitObj)
+    return TargetMachine::CGFT_ObjectFile;
+  else if (Action == Backend_EmitMCNull)
+    return TargetMachine::CGFT_Null;
+  else {
+    assert(Action == Backend_EmitAssembly && "Invalid action!");
+    return TargetMachine::CGFT_AssemblyFile;
+  }
+}
+
+static void initTargetOptions(llvm::TargetOptions &Options,
+                              const CodeGenOptions &CodeGenOpts,
+                              const clang::TargetOptions &TargetOpts,
+                              const LangOptions &LangOpts,
+                              const HeaderSearchOptions &HSOpts) {
+  Options.ThreadModel =
+      llvm::StringSwitch<llvm::ThreadModel::Model>(CodeGenOpts.ThreadModel)
+          .Case("posix", llvm::ThreadModel::POSIX)
+          .Case("single", llvm::ThreadModel::Single);
+
+  // Set float ABI type.
+  assert((CodeGenOpts.FloatABI == "soft" || CodeGenOpts.FloatABI == "softfp" ||
+          CodeGenOpts.FloatABI == "hard" || CodeGenOpts.FloatABI.empty()) &&
+         "Invalid Floating Point ABI!");
+  Options.FloatABIType =
+      llvm::StringSwitch<llvm::FloatABI::ABIType>(CodeGenOpts.FloatABI)
+          .Case("soft", llvm::FloatABI::Soft)
+          .Case("softfp", llvm::FloatABI::Soft)
+          .Case("hard", llvm::FloatABI::Hard)
+          .Default(llvm::FloatABI::Default);
+
+  // Set FP fusion mode.
+  switch (LangOpts.getDefaultFPContractMode()) {
+  case LangOptions::FPC_Off:
+    // Preserve any contraction performed by the front-end.  (Strict performs
+    // splitting of the muladd instrinsic in the backend.)
+    Options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
+    break;
+  case LangOptions::FPC_On:
+    Options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
+    break;
+  case LangOptions::FPC_Fast:
+    Options.AllowFPOpFusion = llvm::FPOpFusion::Fast;
+    break;
+  }
+
+  Options.UseInitArray = CodeGenOpts.UseInitArray;
+  Options.DisableIntegratedAS = CodeGenOpts.DisableIntegratedAS;
+  Options.CompressDebugSections = CodeGenOpts.getCompressDebugSections();
+  Options.RelaxELFRelocations = CodeGenOpts.RelaxELFRelocations;
+
+  // Set EABI version.
+  Options.EABIVersion = TargetOpts.EABIVersion;
+
+  if (LangOpts.SjLjExceptions)
+    Options.ExceptionModel = llvm::ExceptionHandling::SjLj;
+
+  Options.NoInfsFPMath = CodeGenOpts.NoInfsFPMath;
+  Options.NoNaNsFPMath = CodeGenOpts.NoNaNsFPMath;
+  Options.NoZerosInBSS = CodeGenOpts.NoZeroInitializedInBSS;
+  Options.UnsafeFPMath = CodeGenOpts.UnsafeFPMath;
+  Options.StackAlignmentOverride = CodeGenOpts.StackAlignment;
+  Options.FunctionSections = CodeGenOpts.FunctionSections;
+  Options.DataSections = CodeGenOpts.DataSections;
+  Options.UniqueSectionNames = CodeGenOpts.UniqueSectionNames;
+  Options.EmulatedTLS = CodeGenOpts.EmulatedTLS;
+  Options.DebuggerTuning = CodeGenOpts.getDebuggerTuning();
+
+  if (CodeGenOpts.EnableSplitDwarf)
+    Options.MCOptions.SplitDwarfFile = CodeGenOpts.SplitDwarfFile;
+  Options.MCOptions.MCRelaxAll = CodeGenOpts.RelaxAll;
+  Options.MCOptions.MCSaveTempLabels = CodeGenOpts.SaveTempLabels;
+  Options.MCOptions.MCUseDwarfDirectory = !CodeGenOpts.NoDwarfDirectoryAsm;
+  Options.MCOptions.MCNoExecStack = CodeGenOpts.NoExecStack;
+  Options.MCOptions.MCIncrementalLinkerCompatible =
+      CodeGenOpts.IncrementalLinkerCompatible;
+  Options.MCOptions.MCPIECopyRelocations = CodeGenOpts.PIECopyRelocations;
+  Options.MCOptions.MCFatalWarnings = CodeGenOpts.FatalWarnings;
+  Options.MCOptions.AsmVerbose = CodeGenOpts.AsmVerbose;
+  Options.MCOptions.PreserveAsmComments = CodeGenOpts.PreserveAsmComments;
+  Options.MCOptions.ABIName = TargetOpts.ABI;
+  for (const auto &Entry : HSOpts.UserEntries)
+    if (!Entry.IsFramework &&
+        (Entry.Group == frontend::IncludeDirGroup::Quoted ||
+         Entry.Group == frontend::IncludeDirGroup::Angled ||
+         Entry.Group == frontend::IncludeDirGroup::System))
+      Options.MCOptions.IASSearchPaths.push_back(
+          Entry.IgnoreSysRoot ? Entry.Path : HSOpts.Sysroot + Entry.Path);
+}
+
+d302 2
+a311 2
+  PassManagerBuilderWrapper PMBuilder(TargetTriple, CodeGenOpts, LangOpts);
+
+a318 3
+    // We do not want to inline hot callsites for SamplePGO module-summary build
+    // because profile annotation will happen again in ThinLTO backend, and we
+    // want the IR of the hot path to match the profile.
+d320 1
+a320 3
+        CodeGenOpts.OptimizationLevel, CodeGenOpts.OptimizeSize,
+        (!CodeGenOpts.SampleProfileFile.empty() &&
+         CodeGenOpts.EmitSummaryIndex));
+d325 1
+d337 1
+d339 5
+a343 1
+    TM->adjustPassManager(PMBuilder);
+d345 2
+a346 4
+  if (CodeGenOpts.DebugInfoForProfiling ||
+      !CodeGenOpts.SampleProfileFile.empty())
+    PMBuilder.addExtension(PassManagerBuilder::EP_EarlyAsPossible,
+                           addAddDiscriminatorsPass);
+d457 1
+a457 1
+      PMBuilder.PGOInstrGen = DefaultProfileGenName;
+d469 1
+a469 1
+static void setCommandLineOpts(const CodeGenOptions &CodeGenOpts) {
+d498 11
+a508 1
+  llvm::CodeModel::Model CM  = getCodeModel(CodeGenOpts);
+d511 29
+a539 2
+  llvm::Reloc::Model RM = getRelocModel(CodeGenOpts);
+  CodeGenOpt::Level OptLevel = getCGOptLevel(CodeGenOpts);
+d542 76
+a617 1
+  initTargetOptions(Options, CodeGenOpts, TargetOpts, LangOpts, HSOpts);
+d633 7
+a639 1
+  TargetMachine::CodeGenFileType CGFT = getCodeGenFileType(Action);
+d660 1
+a660 1
+  setCommandLineOpts(CodeGenOpts);
+a685 2
+  std::unique_ptr<raw_fd_ostream> ThinLinkOS;
+
+d691 3
+a693 18
+    if (CodeGenOpts.EmitSummaryIndex) {
+      if (!CodeGenOpts.ThinLinkBitcodeFile.empty()) {
+        std::error_code EC;
+        ThinLinkOS.reset(new llvm::raw_fd_ostream(
+            CodeGenOpts.ThinLinkBitcodeFile, EC,
+            llvm::sys::fs::F_None));
+        if (EC) {
+          Diags.Report(diag::err_fe_unable_to_open_output) << CodeGenOpts.ThinLinkBitcodeFile
+                                                           << EC.message();
+          return;
+        }
+      }
+      PerModulePasses.add(
+          createWriteThinLTOBitcodePass(*OS, ThinLinkOS.get()));
+    }
+    else
+      PerModulePasses.add(
+          createBitcodeWriterPass(*OS, CodeGenOpts.EmitLLVMUseLists));
+d772 1
+a772 1
+  setCommandLineOpts(CodeGenOpts);
+d782 1
+a782 22
+  PGOOptions PGOOpt;
+
+  // -fprofile-generate.
+  PGOOpt.RunProfileGen = CodeGenOpts.hasProfileIRInstr();
+  if (PGOOpt.RunProfileGen)
+    PGOOpt.ProfileGenFile = CodeGenOpts.InstrProfileOutput.empty() ?
+      DefaultProfileGenName : CodeGenOpts.InstrProfileOutput;
+
+  // -fprofile-use.
+  if (CodeGenOpts.hasProfileIRUse())
+    PGOOpt.ProfileUseFile = CodeGenOpts.ProfileInstrumentUsePath;
+
+  if (!CodeGenOpts.SampleProfileFile.empty())
+    PGOOpt.SampleProfileFile = CodeGenOpts.SampleProfileFile;
+
+  // Only pass a PGO options struct if -fprofile-generate or
+  // -fprofile-use were passed on the cmdline.
+  PassBuilder PB(TM.get(),
+    (PGOOpt.RunProfileGen ||
+      !PGOOpt.ProfileUseFile.empty() ||
+      !PGOOpt.SampleProfileFile.empty()) ?
+        Optional<PGOOptions>(PGOOpt) : None);
+d799 1
+a799 1
+  ModulePassManager MPM(CodeGenOpts.DebugPassManager);
+a801 3
+    bool IsThinLTO = CodeGenOpts.EmitSummaryIndex;
+    bool IsLTO = CodeGenOpts.PrepareForLTO;
+
+a805 2
+      if (IsThinLTO)
+        MPM.addPass(NameAnonGlobalPass());
+d807 3
+a809 2
+      // Map our optimization levels into one of the distinct levels used to
+      // configure the pipeline.
+d812 1
+a812 11
+      if (IsThinLTO) {
+        MPM = PB.buildThinLTOPreLinkDefaultPipeline(
+            Level, CodeGenOpts.DebugPassManager);
+        MPM.addPass(NameAnonGlobalPass());
+      } else if (IsLTO) {
+        MPM = PB.buildLTOPreLinkDefaultPipeline(Level,
+                                                CodeGenOpts.DebugPassManager);
+      } else {
+        MPM = PB.buildPerModuleDefaultPipeline(Level,
+                                               CodeGenOpts.DebugPassManager);
+      }
+a819 1
+  Optional<raw_fd_ostream> ThinLinkOS;
+d827 3
+a829 18
+    if (CodeGenOpts.EmitSummaryIndex) {
+      if (!CodeGenOpts.ThinLinkBitcodeFile.empty()) {
+        std::error_code EC;
+        ThinLinkOS.emplace(CodeGenOpts.ThinLinkBitcodeFile, EC,
+                           llvm::sys::fs::F_None);
+        if (EC) {
+          Diags.Report(diag::err_fe_unable_to_open_output)
+              << CodeGenOpts.ThinLinkBitcodeFile << EC.message();
+          return;
+        }
+      }
+      MPM.addPass(
+          ThinLTOBitcodeWriterPass(*OS, ThinLinkOS ? &*ThinLinkOS : nullptr));
+    } else {
+      MPM.addPass(BitcodeWriterPass(*OS, CodeGenOpts.EmitLLVMUseLists,
+                                    CodeGenOpts.EmitSummaryIndex,
+                                    CodeGenOpts.EmitSummaryIndex));
+    }
+a863 17
+Expected<BitcodeModule> clang::FindThinLTOModule(MemoryBufferRef MBRef) {
+  Expected<std::vector<BitcodeModule>> BMsOrErr = getBitcodeModuleList(MBRef);
+  if (!BMsOrErr)
+    return BMsOrErr.takeError();
+
+  // The bitcode file may contain multiple modules, we want the one that is
+  // marked as being the ThinLTO module.
+  for (BitcodeModule &BM : *BMsOrErr) {
+    Expected<BitcodeLTOInfo> LTOInfo = BM.getLTOInfo();
+    if (LTOInfo && LTOInfo->IsThinLTO)
+      return BM;
+  }
+
+  return make_error<StringError>("Could not find module summary",
+                                 inconvertibleErrorCode());
+}
+
+d865 2
+a866 8
+                              const HeaderSearchOptions &HeaderOpts,
+                              const CodeGenOptions &CGOpts,
+                              const clang::TargetOptions &TOpts,
+                              const LangOptions &LOpts,
+                              std::unique_ptr<raw_pwrite_stream> OS,
+                              std::string SampleProfile,
+                              BackendAction Action) {
+  StringMap<DenseMap<GlobalValue::GUID, GlobalValueSummary *>>
+a869 2
+  setCommandLineOpts(CGOpts);
+
+a874 4
+    // Ignore entries for undefined references.
+    if (GlobalList.second.SummaryList.empty())
+      continue;
+
+d876 1
+a876 1
+    assert(GlobalList.second.SummaryList.size() == 1 &&
+d878 1
+a878 1
+    auto &Summary = GlobalList.second.SummaryList[0];
+d900 4
+a903 3
+    Expected<BitcodeModule> BMOrErr = FindThinLTOModule(**MBOrErr);
+    if (!BMOrErr) {
+      handleAllErrors(BMOrErr.takeError(), [&](ErrorInfoBase &EIB) {
+d909 17
+a925 1
+    ModuleMap.insert({I.first(), *BMOrErr});
+a932 30
+  Conf.CPU = TOpts.CPU;
+  Conf.CodeModel = getCodeModel(CGOpts);
+  Conf.MAttrs = TOpts.Features;
+  Conf.RelocModel = getRelocModel(CGOpts);
+  Conf.CGOptLevel = getCGOptLevel(CGOpts);
+  initTargetOptions(Conf.Options, CGOpts, TOpts, LOpts, HeaderOpts);
+  Conf.SampleProfile = std::move(SampleProfile);
+  Conf.UseNewPM = CGOpts.ExperimentalNewPassManager;
+  switch (Action) {
+  case Backend_EmitNothing:
+    Conf.PreCodeGenModuleHook = [](size_t Task, const Module &Mod) {
+      return false;
+    };
+    break;
+  case Backend_EmitLL:
+    Conf.PreCodeGenModuleHook = [&](size_t Task, const Module &Mod) {
+      M->print(*OS, nullptr, CGOpts.EmitLLVMUseLists);
+      return false;
+    };
+    break;
+  case Backend_EmitBC:
+    Conf.PreCodeGenModuleHook = [&](size_t Task, const Module &Mod) {
+      WriteBitcodeToFile(M, *OS, CGOpts.EmitLLVMUseLists);
+      return false;
+    };
+    break;
+  default:
+    Conf.CGFileType = getCodeGenFileType(Action);
+    break;
+  }
+d955 1
+a955 2
+        llvm::getModuleSummaryIndexForFile(CGOpts.ThinLTOIndexFile,
+                                           /*IgnoreEmptyThinLTOIndexFile*/true);
+d968 1
+a968 2
+      runThinLTOBackend(CombinedIndex.get(), M, HeaderOpts, CGOpts, TOpts,
+                        LOpts, std::move(OS), CGOpts.SampleProfileFile, Action);
+a998 1
+  case Triple::Wasm:
+a1010 1
+  case Triple::Wasm:
 @
 
 

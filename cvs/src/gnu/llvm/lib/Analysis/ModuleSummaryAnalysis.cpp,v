@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.3
 date	2017.03.14.08.08.04;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	aUi5NxOzBSLCN5eN;
+
+1.1.1.4
+date	2017.10.04.20.27.58;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -677,6 +684,212 @@ log
 text
 @a407 1
 INITIALIZE_PASS_DEPENDENCY(ProfileSummaryInfoWrapperPass)
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d31 1
+a31 1
+#include "llvm/Object/ModuleSymbolTable.h"
+d40 1
+a40 2
+static void findRefEdges(ModuleSummaryIndex &Index, const User *CurUser,
+                         SetVector<ValueInfo> &RefEdges,
+d64 1
+a64 1
+          RefEdges.insert(Index.getOrInsertValueInfo(GV));
+a86 86
+/// Determine whether this call has all constant integer arguments (excluding
+/// "this") and summarize it to VCalls or ConstVCalls as appropriate.
+static void addVCallToSet(DevirtCallSite Call, GlobalValue::GUID Guid,
+                          SetVector<FunctionSummary::VFuncId> &VCalls,
+                          SetVector<FunctionSummary::ConstVCall> &ConstVCalls) {
+  std::vector<uint64_t> Args;
+  // Start from the second argument to skip the "this" pointer.
+  for (auto &Arg : make_range(Call.CS.arg_begin() + 1, Call.CS.arg_end())) {
+    auto *CI = dyn_cast<ConstantInt>(Arg);
+    if (!CI || CI->getBitWidth() > 64) {
+      VCalls.insert({Guid, Call.Offset});
+      return;
+    }
+    Args.push_back(CI->getZExtValue());
+  }
+  ConstVCalls.insert({{Guid, Call.Offset}, std::move(Args)});
+}
+
+/// If this intrinsic call requires that we add information to the function
+/// summary, do so via the non-constant reference arguments.
+static void addIntrinsicToSummary(
+    const CallInst *CI, SetVector<GlobalValue::GUID> &TypeTests,
+    SetVector<FunctionSummary::VFuncId> &TypeTestAssumeVCalls,
+    SetVector<FunctionSummary::VFuncId> &TypeCheckedLoadVCalls,
+    SetVector<FunctionSummary::ConstVCall> &TypeTestAssumeConstVCalls,
+    SetVector<FunctionSummary::ConstVCall> &TypeCheckedLoadConstVCalls) {
+  switch (CI->getCalledFunction()->getIntrinsicID()) {
+  case Intrinsic::type_test: {
+    auto *TypeMDVal = cast<MetadataAsValue>(CI->getArgOperand(1));
+    auto *TypeId = dyn_cast<MDString>(TypeMDVal->getMetadata());
+    if (!TypeId)
+      break;
+    GlobalValue::GUID Guid = GlobalValue::getGUID(TypeId->getString());
+
+    // Produce a summary from type.test intrinsics. We only summarize type.test
+    // intrinsics that are used other than by an llvm.assume intrinsic.
+    // Intrinsics that are assumed are relevant only to the devirtualization
+    // pass, not the type test lowering pass.
+    bool HasNonAssumeUses = llvm::any_of(CI->uses(), [](const Use &CIU) {
+      auto *AssumeCI = dyn_cast<CallInst>(CIU.getUser());
+      if (!AssumeCI)
+        return true;
+      Function *F = AssumeCI->getCalledFunction();
+      return !F || F->getIntrinsicID() != Intrinsic::assume;
+    });
+    if (HasNonAssumeUses)
+      TypeTests.insert(Guid);
+
+    SmallVector<DevirtCallSite, 4> DevirtCalls;
+    SmallVector<CallInst *, 4> Assumes;
+    findDevirtualizableCallsForTypeTest(DevirtCalls, Assumes, CI);
+    for (auto &Call : DevirtCalls)
+      addVCallToSet(Call, Guid, TypeTestAssumeVCalls,
+                    TypeTestAssumeConstVCalls);
+
+    break;
+  }
+
+  case Intrinsic::type_checked_load: {
+    auto *TypeMDVal = cast<MetadataAsValue>(CI->getArgOperand(2));
+    auto *TypeId = dyn_cast<MDString>(TypeMDVal->getMetadata());
+    if (!TypeId)
+      break;
+    GlobalValue::GUID Guid = GlobalValue::getGUID(TypeId->getString());
+
+    SmallVector<DevirtCallSite, 4> DevirtCalls;
+    SmallVector<Instruction *, 4> LoadedPtrs;
+    SmallVector<Instruction *, 4> Preds;
+    bool HasNonCallUses = false;
+    findDevirtualizableCallsForTypeCheckedLoad(DevirtCalls, LoadedPtrs, Preds,
+                                               HasNonCallUses, CI);
+    // Any non-call uses of the result of llvm.type.checked.load will
+    // prevent us from optimizing away the llvm.type.test.
+    if (HasNonCallUses)
+      TypeTests.insert(Guid);
+    for (auto &Call : DevirtCalls)
+      addVCallToSet(Call, Guid, TypeCheckedLoadVCalls,
+                    TypeCheckedLoadConstVCalls);
+
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+a101 4
+  SetVector<FunctionSummary::VFuncId> TypeTestAssumeVCalls,
+      TypeCheckedLoadVCalls;
+  SetVector<FunctionSummary::ConstVCall> TypeTestAssumeConstVCalls,
+      TypeCheckedLoadConstVCalls;
+d111 1
+a111 1
+      findRefEdges(Index, &I, RefEdges, Visited);
+d136 19
+a154 5
+        if (CI && CalledFunction->isIntrinsic()) {
+          addIntrinsicToSummary(
+              CI, TypeTests, TypeTestAssumeVCalls, TypeCheckedLoadVCalls,
+              TypeTestAssumeConstVCalls, TypeCheckedLoadConstVCalls);
+          continue;
+d158 1
+a158 1
+        auto ScaledCount = PSI->getProfileCount(&I, BFI);
+d166 1
+a166 3
+        CallGraphEdges[Index.getOrInsertValueInfo(
+                           cast<GlobalValue>(CalledValue))]
+            .updateHotness(Hotness);
+d181 2
+a182 2
+          CallGraphEdges[Index.getOrInsertValueInfo(Candidate.Value)]
+              .updateHotness(getHotness(Candidate.Count, PSI));
+a185 6
+  // Explicit add hot edges to enforce importing for designated GUIDs for
+  // sample PGO, to enable the same inlines as the profiled optimized binary.
+  for (auto &I : F.getImportGUIDs())
+    CallGraphEdges[Index.getOrInsertValueInfo(I)].updateHotness(
+        CalleeInfo::HotnessType::Critical);
+
+d193 1
+a193 1
+                                    /* Live = */ false);
+d196 1
+a196 4
+      TypeTests.takeVector(), TypeTestAssumeVCalls.takeVector(),
+      TypeCheckedLoadVCalls.takeVector(),
+      TypeTestAssumeConstVCalls.takeVector(),
+      TypeCheckedLoadConstVCalls.takeVector());
+d207 1
+a207 1
+  findRefEdges(Index, &V, RefEdges, Visited);
+d210 1
+a210 1
+                                    /* Live = */ false);
+d223 1
+a223 1
+                                    /* Live = */ false);
+d236 6
+a241 3
+  if (ValueInfo VI = Index.getValueInfo(GlobalValue::getGUID(Name)))
+    for (auto &Summary : VI.getSummaryList())
+      Summary->setLive(true);
+a247 1
+  assert(PSI);
+d329 3
+a331 2
+        M, [&M, &Index, &CantBePromoted](StringRef Name,
+                                         object::BasicSymbolRef::Flags Flags) {
+d341 2
+a342 2
+                                              /* NotEligibleToImport = */ true,
+                                              /* Live = */ true);
+d350 1
+a350 5
+                    ArrayRef<GlobalValue::GUID>{},
+                    ArrayRef<FunctionSummary::VFuncId>{},
+                    ArrayRef<FunctionSummary::VFuncId>{},
+                    ArrayRef<FunctionSummary::ConstVCall>{},
+                    ArrayRef<FunctionSummary::ConstVCall>{});
+a360 5
+  bool IsThinLTO = true;
+  if (auto *MD =
+          mdconst::extract_or_null<ConstantInt>(M.getModuleFlag("ThinLTO")))
+    IsThinLTO = MD->getZExtValue();
+
+d362 1
+a362 5
+    // Ignore entries for references that are undefined in the current module.
+    if (GlobalList.second.SummaryList.empty())
+      continue;
+
+    assert(GlobalList.second.SummaryList.size() == 1 &&
+d364 1
+a364 6
+    auto &Summary = GlobalList.second.SummaryList[0];
+    if (!IsThinLTO) {
+      Summary->setNotEligibleToImport();
+      continue;
+    }
+
+d367 1
+a367 1
+          return !CantBePromoted.count(VI.getGUID());
+d377 3
+a379 1
+            return !CantBePromoted.count(Edge.first.getGUID());
 @
 
 

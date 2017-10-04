@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.5
 	OPENBSD_6_2:1.1.1.4.0.2
 	OPENBSD_6_2_BASE:1.1.1.4
 	OPENBSD_6_1:1.1.1.4.0.4
@@ -43,8 +44,14 @@ commitid	so2WA7LCP6wbxtYl;
 1.1.1.4
 date	2017.03.14.08.08.14;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.5;
 commitid	aUi5NxOzBSLCN5eN;
+
+1.1.1.5
+date	2017.10.04.20.28.11;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -4349,6 +4356,615 @@ a2791 3
 d3084 1
 a3084 1
         MSU.reset(new MatchStateUpdater(*CurDAG, &NodeToMatch, RecordedNodes,
+@
+
+
+1.1.1.5
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d1 1
+a1 1
+//===- SelectionDAGISel.cpp - Implement the SelectionDAGISel class --------===//
+d14 1
+a16 3
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/None.h"
+a17 4
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
+a18 1
+#include "llvm/ADT/StringRef.h"
+d22 1
+a22 1
+#include "llvm/Analysis/OptimizationDiagnosticInfo.h"
+d27 1
+a27 2
+#include "llvm/CodeGen/ISDOpcodes.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+a29 2
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
+d31 1
+a31 3
+#include "llvm/CodeGen/MachineMemOperand.h"
+#include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/MachinePassRegistry.h"
+d33 1
+a33 1
+#include "llvm/CodeGen/MachineValueType.h"
+a34 1
+#include "llvm/CodeGen/SelectionDAG.h"
+a35 1
+#include "llvm/CodeGen/SelectionDAGNodes.h"
+d37 1
+a37 2
+#include "llvm/CodeGen/ValueTypes.h"
+#include "llvm/IR/BasicBlock.h"
+d39 1
+a39 5
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/Dominators.h"
+a41 2
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
+d45 3
+a47 11
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/User.h"
+#include "llvm/IR/Value.h"
+#include "llvm/MC/MCInstrDesc.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/BranchProbability.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/CodeGen.h"
+#include "llvm/Support/CommandLine.h"
+a50 1
+#include "llvm/Support/KnownBits.h"
+a61 8
+#include <cassert>
+#include <cstdint>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+d76 98
+a181 5
+static cl::opt<bool> EnableFastISelFallbackReport(
+    "fast-isel-report-on-fallback", cl::Hidden,
+    cl::desc("Emit a diagnostic when \"fast\" instruction selection "
+             "falls back to SelectionDAG."));
+
+d241 1
+a241 1
+               RegisterPassParser<RegisterScheduler>>
+a251 1
+
+a320 1
+
+d360 1
+a360 1
+  AA(), GFI(),
+d378 1
+a378 2
+  if (OptLevel != CodeGenOpt::None)
+    AU.addRequired<AAResultsWrapperPass>();
+d392 2
+a393 3
+/// execute the possibly trapping instruction. If available, we pass domtree
+/// and loop info to be updated when we split critical edges. This is because
+/// SelectionDAGISel preserves these analyses.
+d396 1
+a396 2
+static void SplitCriticalSideEffectEdges(Function &Fn, DominatorTree *DT,
+                                         LoopInfo *LI) {
+d422 1
+a422 1
+            CriticalEdgeSplittingOptions(DT, LI).setMergeIdenticalEdges());
+d434 2
+d457 1
+a459 5
+  ORE = make_unique<OptimizationRemarkEmitter>(&Fn);
+  auto *DTWP = getAnalysisIfAvailable<DominatorTreeWrapperPass>();
+  DominatorTree *DT = DTWP ? &DTWP->getDomTree() : nullptr;
+  auto *LIWP = getAnalysisIfAvailable<LoopInfoWrapperPass>();
+  LoopInfo *LI = LIWP ? &LIWP->getLoopInfo() : nullptr;
+d463 1
+a463 1
+  SplitCriticalSideEffectEdges(const_cast<Function &>(Fn), DT, LI);
+d465 1
+a465 1
+  CurDAG->init(*MF, *ORE);
+a467 5
+  // Now get the optional analyzes if we want to.
+  // This is based on the possibly changed OptLevel (after optnone is taken
+  // into account).  That's unfortunate but OK because it just means we won't
+  // ask for passes that have been required anyway.
+
+d473 1
+a473 6
+  if (OptLevel != CodeGenOpt::None)
+    AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+  else
+    AA = nullptr;
+
+  SDB->init(GFI, AA, LibInfo);
+a504 4
+  if (FastISelFailed && EnableFastISelFallbackReport) {
+    DiagnosticInfoISelFallback DiagFallback(Fn);
+    Fn.getContext().diagnose(DiagFallback);
+  }
+d631 1
+a631 1
+    while (true) {
+d651 7
+a657 1
+  TLI->finalizeLowering(*MF);
+a668 15
+static void reportFastISelFailure(MachineFunction &MF,
+                                  OptimizationRemarkEmitter &ORE,
+                                  OptimizationRemarkMissed &R,
+                                  bool ShouldAbort) {
+  // Print the function name explicitly if we don't have a debug location (which
+  // makes the diagnostic less useful) or if we're going to emit a raw error.
+  if (!R.getLocation().isValid() || ShouldAbort)
+    R << (" (in function: " + MF.getName() + ")").str();
+
+  if (ShouldAbort)
+    report_fatal_error(R.getMsg());
+
+  ORE.emit(R);
+}
+
+d674 2
+a675 4
+  for (BasicBlock::const_iterator I = Begin; I != End && !SDB->HasTailCall; ++I) {
+    if (!ElidedArgCopyInstrs.count(&*I))
+      SDB->visit(*I);
+  }
+d692 2
+a693 1
+  KnownBits Known;
+d722 2
+a723 2
+    CurDAG->computeKnownBits(Src, Known);
+    FuncInfo->AddLiveOutRegInfo(DestReg, NumSignBits, Known);
+a733 4
+
+  // Pre-type legalization allow creation of any node types.
+  CurDAG->NewNodesMustHaveLegalTypes = false;
+
+d759 1
+a759 1
+    CurDAG->Combine(BeforeLegalizeTypes, AA, OptLevel);
+a779 1
+  // Only allow creation of legal node types.
+d790 1
+a790 1
+      CurDAG->Combine(AfterLegalizeTypes, AA, OptLevel);
+d795 1
+a804 3
+    DEBUG(dbgs() << "Vector-legalized selection DAG: BB#" << BlockNumber
+          << " '" << BlockName << "'\n"; CurDAG->dump());
+
+a810 3
+    DEBUG(dbgs() << "Vector/type-legalized selection DAG: BB#" << BlockNumber
+          << " '" << BlockName << "'\n"; CurDAG->dump());
+
+d818 1
+a818 1
+      CurDAG->Combine(AfterLegalizeVectorOps, AA, OptLevel);
+d844 1
+a844 1
+    CurDAG->Combine(AfterLegalizeDAG, AA, OptLevel);
+a909 1
+
+a913 1
+
+a925 1
+
+a962 13
+      // When we are using non-default rounding modes or FP exception behavior
+      // FP operations are represented by StrictFP pseudo-operations.  They
+      // need to be simplified here so that the target-specific instruction
+      // selectors know how to handle them.
+      //
+      // If the current node is a strict FP pseudo-op, the isStrictFPOp()
+      // function will provide the corresponding normal FP opcode to which the
+      // node should be mutated.
+      //
+      // FIXME: The backends need a way to handle FP constraints.
+      if (Node->isStrictFPOpcode())
+        Node = CurDAG->mutateStrictFPToFP(Node);
+
+d1049 110
+a1168 1
+  FuncInfo->SwiftErrorVRegDefUses.clear();
+a1192 1
+                                                FastISel *FastIS,
+d1195 1
+d1205 15
+a1219 65
+  assert(FuncInfo->MBB == &*FuncInfo->MF->begin() &&
+         "expected to insert into entry block");
+  auto &DL = FuncInfo->MF->getDataLayout();
+  auto const *RC = TLI->getRegClassFor(TLI->getPointerTy(DL));
+  for (const auto *SwiftErrorVal : FuncInfo->SwiftErrorVals) {
+    // We will always generate a copy from the argument. It is always used at
+    // least by the 'return' of the swifterror.
+    if (FuncInfo->SwiftErrorArg && FuncInfo->SwiftErrorArg == SwiftErrorVal)
+      continue;
+    unsigned VReg = FuncInfo->MF->getRegInfo().createVirtualRegister(RC);
+    // Assign Undef to Vreg. We construct MI directly to make sure it works
+    // with FastISel.
+    BuildMI(*FuncInfo->MBB, FuncInfo->MBB->getFirstNonPHI(),
+            SDB->getCurDebugLoc(), TII->get(TargetOpcode::IMPLICIT_DEF),
+            VReg);
+
+    // Keep FastIS informed about the value we just inserted.
+    if (FastIS)
+      FastIS->setLastLocalValue(&*std::prev(FuncInfo->InsertPt));
+
+    FuncInfo->setCurrentSwiftErrorVReg(FuncInfo->MBB, SwiftErrorVal, VReg);
+  }
+}
+
+/// Collect llvm.dbg.declare information. This is done after argument lowering
+/// in case the declarations refer to arguments.
+static void processDbgDeclares(FunctionLoweringInfo *FuncInfo) {
+  MachineFunction *MF = FuncInfo->MF;
+  const DataLayout &DL = MF->getDataLayout();
+  for (const BasicBlock &BB : *FuncInfo->Fn) {
+    for (const Instruction &I : BB) {
+      const DbgDeclareInst *DI = dyn_cast<DbgDeclareInst>(&I);
+      if (!DI)
+        continue;
+
+      assert(DI->getVariable() && "Missing variable");
+      assert(DI->getDebugLoc() && "Missing location");
+      const Value *Address = DI->getAddress();
+      if (!Address)
+        continue;
+
+      // Look through casts and constant offset GEPs. These mostly come from
+      // inalloca.
+      APInt Offset(DL.getPointerSizeInBits(0), 0);
+      Address = Address->stripAndAccumulateInBoundsConstantOffsets(DL, Offset);
+
+      // Check if the variable is a static alloca or a byval or inalloca
+      // argument passed in memory. If it is not, then we will ignore this
+      // intrinsic and handle this during isel like dbg.value.
+      int FI = std::numeric_limits<int>::max();
+      if (const auto *AI = dyn_cast<AllocaInst>(Address)) {
+        auto SI = FuncInfo->StaticAllocaMap.find(AI);
+        if (SI != FuncInfo->StaticAllocaMap.end())
+          FI = SI->second;
+      } else if (const auto *Arg = dyn_cast<Argument>(Address))
+        FI = FuncInfo->getArgumentFrameIndex(Arg);
+
+      if (FI == std::numeric_limits<int>::max())
+        continue;
+
+      DIExpression *Expr = DI->getExpression();
+      if (Offset.getBoolValue())
+        Expr = DIExpression::prepend(Expr, DIExpression::NoDeref,
+                                     Offset.getZExtValue());
+      MF->setVariableDbgInfo(DI->getVariable(), Expr, FI, DI->getDebugLoc());
+a1341 74
+void preassignSwiftErrorRegs(const TargetLowering *TLI,
+                             FunctionLoweringInfo *FuncInfo,
+                             BasicBlock::const_iterator Begin,
+                             BasicBlock::const_iterator End) {
+  if (!TLI->supportSwiftError() || FuncInfo->SwiftErrorVals.empty())
+    return;
+
+  // Iterator over instructions and assign vregs to swifterror defs and uses.
+  for (auto It = Begin; It != End; ++It) {
+    ImmutableCallSite CS(&*It);
+    if (CS) {
+      // A call-site with a swifterror argument is both use and def.
+      const Value *SwiftErrorAddr = nullptr;
+      for (auto &Arg : CS.args()) {
+        if (!Arg->isSwiftError())
+          continue;
+        // Use of swifterror.
+        assert(!SwiftErrorAddr && "Cannot have multiple swifterror arguments");
+        SwiftErrorAddr = &*Arg;
+        assert(SwiftErrorAddr->isSwiftError() &&
+               "Must have a swifterror value argument");
+        unsigned VReg; bool CreatedReg;
+        std::tie(VReg, CreatedReg) = FuncInfo->getOrCreateSwiftErrorVRegUseAt(
+          &*It, FuncInfo->MBB, SwiftErrorAddr);
+        assert(CreatedReg);
+      }
+      if (!SwiftErrorAddr)
+        continue;
+
+      // Def of swifterror.
+      unsigned VReg; bool CreatedReg;
+      std::tie(VReg, CreatedReg) =
+          FuncInfo->getOrCreateSwiftErrorVRegDefAt(&*It);
+      assert(CreatedReg);
+      FuncInfo->setCurrentSwiftErrorVReg(FuncInfo->MBB, SwiftErrorAddr, VReg);
+
+    // A load is a use.
+    } else if (const LoadInst *LI = dyn_cast<const LoadInst>(&*It)) {
+      const Value *V = LI->getOperand(0);
+      if (!V->isSwiftError())
+        continue;
+
+      unsigned VReg; bool CreatedReg;
+      std::tie(VReg, CreatedReg) =
+          FuncInfo->getOrCreateSwiftErrorVRegUseAt(LI, FuncInfo->MBB, V);
+      assert(CreatedReg);
+
+    // A store is a def.
+    } else if (const StoreInst *SI = dyn_cast<const StoreInst>(&*It)) {
+      const Value *SwiftErrorAddr = SI->getOperand(1);
+      if (!SwiftErrorAddr->isSwiftError())
+        continue;
+
+      // Def of swifterror.
+      unsigned VReg; bool CreatedReg;
+      std::tie(VReg, CreatedReg) =
+          FuncInfo->getOrCreateSwiftErrorVRegDefAt(&*It);
+      assert(CreatedReg);
+      FuncInfo->setCurrentSwiftErrorVReg(FuncInfo->MBB, SwiftErrorAddr, VReg);
+
+    // A return in a swiferror returning function is a use.
+    } else if (const ReturnInst *R = dyn_cast<const ReturnInst>(&*It)) {
+      const Function *F = R->getParent()->getParent();
+      if(!F->getAttributes().hasAttrSomewhere(Attribute::SwiftError))
+        continue;
+
+      unsigned VReg; bool CreatedReg;
+      std::tie(VReg, CreatedReg) = FuncInfo->getOrCreateSwiftErrorVRegUseAt(
+          R, FuncInfo->MBB, FuncInfo->SwiftErrorArg);
+      assert(CreatedReg);
+    }
+  }
+}
+
+a1342 1
+  FastISelFailed = false;
+d1350 1
+d1352 3
+a1355 47
+  // Lower arguments up front. An RPO iteration always visits the entry block
+  // first.
+  assert(*RPOT.begin() == &Fn.getEntryBlock());
+  ++NumEntryBlocks;
+
+  // Set up FuncInfo for ISel. Entry blocks never have PHIs.
+  FuncInfo->MBB = FuncInfo->MBBMap[&Fn.getEntryBlock()];
+  FuncInfo->InsertPt = FuncInfo->MBB->begin();
+
+  if (!FastIS) {
+    LowerArguments(Fn);
+  } else {
+    // See if fast isel can lower the arguments.
+    FastIS->startNewBlock();
+    if (!FastIS->lowerArguments()) {
+      FastISelFailed = true;
+      // Fast isel failed to lower these arguments
+      ++NumFastIselFailLowerArguments;
+
+      OptimizationRemarkMissed R("sdagisel", "FastISelFailure",
+                                 Fn.getSubprogram(),
+                                 &Fn.getEntryBlock());
+      R << "FastISel didn't lower all arguments: "
+        << ore::NV("Prototype", Fn.getType());
+      reportFastISelFailure(*MF, *ORE, R, EnableFastISelAbort > 1);
+
+      // Use SelectionDAG argument lowering
+      LowerArguments(Fn);
+      CurDAG->setRoot(SDB->getControlRoot());
+      SDB->clear();
+      CodeGenAndEmitDAG();
+    }
+
+    // If we inserted any instructions at the beginning, make a note of
+    // where they are, so we can be sure to emit subsequent instructions
+    // after them.
+    if (FuncInfo->InsertPt != FuncInfo->MBB->begin())
+      FastIS->setLastLocalValue(&*std::prev(FuncInfo->InsertPt));
+    else
+      FastIS->setLastLocalValue(nullptr);
+  }
+  createSwiftErrorEntriesInEntryBlock(FuncInfo, FastIS, TLI, TII, SDB);
+
+  processDbgDeclares(FuncInfo);
+
+  // Iterate over all basic blocks in the function.
+  for (const BasicBlock *LLVMBB : RPOT) {
+d1387 2
+a1388 3
+
+    // Insert new instructions after any phi or argument setup code.
+    FuncInfo->InsertPt = FuncInfo->MBB->end();
+d1399 1
+a1399 2
+      if (LLVMBB != &Fn.getEntryBlock())
+        FastIS->startNewBlock();
+d1401 18
+a1418 1
+      unsigned NumFastIselRemaining = std::distance(Begin, End);
+d1420 8
+a1427 2
+      // Pre-assign swifterror vregs.
+      preassignSwiftErrorRegs(TLI, FuncInfo, Begin, End);
+d1429 1
+d1435 1
+a1435 2
+        if (isFoldedOrDeadInstruction(Inst, FuncInfo) ||
+            ElidedArgCopyInstrs.count(Inst)) {
+d1468 4
+a1471 1
+        FastISelFailed = true;
+d1474 1
+a1474 14
+        // We cannot separate out GCrelocates to their own blocks since we need
+        // to keep track of gc-relocates for a particular gc-statepoint. This is
+        // done by SelectionDAGBuilder::LowerAsSTATEPOINT, called before
+        // visitGCRelocate.
+        if (isa<CallInst>(Inst) && !isStatepoint(Inst) && !isGCRelocate(Inst)) {
+          OptimizationRemarkMissed R("sdagisel", "FastISelFailure",
+                                     Inst->getDebugLoc(), LLVMBB);
+
+          R << "FastISel missed call";
+
+          if (R.isEnabled() || EnableFastISelAbort) {
+            std::string InstStrStorage;
+            raw_string_ostream InstStr(InstStrStorage);
+            InstStr << *Inst;
+d1476 3
+a1478 1
+            R << ": " << InstStr.str();
+d1480 4
+a1483 2
+
+          reportFastISelFailure(*MF, *ORE, R, EnableFastISelAbort > 2);
+a1511 3
+        OptimizationRemarkMissed R("sdagisel", "FastISelFailure",
+                                   Inst->getDebugLoc(), LLVMBB);
+
+d1513 10
+a1522 7
+        if (isa<TerminatorInst>(Inst)) {
+          // Use a different message for terminator misses.
+          R << "FastISel missed terminator";
+          // Don't abort for terminator unless the level is really high
+          ShouldAbort = (EnableFastISelAbort > 2);
+        } else {
+          R << "FastISel missed";
+d1524 4
+a1527 9
+
+        if (R.isEnabled() || EnableFastISelAbort) {
+          std::string InstStrStorage;
+          raw_string_ostream InstStr(InstStrStorage);
+          InstStr << *Inst;
+          R << ": " << InstStr.str();
+        }
+
+        reportFastISelFailure(*MF, *ORE, R, ShouldAbort);
+d1534 6
+a1540 1
+
+a1558 6
+
+      // But if FastISel was run, we already selected some of the block.
+      // If we emitted a tail-call, we need to delete any previously emitted
+      // instruction that follows it.
+      if (HadTailCall && FuncInfo->InsertPt != FuncInfo->MBB->end())
+        FastIS->removeDeadCode(FuncInfo->InsertPt, FuncInfo->MBB->end());
+a1562 1
+    ElidedArgCopyInstrs.clear();
+d1978 2
+a1979 2
+  KnownBits Known;
+  CurDAG->computeKnownBits(LHS, Known);
+d1982 1
+a1982 1
+  if (NeededMask.isSubsetOf(Known.One))
+d2065 1
+a2065 1
+/// This function iteratively traverses up the operand chain, ignoring
+d2078 2
+a2079 2
+  std::vector<SDNode *> WorkList;
+  WorkList.push_back(Use);
+d2081 4
+a2084 5
+  while (!WorkList.empty()) {
+    Use = WorkList.back();
+    WorkList.pop_back();
+    if (Use->getNodeId() < Def->getNodeId() && Use->getNodeId() != -1)
+      continue;
+d2086 16
+a2101 21
+    // Don't revisit nodes if we already scanned it and didn't fail, we know we
+    // won't fail if we scan it again.
+    if (!Visited.insert(Use).second)
+      continue;
+
+    for (const SDValue &Op : Use->op_values()) {
+      // Ignore chain uses, they are validated by HandleMergeInputChains.
+      if (Op.getValueType() == MVT::Other && IgnoreChains)
+        continue;
+
+      SDNode *N = Op.getNode();
+      if (N == Def) {
+        if (Use == ImmedUse || Use == Root)
+          continue;  // We are not looking for immediate use.
+        assert(N != Root);
+        return true;
+      }
+
+      // Traverse up the operand chain.
+      WorkList.push_back(N);
+    }
+d2180 1
+d2557 1
+a2557 1
+          const SmallVectorImpl<std::pair<SDValue, SDNode*>> &RecordedNodes) {
+d2567 3
+a2569 3
+              SDValue N,
+              const SmallVectorImpl<std::pair<SDValue, SDNode*>> &RecordedNodes,
+              unsigned ChildNo) {
+d2691 1
+a2691 1
+                  SmallVectorImpl<std::pair<SDValue, SDNode*>> &RecordedNodes) {
+a2758 1
+
+a2787 1
+
+a2818 1
+
+d2924 1
+a2924 1
+    while (true) {
+d2945 1
+a2945 1
+  while (true) {
+d2960 1
+a2960 1
+      while (true) {
+d3121 1
+a3121 1
+      while (true) {
+d3152 1
+a3152 1
+      while (true) {
+d3218 1
+a3218 1
+        if (!NodeStack[i].getNode()->hasOneUse()) {
+a3383 9
+    case OPC_Coverage: {
+      // This is emitted right before MorphNode/EmitNode.
+      // So it should be safe to assume that this node has been selected
+      unsigned index = MatcherTable[MatcherIndex++];
+      index |= (MatcherTable[MatcherIndex++] << 8);
+      dbgs() << "COVERED: " << getPatternForIndex(index) << "\n";
+      dbgs() << "INCLUDED: " << getIncludePathForIndex(index) << "\n";
+      continue;
+    }
+d3476 1
+d3613 1
+a3613 1
+    while (true) {
 @
 
 

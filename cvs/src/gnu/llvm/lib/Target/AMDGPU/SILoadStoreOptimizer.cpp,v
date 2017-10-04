@@ -2,6 +2,7 @@ head	1.1;
 branch	1.1.1;
 access;
 symbols
+	LLVM_5_0_0:1.1.1.4
 	OPENBSD_6_2:1.1.1.3.0.2
 	OPENBSD_6_2_BASE:1.1.1.3
 	OPENBSD_6_1:1.1.1.3.0.4
@@ -37,8 +38,14 @@ commitid	qMUxATnKgqN83Oct;
 1.1.1.3
 date	2017.01.24.08.33.33;	author patrick;	state Exp;
 branches;
-next	;
+next	1.1.1.4;
 commitid	so2WA7LCP6wbxtYl;
+
+1.1.1.4
+date	2017.10.04.20.28.07;	author patrick;	state Exp;
+branches;
+next	;
+commitid	ufzi3t8MqoilCPqO;
 
 
 desc
@@ -826,6 +833,320 @@ d422 2
 a423 1
   AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
 d426 2
+@
+
+
+1.1.1.4
+log
+@Import LLVM 5.0.0 release including clang, lld and lldb.
+@
+text
+@d42 2
+a43 6
+#include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+a45 1
+#include "llvm/CodeGen/MachineInstr.h"
+a46 1
+#include "llvm/CodeGen/MachineOperand.h"
+a47 2
+#include "llvm/IR/DebugLoc.h"
+#include "llvm/Pass.h"
+a48 1
+#include "llvm/Support/MathExtras.h"
+a50 3
+#include <cassert>
+#include <iterator>
+#include <utility>
+a58 12
+
+  typedef struct {
+    MachineBasicBlock::iterator I;
+    MachineBasicBlock::iterator Paired;
+    unsigned EltSize;
+    unsigned Offset0;
+    unsigned Offset1;
+    unsigned BaseOff;
+    bool UseST64;
+    SmallVector<MachineInstr*, 8> InstsToMove;
+   } CombineInfo;
+
+d60 25
+a84 12
+  const SIInstrInfo *TII = nullptr;
+  const SIRegisterInfo *TRI = nullptr;
+  MachineRegisterInfo *MRI = nullptr;
+  AliasAnalysis *AA = nullptr;
+
+  static bool offsetsCanBeCombined(CombineInfo &CI);
+
+  bool findMatchingDSInst(CombineInfo &CI);
+
+  MachineBasicBlock::iterator mergeRead2Pair(CombineInfo &CI);
+
+  MachineBasicBlock::iterator mergeWrite2Pair(CombineInfo &CI);
+d89 5
+a93 1
+  SILoadStoreOptimizer() : MachineFunctionPass(ID) {
+d111 1
+a111 1
+} // end anonymous namespace.
+d123 2
+a124 2
+FunctionPass *llvm::createSILoadStoreOptimizerPass() {
+  return new SILoadStoreOptimizer();
+d144 5
+a148 4
+static bool memAccessesCanBeReordered(MachineBasicBlock::iterator A,
+                                      MachineBasicBlock::iterator B,
+                                      const SIInstrInfo *TII,
+                                      AliasAnalysis * AA) {
+d182 1
+d194 3
+a196 1
+bool SILoadStoreOptimizer::offsetsCanBeCombined(CombineInfo &CI) {
+d199 1
+a199 1
+  if (CI.Offset0 == CI.Offset1)
+d203 1
+a203 1
+  if ((CI.Offset0 % CI.EltSize != 0) || (CI.Offset1 % CI.EltSize != 0))
+d206 2
+a207 14
+  unsigned EltOffset0 = CI.Offset0 / CI.EltSize;
+  unsigned EltOffset1 = CI.Offset1 / CI.EltSize;
+  CI.UseST64 = false;
+  CI.BaseOff = 0;
+
+  // If the offset in elements doesn't fit in 8-bits, we might be able to use
+  // the stride 64 versions.
+  if ((EltOffset0 % 64 == 0) && (EltOffset1 % 64) == 0 &&
+      isUInt<8>(EltOffset0 / 64) && isUInt<8>(EltOffset1 / 64)) {
+    CI.Offset0 = EltOffset0 / 64;
+    CI.Offset1 = EltOffset1 / 64;
+    CI.UseST64 = true;
+    return true;
+  }
+d210 1
+a210 3
+  if (isUInt<8>(EltOffset0) && isUInt<8>(EltOffset1)) {
+    CI.Offset0 = EltOffset0;
+    CI.Offset1 = EltOffset1;
+a211 1
+  }
+d213 4
+a216 16
+  // Try to shift base address to decrease offsets.
+  unsigned OffsetDiff = std::abs((int)EltOffset1 - (int)EltOffset0);
+  CI.BaseOff = std::min(CI.Offset0, CI.Offset1);
+
+  if ((OffsetDiff % 64 == 0) && isUInt<8>(OffsetDiff / 64)) {
+    CI.Offset0 = (EltOffset0 - CI.BaseOff / CI.EltSize) / 64;
+    CI.Offset1 = (EltOffset1 - CI.BaseOff / CI.EltSize) / 64;
+    CI.UseST64 = true;
+    return true;
+  }
+
+  if (isUInt<8>(OffsetDiff)) {
+    CI.Offset0 = EltOffset0 - CI.BaseOff / CI.EltSize;
+    CI.Offset1 = EltOffset1 - CI.BaseOff / CI.EltSize;
+    return true;
+  }
+d218 1
+a218 1
+  return false;
+d221 6
+a226 3
+bool SILoadStoreOptimizer::findMatchingDSInst(CombineInfo &CI) {
+  MachineBasicBlock::iterator E = CI.I->getParent()->end();
+  MachineBasicBlock::iterator MBBI = CI.I;
+d230 1
+a230 1
+  addDefsToList(*CI.I, DefsToMove);
+d233 2
+a234 1
+    if (MBBI->getOpcode() != CI.I->getOpcode()) {
+d245 1
+a245 1
+        return false;
+d248 1
+a248 1
+        !memAccessesCanBeReordered(*CI.I, *MBBI, TII, AA)) {
+d252 1
+a252 1
+        CI.InstsToMove.push_back(&*MBBI);
+d260 1
+a260 1
+      addToListsIfDependent(*MBBI, DefsToMove, CI.InstsToMove);
+d266 1
+a266 1
+      return false;
+d274 1
+a274 1
+    if (addToListsIfDependent(*MBBI, DefsToMove, CI.InstsToMove))
+d277 2
+a278 3
+    int AddrIdx = AMDGPU::getNamedOperandIdx(CI.I->getOpcode(),
+                                             AMDGPU::OpName::addr);
+    const MachineOperand &AddrReg0 = CI.I->getOperand(AddrIdx);
+d285 1
+a285 1
+      int OffsetIdx = AMDGPU::getNamedOperandIdx(CI.I->getOpcode(),
+d287 2
+a288 3
+      CI.Offset0 = CI.I->getOperand(OffsetIdx).getImm() & 0xffff;
+      CI.Offset1 = MBBI->getOperand(OffsetIdx).getImm() & 0xffff;
+      CI.Paired = MBBI;
+d294 3
+a296 3
+      if (offsetsCanBeCombined(CI))
+        if (canMoveInstsAcrossMemOp(*MBBI, CI.InstsToMove, TII, AA))
+          return true;
+d303 3
+a305 3
+    // check if we can move I across MBBI and if we can move all I's users
+    if (!memAccessesCanBeReordered(*CI.I, *MBBI, TII, AA) ||
+      !canMoveInstsAcrossMemOp(*MBBI, CI.InstsToMove, TII, AA))
+d308 1
+a308 1
+  return false;
+d312 5
+a316 2
+  CombineInfo &CI) {
+  MachineBasicBlock *MBB = CI.I->getParent();
+d320 1
+a320 1
+  const auto *AddrReg = TII->getNamedOperand(*CI.I, AMDGPU::OpName::addr);
+d322 2
+a323 2
+  const auto *Dest0 = TII->getNamedOperand(*CI.I, AMDGPU::OpName::vdst);
+  const auto *Dest1 = TII->getNamedOperand(*CI.Paired, AMDGPU::OpName::vdst);
+d325 17
+a341 8
+  unsigned NewOffset0 = CI.Offset0;
+  unsigned NewOffset1 = CI.Offset1;
+  unsigned Opc = (CI.EltSize == 4) ? AMDGPU::DS_READ2_B32
+                                   : AMDGPU::DS_READ2_B64;
+
+  if (CI.UseST64)
+    Opc = (CI.EltSize == 4) ? AMDGPU::DS_READ2ST64_B32
+                            : AMDGPU::DS_READ2ST64_B64;
+d343 2
+a344 2
+  unsigned SubRegIdx0 = (CI.EltSize == 4) ? AMDGPU::sub0 : AMDGPU::sub0_sub1;
+  unsigned SubRegIdx1 = (CI.EltSize == 4) ? AMDGPU::sub1 : AMDGPU::sub2_sub3;
+d359 1
+a359 1
+    = (CI.EltSize == 4) ? &AMDGPU::VReg_64RegClass : &AMDGPU::VReg_128RegClass;
+d362 9
+a370 20
+  DebugLoc DL = CI.I->getDebugLoc();
+
+  unsigned BaseReg = AddrReg->getReg();
+  unsigned BaseRegFlags = 0;
+  if (CI.BaseOff) {
+    BaseReg = MRI->createVirtualRegister(&AMDGPU::VGPR_32RegClass);
+    BaseRegFlags = RegState::Kill;
+    BuildMI(*MBB, CI.Paired, DL, TII->get(AMDGPU::V_ADD_I32_e32), BaseReg)
+           .addImm(CI.BaseOff)
+           .addReg(AddrReg->getReg());
+  }
+
+  MachineInstrBuilder Read2 =
+    BuildMI(*MBB, CI.Paired, DL, Read2Desc, DestReg)
+      .addReg(BaseReg, BaseRegFlags) // addr
+      .addImm(NewOffset0)            // offset0
+      .addImm(NewOffset1)            // offset1
+      .addImm(0)                     // gds
+      .setMemRefs(CI.I->mergeMemRefsWith(*CI.Paired));
+
+d376 12
+a387 12
+  BuildMI(*MBB, CI.Paired, DL, CopyDesc)
+      .add(*Dest0) // Copy to same destination including flags and sub reg.
+      .addReg(DestReg, 0, SubRegIdx0);
+  MachineInstr *Copy1 = BuildMI(*MBB, CI.Paired, DL, CopyDesc)
+                            .add(*Dest1)
+                            .addReg(DestReg, RegState::Kill, SubRegIdx1);
+
+  moveInstsAfter(Copy1, CI.InstsToMove);
+
+  MachineBasicBlock::iterator Next = std::next(CI.I);
+  CI.I->eraseFromParent();
+  CI.Paired->eraseFromParent();
+d394 5
+a398 2
+  CombineInfo &CI) {
+  MachineBasicBlock *MBB = CI.I->getParent();
+d402 2
+a403 2
+  const MachineOperand *Addr = TII->getNamedOperand(*CI.I, AMDGPU::OpName::addr);
+  const MachineOperand *Data0 = TII->getNamedOperand(*CI.I, AMDGPU::OpName::data0);
+d405 2
+a406 1
+    = TII->getNamedOperand(*CI.Paired, AMDGPU::OpName::data0);
+d408 17
+a424 8
+  unsigned NewOffset0 = CI.Offset0;
+  unsigned NewOffset1 = CI.Offset1;
+  unsigned Opc = (CI.EltSize == 4) ? AMDGPU::DS_WRITE2_B32
+                                   : AMDGPU::DS_WRITE2_B64;
+
+  if (CI.UseST64)
+    Opc = (CI.EltSize == 4) ? AMDGPU::DS_WRITE2ST64_B32
+                            : AMDGPU::DS_WRITE2ST64_B64;
+d437 1
+a437 1
+  DebugLoc DL = CI.I->getDebugLoc();
+d439 16
+a454 25
+  unsigned BaseReg = Addr->getReg();
+  unsigned BaseRegFlags = 0;
+  if (CI.BaseOff) {
+    BaseReg = MRI->createVirtualRegister(&AMDGPU::VGPR_32RegClass);
+    BaseRegFlags = RegState::Kill;
+    BuildMI(*MBB, CI.Paired, DL, TII->get(AMDGPU::V_ADD_I32_e32), BaseReg)
+           .addImm(CI.BaseOff)
+           .addReg(Addr->getReg());
+  }
+
+  MachineInstrBuilder Write2 =
+    BuildMI(*MBB, CI.Paired, DL, Write2Desc)
+      .addReg(BaseReg, BaseRegFlags) // addr
+      .add(*Data0)                   // data0
+      .add(*Data1)                   // data1
+      .addImm(NewOffset0)            // offset0
+      .addImm(NewOffset1)            // offset1
+      .addImm(0)                     // gds
+      .setMemRefs(CI.I->mergeMemRefsWith(*CI.Paired));
+
+  moveInstsAfter(Write2, CI.InstsToMove);
+
+  MachineBasicBlock::iterator Next = std::next(CI.I);
+  CI.I->eraseFromParent();
+  CI.Paired->eraseFromParent();
+d475 1
+a475 2
+    CombineInfo CI;
+    CI.I = I;
+d478 4
+a481 2
+      CI.EltSize = (Opc == AMDGPU::DS_READ_B64) ? 8 : 4;
+      if (findMatchingDSInst(CI)) {
+d483 1
+a483 1
+        I = mergeRead2Pair(CI);
+d490 4
+a493 2
+      CI.EltSize = (Opc == AMDGPU::DS_WRITE_B64) ? 8 : 4;
+      if (findMatchingDSInst(CI)) {
+d495 1
+a495 1
+        I = mergeWrite2Pair(CI);
 @
 
 

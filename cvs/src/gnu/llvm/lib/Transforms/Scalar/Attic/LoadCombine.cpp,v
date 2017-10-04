@@ -1,0 +1,466 @@
+head	1.2;
+access;
+symbols
+	OPENBSD_6_2:1.1.1.3.0.2
+	OPENBSD_6_2_BASE:1.1.1.3
+	OPENBSD_6_1:1.1.1.3.0.4
+	OPENBSD_6_1_BASE:1.1.1.3
+	LLVM_4_0_0:1.1.1.3
+	LLVM_4_0_0_RC1:1.1.1.3
+	LLVM_3_9_1:1.1.1.2
+	LLVM_3_8_1:1.1.1.1
+	LLVM:1.1.1;
+locks; strict;
+comment	@// @;
+
+
+1.2
+date	2017.10.04.21.16.55;	author patrick;	state dead;
+branches;
+next	1.1;
+commitid	QXgPafJLIDgeA2ax;
+
+1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches
+	1.1.1.1;
+next	;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.1
+date	2016.09.03.22.47.00;	author pascal;	state Exp;
+branches;
+next	1.1.1.2;
+commitid	piLU3CHugy63NlaI;
+
+1.1.1.2
+date	2017.01.14.19.56.02;	author patrick;	state Exp;
+branches;
+next	1.1.1.3;
+commitid	qMUxATnKgqN83Oct;
+
+1.1.1.3
+date	2017.01.24.08.33.24;	author patrick;	state Exp;
+branches;
+next	;
+commitid	so2WA7LCP6wbxtYl;
+
+
+desc
+@@
+
+
+1.2
+log
+@Tedu files that got removed in LLVM 5.0.0.
+@
+text
+@//===- LoadCombine.cpp - Combine Adjacent Loads ---------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+/// \file
+/// This transformation combines adjacent loads.
+///
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AliasSetTracker.h"
+#include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/TargetFolder.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "load-combine"
+
+STATISTIC(NumLoadsAnalyzed, "Number of loads analyzed for combining");
+STATISTIC(NumLoadsCombined, "Number of loads combined");
+
+namespace {
+struct PointerOffsetPair {
+  Value *Pointer;
+  uint64_t Offset;
+};
+
+struct LoadPOPPair {
+  LoadPOPPair() = default;
+  LoadPOPPair(LoadInst *L, PointerOffsetPair P, unsigned O)
+      : Load(L), POP(P), InsertOrder(O) {}
+  LoadInst *Load;
+  PointerOffsetPair POP;
+  /// \brief The new load needs to be created before the first load in IR order.
+  unsigned InsertOrder;
+};
+
+class LoadCombine : public BasicBlockPass {
+  LLVMContext *C;
+  AliasAnalysis *AA;
+
+public:
+  LoadCombine() : BasicBlockPass(ID), C(nullptr), AA(nullptr) {
+    initializeLoadCombinePass(*PassRegistry::getPassRegistry());
+  }
+  
+  using llvm::Pass::doInitialization;
+  bool doInitialization(Function &) override;
+  bool runOnBasicBlock(BasicBlock &BB) override;
+  void getAnalysisUsage(AnalysisUsage &AU) const override;
+
+  const char *getPassName() const override { return "LoadCombine"; }
+  static char ID;
+
+  typedef IRBuilder<true, TargetFolder> BuilderTy;
+
+private:
+  BuilderTy *Builder;
+
+  PointerOffsetPair getPointerOffsetPair(LoadInst &);
+  bool combineLoads(DenseMap<const Value *, SmallVector<LoadPOPPair, 8>> &);
+  bool aggregateLoads(SmallVectorImpl<LoadPOPPair> &);
+  bool combineLoads(SmallVectorImpl<LoadPOPPair> &);
+};
+}
+
+bool LoadCombine::doInitialization(Function &F) {
+  DEBUG(dbgs() << "LoadCombine function: " << F.getName() << "\n");
+  C = &F.getContext();
+  return true;
+}
+
+PointerOffsetPair LoadCombine::getPointerOffsetPair(LoadInst &LI) {
+  PointerOffsetPair POP;
+  POP.Pointer = LI.getPointerOperand();
+  POP.Offset = 0;
+  while (isa<BitCastInst>(POP.Pointer) || isa<GetElementPtrInst>(POP.Pointer)) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(POP.Pointer)) {
+      auto &DL = LI.getModule()->getDataLayout();
+      unsigned BitWidth = DL.getPointerTypeSizeInBits(GEP->getType());
+      APInt Offset(BitWidth, 0);
+      if (GEP->accumulateConstantOffset(DL, Offset))
+        POP.Offset += Offset.getZExtValue();
+      else
+        // Can't handle GEPs with variable indices.
+        return POP;
+      POP.Pointer = GEP->getPointerOperand();
+    } else if (auto *BC = dyn_cast<BitCastInst>(POP.Pointer))
+      POP.Pointer = BC->getOperand(0);
+  }
+  return POP;
+}
+
+bool LoadCombine::combineLoads(
+    DenseMap<const Value *, SmallVector<LoadPOPPair, 8>> &LoadMap) {
+  bool Combined = false;
+  for (auto &Loads : LoadMap) {
+    if (Loads.second.size() < 2)
+      continue;
+    std::sort(Loads.second.begin(), Loads.second.end(),
+              [](const LoadPOPPair &A, const LoadPOPPair &B) {
+      return A.POP.Offset < B.POP.Offset;
+    });
+    if (aggregateLoads(Loads.second))
+      Combined = true;
+  }
+  return Combined;
+}
+
+/// \brief Try to aggregate loads from a sorted list of loads to be combined.
+///
+/// It is guaranteed that no writes occur between any of the loads. All loads
+/// have the same base pointer. There are at least two loads.
+bool LoadCombine::aggregateLoads(SmallVectorImpl<LoadPOPPair> &Loads) {
+  assert(Loads.size() >= 2 && "Insufficient loads!");
+  LoadInst *BaseLoad = nullptr;
+  SmallVector<LoadPOPPair, 8> AggregateLoads;
+  bool Combined = false;
+  uint64_t PrevOffset = -1ull;
+  uint64_t PrevSize = 0;
+  for (auto &L : Loads) {
+    if (PrevOffset == -1ull) {
+      BaseLoad = L.Load;
+      PrevOffset = L.POP.Offset;
+      PrevSize = L.Load->getModule()->getDataLayout().getTypeStoreSize(
+          L.Load->getType());
+      AggregateLoads.push_back(L);
+      continue;
+    }
+    if (L.Load->getAlignment() > BaseLoad->getAlignment())
+      continue;
+    if (L.POP.Offset > PrevOffset + PrevSize) {
+      // No other load will be combinable
+      if (combineLoads(AggregateLoads))
+        Combined = true;
+      AggregateLoads.clear();
+      PrevOffset = -1;
+      continue;
+    }
+    if (L.POP.Offset != PrevOffset + PrevSize)
+      // This load is offset less than the size of the last load.
+      // FIXME: We may want to handle this case.
+      continue;
+    PrevOffset = L.POP.Offset;
+    PrevSize = L.Load->getModule()->getDataLayout().getTypeStoreSize(
+        L.Load->getType());
+    AggregateLoads.push_back(L);
+  }
+  if (combineLoads(AggregateLoads))
+    Combined = true;
+  return Combined;
+}
+
+/// \brief Given a list of combinable load. Combine the maximum number of them.
+bool LoadCombine::combineLoads(SmallVectorImpl<LoadPOPPair> &Loads) {
+  // Remove loads from the end while the size is not a power of 2.
+  unsigned TotalSize = 0;
+  for (const auto &L : Loads)
+    TotalSize += L.Load->getType()->getPrimitiveSizeInBits();
+  while (TotalSize != 0 && !isPowerOf2_32(TotalSize))
+    TotalSize -= Loads.pop_back_val().Load->getType()->getPrimitiveSizeInBits();
+  if (Loads.size() < 2)
+    return false;
+
+  DEBUG({
+    dbgs() << "***** Combining Loads ******\n";
+    for (const auto &L : Loads) {
+      dbgs() << L.POP.Offset << ": " << *L.Load << "\n";
+    }
+  });
+
+  // Find first load. This is where we put the new load.
+  LoadPOPPair FirstLP;
+  FirstLP.InsertOrder = -1u;
+  for (const auto &L : Loads)
+    if (L.InsertOrder < FirstLP.InsertOrder)
+      FirstLP = L;
+
+  unsigned AddressSpace =
+      FirstLP.POP.Pointer->getType()->getPointerAddressSpace();
+
+  Builder->SetInsertPoint(FirstLP.Load);
+  Value *Ptr = Builder->CreateConstGEP1_64(
+      Builder->CreatePointerCast(Loads[0].POP.Pointer,
+                                 Builder->getInt8PtrTy(AddressSpace)),
+      Loads[0].POP.Offset);
+  LoadInst *NewLoad = new LoadInst(
+      Builder->CreatePointerCast(
+          Ptr, PointerType::get(IntegerType::get(Ptr->getContext(), TotalSize),
+                                Ptr->getType()->getPointerAddressSpace())),
+      Twine(Loads[0].Load->getName()) + ".combined", false,
+      Loads[0].Load->getAlignment(), FirstLP.Load);
+
+  for (const auto &L : Loads) {
+    Builder->SetInsertPoint(L.Load);
+    Value *V = Builder->CreateExtractInteger(
+        L.Load->getModule()->getDataLayout(), NewLoad,
+        cast<IntegerType>(L.Load->getType()),
+        L.POP.Offset - Loads[0].POP.Offset, "combine.extract");
+    L.Load->replaceAllUsesWith(V);
+  }
+
+  NumLoadsCombined = NumLoadsCombined + Loads.size();
+  return true;
+}
+
+bool LoadCombine::runOnBasicBlock(BasicBlock &BB) {
+  if (skipOptnoneFunction(BB))
+    return false;
+
+  AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+
+  IRBuilder<true, TargetFolder> TheBuilder(
+      BB.getContext(), TargetFolder(BB.getModule()->getDataLayout()));
+  Builder = &TheBuilder;
+
+  DenseMap<const Value *, SmallVector<LoadPOPPair, 8>> LoadMap;
+  AliasSetTracker AST(*AA);
+
+  bool Combined = false;
+  unsigned Index = 0;
+  for (auto &I : BB) {
+    if (I.mayThrow() || (I.mayWriteToMemory() && AST.containsUnknown(&I))) {
+      if (combineLoads(LoadMap))
+        Combined = true;
+      LoadMap.clear();
+      AST.clear();
+      continue;
+    }
+    LoadInst *LI = dyn_cast<LoadInst>(&I);
+    if (!LI)
+      continue;
+    ++NumLoadsAnalyzed;
+    if (!LI->isSimple() || !LI->getType()->isIntegerTy())
+      continue;
+    auto POP = getPointerOffsetPair(*LI);
+    if (!POP.Pointer)
+      continue;
+    LoadMap[POP.Pointer].push_back(LoadPOPPair(LI, POP, Index++));
+    AST.add(LI);
+  }
+  if (combineLoads(LoadMap))
+    Combined = true;
+  return Combined;
+}
+
+void LoadCombine::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.setPreservesCFG();
+
+  AU.addRequired<AAResultsWrapperPass>();
+  AU.addPreserved<GlobalsAAWrapperPass>();
+}
+
+char LoadCombine::ID = 0;
+
+BasicBlockPass *llvm::createLoadCombinePass() {
+  return new LoadCombine();
+}
+
+INITIALIZE_PASS_BEGIN(LoadCombine, "load-combine", "Combine Adjacent Loads",
+                      false, false)
+INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(GlobalsAAWrapperPass)
+INITIALIZE_PASS_END(LoadCombine, "load-combine", "Combine Adjacent Loads",
+                    false, false)
+
+@
+
+
+1.1
+log
+@Initial revision
+@
+text
+@@
+
+
+1.1.1.1
+log
+@Use the space freed up by sparc and zaurus to import LLVM.
+
+ok hackroom@@
+@
+text
+@@
+
+
+1.1.1.2
+log
+@Import LLVM 3.9.1 including clang and lld.
+@
+text
+@a37 2
+#define LDCOMBINE_NAME "Combine Adjacent Loads"
+
+d41 1
+a41 1
+  APInt Offset;
+d66 1
+a66 5
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    AU.addRequired<AAResultsWrapperPass>();
+    AU.addPreserved<GlobalsAAWrapperPass>();
+  }
+d68 1
+a68 1
+  const char *getPassName() const override { return LDCOMBINE_NAME; }
+d71 1
+a71 1
+  typedef IRBuilder<TargetFolder> BuilderTy;
+a89 2
+  auto &DL = LI.getModule()->getDataLayout();
+
+d92 1
+a92 3
+  unsigned BitWidth = DL.getPointerSizeInBits(LI.getPointerAddressSpace());
+  POP.Offset = APInt(BitWidth, 0);
+
+d95 6
+a100 2
+      APInt LastOffset = POP.Offset;
+      if (!GEP->accumulateConstantOffset(DL, POP.Offset)) {
+a101 1
+        POP.Offset = LastOffset;
+a102 1
+      }
+d104 1
+a104 1
+    } else if (auto *BC = dyn_cast<BitCastInst>(POP.Pointer)) {
+a105 1
+    }
+d118 2
+a119 2
+                return A.POP.Offset.slt(B.POP.Offset);
+              });
+d135 1
+a135 2
+  bool ValidPrevOffset = false;
+  APInt PrevOffset;
+d138 1
+a138 1
+    if (ValidPrevOffset == false) {
+a143 1
+      ValidPrevOffset = true;
+d148 1
+a148 2
+    APInt PrevEnd = PrevOffset + PrevSize;
+    if (L.POP.Offset.sgt(PrevEnd)) {
+d153 1
+a153 1
+      ValidPrevOffset = false;
+d156 1
+a156 1
+    if (L.POP.Offset != PrevEnd)
+d202 1
+a202 1
+      Loads[0].POP.Offset.getSExtValue());
+d215 1
+a215 1
+        (L.POP.Offset - Loads[0].POP.Offset).getZExtValue(), "combine.extract");
+d224 1
+a224 1
+  if (skipBasicBlock(BB))
+d229 1
+a229 1
+  IRBuilder<TargetFolder> TheBuilder(
+d263 7
+d276 2
+a277 1
+INITIALIZE_PASS_BEGIN(LoadCombine, "load-combine", LDCOMBINE_NAME, false, false)
+d279 4
+a282 1
+INITIALIZE_PASS_END(LoadCombine, "load-combine", LDCOMBINE_NAME, false, false)
+@
+
+
+1.1.1.3
+log
+@Import LLVM 4.0.0 rc1 including clang and lld to help the current
+development effort on OpenBSD/arm64.
+@
+text
+@d47 3
+d74 1
+a74 1
+  StringRef getPassName() const override { return LDCOMBINE_NAME; }
+d267 1
+a267 1
+    LoadMap[POP.Pointer].push_back({LI, std::move(POP), Index++});
+@
+
+

@@ -1,4 +1,4 @@
-head	1.60;
+head	1.61;
 access;
 symbols
 	OPENBSD_6_2:1.60.0.4
@@ -38,6 +38,12 @@ symbols
 locks; strict;
 comment	@ * @;
 
+
+1.61
+date	2017.10.06.18.02.30;	author nicm;	state Exp;
+branches;
+next	1.60;
+commitid	UDU2eKTiPTutOmkf;
 
 1.60
 date	2017.05.30.21.44.59;	author nicm;	state Exp;
@@ -373,47 +379,13 @@ desc
 @@
 
 
-1.60
+1.61
 log
-@Rewrite of choose mode, both to simplify and tidy the code and to add
-some modern features.
-
-Now the common code is in mode-tree.c, which provides an API used by the
-three modes now separated into window-{buffer,client,tree}.c. Buffer
-mode shows buffers, client mode clients and tree mode a tree of
-sessions, windows and panes.
-
-Each mode has a common set of key bindings plus a few that are specific
-to the mode. Other changes are:
-
-- each mode has a preview pane: for buffers this is the buffer content
-  (very useful), for others it is a preview of the pane;
-
-- items may be sorted in different ways ('O' key);
-
-- multiple items may be tagged and an operation applied to all of them
-  (for example, to delete multiple buffers at once);
-
-- in tree mode a command may be run on the selected item (session,
-  window, pane) or on tagged items (key ':');
-
-- displayed items may be filtered in tree mode by using a format (this
-  is used to implement find-window) (key 'f');
-
-- the custom format (-F) for the display is no longer available;
-
-- shortcut keys change from 0-9, a-z, A-Z which was always a bit weird
-  with keys used for other uses to 0-9, M-a to M-z.
-
-Now that the code is simpler, other improvements will come later.
-
-Primary key bindings for each mode are documented under the commands in
-the man page (choose-buffer, choose-client, choose-tree).
-
-Parts written by Thomas Adam.
+@Support %else in config files to match %if, from Brad Town in GitHub
+issue 1071.
 @
 text
-@/* $OpenBSD: cfg.c,v 1.59 2017/05/01 12:20:55 nicm Exp $ */
+@/* $OpenBSD: cfg.c,v 1.60 2017/05/30 21:44:59 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@@gmail.com>
@@ -441,6 +413,17 @@ text
 #include <util.h>
 
 #include "tmux.h"
+
+/* Condition for %if, %elif, %else and %endif. */
+struct cfg_cond {
+	size_t			line;		/* line number of %if */
+	int			met;		/* condition was met */
+	int			skip;		/* skip later %elif/%else */
+	int			saw_else;	/* saw a %else */
+
+	TAILQ_ENTRY(cfg_cond)	entry;
+};
+TAILQ_HEAD(cfg_conds, cfg_cond);
 
 static char		 *cfg_file;
 int			  cfg_finished;
@@ -517,6 +500,124 @@ start_cfg(void)
 	cmdq_append(NULL, cmdq_get_callback(cfg_done, NULL));
 }
 
+static int
+cfg_check_condition(const char *path, size_t line, const char *p, int *skip)
+{
+	struct format_tree	*ft;
+	char			*s;
+	int			 result;
+
+	while (isspace((u_char)*p))
+		p++;
+	if (p[0] == '\0') {
+		cfg_add_cause("%s:%zu: invalid condition", path, line);
+		*skip = 1;
+		return (0);
+	}
+
+	ft = format_create(NULL, NULL, FORMAT_NONE, FORMAT_NOJOBS);
+	s = format_expand(ft, p);
+	result = format_true(s);
+	free(s);
+	format_free(ft);
+
+	*skip = result;
+	return (result);
+}
+
+static void
+cfg_handle_if(const char *path, size_t line, struct cfg_conds *conds,
+    const char *p)
+{
+	struct cfg_cond	*cond;
+	struct cfg_cond	*parent = TAILQ_FIRST(conds);
+
+	/*
+	 * Add a new condition. If a previous condition exists and isn't
+	 * currently met, this new one also can't be met.
+	 */
+	cond = xcalloc(1, sizeof *cond);
+	cond->line = line;
+	if (parent == NULL || parent->met)
+		cond->met = cfg_check_condition(path, line, p, &cond->skip);
+	else
+		cond->skip = 1;
+	cond->saw_else = 0;
+	TAILQ_INSERT_HEAD(conds, cond, entry);
+}
+
+static void
+cfg_handle_elif(const char *path, size_t line, struct cfg_conds *conds,
+    const char *p)
+{
+	struct cfg_cond	*cond = TAILQ_FIRST(conds);
+
+	/*
+	 * If a previous condition exists and wasn't met, check this
+	 * one instead and change the state.
+	 */
+	if (cond == NULL || cond->saw_else)
+		cfg_add_cause("%s:%zu: unexpected %%elif", path, line);
+	else if (!cond->skip)
+		cond->met = cfg_check_condition(path, line, p, &cond->skip);
+	else
+		cond->met = 0;
+}
+
+static void
+cfg_handle_else(const char *path, size_t line, struct cfg_conds *conds)
+{
+	struct cfg_cond	*cond = TAILQ_FIRST(conds);
+
+	/*
+	 * If a previous condition exists and wasn't met and wasn't already
+	 * %else, use this one instead.
+	 */
+	if (cond == NULL || cond->saw_else) {
+		cfg_add_cause("%s:%zu: unexpected %%else", path, line);
+		return;
+	}
+	cond->saw_else = 1;
+	cond->met = !cond->skip;
+	cond->skip = 1;
+}
+
+static void
+cfg_handle_endif(const char *path, size_t line, struct cfg_conds *conds)
+{
+	struct cfg_cond	*cond = TAILQ_FIRST(conds);
+
+	/*
+	 * Remove previous condition if one exists.
+	 */
+	if (cond == NULL) {
+		cfg_add_cause("%s:%zu: unexpected %%endif", path, line);
+		return;
+	}
+	TAILQ_REMOVE(conds, cond, entry);
+	free(cond);
+}
+
+static void
+cfg_handle_directive(const char *p, const char *path, size_t line,
+    struct cfg_conds *conds)
+{
+	int	n = 0;
+
+	while (p[n] != '\0' && !isspace((u_char)p[n]))
+		n++;
+	if (strncmp(p, "%if", n) == 0)
+		cfg_handle_if(path, line, conds, p + n);
+	else if (strncmp(p, "%elif", n) == 0)
+		cfg_handle_elif(path, line, conds, p + n);
+	else if (strcmp(p, "%else") == 0)
+		cfg_handle_else(path, line, conds);
+	else if (strcmp(p, "%endif") == 0)
+		cfg_handle_endif(path, line, conds);
+	else
+		cfg_add_cause("%s:%zu: invalid directive: %s", path, line, p);
+}
+
 int
 load_cfg(const char *path, struct client *c, struct cmdq_item *item, int quiet)
 {
@@ -524,11 +625,13 @@ load_cfg(const char *path, struct client *c, struct cmdq_item *item, int quiet)
 	const char		 delim[3] = { '\\', '\\', '\0' };
 	u_int			 found = 0;
 	size_t			 line = 0;
-	char			*buf, *cause1, *p, *q, *s;
+	char			*buf, *cause1, *p, *q;
 	struct cmd_list		*cmdlist;
 	struct cmdq_item	*new_item;
-	int			 condition = 0;
-	struct format_tree	*ft;
+	struct cfg_cond		*cond, *cond1;
+	struct cfg_conds	 conds;
+
+	TAILQ_INIT(&conds);
 
 	log_debug("loading %s", path);
 	if ((f = fopen(path, "rb")) == NULL) {
@@ -552,33 +655,12 @@ load_cfg(const char *path, struct client *c, struct cmdq_item *item, int quiet)
 		while (q != p && isspace((u_char)*q))
 			*q-- = '\0';
 
-		if (condition != 0 && strcmp(p, "%endif") == 0) {
-			condition = 0;
+		if (*p == '%') {
+			cfg_handle_directive(p, path, line, &conds);
 			continue;
 		}
-		if (strncmp(p, "%if ", 4) == 0) {
-			if (condition != 0) {
-				cfg_add_cause("%s:%zu: nested %%if", path,
-				    line);
-				continue;
-			}
-			ft = format_create(NULL, NULL, FORMAT_NONE,
-			    FORMAT_NOJOBS);
-
-			s = p + 3;
-			while (isspace((u_char)*s))
-				s++;
-			s = format_expand(ft, s);
-			if (*s != '\0' && (s[0] != '0' || s[1] != '\0'))
-				condition = 1;
-			else
-				condition = -1;
-			free(s);
-
-			format_free(ft);
-			continue;
-		}
-		if (condition == -1)
+		cond = TAILQ_FIRST(&conds);
+		if (cond != NULL && !cond->met)
 			continue;
 
 		cmdlist = cmd_string_parse(p, path, line, &cause1);
@@ -604,6 +686,12 @@ load_cfg(const char *path, struct client *c, struct cmdq_item *item, int quiet)
 		found++;
 	}
 	fclose(f);
+
+	TAILQ_FOREACH_REVERSE_SAFE(cond, &conds, cfg_conds, entry, cond1) {
+		cfg_add_cause("%s:%zu: unterminated %%if", path, cond->line);
+		TAILQ_REMOVE(&conds, cond, entry);
+		free(cond);
+	}
 
 	return (found);
 }
@@ -659,6 +747,91 @@ cfg_show_causes(struct session *s)
 	cfg_causes = NULL;
 	cfg_ncauses = 0;
 }
+@
+
+
+1.60
+log
+@Rewrite of choose mode, both to simplify and tidy the code and to add
+some modern features.
+
+Now the common code is in mode-tree.c, which provides an API used by the
+three modes now separated into window-{buffer,client,tree}.c. Buffer
+mode shows buffers, client mode clients and tree mode a tree of
+sessions, windows and panes.
+
+Each mode has a common set of key bindings plus a few that are specific
+to the mode. Other changes are:
+
+- each mode has a preview pane: for buffers this is the buffer content
+  (very useful), for others it is a preview of the pane;
+
+- items may be sorted in different ways ('O' key);
+
+- multiple items may be tagged and an operation applied to all of them
+  (for example, to delete multiple buffers at once);
+
+- in tree mode a command may be run on the selected item (session,
+  window, pane) or on tagged items (key ':');
+
+- displayed items may be filtered in tree mode by using a format (this
+  is used to implement find-window) (key 'f');
+
+- the custom format (-F) for the display is no longer available;
+
+- shortcut keys change from 0-9, a-z, A-Z which was always a bit weird
+  with keys used for other uses to 0-9, M-a to M-z.
+
+Now that the code is simpler, other improvements will come later.
+
+Primary key bindings for each mode are documented under the commands in
+the man page (choose-buffer, choose-client, choose-tree).
+
+Parts written by Thomas Adam.
+@
+text
+@d1 1
+a1 1
+/* $OpenBSD: cfg.c,v 1.59 2017/05/01 12:20:55 nicm Exp $ */
+d30 11
+d116 118
+d241 1
+a241 1
+	char			*buf, *cause1, *p, *q, *s;
+d244 4
+a247 2
+	int			 condition = 0;
+	struct format_tree	*ft;
+d271 2
+a272 2
+		if (condition != 0 && strcmp(p, "%endif") == 0) {
+			condition = 0;
+d275 2
+a276 23
+		if (strncmp(p, "%if ", 4) == 0) {
+			if (condition != 0) {
+				cfg_add_cause("%s:%zu: nested %%if", path,
+				    line);
+				continue;
+			}
+			ft = format_create(NULL, NULL, FORMAT_NONE,
+			    FORMAT_NOJOBS);
+
+			s = p + 3;
+			while (isspace((u_char)*s))
+				s++;
+			s = format_expand(ft, s);
+			if (*s != '\0' && (s[0] != '0' || s[1] != '\0'))
+				condition = 1;
+			else
+				condition = -1;
+			free(s);
+
+			format_free(ft);
+			continue;
+		}
+		if (condition == -1)
+d302 6
 @
 
 
